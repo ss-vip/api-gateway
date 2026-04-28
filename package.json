@@ -1,0 +1,18 @@
+{
+  "name": "api-gateway",
+  "main": "src/index.js",
+  "scripts": {
+    "reset-db": "rm -rf .wrangler/state/v3/d1 && npx wrangler d1 execute DB --local --file=./schema.sql",
+    "init-db": "wrangler d1 execute DB --local --file=./schema.sql",
+    "dev": "npm run init-db && wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240000.0",
+    "wrangler": "^4.84.1"
+  }
+}
