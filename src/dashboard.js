@@ -71,6 +71,29 @@ app.post('/admin/api/config', async c => {
   return c.json({ ok: true })
 })
 
+app.post('/admin/api/import-all', async c => {
+  const d = await c.req.json()
+  const batch = []
+  if (d.channels) {
+    batch.push(c.env.DB.prepare("DELETE FROM channels"))
+    d.channels.forEach(ch => {
+      batch.push(c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0))
+    })
+  }
+  if (d.filters) {
+    batch.push(c.env.DB.prepare("DELETE FROM filters"))
+    d.filters.forEach(f => {
+      batch.push(c.env.DB.prepare(`INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)`).bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0))
+    })
+  }
+  if (d.config) {
+    const currentPass = await getAdminPass(c)
+    batch.push(c.env.DB.prepare(`INSERT OR REPLACE INTO config (id, client_token, admin_password, cooldown_time) VALUES (1, ?, ?, ?)`).bind(d.config.token || DEFAULTS.token, d.config.pass || currentPass, parseInt(d.config.cooldown) || DEFAULTS.cooldown))
+  }
+  if (batch.length > 0) await c.env.DB.batch(batch)
+  return c.json({ ok: true })
+})
+
 app.post('/admin/login', async c => {
   const { password } = await c.req.json()
   const pass = await getAdminPass(c)
@@ -82,7 +105,7 @@ app.post('/admin/api/reset', async c => {
   await c.env.DB.batch([
     c.env.DB.prepare("DELETE FROM channels"),
     c.env.DB.prepare("DELETE FROM filters"),
-    c.env.DB.prepare("UPDATE config SET client_token = ?, admin_password = ?, cooldown_time = ? WHERE id = 1").bind(DEFAULTS.token, DEFAULTS.pass, DEFAULTS.cooldown)
+    c.env.DB.prepare("INSERT OR REPLACE INTO config (id, client_token, admin_password, cooldown_time) VALUES (1, ?, ?, ?)").bind(DEFAULTS.token, DEFAULTS.pass, DEFAULTS.cooldown)
   ])
   return c.json({ ok: true })
 })
@@ -105,6 +128,13 @@ const UI_SHELL = html`<!DOCTYPE html>
     #loading-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9999; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
     .spinner-border { width: 3rem; height: 3rem; color: white; }
     .stat-card { border-left: 4px solid var(--bs-primary); }
+    .table-responsive { border-radius: 12px; overflow: hidden; }
+    @media (max-width: 576px) {
+      .navbar-brand { font-size: 1rem; }
+      .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+      .card-header span { font-size: 0.85rem; }
+      .input-group-text { font-size: 0.7rem; }
+    }
   </style>
 </head>
 <body>
@@ -117,52 +147,75 @@ const UI_SHELL = html`<!DOCTYPE html>
   </div>
 
   <div id="admin-view">
-    <nav class="navbar navbar-expand-md border-bottom sticky-top mb-4 py-2"><div class="container"><a class="navbar-brand fw-bold" href="#">Dashboard</a>
-      <div class="d-flex gap-2">
-        <button onclick="toggleTheme()" class="btn btn-sm btn-outline-secondary border-0"><i id="theme-icon" class="bi bi-sun"></i></button>
-        <button onclick="passModal.show()" class="btn btn-sm btn-outline-warning fw-bold">UPDATE PASS</button>
-        <button onclick="exportJson()" class="btn btn-sm btn-outline-primary fw-bold">EXPORT</button>
-        <label class="btn btn-sm btn-outline-info fw-bold mb-0">IMPORT<input type="file" onchange="importJson(event)" style="display:none" /></label>
-        <button onclick="resetSystem()" class="btn btn-sm btn-outline-danger fw-bold">RESET</button>
-        <button onclick="logout()" class="btn btn-danger btn-sm fw-bold">LOGOUT</button>
+    <nav class="navbar navbar-expand border-bottom sticky-top mb-4 py-2"><div class="container">
+      <a class="navbar-brand fw-bold text-primary" href="#">Gateway</a>
+      <div class="ms-auto d-flex gap-2 align-items-center">
+        <button onclick="toggleTheme()" class="btn btn-sm btn-outline-secondary border-0 px-2"><i id="theme-icon" class="bi bi-sun"></i></button>
+        <div class="dropdown">
+          <button class="btn btn-sm btn-outline-primary dropdown-toggle fw-bold" data-bs-toggle="dropdown">TOOLS</button>
+          <ul class="dropdown-menu dropdown-menu-end shadow border-0">
+            <li><button class="dropdown-item py-2 small" onclick="passModal.show()"><i class="bi bi-shield-lock me-2"></i>Update Pass</button></li>
+            <li><button class="dropdown-item py-2 small" onclick="exportJson()"><i class="bi bi-download me-2"></i>Export JSON</button></li>
+            <li><label class="dropdown-item py-2 small mb-0 cursor-pointer" style="cursor:pointer"><i class="bi bi-upload me-2"></i>Import JSON<input type="file" onchange="importJson(event)" style="display:none" /></label></li>
+            <li><hr class="dropdown-divider"></li>
+            <li><button class="dropdown-item py-2 small text-danger" onclick="resetSystem()"><i class="bi bi-arrow-counterclockwise me-2"></i>System Reset</button></li>
+          </ul>
+        </div>
+        <button onclick="logout()" class="btn btn-danger btn-sm fw-bold px-3">LOGOUT</button>
       </div>
     </div></nav>
     <div class="container pb-5">
       <div class="row g-3 mb-4">
-        <div class="col-md-5">
+        <div class="col-lg-5">
           <div class="card h-100 stat-card"><div class="card-body">
             <p class="text-muted small fw-bold mb-3 text-uppercase">System Status</p>
-            <div class="row text-center g-2" id="stat-content"></div>
+            <div class="row text-center g-3" id="stat-content"></div>
           </div></div>
         </div>
-        <div class="col-md-7">
-          <div class="card h-100"><div class="card-body">
-            <p class="text-muted small fw-bold mb-3 text-uppercase">API Configuration</p>
-            <div class="row g-2">
-              <div class="col-md-8"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">TOKEN</span><input type="text" id="cfg-token" class="form-control font-monospace" /><button class="btn btn-outline-secondary" onclick="copyToken()"><i class="bi bi-copy"></i></button></div></div>
-              <div class="col-md-4"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">429 (S)</span><input type="number" id="cfg-cooldown" class="form-control" /></div></div>
-              <div class="col-12 mt-2"><button onclick="saveConfig()" class="btn btn-primary btn-sm w-100 fw-bold">SAVE CONFIGURATION</button></div>
+        <div class="col-lg-7">
+          <div class="card h-100">
+            <div class="card-header bg-transparent d-flex justify-content-between align-items-center py-3 border-0">
+              <span class="text-muted small fw-bold text-uppercase">API Configuration</span>
+              <button onclick="saveConfig()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE</button>
             </div>
-          </div></div>
+            <div class="card-body pt-0">
+              <div class="row g-2">
+                <div class="col-sm-8"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">TOKEN</span><input type="text" id="cfg-token" class="form-control font-monospace" /><button class="btn btn-outline-secondary" onclick="copyToken()"><i class="bi bi-copy"></i></button></div></div>
+                <div class="col-sm-4"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">429(s)</span><input type="number" id="cfg-cooldown" class="form-control" /></div></div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
-      <div class="card mb-4">
+      <div class="card mb-4 border-0 shadow-sm">
         <div class="card-header bg-transparent fw-bold d-flex justify-content-between align-items-center py-3 border-0">
           <span>Channels</span>
           <div class="d-flex gap-2"><button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button><button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button></div>
         </div>
-        <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle">
-          <thead><tr><th>ON/OFF</th><th>Name</th><th>Model <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="若有帶圖像的請求將優先調用視覺模型"></i></th><th>Weight <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="大值優先"></i></th><th>Health <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="健康狀態與資訊，可手動重置"></i></th><th>Actions <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="手動重置健康狀態或等候自動觀察"></i></th></tr></thead>
+        <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
+          <thead class="table-light"><tr>
+            <th>ON/OFF</th>
+            <th>Name</th>
+            <th>Model <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="圖像請求將優先調用視覺模型"></i></th>
+            <th class="d-none d-sm-table-cell">Weight <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="權重越高分配機率越大"></i></th>
+            <th>Health <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="健康狀態，連續失敗5次將熔斷"></i></th>
+            <th>Actions</th>
+          </tr></thead>
           <tbody id="channel-list"></tbody>
         </table></div>
       </div>
-      <div class="card">
+      <div class="card border-0 shadow-sm">
         <div class="card-header bg-transparent fw-bold d-flex justify-content-between align-items-center py-3 border-0">
           <span>Filters</span>
           <div class="d-flex gap-2"><button onclick="addFilter()" class="btn btn-outline-info btn-sm px-3 fw-bold">ADD</button><button onclick="saveAllFilters()" class="btn btn-info btn-sm px-3 fw-bold">SAVE ALL</button></div>
         </div>
-        <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle">
-          <thead><tr><th>ON/OFF</th><th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="空白則全部刪除"></i></th><th>Mode <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="截斷關鍵字及其後所有字元或僅刪除關鍵字"></i></th><th>Actions</th></tr></thead>
+        <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
+          <thead class="table-light"><tr>
+            <th>ON/OFF</th>
+            <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="命中關鍵字後的過濾動作"></i></th>
+            <th class="d-none d-sm-table-cell">Mode</th>
+            <th>Actions</th>
+          </tr></thead>
           <tbody id="filter-list"></tbody>
         </table></div>
       </div>
@@ -176,23 +229,25 @@ const UI_SHELL = html`<!DOCTYPE html>
   </div></div></div>
 
   <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content">
-    <div class="modal-header border-0 pb-0"><h5 class="fw-bold">Channel Editor</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
-    <div class="modal-body p-4">
+    <div class="modal-header border-0 pb-0"><h5 class="fw-bold small">Channel Editor</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body p-3 p-md-4">
       <input type="hidden" id="ch-idx" />
-      <div class="mb-3"><label class="form-label small fw-bold">Name * (Unique)</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
-      <div class="mb-3"><label class="form-label small fw-bold">API Key</label><input type="password" id="ch-key" class="form-control form-control-sm" /></div>
-      <div class="mb-3"><label class="form-label small fw-bold">Base URL (Auto /v1)</label><input type="text" id="ch-url" class="form-control form-control-sm" /></div>
-      <div class="row g-2 mb-3"><div class="col-8"><label class="form-label small fw-bold">Model</label><input type="text" id="ch-model" class="form-control form-control-sm" /></div><div class="col-4"><label class="form-label small fw-bold">Weight</label><input type="number" id="ch-weight" class="form-control form-control-sm" value="1" /></div></div>
-      <div class="row g-2 mb-3">
-        <div class="col-3"><label class="form-label small fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm" value="0" /></div>
-        <div class="col-3"><label class="form-label small fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm" value="0" /></div>
-        <div class="col-3"><label class="form-label small fw-bold">TPM</label><input type="number" id="ch-tpm" class="form-control form-control-sm" value="0" /></div>
-        <div class="col-3"><label class="form-label small fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm" value="0" /></div>
+      <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
+      <div class="mb-2"><label class="form-label mini-label fw-bold">API Key</label><input type="password" id="ch-key" class="form-control form-control-sm" /></div>
+      <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL</label><input type="text" id="ch-url" class="form-control form-control-sm" /></div>
+      <div class="row g-2 mb-2"><div class="col-8"><label class="form-label mini-label fw-bold">Model</label><input type="text" id="ch-model" class="form-control form-control-sm" /></div><div class="col-4"><label class="form-label mini-label fw-bold">Weight</label><input type="number" id="ch-weight" class="form-control form-control-sm" value="1" /></div></div>
+      <div class="row g-1 mb-2">
+        <div class="col-3"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" value="0" /></div>
+        <div class="col-3"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" value="0" /></div>
+        <div class="col-3"><label class="form-label mini-label fw-bold">TPM</label><input type="number" id="ch-tpm" class="form-control form-control-sm p-1" value="0" /></div>
+        <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" value="0" /></div>
       </div>
       <div class="d-flex gap-3 mt-3"><div class="form-check"><input class="form-check-input" type="checkbox" id="ch-vision" /><label class="form-check-label small fw-bold">Vision</label></div><div class="form-check"><input class="form-check-input" type="checkbox" id="ch-enabled" checked /><label class="form-check-label small fw-bold">Enabled</label></div></div>
     </div>
     <div class="modal-footer border-0 pt-0"><button onclick="applyChannel()" class="btn btn-primary w-100 fw-bold">APPLY</button></div>
   </div></div></div>
+
+  <style>.mini-label { font-size: 0.65rem; margin-bottom: 2px; text-transform: uppercase; color: var(--bs-secondary); }</style>
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script>
@@ -237,7 +292,7 @@ const UI_SHELL = html`<!DOCTYPE html>
         { label: 'Active', val: healthy, color: 'success' },
         { label: 'Unstable', val: unstable, color: 'warning' },
         { label: 'Error', val: error, color: 'danger' }
-      ].map(s => '<div class="col-3"><div class="fw-bold small text-' + s.color + '">' + s.label + '</div><div class="h5 fw-bold mb-0">' + s.val + '</div></div>').join('');
+      ].map(s => '<div class="col-6 col-md-3"><div class="fw-bold mini-label text-' + s.color + '">' + s.label + '</div><div class="h5 fw-bold mb-0">' + s.val + '</div></div>').join('');
     };
 
     const renderChannels = () => {
@@ -255,15 +310,26 @@ const UI_SHELL = html`<!DOCTYPE html>
           '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + i + '].is_enabled=this.checked;renderStats()"></div></td>' +
           '<td class="fw-bold">' + c.name + '</td>' +
           '<td><code class="small">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + '</td>' +
-          '<td>' + c.weight + '</td>' +
+          '<td class="d-none d-sm-table-cell">' + c.weight + '</td>' +
           '<td>' + h + '</td>' +
           '<td>' +
-            '<button onclick="editChannel(' + i + ')" class="btn btn-sm btn-outline-primary py-0 px-2 me-1">Edit</button>' +
-            '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-0 px-2 me-1">Reset</button>' +
-            '<button onclick="delChannel(' + i + ')" class="btn btn-sm btn-outline-danger py-0 px-2">Del</button>' +
+            '<div class="d-none d-md-flex justify-content-center gap-1">' +
+              '<button onclick="editChannel(' + i + ')" class="btn btn-sm btn-outline-primary py-0 px-2">Edit</button>' +
+              '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-0 px-2">Reset</button>' +
+              '<button onclick="delChannel(' + i + ')" class="btn btn-sm btn-outline-danger py-0 px-2">Del</button>' +
+            '</div>' +
+            '<div class="d-md-none dropdown">' +
+              '<button class="btn btn-sm btn-light py-0 px-2" type="button" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>' +
+              '<ul class="dropdown-menu dropdown-menu-end shadow border-0">' +
+                '<li><button onclick="editChannel(' + i + ')" class="dropdown-item small">Edit</button></li>' +
+                '<li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>' +
+                '<li><button onclick="delChannel(' + i + ')" class="dropdown-item small text-danger">Delete</button></li>' +
+              '</ul>' +
+            '</div>' +
           '</td>' +
         '</tr>';
       }).join('') || '<tr><td colspan="6" class="py-4 text-muted">No channels.</td></tr>';
+      initTooltips();
     };
 
     const resetHealth = async (id) => {
@@ -285,9 +351,10 @@ const UI_SHELL = html`<!DOCTYPE html>
       document.getElementById('filter-list').innerHTML = filters.map((f, i) => '<tr>' +
         '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
         '<td><input type="text" class="form-control form-control-sm font-monospace" value="' + f.text + '" onchange="filters[' + i + '].text=this.value"></td>' +
-        '<td><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
-        '<td><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-0 px-2">Del</button></td>' +
+        '<td class="d-none d-sm-table-cell"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
+        '<td><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-0 px-2"><i class="bi bi-trash"></i></button></td>' +
       '</tr>').join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
+      initTooltips();
     };
 
     const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, pass: adminPass, cooldown: document.getElementById('cfg-cooldown').value }); alert('Saved'); };
@@ -316,7 +383,7 @@ const UI_SHELL = html`<!DOCTYPE html>
       const b = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }); 
       const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-' + ts + '.json'; a.click(); 
     };
-    const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (d.channels) channels = d.channels; if (d.filters) filters = d.filters; if (d.config) { document.getElementById('cfg-token').value = d.config.token; document.getElementById('cfg-cooldown').value = d.config.cooldown; adminPass = d.config.pass; await saveConfig(); } await saveAllChannels(); await saveAllFilters(); alert('Imported'); }; r.readAsText(e.target.files[0]); };
+    const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (await api('/admin/api/import-all', 'POST', d)) { if (d.config && d.config.pass) { sessionStorage.setItem('adminToken', d.config.pass); } alert('Imported Successfully'); init(); } }; r.readAsText(e.target.files[0]); };
     const resetSystem = async () => { if (confirm('Reset All?')) { await api('/admin/api/reset', 'POST'); location.reload(); } };
     window.onload = async () => {
       const t = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
