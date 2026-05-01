@@ -8,4 +8,8 @@ mode = "smart"
 [[d1_databases]]
 binding = "DB"
 database_name = "api-gateway-db"
-database_id = "api-gateway-id"
+database_id = "db-uuid"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "kv-id"

@@ -1,18 +1,18 @@
 {
   "name": "api-gateway",
+  "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "reset-db": "rm -rf .wrangler/state/v3/d1 && npx wrangler d1 execute DB --local --file=./schema.sql",
-    "init-db": "wrangler d1 execute DB --local --file=./schema.sql",
-    "dev": "npm run init-db && wrangler dev",
-    "deploy": "wrangler deploy",
-    "build": "wrangler deploy"
+    "reset-db": "node -e \"require('fs').rmSync('.wrangler/state/v3/d1', {recursive:true, force:true})\"",
+    "setup": "npx wrangler d1 execute DB --local --file=./schema.sql",
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler d1 execute DB --remote --file=./schema.sql && npx wrangler deploy"
   },
   "dependencies": {
-    "hono": "^4.0.0"
+    "hono": "^4.12.16"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240000.0",
-    "wrangler": "^4.84.1"
+    "@cloudflare/workers-types": "^4.20260501.1",
+    "wrangler": "^4.87.0"
   }
 }

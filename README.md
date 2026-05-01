@@ -19,22 +19,18 @@ OpenAI 相容格式的 API 分流服務，可佈署於 **Cloudflare Workers**，
 ```text
 api-gateway/
 ├── src/
-│   ├── index.js      # 應用入口與路由總控
-│   ├── proxy.js      # 代理與分流核心邏輯
-│   ├── db.js         # D1 資料庫操作封裝
-│   └── admin.js      # 管理後台介面與 API
-├── wrangler.toml     # Cloudflare Workers 配置
-├── schema.sql        # 資料庫結構定義
-└── package.json      # 專案依賴
+│   ├── index.js            # 入口與核心程式
+│   └── dashboard.js        # 管理後台介面
+├── wrangler.toml.example   # Cloudflare Workers 配置
+├── schema.sql              # 資料庫結構定義
+└── package.json            # 專案依賴
 ```
 
 ---
 
 ## ⚙️ 環境變數
 
-在 `.dev.vars` (開發環境) 或 Cloudflare Secrets (正式環境) 中設定：
-
-`ADMIN_PASSWORD=管理後台登入密碼`
+請修改 `wrangler.toml` 加入 d1_databases 與 kv_namespaces 資訊
 
 ---
 
@@ -48,7 +44,15 @@ api-gateway/
 npm install
 ```
 
-### 2. 本地開發
+### 2. 資料庫初始化
+
+使用 Wrangler 重置 D1 資料庫 (本地測試)：
+
+```bash
+npm run setup
+```
+
+### 3. 本地開發
 
 啟動本地開發伺服器：
 
@@ -56,7 +60,7 @@ npm install
 npm run dev
 ```
 
-### 3. 部署至 Cloudflare
+### 4. 部署至 Cloudflare
 
 ```bash
 npm run deploy
@@ -74,7 +78,7 @@ npm run reset-db
 
 ## 🛠️ 管理後台
 
-於路徑 `/admin` 輸入密碼登入。
+於路徑 `/admin` 輸入密碼登入。 (預設為 `adm123456`)
 
 ### 渠道管理
 
