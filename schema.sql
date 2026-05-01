@@ -3,14 +3,18 @@ CREATE TABLE IF NOT EXISTS channels (
   name TEXT,
   base_url TEXT,
   api_key TEXT,
-  provider TEXT, -- openai | anthropic
+  provider TEXT DEFAULT 'openai', -- openai | anthropic
   model TEXT,
   model_name TEXT,
   weight INTEGER DEFAULT 1,
-  rpm_limit INTEGER DEFAULT 5,
+  rpm_limit INTEGER DEFAULT 0,
   rpd_limit INTEGER DEFAULT 0,
   tpm_limit INTEGER DEFAULT 0,
   tpd_limit INTEGER DEFAULT 0,
+  rpm_count INTEGER DEFAULT 0,
+  rpm_reset_at INTEGER DEFAULT 0,
+  rpd_count INTEGER DEFAULT 0,
+  rpd_reset_at INTEGER DEFAULT 0,
   is_enabled INTEGER DEFAULT 1,
   is_vision INTEGER DEFAULT 0,
   last_429 INTEGER DEFAULT 0,
@@ -31,10 +35,4 @@ CREATE TABLE IF NOT EXISTS config (
   client_token TEXT,
   admin_password TEXT,
   cooldown_time INTEGER DEFAULT 300
-);
-
-CREATE TABLE IF NOT EXISTS tools (
-  name TEXT PRIMARY KEY,
-  description TEXT,
-  schema TEXT
 );
