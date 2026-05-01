@@ -6,8 +6,12 @@ const app = new Hono()
 const DEFAULTS = { token: 'sk-test123456', pass: 'adm123456', cooldown: 300 }
 
 const getAdminPass = async (c) => {
-  const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first()
-  return cf?.admin_password || c.env.ADMIN_PASSWORD || DEFAULTS.pass
+  try {
+    const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first()
+    return cf?.admin_password || c.env.ADMIN_PASSWORD || DEFAULTS.pass
+  } catch (e) {
+    return c.env.ADMIN_PASSWORD || DEFAULTS.pass
+  }
 }
 
 app.use('/admin/api/*', async (c, next) => {
@@ -148,8 +152,7 @@ const UI_SHELL = html`<!DOCTYPE html>
           <div class="d-flex gap-2"><button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button><button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button></div>
         </div>
         <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle">
-          <thead><tr><th>ON/OFF</th><th>Name</th><th>Model <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="若有帶圖像的請求將優先調用視覺模型"></i>
-          </th><th>Weight <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="大值優先"></i></th><th>Health <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="健康狀態與資訊，可手動重置"></i></th><th>Actions <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="手動重置健康狀態或等候自動觀察"></i></th></tr></thead>
+          <thead><tr><th>ON/OFF</th><th>Name</th><th>Model <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="若有帶圖像的請求將優先調用視覺模型"></i></th><th>Weight <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="大值優先"></i></th><th>Health <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="健康狀態與資訊，可手動重置"></i></th><th>Actions <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="手動重置健康狀態或等候自動觀察"></i></th></tr></thead>
           <tbody id="channel-list"></tbody>
         </table></div>
       </div>
@@ -159,8 +162,7 @@ const UI_SHELL = html`<!DOCTYPE html>
           <div class="d-flex gap-2"><button onclick="addFilter()" class="btn btn-outline-info btn-sm px-3 fw-bold">ADD</button><button onclick="saveAllFilters()" class="btn btn-info btn-sm px-3 fw-bold">SAVE ALL</button></div>
         </div>
         <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle">
-          <thead><tr><th>ON/OFF</th><th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="空白則全部刪除"></i></th><th>Mode <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="截斷關鍵字及其後所有字元或僅刪除關鍵字"></i>
-</th><th>Actions</th></tr></thead>
+          <thead><tr><th>ON/OFF</th><th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="空白則全部刪除"></i></th><th>Mode <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="截斷關鍵字及其後所有字元或僅刪除關鍵字"></i></th><th>Actions</th></tr></thead>
           <tbody id="filter-list"></tbody>
         </table></div>
       </div>
@@ -201,7 +203,8 @@ const UI_SHELL = html`<!DOCTYPE html>
       const r = await fetch(u, { method: m, headers: { 'Content-Type': 'application/json', 'X-Admin-Token': sessionStorage.getItem('adminToken') || '' }, body: b ? JSON.stringify(b) : null });
       loading(false);
       if (r.status === 401) { showLogin(); return null; }
-      return r.ok ? r.json() : null;
+      if (!r.ok) { const err = await r.json(); alert(err.error || 'Request Failed'); return null; }
+      return r.json();
     };
     const showLogin = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('login-view').style.display = 'block'; };
     const showAdmin = () => { document.getElementById('login-view').style.display = 'none'; document.getElementById('admin-view').style.display = 'block'; init(); };
@@ -209,14 +212,15 @@ const UI_SHELL = html`<!DOCTYPE html>
     const toggleTheme = () => { const t = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun'; localStorage.setItem('theme', t); };
     const copyToken = () => { const t = document.getElementById('cfg-token'); t.select(); document.execCommand('copy'); alert('Token Copied'); };
     const esc = (s) => String(s || "").replace(/[\\"\\n\\r\\t]/g, ' ').replace(/"/g, '&quot;');
+    const initTooltips = () => { [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].map(el => new bootstrap.Tooltip(el)); };
 
-    document.getElementById('loginForm').onsubmit = async (e) => { e.preventDefault(); const p = document.getElementById('login-pass').value; loading(true); const r = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: p }) }); loading(false); if (r.ok) { sessionStorage.setItem('adminToken', p); showAdmin(); } else alert('密碼錯誤'); };
+    document.getElementById('loginForm').onsubmit = async (e) => { e.preventDefault(); const p = document.getElementById('login-pass').value; loading(true); try { const r = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: p }) }); loading(false); if (r.ok) { sessionStorage.setItem('adminToken', p); showAdmin(); } else { const err = await r.json(); alert(err.error || '密碼錯誤'); } } catch(err) { loading(false); alert('網絡或資料庫異常，請確保已執行 D1 初始化'); } };
 
     const init = async () => {
       const cfg = await api('/admin/api/config'); if (!cfg) return;
       document.getElementById('cfg-token').value = cfg.token; document.getElementById('cfg-cooldown').value = cfg.cooldown; cooldown = cfg.cooldown; adminPass = cfg.pass;
       channels = await api('/admin/api'); filters = await api('/admin/api/filters');
-      renderStats(); renderChannels(); renderFilters();
+      renderStats(); renderChannels(); renderFilters(); initTooltips();
     };
 
     const renderStats = () => {
@@ -227,7 +231,7 @@ const UI_SHELL = html`<!DOCTYPE html>
       const error = channels.filter(c => c.is_enabled && c.consecutive_errors >= 5).length;
       const unstable = channels.filter(c => c.is_enabled && c.consecutive_errors > 0 && c.consecutive_errors < 5).length;
       const healthy = enabled - cooling - error - unstable;
-
+      
       document.getElementById('stat-content').innerHTML = [
         { label: 'Total', val: total, color: 'secondary' },
         { label: 'Active', val: healthy, color: 'success' },
@@ -246,7 +250,7 @@ const UI_SHELL = html`<!DOCTYPE html>
         }
         else if (now - (c.last_429 || 0) < cooldown) h = '<span class="badge bg-info health-badge" title="Cooldown active">冷卻</span>';
         else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="' + esc(c.last_error_msg || 'Minor errors') + '">不穩</span>';
-
+        
         return '<tr>' +
           '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + i + '].is_enabled=this.checked;renderStats()"></div></td>' +
           '<td class="fw-bold">' + c.name + '</td>' +
@@ -295,7 +299,7 @@ const UI_SHELL = html`<!DOCTYPE html>
       const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-enabled').checked = c.is_enabled == 1; chModal.show();
     };
     const applyChannel = () => {
-      const idx = document.getElementById('ch-idx').value;
+      const idx = document.getElementById('ch-idx').value; 
       const name = document.getElementById('ch-name').value.trim();
       if (!name) return alert('Name is required');
       if (channels.some((c, i) => c.name === name && String(i) !== String(idx))) return alert('Name must be unique');
@@ -308,9 +312,9 @@ const UI_SHELL = html`<!DOCTYPE html>
     const exportJson = () => {
       const now = new Date(); const pad = (n) => String(n).padStart(2, '0');
       const ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
-      const data = { channels, filters, config: { token: document.getElementById('cfg-token').value, pass: adminPass, cooldown: document.getElementById('cfg-cooldown').value } };
-      const b = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-' + ts + '.json'; a.click();
+      const data = { channels, filters, config: { token: document.getElementById('cfg-token').value, pass: adminPass, cooldown: document.getElementById('cfg-cooldown').value } }; 
+      const b = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }); 
+      const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-' + ts + '.json'; a.click(); 
     };
     const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (d.channels) channels = d.channels; if (d.filters) filters = d.filters; if (d.config) { document.getElementById('cfg-token').value = d.config.token; document.getElementById('cfg-cooldown').value = d.config.cooldown; adminPass = d.config.pass; await saveConfig(); } await saveAllChannels(); await saveAllFilters(); alert('Imported'); }; r.readAsText(e.target.files[0]); };
     const resetSystem = async () => { if (confirm('Reset All?')) { await api('/admin/api/reset', 'POST'); location.reload(); } };
