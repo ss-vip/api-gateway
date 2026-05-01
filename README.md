@@ -30,7 +30,7 @@ api-gateway/
 
 ## ⚙️ 環境變數
 
-請修改 `wrangler.toml` 加入 d1_databases 與 kv_namespaces 資訊
+請修改 `wrangler.toml` 加入 d1_databases 與 kv_namespaces ID
 
 ---
 
@@ -46,7 +46,7 @@ npm install
 
 ### 2. 資料庫初始化
 
-使用 Wrangler 重置 D1 資料庫 (本地測試)：
+建置 D1 資料庫 (本地測試)：
 
 ```bash
 npm run setup
@@ -78,7 +78,7 @@ npm run reset-db
 
 ## 🛠️ 管理後台
 
-於路徑 `/admin` 輸入密碼登入。 (預設為 `adm123456`)
+於路徑 `/admin` 輸入密碼登入，錯誤多次將 BAN IP。 (預設為 `adm123456`)
 
 ### 渠道管理
 
