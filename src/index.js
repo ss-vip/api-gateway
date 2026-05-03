@@ -5,11 +5,11 @@ import dashboard from './dashboard'
 const app = new Hono()
 app.use('*', cors({
   origin: '*',
-  allowHeaders: ['Content-Type', 'Authorization', 'X-Admin-Token', 'anthropic-version'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-Admin-Token'],
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  exposeHeaders: ['Content-Length', 'X-Kuma-Revision'],
+  exposeHeaders: ['Content-Length'],
   maxAge: 600,
-  credentials: true,
+  credentials: false,
 }))
 
 let cache = { data: null, ts: 0 }
@@ -20,109 +20,13 @@ app.route('/', dashboard(clearCache))
 
 const debug = (c, msg) => { if (c.req.url.includes('localhost') || c.req.url.includes('127.0.0.1')) console.log(msg) }
 
-function mapToClaude(body) {
-  // Extract system messages from messages array (Anthropic requires top-level system field)
-  const systemMsgs = (body.messages || []).filter(m => m.role === 'system')
-  const system = systemMsgs.map(m => (typeof m.content === 'string' ? m.content : m.content?.map?.(c => c.text || '').join('') || '')).join('\n') || undefined
-
-  // Convert OpenAI tools format → Anthropic format
-  const tools = body.tools?.map(t => {
-    if (t.type === 'function' && t.function) {
-      return { name: t.function.name, description: t.function.description, input_schema: t.function.parameters || { type: 'object', properties: {} } }
-    }
-    return t
-  })
-
-  // Convert messages: handle tool_calls and tool responses
-  const messages = []
-  for (const m of (body.messages || [])) {
-    if (m.role === 'system') continue
-    if (m.role === 'tool') {
-      // Anthropic requires tool results to be inside a 'user' message
-      // We append it to the previous user message if possible, or create a new one
-      const tr = { type: 'tool_result', tool_use_id: m.tool_call_id, content: m.content }
-      if (messages.length > 0 && messages[messages.length - 1].role === 'user') {
-        const last = messages[messages.length - 1]
-        if (Array.isArray(last.content)) last.content.push(tr)
-        else last.content = [{ type: 'text', text: last.content }, tr]
-      } else {
-        messages.push({ role: 'user', content: [tr] })
-      }
-    } else if (m.role === 'assistant' && m.tool_calls) {
-      const content = []
-      if (m.content) content.push({ type: 'text', text: m.content })
-      for (const t of m.tool_calls) {
-        if (t.type === 'function') {
-          content.push({ type: 'tool_use', id: t.id, name: t.function.name, input: JSON.parse(t.function.arguments || '{}') })
-        }
-      }
-      messages.push({ role: 'assistant', content })
-    } else {
-      // Standard user/assistant message. Clean up any 'name' fields Anthropic rejects
-      const cleanMsg = { role: m.role, content: m.content }
-      messages.push(cleanMsg)
-    }
-  }
-
-  // Convert OpenAI tool_choice → Anthropic tool_choice
-  let tool_choice
-  if (body.tool_choice === 'auto') tool_choice = { type: 'auto' }
-  else if (body.tool_choice === 'none') tool_choice = { type: 'none' }
-  else if (body.tool_choice === 'required') tool_choice = { type: 'any' }
-  else if (typeof body.tool_choice === 'object' && body.tool_choice?.function?.name)
-    tool_choice = { type: 'tool', name: body.tool_choice.function.name }
-
-  return {
-    model: body.model,
-    system,
-    messages,
-    max_tokens: body.max_tokens || 4096,
-    stream: body.stream,
-    tools: tools?.length ? tools : undefined,
-    tool_choice,
-    thinking: body.thinking,
-  }
-}
-
-function mapFromClaude(json) {
-  const content = json.content || []
-  const text = content.filter(c => c.type === 'text').map(c => c.text).join('')
-  const reasoning = content.filter(c => c.type === 'thinking').map(c => c.thinking).join('')
-  const tool_calls = content.filter(c => c.type === 'tool_use').map(t => ({
-    id: t.id, type: 'function', function: { name: t.name, arguments: JSON.stringify(t.input || {}) }
-  }))
-  const hasTools = tool_calls.length > 0
-  const finish = hasTools ? 'tool_calls'
-    : (json.stop_reason === 'end_turn' ? 'stop' : (json.stop_reason || 'stop'))
-  return {
-    id: json.id,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model: json.model,
-    usage: json.usage ? {
-      prompt_tokens: json.usage.input_tokens || 0,
-      completion_tokens: json.usage.output_tokens || 0,
-      total_tokens: (json.usage.input_tokens || 0) + (json.usage.output_tokens || 0),
-    } : undefined,
-    choices: [{
-      index: 0,
-      message: {
-        role: 'assistant',
-        content: text || null,
-        reasoning_content: reasoning || undefined,
-        tool_calls: hasTools ? tool_calls : undefined,
-      },
-      finish_reason: finish,
-    }],
-  }
-}
-
 function hasImage(messages = []) {
   return messages.some(m => Array.isArray(m.content) &&
     m.content.some(c => c.type === 'image_url' || c.type === 'input_image'))
 }
 
 function attemptRepairJson(str) {
+  if (!str || str.length > 2_000_000) return null
   try { return JSON.parse(str) } catch (e) {}
   let s = str.trim()
   if (s.startsWith('```json')) s = s.replace(/^```json\n?/, '').replace(/\n?```$/, '')
@@ -140,22 +44,33 @@ function attemptRepairJson(str) {
 }
 
 class RollingFilter {
-  constructor(filters) { this.filters = filters.filter(f => f.is_enabled); this.buffer = '' }
+  // Only apply filters whose keyword is 1–30 chars; longer keywords cause streaming latency.
+  // safeLen is computed once in the constructor to avoid per-chunk recalculation.
+  constructor(filters) {
+    this.filters = filters.filter(f => f.is_enabled && f.text && f.text.length > 0 && f.text.length <= 30)
+    this.safeLen = this.filters.reduce((m, f) => Math.max(m, f.text.length - 1), 0)
+    this.buffer = ''
+    this.truncated = false
+  }
   transform(chunk) {
     if (this.filters.length === 0) return chunk
+    if (this.truncated) return ''
     this.buffer += chunk
     for (const f of this.filters) {
-      if (f.mode === 1) { const idx = this.buffer.indexOf(f.text); if (idx !== -1) this.buffer = this.buffer.substring(0, idx) }
-      else { this.buffer = this.buffer.split(f.text).join('') }
+      if (f.mode === 1) {
+        const idx = this.buffer.indexOf(f.text)
+        if (idx !== -1) { this.buffer = this.buffer.substring(0, idx); this.truncated = true; break }
+      } else {
+        this.buffer = this.buffer.split(f.text).join('')
+      }
     }
-    // Keep a lookahead suffix sized to the longest filter (to catch cross-chunk matches)
-    const safeLen = this.filters.reduce((m, f) => Math.max(m, f.text.length - 1), 0)
-    const flushLen = Math.max(0, this.buffer.length - safeLen)
+    if (this.truncated) { const out = this.buffer; this.buffer = ''; return out }
+    const flushLen = Math.max(0, this.buffer.length - this.safeLen)
     const out = this.buffer.slice(0, flushLen)
     this.buffer = this.buffer.slice(flushLen)
     return out
   }
-  flush() { const out = this.buffer; this.buffer = ''; return out }
+  flush() { if (this.truncated) return ''; const out = this.buffer; this.buffer = ''; return out }
 }
 
 function selectChannel(channels, cooldownTime) {
@@ -182,7 +97,6 @@ function selectChannel(channels, cooldownTime) {
   return available[0]
 }
 
-// Update RPM/RPD in-memory counters immediately after a successful request
 function updateRateCounters(cachedCh, nowSec) {
   if (!cachedCh) return
   if (nowSec - (cachedCh.rpm_reset_at || 0) >= 60) { cachedCh.rpm_count = 1; cachedCh.rpm_reset_at = nowSec }
@@ -191,20 +105,21 @@ function updateRateCounters(cachedCh, nowSec) {
   else cachedCh.rpd_count = (cachedCh.rpd_count || 0) + 1
 }
 
-// --- Streaming: full tool_calls support for OpenAI and Anthropic ---
-const mkChunk = (delta, finish_reason = null) => ({
+const mkChunk = (delta, finish_reason = null, model = undefined) => ({
   id: 'chatcmpl-' + Math.random().toString(36).slice(2),
   object: 'chat.completion.chunk',
   created: Math.floor(Date.now() / 1000),
+  model,
   choices: [{ index: 0, delta, finish_reason }],
 })
 
-function transformStream(readable, filters, provider) {
+// OpenAI SSE stream passthrough with rolling filter applied to content
+function transformStream(readable, filters, responseModel) {
   const { readable: r, writable: w } = new TransformStream()
   const writer = w.getWriter(), reader = readable.getReader()
   const decoder = new TextDecoder(), encoder = new TextEncoder()
   const filter = new RollingFilter(filters)
-  let buf = '', toolBlocks = {}, toolCallIdx = 0
+  let buf = ''
   ;(async () => {
     try {
       while (true) {
@@ -216,61 +131,36 @@ function transformStream(readable, filters, provider) {
           const dataStr = line.slice(6).trim()
           if (dataStr === '[DONE]') {
             const tail = filter.flush()
-            if (tail) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ content: tail }))}\n\n`))
+            if (tail) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ content: tail }, null, responseModel))}\n\n`))
             await writer.write(encoder.encode('data: [DONE]\n\n'))
             continue
           }
           try {
             const json = JSON.parse(dataStr)
-            if (provider === 'anthropic') {
-              if (json.type === 'content_block_start' && json.content_block?.type === 'tool_use') {
-                const cb = json.content_block
-                toolBlocks[json.index] = { id: cb.id, name: cb.name, idx: toolCallIdx++ }
-                await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({
-                  tool_calls: [{ index: toolBlocks[json.index].idx, id: cb.id, type: 'function', function: { name: cb.name, arguments: '' } }]
-                }))}\n\n`))
-              } else if (json.type === 'content_block_delta') {
-                const d = json.delta
-                if (d?.type === 'text_delta' && d.text) {
-                  const out = filter.transform(d.text)
-                  if (out) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ content: out }))}\n\n`))
-                } else if (d?.type === 'thinking_delta' && d.thinking) {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ reasoning_content: d.thinking }))}\n\n`))
-                } else if (d?.type === 'input_json_delta' && toolBlocks[json.index]) {
-                  await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({
-                    tool_calls: [{ index: toolBlocks[json.index].idx, function: { arguments: d.partial_json || '' } }]
-                  }))}\n\n`))
-                }
-              } else if (json.type === 'message_delta' && json.delta?.stop_reason) {
-                const finish = json.delta.stop_reason === 'tool_use' ? 'tool_calls' : 'stop'
-                await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({}, finish))}\n\n`))
-              }
-            } else {
-              const delta = json.choices?.[0]?.delta || {}
-              const finish = json.choices?.[0]?.finish_reason || null
-              if (delta.tool_calls?.length) {
-                await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ tool_calls: delta.tool_calls }, finish))}\n\n`))
-              } else if (delta.content || delta.reasoning_content) {
-                let content = delta.content || '', reasoning = delta.reasoning_content || ''
-                if (content) content = filter.transform(content)
-                const out = {}
-                if (content) out.content = content
-                if (reasoning) out.reasoning_content = reasoning
-                if (Object.keys(out).length) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk(out, finish))}\n\n`))
-              } else if (finish) {
-                await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({}, finish))}\n\n`))
-              }
+            const delta = json.choices?.[0]?.delta || {}
+            const finish = json.choices?.[0]?.finish_reason || null
+            // Pass tool_calls through unmodified — critical for function calling / vibe coding
+            if (delta.tool_calls?.length) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ tool_calls: delta.tool_calls }, finish, responseModel))}\n\n`))
+            } else if (delta.content || delta.reasoning_content) {
+              let content = delta.content || '', reasoning = delta.reasoning_content || ''
+              if (content) content = filter.transform(content)
+              const out = {}
+              if (content) out.content = content
+              if (reasoning) out.reasoning_content = reasoning
+              if (Object.keys(out).length) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk(out, finish, responseModel))}\n\n`))
+            } else if (finish) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({}, finish, responseModel))}\n\n`))
             }
           } catch (e) {}
         }
       }
-    } finally { writer.close() }
+    } finally { try { writer.close() } catch (e) {} }
   })()
   return r
 }
 
 async function loadCache(env) {
-  // Use shorter TTL when channels have rate limits so exhaustion is detected faster
   const ttl = cache.data?.channels?.some(ch => ch.rpm_limit > 0 || ch.rpd_limit > 0) ? 10000 : 30000
   if (cache.data && Date.now() - cache.ts < ttl) return cache.data
   if (!cacheFlight) {
@@ -294,17 +184,41 @@ async function loadCache(env) {
   return cacheFlight
 }
 
-app.get('/v1/models', c => c.json({
-  object: 'list',
-  data: [{ id: 'openai', object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'gateway' }],
-}))
+// /v1/models: dynamically return deduplicated models from all enabled channels.
+// This lets IDE tools see the actual models available and do model-based selection.
+// Falls back to 'openai' if no channels have a model configured.
+app.get('/v1/models', async c => {
+  let channels = []
+  try { const d = await loadCache(c.env); channels = d?.channels || [] } catch (e) { channels = cache.data?.channels || [] }
+  const seen = new Set()
+  const models = []
+  for (const ch of channels) {
+    const id = (ch.model || '').trim()
+    if (id && !seen.has(id)) { seen.add(id); models.push(id) }
+  }
+  if (models.length === 0) models.push('openai')
+  return c.json({
+    object: 'list',
+    data: models.map(id => ({ id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: 'gateway' })),
+  })
+})
 
 function validateChatBody(body) {
-  if (!body || typeof body !== 'object') return "Body must be a JSON object"
+  if (!body || typeof body !== 'object') return 'Body must be a JSON object'
   if (!Array.isArray(body.messages)) return "Field 'messages' must be an array"
   if (body.messages.length === 0) return "Field 'messages' cannot be empty"
   for (const m of body.messages) { if (!m.role) return "Each message must have a 'role'" }
   return null
+}
+
+// Build a clean upstream URL from a stored base_url.
+// Handles "/v1", "/v1/", and full "/v1/chat/completions" suffixes.
+function buildUpstreamUrl(baseUrl) {
+  let base = (baseUrl || '').trim()
+  base = base.replace(/\/chat\/completions\/?$/, '') // strip full path if present
+  base = base.replace(/\/v[0-9]+\/?$/, '')           // strip version suffix
+  base = base.replace(/\/+$/, '')                    // strip trailing slashes
+  return base ? `${base}/v1/chat/completions` : null
 }
 
 app.post('/v1/chat/completions', async c => {
@@ -318,8 +232,11 @@ app.post('/v1/chat/completions', async c => {
   if (data.config.client_token && token !== data.config.client_token)
     return c.json({ error: { message: 'Unauthorized', type: 'authentication_error' } }, 401)
 
-  const body = attemptRepairJson(await c.req.text())
-  if (!body) return c.json({ error: { message: 'Invalid JSON body', type: 'invalid_request_error' } }, 400)
+  // Parse user request body strictly — no repair to avoid corrupting message content
+  let body
+  try { body = JSON.parse(await c.req.text()) } catch (e) {
+    return c.json({ error: { message: 'Invalid JSON body', type: 'invalid_request_error' } }, 400)
+  }
   const validErr = validateChatBody(body)
   if (validErr) return c.json({ error: { message: validErr, type: 'invalid_request_error' } }, 400)
 
@@ -327,7 +244,15 @@ app.post('/v1/chat/completions', async c => {
   let pool = data.channels.filter(ch => ch.is_enabled === 1 && (isVision ? ch.is_vision === 1 : true))
   if (pool.length === 0) return c.json({ error: { message: 'No enabled channels configured', type: 'server_error' } }, 503)
 
-  // Detect if all available channels are exhausted by rate limits vs genuinely unavailable
+  // Model-based routing: prefer channels whose configured model matches the user's request.
+  // Falls back to the full enabled pool if no channel matches (fully backward-compatible).
+  const requestedModel = (body.model || '').trim().toLowerCase()
+  if (requestedModel) {
+    const matched = pool.filter(ch => (ch.model || '').trim().toLowerCase() === requestedModel)
+    if (matched.length > 0) pool = matched
+    // else: no match → keep full pool as fallback
+  }
+
   const now503 = Math.floor(Date.now() / 1000)
   const availableCount = pool.filter(ch => {
     if (ch.consecutive_errors >= 5 && (now503 - (ch.last_error_at || 0)) <= 604800) return false
@@ -338,7 +263,6 @@ app.post('/v1/chat/completions', async c => {
   }).length
 
   if (availableCount === 0) {
-    // All channels rate-limited: find earliest RPD reset to inform client
     let earliestResetSec = Infinity
     for (const ch of pool) {
       if (ch.rpd_limit > 0 && (ch.rpd_count || 0) >= ch.rpd_limit) {
@@ -353,25 +277,40 @@ app.post('/v1/chat/completions', async c => {
     )
   }
 
-  for (let i = 0; i < 3; i++) {
+  const isStream = body.stream === true || body.stream === 'true' || body.stream === 1
+
+  for (let i = 0, maxTries = Math.min(pool.length, 5); i < maxTries; i++) {
     const ch = selectChannel(pool, data.config.cooldown_time); if (!ch) break
-    const baseUrl = ch.base_url.replace(/\/v[0-9]+$/, '').replace(/\/$/, '')
-    const url = baseUrl + (ch.provider === 'anthropic' ? '/v1/messages' : '/v1/chat/completions')
-    const reqBody = ch.provider === 'anthropic' ? mapToClaude(body) : body
-    debug(c, `[Gateway] Calling ${ch.name}: ${url}`)
+
+    const url = buildUpstreamUrl(ch.base_url)
+    if (!url) {
+      pool = pool.filter(p => p.id !== ch.id); continue
+    }
+
+    // Always use the channel's configured model, ignoring the user's requested model.
+    // This allows IDE tools (Codex, Claude Code, etc.) to specify any model name
+    // without causing upstream failures due to model mismatch.
+    const reqBody = { ...body, model: ch.model || body.model, stream: isStream }
+
+    debug(c, `[Gateway] Calling ${ch.name} (id=${ch.id}): ${url}\nmodel: ${reqBody.model}`)
+
+    // 28s timeout — keeps us well under Cloudflare's 30s subrequest limit
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 28000)
     try {
       const res = await fetch(url, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${ch.api_key}`,
           'Content-Type': 'application/json',
-          ...(ch.provider === 'anthropic' ? { 'anthropic-version': '2023-06-01' } : {}),
         },
         body: JSON.stringify(reqBody),
+        signal: controller.signal,
       })
+      clearTimeout(timeoutId)
 
       if (!res.ok) {
-        const errText = await res.clone().text().then(t => t.slice(0, 200)).catch(() => 'Unknown error')
+        const errText = await res.text().then(t => t.slice(0, 200)).catch(() => 'Unknown error')
         const ts = Math.floor(Date.now() / 1000)
         if (res.status === 429)
           c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET last_429=?,last_error_msg=?,last_error_at=? WHERE id=?').bind(ts, 'Rate limited (429)', ts, ch.id).run())
@@ -385,7 +324,6 @@ app.post('/v1/chat/completions', async c => {
       const nowSec = Math.floor(Date.now() / 1000)
       const cachedCh = data.channels.find(x => x.id === ch.id)
       updateRateCounters(cachedCh, nowSec)
-      // Merge consecutive_errors reset + RPM/RPD into one DB write when possible
       if (ch.consecutive_errors > 0 && (ch.rpm_limit > 0 || ch.rpd_limit > 0)) {
         c.executionCtx.waitUntil(
           c.env.DB.prepare(
@@ -412,23 +350,28 @@ app.post('/v1/chat/completions', async c => {
         )
       }
 
-      if (body.stream) {
-        return new Response(transformStream(res.body, data.filters, ch.provider), {
+      if (isStream) {
+        const responseModel = requestedModel || ch.model || undefined
+        return new Response(transformStream(res.body, data.filters, responseModel), {
           headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' },
         })
       }
 
       const resText = await res.text()
       let json = attemptRepairJson(resText); if (!json) continue
-      if (ch.provider === 'anthropic') json = mapFromClaude(json)
+      // Normalize model field to match user's requested model so IDE tools don't get confused
+      if (json.model !== undefined && requestedModel) json.model = requestedModel
+      // Apply content filters to non-streamed text responses
       if (json.choices?.[0]?.message?.content) {
         const f = new RollingFilter(data.filters)
         json.choices[0].message.content = f.transform(json.choices[0].message.content) + f.flush()
       }
       return c.json(json)
     } catch (e) {
+      clearTimeout(timeoutId)
+      const errMsg = e.name === 'AbortError' ? 'Request timeout (28s)' : (e.message || 'Network error')
       const ts = Math.floor(Date.now() / 1000)
-      c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind((e.message || 'Network error').slice(0, 200), ts, ch.id).run())
+      c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsg.slice(0, 200), ts, ch.id).run())
       pool = pool.filter(p => p.id !== ch.id)
     }
   }

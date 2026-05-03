@@ -9,7 +9,6 @@ OpenAI 相容格式的 API 分流服務，可佈署於 **Cloudflare Workers**，
 - **🌐 多渠道 URL 支援** 單組 API 與 KEY 及模型為一個渠道，可設定 limit 限制
 - **❄️ 429 及故障冷卻機制** 自動重試且記錄長時間錯誤的渠道，可手動重置計數
 - **🛡️ 回應字串過濾與截斷** 刪除回應中的特定字串
-- **🛠️ JSON 格式自動修復** 修復 API 請求與回應中 JSON 的錯誤格式
 - **📊 功能管理後台與匯出備份** 可匯出 JSON 格式的設定檔，方便備份與還原
 
 ---
@@ -30,7 +29,7 @@ api-gateway/
 
 ## ⚙️ 環境變數
 
-請修改 `wrangler.toml` 加入 d1_databases 與 kv_namespaces ID
+請在 Workers 取得 D1 與 KV 聯繫設定，在 `wrangler.toml` 加入 d1_databases 與 kv_namespaces ID
 
 ---
 

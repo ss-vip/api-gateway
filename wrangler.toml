@@ -1,0 +1,15 @@
+name = "api-gateway"
+main = "src/index.js"
+compatibility_date = "2026-04-01"
+
+[placement]
+mode = "smart"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "api-gateway-db"
+database_id = ""
+
+[[kv_namespaces]]
+binding = "KV"
+id = ""

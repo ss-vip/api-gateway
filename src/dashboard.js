@@ -238,11 +238,12 @@ export default function(clearCache) {
                 <input type="text" id="ch-search" class="form-control border-start-0 ps-0" placeholder="Search..." oninput="renderChannels()" />
               </div>
             </div>
-            <div class="d-flex gap-2"><button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button><button onclick="resetAllHealth()" class="btn btn-outline-warning btn-sm px-3 fw-bold">RESET ALL</button><button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button></div>
+            <div class="d-flex gap-2"><button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button><button onclick="resetAllHealth()" class="btn btn-outline-success btn-sm px-3 fw-bold">RESET ALL</button><button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button></div>
           </div>
           <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
             <thead class="table-light"><tr>
               <th>ON/OFF</th>
+              <th class="d-none d-sm-table-cell">ID</th>
               <th>Name</th>
               <th>Model <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="圖像請求將優先調用視覺模型"></i></th>
               <th class="d-none d-sm-table-cell">Weight <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="權重越高分配機率越大"></i></th>
@@ -260,7 +261,7 @@ export default function(clearCache) {
           <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
             <thead class="table-light"><tr>
               <th>ON/OFF</th>
-              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="命中關鍵字後的過濾動作"></i></th>
+              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="命中關鍵字後的過濾動作。建議使用廣告句的特徵前綴，長度限 1–30 字元"></i></th>
               <th class="d-none d-sm-table-cell" style="width: 120px;">Mode</th>
               <th>Actions</th>
             </tr></thead>
@@ -277,28 +278,34 @@ export default function(clearCache) {
     </div></div></div>
 
     <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content">
-      <div class="modal-header border-0 pb-0"><h5 class="fw-bold small">Channel Editor</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button></div>
+      <div class="modal-header border-0 pb-0">
+        <div class="d-flex align-items-center gap-2">
+          <h5 class="fw-bold small mb-0">Channel Editor</h5>
+          <span id="ch-id-badge" class="badge bg-secondary" style="display:none"></span>
+        </div>
+        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button>
+      </div>
       <div class="modal-body p-3 p-md-4">
         <input type="hidden" id="ch-idx" />
+        <input type="hidden" id="ch-id" />
         <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">API Key</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
-        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL</label><input type="text" id="ch-url" class="form-control form-control-sm" /></div>
-        <div class="row g-2 mb-2"><div class="col-6"><label class="form-label mini-label fw-bold">Provider</label><select id="ch-provider" class="form-select form-select-sm"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></div><div class="col-6"><label class="form-label mini-label fw-bold">Weight</label><input type="number" id="ch-weight" class="form-control form-control-sm" value="1" /></div></div>
-        <div class="mb-2"><label class="form-label mini-label fw-bold">Model</label><input type="text" id="ch-model" class="form-control form-control-sm" /></div>
+        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="text" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" /></div>
+        <div class="row g-2 mb-2"><div class="col-6"><label class="form-label mini-label fw-bold">Model</label><input type="text" id="ch-model" class="form-control form-control-sm" /></div><div class="col-6"><label class="form-label mini-label fw-bold">Weight</label><input type="number" id="ch-weight" class="form-control form-control-sm" value="1" /></div></div>
         <div class="row g-1 mb-2">
           <div class="col-3"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" value="0" /></div>
           <div class="col-3"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" value="0" /></div>
           <div class="col-3"><label class="form-label mini-label fw-bold">TPM</label><input type="number" id="ch-tpm" class="form-control form-control-sm p-1" value="0" /></div>
           <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" value="0" /></div>
         </div>
-        <div class="d-flex justify-content-between mt-3 pt-2 border-top">
-          <div class="form-check form-switch">
-            <input class="form-check-input" type="checkbox" id="ch-vision">
-            <label class="form-check-label small fw-bold" for="ch-vision">Vision</label>
+        <div class="row g-2 mt-3 pt-2 border-top">
+          <div class="col-6 d-flex flex-column align-items-center">
+            <label class="form-check-label small fw-bold mb-1" for="ch-vision">Vision</label>
+            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision"></div>
           </div>
-          <div class="form-check form-switch">
-            <input class="form-check-input" type="checkbox" id="ch-enabled" checked>
-            <label class="form-check-label small fw-bold" for="ch-enabled">Enabled</label>
+          <div class="col-6 d-flex flex-column align-items-center">
+            <label class="form-check-label small fw-bold mb-1" for="ch-enabled">Enabled</label>
+            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
           </div>
         </div>
       </div>
@@ -430,6 +437,7 @@ export default function(clearCache) {
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
           return '<tr>' +
             '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
+            '<td class="d-none d-sm-table-cell text-muted small">' + (c.id || '-') + '</td>' +
             '<td class="fw-bold">' + c.name + '</td>' +
             '<td><code class="small">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + '</td>' +
             '<td class="d-none d-sm-table-cell">' + c.weight + '</td>' +
@@ -438,6 +446,7 @@ export default function(clearCache) {
               '<div class="d-none d-md-flex justify-content-center gap-1">' +
                 '<button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-0 px-2">Edit</button>' +
                 '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-0 px-2">Reset</button>' +
+                '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-0 px-2">Copy</button>' +
                 '<button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-0 px-2">Del</button>' +
               '</div>' +
               '<div class="d-md-none dropdown">' +
@@ -445,12 +454,13 @@ export default function(clearCache) {
                 '<ul class="dropdown-menu dropdown-menu-end shadow border-0">' +
                   '<li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small">Edit</button></li>' +
                   '<li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>' +
+                  '<li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small">Copy</button></li>' +
                   '<li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small text-danger">Delete</button></li>' +
                 '</ul>' +
               '</div>' +
             '</td>' +
           '</tr>';
-        }).join('') || '<tr><td colspan="6" class="py-4 text-muted">No channels.</td></tr>';
+        }).join('') || '<tr><td colspan="7" class="py-4 text-muted">No channels.</td></tr>';
         initTooltips();
       };
 
@@ -473,7 +483,7 @@ export default function(clearCache) {
       const renderFilters = () => {
         document.getElementById('filter-list').innerHTML = filters.map((f, i) => '<tr>' +
           '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
-          '<td><input type="text" class="form-control form-control-sm font-monospace" value="' + f.text + '" onchange="filters[' + i + '].text=this.value"></td>' +
+          '<td><input type="text" class="form-control form-control-sm font-monospace" maxlength="30" placeholder="廣告特徵前綴（建議 1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" data-bs-toggle="tooltip" title="長度限 1-30 字元，取廣告句特徵前綴即可"></td>' +
           '<td class="d-none d-sm-table-cell"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
           '<td><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-0 px-2"><i class="bi bi-trash"></i></button></td>' +
         '</tr>').join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
@@ -482,24 +492,28 @@ export default function(clearCache) {
 
       const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, cooldown: document.getElementById('cfg-cooldown').value }); alert('Saved'); };
       const saveAllChannels = async () => { await api('/admin/api/batch-channels', 'POST', channels); alert('Channels Saved'); init(); };
-      const saveAllFilters = async () => { await api('/admin/api/filters', 'POST', filters); alert('Filters Saved'); renderFilters(); };
+      const saveAllFilters = async () => {
+        const invalid = filters.filter(f => f.text && (f.text.length === 0 || f.text.length > 30));
+        if (invalid.length > 0) return alert('過濾關鍵字長度須介於 1–30 字元，請修正後再儲存。');
+        await api('/admin/api/filters', 'POST', filters); alert('Filters Saved'); renderFilters();
+      };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
-      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=1; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-provider').value='openai'; document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; chModal.show(); };
+      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=1; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; chModal.show(); };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-enabled').checked = c.is_enabled == 1; chModal.show();
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-enabled').checked = c.is_enabled == 1; chModal.show();
       };
       const applyChannel = () => {
         if (document.activeElement) document.activeElement.blur();
         const idx = document.getElementById('ch-idx').value;
         const name = document.getElementById('ch-name').value.trim();
         if (!name) return alert('Name is required');
-        if (channels.some((c, i) => c.name === name && String(i) !== String(idx))) return alert('Name must be unique');
-        let url = document.getElementById('ch-url').value.trim();
-        if (url && !/\\/v[0-9]+(\\/|$)/.test(url)) url = url.replace(/\\/$/, '') + '/v1';
-        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, weight: parseInt(document.getElementById('ch-weight').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, is_enabled: document.getElementById('ch-enabled').checked, last_429: idx!==''?channels[idx].last_429:0, consecutive_errors: idx!==''?channels[idx].consecutive_errors:0, last_error_msg: idx!==''?channels[idx].last_error_msg:'', last_error_at: idx!==''?channels[idx].last_error_at:0 };
+        const url = document.getElementById('ch-url').value.trim().replace(/\\/+$/, '');
+        const prev = idx !== '' ? channels[idx] : null;
+        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: 'openai', model: document.getElementById('ch-model').value, weight: parseInt(document.getElementById('ch-weight').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
         if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats();
       };
       const delChannel = (idx) => { if (confirm('Delete?')) { channels.splice(idx, 1); renderChannels(); renderStats(); } };
+      const copyChannel = (idx) => { const src = channels[idx]; channels.push({ ...src, name: src.name + ' (copy)', id: undefined, last_429: 0, consecutive_errors: 0, last_error_msg: '', last_error_at: 0 }); renderChannels(); renderStats(); };
       const toggleKeyVis = () => { const i = document.getElementById('ch-key'); i.type = i.type === 'password' ? 'text' : 'password'; };
       const resetAllHealth = async () => { if (!confirm('重置所有渠道健康狀態？')) return; await api('/admin/api/channels/reset-all-health', 'POST'); init(); };
       const exportJson = () => {
