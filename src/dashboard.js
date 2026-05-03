@@ -261,7 +261,7 @@ export default function(clearCache) {
           <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
             <thead class="table-light"><tr>
               <th>ON/OFF</th>
-              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="命中關鍵字後的過濾動作。建議使用廣告句的特徵前綴，長度限 1–30 字元"></i></th>
+              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="命中關鍵字後的過濾動作。建議輸入關鍵字，長度限 1–30 字元"></i></th>
               <th class="d-none d-sm-table-cell" style="width: 120px;">Mode</th>
               <th>Actions</th>
             </tr></thead>
@@ -306,6 +306,18 @@ export default function(clearCache) {
           <div class="col-6 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-enabled">Enabled</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
+          </div>
+        </div>
+        <div id="debug-section" class="mt-3 pt-3 border-top" style="display:none">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <span class="mini-label fw-bold mb-0">Debug Info (Last Error)</span>
+            <span id="debug-time" class="text-muted" style="font-size:0.65rem"></span>
+          </div>
+          <div class="mb-2"><label class="form-label mini-label">Error Message</label><input type="text" id="debug-msg" class="form-control form-control-sm font-monospace text-danger" readonly /></div>
+          <div class="mb-2" id="debug-url-wrapper"><label class="form-label mini-label">Target URL</label><input type="text" id="debug-url" class="form-control form-control-sm font-monospace" readonly /></div>
+          <div class="row g-2" id="debug-req-res-wrapper">
+            <div class="col-12"><label class="form-label mini-label">Request Payload</label><textarea id="debug-req" class="form-control form-control-sm font-monospace" rows="2" readonly style="font-size:0.7rem"></textarea></div>
+            <div class="col-12"><label class="form-label mini-label">Response Data</label><textarea id="debug-res" class="form-control form-control-sm font-monospace" rows="2" readonly style="font-size:0.7rem"></textarea></div>
           </div>
         </div>
       </div>
@@ -427,13 +439,15 @@ export default function(clearCache) {
         const filtered = channels.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
         document.getElementById('channel-list').innerHTML = filtered.map((c) => {
           const realIdx = channels.indexOf(c);
+          let hoverMsg = c.last_error_msg || 'Unknown';
+          try { hoverMsg = JSON.parse(hoverMsg).message || hoverMsg; } catch(e) {}
           let h = '<span class="badge bg-success health-badge">正常</span>';
           if (c.consecutive_errors >= 5) {
             if (now - (c.last_error_at || 0) > 604800) h = '<span class="badge bg-secondary health-badge" title="Observed (Retry soon)">觀察</span>';
-            else h = '<span class="badge bg-danger health-badge" title="' + esc(c.last_error_msg || 'Multiple errors') + '">異常</span>';
+            else h = '<span class="badge bg-danger health-badge" title="' + esc(hoverMsg) + '">異常</span>';
           }
           else if (now - (c.last_429 || 0) < cooldown) h = '<span class="badge bg-info health-badge" title="Cooldown active">冷卻</span>';
-          else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="' + esc(c.last_error_msg || 'Minor errors') + '">不穩</span>';
+          else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="' + esc(hoverMsg) + '">不穩</span>';
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
           return '<tr>' +
             '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
@@ -483,7 +497,7 @@ export default function(clearCache) {
       const renderFilters = () => {
         document.getElementById('filter-list').innerHTML = filters.map((f, i) => '<tr>' +
           '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
-          '<td><input type="text" class="form-control form-control-sm font-monospace" maxlength="30" placeholder="廣告特徵前綴（建議 1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" data-bs-toggle="tooltip" title="長度限 1-30 字元，取廣告句特徵前綴即可"></td>' +
+          '<td><input type="text" class="form-control form-control-sm font-monospace" maxlength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" data-bs-toggle="tooltip" title="長度限 1-30 字元"></td>' +
           '<td class="d-none d-sm-table-cell"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
           '<td><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-0 px-2"><i class="bi bi-trash"></i></button></td>' +
         '</tr>').join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
@@ -493,14 +507,36 @@ export default function(clearCache) {
       const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, cooldown: document.getElementById('cfg-cooldown').value }); alert('Saved'); };
       const saveAllChannels = async () => { await api('/admin/api/batch-channels', 'POST', channels); alert('Channels Saved'); init(); };
       const saveAllFilters = async () => {
-        const invalid = filters.filter(f => f.text && (f.text.length === 0 || f.text.length > 30));
+        const invalid = filters.filter(f => !f.text || f.text.trim().length === 0 || f.text.length > 30);
         if (invalid.length > 0) return alert('過濾關鍵字長度須介於 1–30 字元，請修正後再儲存。');
         await api('/admin/api/filters', 'POST', filters); alert('Filters Saved'); renderFilters();
       };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
-      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=1; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; chModal.show(); };
+      const openChannelModal = () => { document.getElementById('debug-section').style.display = 'none'; document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=1; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; chModal.show(); };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-enabled').checked = c.is_enabled == 1; chModal.show();
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-enabled').checked = c.is_enabled == 1; 
+        const debugSec = document.getElementById('debug-section');
+        if (c.id && c.last_error_at > 0 && c.last_error_msg) {
+          debugSec.style.display = 'block';
+          document.getElementById('debug-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
+          let parsed = null;
+          try { parsed = JSON.parse(c.last_error_msg); } catch(e) {}
+          if (parsed && typeof parsed === 'object') {
+            document.getElementById('debug-msg').value = parsed.message || '';
+            document.getElementById('debug-url').value = parsed.url || '';
+            document.getElementById('debug-req').value = parsed.request || '';
+            document.getElementById('debug-res').value = parsed.response || '';
+            document.getElementById('debug-url-wrapper').style.display = 'block';
+            document.getElementById('debug-req-res-wrapper').style.display = 'flex';
+          } else {
+            document.getElementById('debug-msg').value = c.last_error_msg;
+            document.getElementById('debug-url-wrapper').style.display = 'none';
+            document.getElementById('debug-req-res-wrapper').style.display = 'none';
+          }
+        } else {
+          debugSec.style.display = 'none';
+        }
+        chModal.show();
       };
       const applyChannel = () => {
         if (document.activeElement) document.activeElement.blur();

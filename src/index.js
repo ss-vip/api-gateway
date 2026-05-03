@@ -137,20 +137,24 @@ function transformStream(readable, filters, responseModel) {
           }
           try {
             const json = JSON.parse(dataStr)
-            const delta = json.choices?.[0]?.delta || {}
-            const finish = json.choices?.[0]?.finish_reason || null
-            // Pass tool_calls through unmodified — critical for function calling / vibe coding
-            if (delta.tool_calls?.length) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ tool_calls: delta.tool_calls }, finish, responseModel))}\n\n`))
-            } else if (delta.content || delta.reasoning_content) {
-              let content = delta.content || '', reasoning = delta.reasoning_content || ''
-              if (content) content = filter.transform(content)
-              const out = {}
-              if (content) out.content = content
-              if (reasoning) out.reasoning_content = reasoning
-              if (Object.keys(out).length) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk(out, finish, responseModel))}\n\n`))
-            } else if (finish) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({}, finish, responseModel))}\n\n`))
+            if (responseModel) json.model = responseModel
+            const choice = json.choices?.[0]
+            if (!choice) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
+              continue
+            }
+            const delta = choice.delta || {}
+            if (typeof delta.content === 'string') {
+              const outContent = filter.transform(delta.content)
+              if (outContent) {
+                choice.delta.content = outContent
+                await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
+              } else if (delta.role || choice.finish_reason || delta.tool_calls) {
+                choice.delta.content = ""
+                await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
+              }
+            } else {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
             }
           } catch (e) {}
         }
@@ -212,13 +216,23 @@ function validateChatBody(body) {
 }
 
 // Build a clean upstream URL from a stored base_url.
-// Handles "/v1", "/v1/", and full "/v1/chat/completions" suffixes.
+// Handles different API versions (e.g. /v1, /v2) and custom paths.
 function buildUpstreamUrl(baseUrl) {
   let base = (baseUrl || '').trim()
-  base = base.replace(/\/chat\/completions\/?$/, '') // strip full path if present
-  base = base.replace(/\/v[0-9]+\/?$/, '')           // strip version suffix
-  base = base.replace(/\/+$/, '')                    // strip trailing slashes
-  return base ? `${base}/v1/chat/completions` : null
+  if (!base) return null
+  base = base.replace(/\/+$/, '') // strip trailing slashes
+
+  if (base.endsWith('/chat/completions')) {
+    return base
+  }
+
+  // If the base URL ends with a version like /v1, /v2, just append /chat/completions
+  if (/\/v\d+$/.test(base)) {
+    return `${base}/chat/completions`
+  }
+
+  // Default fallback for bare domains
+  return `${base}/v1/chat/completions`
 }
 
 app.post('/v1/chat/completions', async c => {
@@ -246,7 +260,8 @@ app.post('/v1/chat/completions', async c => {
 
   // Model-based routing: prefer channels whose configured model matches the user's request.
   // Falls back to the full enabled pool if no channel matches (fully backward-compatible).
-  const requestedModel = (body.model || '').trim().toLowerCase()
+  const originalModel = body.model
+  const requestedModel = (originalModel || '').trim().toLowerCase()
   if (requestedModel) {
     const matched = pool.filter(ch => (ch.model || '').trim().toLowerCase() === requestedModel)
     if (matched.length > 0) pool = matched
@@ -287,12 +302,43 @@ app.post('/v1/chat/completions', async c => {
       pool = pool.filter(p => p.id !== ch.id); continue
     }
 
-    // Always use the channel's configured model, ignoring the user's requested model.
-    // This allows IDE tools (Codex, Claude Code, etc.) to specify any model name
-    // without causing upstream failures due to model mismatch.
-    const reqBody = { ...body, model: ch.model || body.model, stream: isStream }
+    const reqBody = { ...body }
+    if (ch.model) reqBody.model = ch.model
 
-    debug(c, `[Gateway] Calling ${ch.name} (id=${ch.id}): ${url}\nmodel: ${reqBody.model}`)
+    // --- Auto Sanitization for Upstream Compatibility ---
+    // 1. Remove top-level null values (causes 400 on some strict proxies)
+    for (const key of Object.keys(reqBody)) {
+      if (reqBody[key] === null) delete reqBody[key]
+    }
+
+    // 2. Remove stream_options if not streaming (OpenAI spec says it's only valid for stream)
+    if (!isStream) {
+      delete reqBody.stream_options
+    }
+
+    if (Array.isArray(reqBody.messages)) {
+      reqBody.messages = reqBody.messages.filter(m => {
+        // 3. Drop empty assistant messages with no tool calls (Claude/Anthropic throws 400)
+        if (m.role === 'assistant' && (!m.tool_calls || m.tool_calls.length === 0)) {
+          if (m.content === '' || m.content === null || (Array.isArray(m.content) && m.content.length === 0)) {
+            return false
+          }
+        }
+        return true
+      }).map(m => {
+        let newM = { ...m }
+        // 4. OpenAI's new 'developer' role often breaks older proxies; fallback to 'system'
+        if (newM.role === 'developer') newM.role = 'system'
+        // 5. Prevent empty user messages (some models throw 400 for empty user content)
+        if (newM.role === 'user' && (newM.content === '' || newM.content === null)) {
+          newM.content = ' '
+        }
+        return newM
+      })
+    }
+    // ---------------------------------------------------
+
+    debug(c, `[Gateway] Calling ${ch.name} (id=${ch.id}): ${url}\nuser requested: ${originalModel}, forwarding as: ${reqBody.model}`)
 
     // 28s timeout — keeps us well under Cloudflare's 30s subrequest limit
     const controller = new AbortController()
@@ -310,14 +356,19 @@ app.post('/v1/chat/completions', async c => {
       clearTimeout(timeoutId)
 
       if (!res.ok) {
-        const errText = await res.text().then(t => t.slice(0, 200)).catch(() => 'Unknown error')
+        const errText = await res.text().catch(() => 'Unknown error')
         const ts = Math.floor(Date.now() / 1000)
-        if (res.status === 429)
-          c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET last_429=?,last_error_msg=?,last_error_at=? WHERE id=?').bind(ts, 'Rate limited (429)', ts, ch.id).run())
-        else if (res.status === 401 || res.status === 403)
-          c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=5,last_error_msg=?,last_error_at=? WHERE id=?').bind('Auth failed (' + res.status + ')', ts, ch.id).run())
-        else
-          c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errText, ts, ch.id).run())
+        let errMsgInfo = ''
+        if (res.status === 429) {
+          errMsgInfo = JSON.stringify({ message: 'Rate limited (429)', url, request: JSON.stringify(reqBody).slice(0, 1000), response: errText.slice(0, 1000) })
+          c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET last_429=?,last_error_msg=?,last_error_at=? WHERE id=?').bind(ts, errMsgInfo, ts, ch.id).run())
+        } else if (res.status === 401 || res.status === 403) {
+          errMsgInfo = JSON.stringify({ message: `Auth failed (${res.status})`, url, request: JSON.stringify(reqBody).slice(0, 1000), response: errText.slice(0, 1000) })
+          c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=5,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsgInfo, ts, ch.id).run())
+        } else {
+          errMsgInfo = JSON.stringify({ message: `HTTP ${res.status}`, url, request: JSON.stringify(reqBody).slice(0, 1000), response: errText.slice(0, 1000) })
+          c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsgInfo, ts, ch.id).run())
+        }
         pool = pool.filter(p => p.id !== ch.id); continue
       }
 
@@ -351,7 +402,7 @@ app.post('/v1/chat/completions', async c => {
       }
 
       if (isStream) {
-        const responseModel = requestedModel || ch.model || undefined
+        const responseModel = originalModel || ch.model || undefined
         return new Response(transformStream(res.body, data.filters, responseModel), {
           headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' },
         })
@@ -360,7 +411,7 @@ app.post('/v1/chat/completions', async c => {
       const resText = await res.text()
       let json = attemptRepairJson(resText); if (!json) continue
       // Normalize model field to match user's requested model so IDE tools don't get confused
-      if (json.model !== undefined && requestedModel) json.model = requestedModel
+      if (json.model !== undefined && originalModel) json.model = originalModel
       // Apply content filters to non-streamed text responses
       if (json.choices?.[0]?.message?.content) {
         const f = new RollingFilter(data.filters)
@@ -369,9 +420,10 @@ app.post('/v1/chat/completions', async c => {
       return c.json(json)
     } catch (e) {
       clearTimeout(timeoutId)
-      const errMsg = e.name === 'AbortError' ? 'Request timeout (28s)' : (e.message || 'Network error')
+      const baseMsg = e.name === 'AbortError' ? 'Request timeout (28s)' : (e.message || 'Network error')
+      const errMsgInfo = JSON.stringify({ message: baseMsg, url, request: JSON.stringify(reqBody).slice(0, 1000), response: '' })
       const ts = Math.floor(Date.now() / 1000)
-      c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsg.slice(0, 200), ts, ch.id).run())
+      c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsgInfo, ts, ch.id).run())
       pool = pool.filter(p => p.id !== ch.id)
     }
   }
