@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { html } from 'hono/html'
 
-export default function(clearCache) {
+export default function (clearCache) {
   const app = new Hono()
 
   const DEFAULTS = { token: 'sk-test123456', pass: 'adm123456', cooldown: 300 }
@@ -31,7 +31,7 @@ export default function(clearCache) {
     const channels = await c.req.json()
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
-      ...channels.map(ch => c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0))
+      ...channels.map(ch => c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0, ch.max_tokens || 0, ch.support_tools !== false ? 1 : 0))
     ])
     clearCache()
     return c.json({ ok: true })
@@ -102,7 +102,7 @@ export default function(clearCache) {
     if (d.channels) {
       batch.push(c.env.DB.prepare("DELETE FROM channels"))
       d.channels.forEach(ch => {
-        batch.push(c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0))
+        batch.push(c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0, ch.max_tokens || 0, ch.support_tools !== false ? 1 : 0))
       })
     }
     if (d.filters) {
@@ -126,11 +126,11 @@ export default function(clearCache) {
     try {
       const banned = await c.env.KV.get(banKey)
       if (banned) return c.json({ error: '登入嘗試過多，IP 已暫時封鎖，請 1 小時後再試' }, 429)
-    } catch (e) {}
+    } catch (e) { }
     const { password } = await c.req.json()
     const pass = await getAdminPass(c)
     if (password === pass) {
-      try { await c.env.KV.delete(failKey) } catch (e) {}
+      try { await c.env.KV.delete(failKey) } catch (e) { }
       return c.json({ ok: true })
     }
     try {
@@ -142,7 +142,7 @@ export default function(clearCache) {
         return c.json({ error: 'IP 已被封鎖 1 小時（連續失敗 5 次）' }, 429)
       }
       await c.env.KV.put(failKey, JSON.stringify(failData), { expirationTtl: 900 })
-    } catch (e) {}
+    } catch (e) { }
     return c.json({ error: '密碼錯誤' }, 401)
   })
 
@@ -155,6 +155,31 @@ export default function(clearCache) {
     clearCache()
     return c.json({ ok: true })
   })
+
+  app.post('/admin/api/proxy-models', async c => {
+    const { url, key } = await c.req.json()
+    if (!url) return c.json({ error: 'URL is required' }, 400)
+    try {
+      let fetchUrl = url.trim().replace(/\/+$/, '')
+      if (!fetchUrl.endsWith('/v1') && !fetchUrl.includes('/v1/')) {
+        fetchUrl += '/v1/models'
+      } else if (fetchUrl.endsWith('/chat/completions')) {
+        fetchUrl = fetchUrl.replace('/chat/completions', '/models')
+      } else {
+        fetchUrl += '/models'
+      }
+
+      const res = await fetch(fetchUrl, {
+        headers: { 'Authorization': key ? `Bearer ${key}` : '' }
+      })
+      if (!res.ok) return c.json({ error: 'Failed to fetch: ' + res.status })
+      const data = await res.json()
+      return c.json(data)
+    } catch (e) {
+      return c.json({ error: 'Failed to fetch: ' + e.message })
+    }
+  })
+
 
   const UI_SHELL = html`<!DOCTYPE html>
   <html lang="zh-TW" data-bs-theme="light">
@@ -194,9 +219,8 @@ export default function(clearCache) {
 
     <div id="admin-view">
       <nav class="navbar navbar-expand border-bottom sticky-top mb-4 py-2"><div class="container">
-        <a class="navbar-brand fw-bold text-primary" href="#">Gateway</a>
+        <a class="navbar-brand fw-bold text-primary" href="javascript:location.reload()">Gateway</a>
         <div class="ms-auto d-flex gap-2 align-items-center">
-          <button onclick="toggleTheme()" class="btn btn-sm btn-outline-secondary border-0 px-2"><i id="theme-icon" class="bi bi-sun"></i></button>
           <div class="dropdown">
             <button class="btn btn-sm btn-outline-primary dropdown-toggle fw-bold" data-bs-toggle="dropdown">TOOLS</button>
             <ul class="dropdown-menu dropdown-menu-end shadow border-0">
@@ -207,7 +231,9 @@ export default function(clearCache) {
               <li><button class="dropdown-item py-2 small text-danger" onclick="resetSystem()"><i class="bi bi-arrow-counterclockwise me-2"></i>System Reset</button></li>
             </ul>
           </div>
-          <button onclick="logout()" class="btn btn-danger btn-sm fw-bold px-3">LOGOUT</button>
+          <a href="https://github.com/ss-vip/api-gateway" target="_blank" class="btn btn-sm btn-outline-secondary border-0 px-2" title="GitHub Project"><i class="bi bi-github"></i></a>
+          <button onclick="toggleTheme()" class="btn btn-sm btn-outline-secondary border-0 px-2"><i id="theme-icon" class="bi bi-sun"></i></button>
+          <button onclick="logout()" class="btn btn-sm btn-outline-danger border-0 px-2" title="LOGOUT"><i class="bi bi-box-arrow-right"></i></button>
         </div>
       </div></nav>
       <div class="container pb-5">
@@ -238,17 +264,17 @@ export default function(clearCache) {
                 <input type="text" id="ch-search" class="form-control border-start-0 ps-0" placeholder="Search..." oninput="renderChannels()" />
               </div>
             </div>
-            <div class="d-flex gap-2"><button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button><button onclick="resetAllHealth()" class="btn btn-outline-success btn-sm px-3 fw-bold">RESET ALL</button><button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button></div>
+            <div class="d-flex gap-2"><button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button><button onclick="resetAllHealth()" class="btn btn-outline-success btn-sm px-3 fw-bold">RESET ALL HEALTH</button><button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button></div>
           </div>
-          <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
-            <thead class="table-light"><tr>
-              <th>ON/OFF</th>
-              <th class="d-none d-sm-table-cell">ID</th>
-              <th>Name</th>
-              <th>Model <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="圖像請求將優先調用視覺模型"></i></th>
-              <th class="d-none d-sm-table-cell">Weight <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="權重越高分配機率越大"></i></th>
-              <th>Health <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="健康狀態，連續失敗5次將熔斷"></i></th>
-              <th>Actions</th>
+          <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small text-nowrap">
+            <thead class="table-light"><tr class="text-uppercase text-muted small" style="letter-spacing: 0.5px;">
+              <th style="width: 80px" class="border-0">ON/OFF</th>
+              <th style="width: 60px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('id')">ID <i id="sort-id" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i> <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="點擊模型名稱可直接複製。圖像請求將優先分發至 Vision 標註頻道。"></i></th>
+              <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i> <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="權重範圍 1-100，數值越高被選中的機率越大。"></i></th>
+              <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i> <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="點擊狀態標籤可查看詳細錯誤記錄。"></i></th>
+              <th style="width: 150px" class="text-center border-0">Actions</th>
             </tr></thead>
             <tbody id="channel-list"></tbody>
           </table></div>
@@ -261,8 +287,8 @@ export default function(clearCache) {
           <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
             <thead class="table-light"><tr>
               <th>ON/OFF</th>
-              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="命中關鍵字後的過濾動作。建議輸入關鍵字，長度限 1–30 字元"></i></th>
-              <th class="d-none d-sm-table-cell" style="width: 120px;">Mode</th>
+              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="輸入要過濾的關鍵字（1–30 字元）。"></i></th>
+              <th class="d-none d-sm-table-cell" style="width: 120px;">Mode <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="Truncate: 刪除該關鍵字及其後的所有內容；Delete: 僅刪除匹配的關鍵字本身。"></i></th>
               <th>Actions</th>
             </tr></thead>
             <tbody id="filter-list"></tbody>
@@ -290,8 +316,18 @@ export default function(clearCache) {
         <input type="hidden" id="ch-id" />
         <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">API Key</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
-        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="text" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" /></div>
-        <div class="row g-2 mb-2"><div class="col-6"><label class="form-label mini-label fw-bold">Model</label><input type="text" id="ch-model" class="form-control form-control-sm" /></div><div class="col-6"><label class="form-label mini-label fw-bold">Weight</label><input type="number" id="ch-weight" class="form-control form-control-sm" value="1" /></div></div>
+        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="text" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" /></div>
+        <div class="mb-2">
+          <label class="form-label mini-label fw-bold">Model</label>
+          <div class="input-group input-group-sm">
+            <input type="text" id="ch-model" class="form-control form-control-sm" />
+            <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models" onclick="fetchModels()" disabled>FETCH</button>
+          </div>
+        </div>
+        <div class="row g-2 mb-2">
+          <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" /></div>
+          <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" value="0" /></div>
+        </div>
         <div class="row g-1 mb-2">
           <div class="col-3"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" value="0" /></div>
           <div class="col-3"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" value="0" /></div>
@@ -299,36 +335,55 @@ export default function(clearCache) {
           <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" value="0" /></div>
         </div>
         <div class="row g-2 mt-3 pt-2 border-top">
-          <div class="col-6 d-flex flex-column align-items-center">
-            <label class="form-check-label small fw-bold mb-1" for="ch-vision">Vision</label>
+          <div class="col-4 d-flex flex-column align-items-center">
+            <label class="form-check-label small fw-bold mb-1" for="ch-vision">👁️ Vision</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision"></div>
           </div>
-          <div class="col-6 d-flex flex-column align-items-center">
-            <label class="form-check-label small fw-bold mb-1" for="ch-enabled">Enabled</label>
+          <div class="col-4 d-flex flex-column align-items-center">
+            <label class="form-check-label small fw-bold mb-1" for="ch-tools">🔧 Tools</label>
+            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-tools" checked></div>
+          </div>
+          <div class="col-4 d-flex flex-column align-items-center">
+            <label class="form-check-label small fw-bold mb-1" for="ch-enabled">✔️ Enabled</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
-          </div>
-        </div>
-        <div id="debug-section" class="mt-3 pt-3 border-top" style="display:none">
-          <div class="d-flex justify-content-between align-items-center mb-2">
-            <span class="mini-label fw-bold mb-0">Debug Info (Last Error)</span>
-            <span id="debug-time" class="text-muted" style="font-size:0.65rem"></span>
-          </div>
-          <div class="mb-2"><label class="form-label mini-label">Error Message</label><input type="text" id="debug-msg" class="form-control form-control-sm font-monospace text-danger" readonly /></div>
-          <div class="mb-2" id="debug-url-wrapper"><label class="form-label mini-label">Target URL</label><input type="text" id="debug-url" class="form-control form-control-sm font-monospace" readonly /></div>
-          <div class="row g-2" id="debug-req-res-wrapper">
-            <div class="col-12"><label class="form-label mini-label">Request Payload</label><textarea id="debug-req" class="form-control form-control-sm font-monospace" rows="2" readonly style="font-size:0.7rem"></textarea></div>
-            <div class="col-12"><label class="form-label mini-label">Response Data</label><textarea id="debug-res" class="form-control form-control-sm font-monospace" rows="2" readonly style="font-size:0.7rem"></textarea></div>
           </div>
         </div>
       </div>
       <div class="modal-footer border-0 pt-0"><button onclick="applyChannel()" class="btn btn-primary w-100 fw-bold">APPLY</button></div>
     </div></div></div>
 
+    <div class="modal fade" id="debugModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg"><div class="modal-content">
+      <div class="modal-header border-0 pb-0">
+        <h5 class="fw-bold small mb-0">Debug Info (Last Error)</h5>
+        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button>
+      </div>
+      <div class="modal-body p-3 p-md-4">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span id="debug-time" class="text-muted fw-bold" style="font-size:0.8rem"></span>
+        </div>
+        <div class="mb-2"><label class="form-label mini-label">Error Message</label><input type="text" id="debug-msg" class="form-control form-control-sm font-monospace text-danger" readonly /></div>
+        <div class="mb-2" id="debug-url-wrapper"><label class="form-label mini-label">Target URL</label><input type="text" id="debug-url" class="form-control form-control-sm font-monospace" readonly /></div>
+        <div class="row g-2" id="debug-req-res-wrapper">
+          <div class="col-12"><label class="form-label mini-label">Request Payload</label><textarea id="debug-req" class="form-control form-control-sm font-monospace" rows="5" readonly style="font-size:0.7rem"></textarea></div>
+          <div class="col-12"><label class="form-label mini-label">Response Data</label><textarea id="debug-res" class="form-control form-control-sm font-monospace" rows="5" readonly style="font-size:0.7rem"></textarea></div>
+        </div>
+      </div>
+    </div></div></div>
+
+    <div class="modal fade" id="modelsModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+      <div class="modal-header border-0 pb-0"><h5 class="fw-bold small mb-0">Select a Model</h5><button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button></div>
+      <div class="modal-body p-3">
+        <input type="text" id="model-search" class="form-control form-control-sm mb-2" placeholder="Search models..." oninput="renderModelList()" />
+        <div class="list-group list-group-flush" id="models-list" style="max-height: 300px; overflow-y: auto;"></div>
+      </div>
+    </div></div></div>
+
     <style>.mini-label { font-size: 0.65rem; margin-bottom: 2px; text-transform: uppercase; color: var(--bs-secondary); }</style>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-      let chModal, passModal, channels = [], filters = [], cooldown = 300, refreshTimer = null, lastChannelsStr = '';
+      let chModal, passModal, debugModal, modelsModal, channels = [], filters = [], cooldown = 300, refreshTimer = null, lastChannelsStr = '';
+      let sortKey = null, sortOrder = 0; // 0: none, 1: asc, 2: desc
       const loading = (s) => document.getElementById('loading-overlay').style.display = s ? 'flex' : 'none';
       const api = async (u, m='GET', b=null, showLoader=true) => {
         if (showLoader) loading(true);
@@ -436,32 +491,64 @@ export default function(clearCache) {
       const renderChannels = () => {
         const now = Math.floor(Date.now() / 1000);
         const query = document.getElementById('ch-search').value.toLowerCase();
-        const filtered = channels.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
+        let display = [...channels];
+
+        // Sorting logic
+        if (sortKey && sortOrder > 0) {
+          display.sort((a, b) => {
+            let vA, vB;
+            if (sortKey === 'status') {
+              vA = a.consecutive_errors >= 5 ? 2 : (now - (a.last_429 || 0) < cooldown ? 1 : 0);
+              vB = b.consecutive_errors >= 5 ? 2 : (now - (b.last_429 || 0) < cooldown ? 1 : 0);
+            } else {
+              vA = a[sortKey]; vB = b[sortKey];
+            }
+            if (typeof vA === 'string') vA = vA.toLowerCase();
+            if (typeof vB === 'string') vB = vB.toLowerCase();
+            if (vA < vB) return sortOrder === 1 ? -1 : 1;
+            if (vA > vB) return sortOrder === 1 ? 1 : -1;
+            return 0;
+          });
+        }
+
+        const filtered = display.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
+
+        // Update sort icons
+        ['id','name','model','weight','status'].forEach(k => {
+          const icon = document.getElementById('sort-' + k);
+          if (!icon) return;
+          icon.className = 'bi bi-arrow-down-up opacity-25';
+          if (k === sortKey) {
+            if (sortOrder === 1) icon.className = 'bi bi-sort-down-alt text-primary opacity-100';
+            else if (sortOrder === 2) icon.className = 'bi bi-sort-up text-primary opacity-100';
+          }
+        });
+
         document.getElementById('channel-list').innerHTML = filtered.map((c) => {
           const realIdx = channels.indexOf(c);
           let hoverMsg = c.last_error_msg || 'Unknown';
           try { hoverMsg = JSON.parse(hoverMsg).message || hoverMsg; } catch(e) {}
           let h = '<span class="badge bg-success health-badge">正常</span>';
           if (c.consecutive_errors >= 5) {
-            if (now - (c.last_error_at || 0) > 604800) h = '<span class="badge bg-secondary health-badge" title="Observed (Retry soon)">觀察</span>';
-            else h = '<span class="badge bg-danger health-badge" title="' + esc(hoverMsg) + '">異常</span>';
+            if (now - (c.last_error_at || 0) > 604800) h = '<span class="badge bg-secondary health-badge" title="Observed (Retry soon)" onclick="showDebug(' + realIdx + ')">觀察</span>';
+            else h = '<span class="badge bg-danger health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">異常</span>';
           }
-          else if (now - (c.last_429 || 0) < cooldown) h = '<span class="badge bg-info health-badge" title="Cooldown active">冷卻</span>';
-          else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="' + esc(hoverMsg) + '">不穩</span>';
+          else if (now - (c.last_429 || 0) < cooldown) h = '<span class="badge bg-info health-badge" title="Cooldown active" onclick="showDebug(' + realIdx + ')">冷卻</span>';
+          else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
           return '<tr>' +
             '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
             '<td class="d-none d-sm-table-cell text-muted small">' + (c.id || '-') + '</td>' +
             '<td class="fw-bold">' + c.name + '</td>' +
-            '<td><code class="small">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + '</td>' +
+            '<td><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
             '<td class="d-none d-sm-table-cell">' + c.weight + '</td>' +
             '<td>' + h + '</td>' +
             '<td>' +
               '<div class="d-none d-md-flex justify-content-center gap-1">' +
-                '<button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-0 px-2">Edit</button>' +
-                '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-0 px-2">Reset</button>' +
-                '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-0 px-2">Copy</button>' +
-                '<button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-0 px-2">Del</button>' +
+                '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-0 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>' +
+                '<button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-0 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>' +
+                '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-0 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>' +
+                '<button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-0 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>' +
               '</div>' +
               '<div class="d-md-none dropdown">' +
                 '<button class="btn btn-sm btn-light py-0 px-2" type="button" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>' +
@@ -476,6 +563,12 @@ export default function(clearCache) {
           '</tr>';
         }).join('') || '<tr><td colspan="7" class="py-4 text-muted">No channels.</td></tr>';
         initTooltips();
+      };
+
+      const copyModelName = (name) => {
+        if (!name) return;
+        const tmp = document.createElement('textarea'); tmp.value = name; document.body.appendChild(tmp); tmp.select(); document.execCommand('copy'); document.body.removeChild(tmp);
+        alert('Model ID copied to clipboard: ' + name);
       };
 
       const resetHealth = async (id) => {
@@ -512,45 +605,114 @@ export default function(clearCache) {
         await api('/admin/api/filters', 'POST', filters); alert('Filters Saved'); renderFilters();
       };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
-      const openChannelModal = () => { document.getElementById('debug-section').style.display = 'none'; document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=1; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; chModal.show(); };
+      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-enabled').checked = c.is_enabled == 1; 
-        const debugSec = document.getElementById('debug-section');
-        if (c.id && c.last_error_at > 0 && c.last_error_msg) {
-          debugSec.style.display = 'block';
-          document.getElementById('debug-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
-          let parsed = null;
-          try { parsed = JSON.parse(c.last_error_msg); } catch(e) {}
-          if (parsed && typeof parsed === 'object') {
-            document.getElementById('debug-msg').value = parsed.message || '';
-            document.getElementById('debug-url').value = parsed.url || '';
-            document.getElementById('debug-req').value = parsed.request || '';
-            document.getElementById('debug-res').value = parsed.response || '';
-            document.getElementById('debug-url-wrapper').style.display = 'block';
-            document.getElementById('debug-req-res-wrapper').style.display = 'flex';
-          } else {
-            document.getElementById('debug-msg').value = c.last_error_msg;
-            document.getElementById('debug-url-wrapper').style.display = 'none';
-            document.getElementById('debug-req-res-wrapper').style.display = 'none';
-          }
-        } else {
-          debugSec.style.display = 'none';
-        }
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+        checkFetchModelsBtn();
         chModal.show();
       };
+
+      const showDebug = (idx) => {
+        const c = channels[idx];
+        if (!c || !c.last_error_msg) return alert('No error info available.');
+        document.getElementById('debug-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
+        let parsed = null;
+        try { parsed = JSON.parse(c.last_error_msg); } catch(e) {}
+        if (parsed && typeof parsed === 'object') {
+          document.getElementById('debug-msg').value = parsed.message || '';
+          document.getElementById('debug-url').value = parsed.url || '';
+          document.getElementById('debug-req').value = parsed.request || '';
+          document.getElementById('debug-res').value = parsed.response || '';
+          document.getElementById('debug-url-wrapper').style.display = 'block';
+          document.getElementById('debug-req-res-wrapper').style.display = 'flex';
+        } else {
+          document.getElementById('debug-msg').value = c.last_error_msg;
+          document.getElementById('debug-url-wrapper').style.display = 'none';
+          document.getElementById('debug-req-res-wrapper').style.display = 'none';
+        }
+        debugModal.show();
+      };
+
       const applyChannel = () => {
         if (document.activeElement) document.activeElement.blur();
         const idx = document.getElementById('ch-idx').value;
         const name = document.getElementById('ch-name').value.trim();
         if (!name) return alert('Name is required');
-        const url = document.getElementById('ch-url').value.trim().replace(/\\/+$/, '');
+        const weightInput = document.getElementById('ch-weight');
+        const weight = parseInt(weightInput.value);
+        if (isNaN(weight) || weight < 1 || weight > 100) return alert('Weight must be between 1 and 100');
+        const url = document.getElementById('ch-url').value.trim().replace(new RegExp('/+$'), '');
         const prev = idx !== '' ? channels[idx] : null;
-        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: 'openai', model: document.getElementById('ch-model').value, weight: parseInt(document.getElementById('ch-weight').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
+        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: 'openai', model: document.getElementById('ch-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
         if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats();
       };
       const delChannel = (idx) => { if (confirm('Delete?')) { channels.splice(idx, 1); renderChannels(); renderStats(); } };
       const copyChannel = (idx) => { const src = channels[idx]; channels.push({ ...src, name: src.name + ' (copy)', id: undefined, last_429: 0, consecutive_errors: 0, last_error_msg: '', last_error_at: 0 }); renderChannels(); renderStats(); };
       const toggleKeyVis = () => { const i = document.getElementById('ch-key'); i.type = i.type === 'password' ? 'text' : 'password'; };
+
+      let fetchedModels = [];
+      const checkFetchModelsBtn = () => {
+        const url = document.getElementById('ch-url').value.trim();
+        document.getElementById('btn-fetch-models').disabled = url.length === 0;
+      };
+      const fetchModels = async () => {
+        const url = document.getElementById('ch-url').value.trim();
+        const key = document.getElementById('ch-key').value.trim();
+        if (!url) return;
+        const data = await api('/admin/api/proxy-models', 'POST', { url, key });
+        if (data && data.data) {
+          fetchedModels = data.data;
+          document.getElementById('model-search').value = '';
+          renderModelList();
+          modelsModal.show();
+        } else if (data && Array.isArray(data)) {
+          // Fallback for some non-standard APIs
+          fetchedModels = data.map(m => typeof m === 'string' ? { id: m } : m);
+          document.getElementById('model-search').value = '';
+          renderModelList();
+          modelsModal.show();
+        }
+      };
+      const renderModelList = () => {
+        const q = document.getElementById('model-search').value.toLowerCase();
+        const list = fetchedModels.filter(m => (m.id||m.name||'').toLowerCase().includes(q));
+        document.getElementById('models-list').innerHTML = list.map(m => {
+          let limitText = '';
+          if (m.max_tokens) limitText += 'MaxTokens: ' + m.max_tokens + ' ';
+          if (m.rpm) limitText += 'RPM: ' + m.rpm + ' ';
+          const subText = limitText ? '<br><small class="text-muted">' + limitText + '</small>' : '';
+          const mJson = JSON.stringify(m).replace(/"/g, '&quot;');
+          return '<button class="list-group-item list-group-item-action py-2" onclick="selectModel(' + mJson + ')"><strong>' + esc(m.id||m.name) + '</strong>' + subText + '</button>';
+        }).join('') || '<div class="p-3 text-center text-muted">No models found</div>';
+      };
+      const selectModel = (m) => {
+        const id = (m.id || m.name || '').toLowerCase();
+        document.getElementById('ch-model').value = m.id || m.name;
+        if (m.max_tokens) document.getElementById('ch-tokens').value = m.max_tokens;
+        if (m.rpm) document.getElementById('ch-rpm').value = m.rpm;
+        if (m.rpd) document.getElementById('ch-rpd').value = m.rpd;
+        if (m.tpm) document.getElementById('ch-tpm').value = m.tpm;
+        if (m.tpd) document.getElementById('ch-tpd').value = m.tpd;
+
+        // Auto-detect Vision support from model name
+        if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo')) {
+          document.getElementById('ch-vision').checked = true;
+        } else {
+          document.getElementById('ch-vision').checked = false;
+        }
+        modelsModal.hide();
+      };
+
+      const toggleSort = (key) => {
+        if (sortKey === key) {
+          sortOrder = (sortOrder + 1) % 3;
+          if (sortOrder === 0) sortKey = null;
+        } else {
+          sortKey = key; sortOrder = 1;
+        }
+        renderChannels();
+      };
+
       const resetAllHealth = async () => { if (!confirm('重置所有渠道健康狀態？')) return; await api('/admin/api/channels/reset-all-health', 'POST'); init(); };
       const exportJson = () => {
         const now = new Date(); const pad = (n) => String(n).padStart(2, '0');
@@ -565,6 +727,8 @@ export default function(clearCache) {
         const t = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
         chModal = new bootstrap.Modal(document.getElementById('chModal'));
         passModal = new bootstrap.Modal(document.getElementById('passModal'));
+        debugModal = new bootstrap.Modal(document.getElementById('debugModal'));
+        modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'));
         const r = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: sessionStorage.getItem('adminToken') || '' }) });
         if (r.ok) showAdmin(); else showLogin();
       };

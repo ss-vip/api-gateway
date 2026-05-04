@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS channels (
   last_429 INTEGER DEFAULT 0,
   consecutive_errors INTEGER DEFAULT 0,
   last_error_at INTEGER DEFAULT 0,
-  last_error_msg TEXT
+  last_error_msg TEXT,
+  max_tokens INTEGER DEFAULT 0,
+  support_tools INTEGER DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS filters (

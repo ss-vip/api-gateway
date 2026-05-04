@@ -27,10 +27,10 @@ function hasImage(messages = []) {
 
 function attemptRepairJson(str) {
   if (!str || str.length > 2_000_000) return null
-  try { return JSON.parse(str) } catch (e) {}
+  try { return JSON.parse(str) } catch (e) { }
   let s = str.trim()
   if (s.startsWith('```json')) s = s.replace(/^```json\n?/, '').replace(/\n?```$/, '')
-  try { return JSON.parse(s) } catch (e) {}
+  try { return JSON.parse(s) } catch (e) { }
   try {
     let inString = false, output = ''
     for (let i = 0; i < s.length; i++) {
@@ -39,7 +39,7 @@ function attemptRepairJson(str) {
       if (inString && (ch === '\n' || ch === '\r')) { output += ch === '\n' ? '\\n' : '\\r' } else { output += ch }
     }
     return JSON.parse(output)
-  } catch (e) {}
+  } catch (e) { }
   return null
 }
 
@@ -120,47 +120,60 @@ function transformStream(readable, filters, responseModel) {
   const decoder = new TextDecoder(), encoder = new TextEncoder()
   const filter = new RollingFilter(filters)
   let buf = ''
-  ;(async () => {
-    try {
-      while (true) {
-        const { done, value } = await reader.read(); if (done) break
-        buf += decoder.decode(value, { stream: true })
-        let lines = buf.split('\n'); buf = lines.pop()
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const dataStr = line.slice(6).trim()
-          if (dataStr === '[DONE]') {
-            const tail = filter.flush()
-            if (tail) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ content: tail }, null, responseModel))}\n\n`))
-            await writer.write(encoder.encode('data: [DONE]\n\n'))
-            continue
-          }
-          try {
-            const json = JSON.parse(dataStr)
-            if (responseModel) json.model = responseModel
-            const choice = json.choices?.[0]
-            if (!choice) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
+    ; (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read(); if (done) break
+          buf += decoder.decode(value, { stream: true })
+          let lines = buf.split('\n'); buf = lines.pop()
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue
+            const dataStr = line.startsWith('data: ') ? line.slice(6).trim() : line.slice(5).trim()
+            if (dataStr === '[DONE]') {
+              const tail = filter.flush()
+              if (tail) await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ content: tail }, null, responseModel))}\n\n`))
+              await writer.write(encoder.encode('data: [DONE]\n\n'))
               continue
             }
-            const delta = choice.delta || {}
-            if (typeof delta.content === 'string') {
-              const outContent = filter.transform(delta.content)
-              if (outContent) {
-                choice.delta.content = outContent
+            try {
+              const json = JSON.parse(dataStr)
+              if (responseModel) json.model = responseModel
+              const choice = json.choices?.[0]
+              if (!choice) {
                 await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
-              } else if (delta.role || choice.finish_reason || delta.tool_calls) {
-                choice.delta.content = ""
+                continue
+              }
+              const delta = choice.delta || {}
+
+              if (typeof delta.content === 'string') {
+                let outContent = filter.transform(delta.content)
+                // Flush filter immediately if finish_reason is received so text isn't sent after stop
+                if (choice.finish_reason) {
+                  outContent += filter.flush()
+                }
+
+                if (outContent) {
+                  choice.delta.content = outContent
+                  await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
+                } else if (delta.role || choice.finish_reason || delta.tool_calls) {
+                  choice.delta.content = ""
+                  await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
+                }
+              } else {
+                if (choice.finish_reason) {
+                  const tail = filter.flush()
+                  if (tail) {
+                    // Send tail as a separate chunk before the finish_reason chunk
+                    await writer.write(encoder.encode(`data: ${JSON.stringify(mkChunk({ content: tail }, null, responseModel))}\n\n`))
+                  }
+                }
                 await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
               }
-            } else {
-              await writer.write(encoder.encode(`data: ${JSON.stringify(json)}\n\n`))
-            }
-          } catch (e) {}
+            } catch (e) { }
+          }
         }
-      }
-    } finally { try { writer.close() } catch (e) {} }
-  })()
+      } finally { try { writer.close() } catch (e) { } }
+    })()
   return r
 }
 
@@ -255,8 +268,25 @@ app.post('/v1/chat/completions', async c => {
   if (validErr) return c.json({ error: { message: validErr, type: 'invalid_request_error' } }, 400)
 
   const isVision = hasImage(body.messages)
-  let pool = data.channels.filter(ch => ch.is_enabled === 1 && (isVision ? ch.is_vision === 1 : true))
-  if (pool.length === 0) return c.json({ error: { message: 'No enabled channels configured', type: 'server_error' } }, 503)
+  const isToolUse = !!(body.tools && body.tools.length > 0)
+  let pool = data.channels.filter(ch => {
+    if (ch.is_enabled !== 1) return false
+    if (isVision && ch.is_vision !== 1) return false
+    return true
+  })
+
+  // Dynamic Context Window Routing: estimate tokens (rough approx: char length / 3.5)
+  const estTokens = Math.floor(JSON.stringify(body.messages || []).length / 3.5)
+  const tokenMatchedPool = pool.filter(ch => !ch.max_tokens || ch.max_tokens === 0 || estTokens <= ch.max_tokens)
+  if (tokenMatchedPool.length > 0) pool = tokenMatchedPool
+
+  // Tool-based routing: prioritize channels that support tools if the request needs them
+  if (isToolUse) {
+    const toolSupportedPool = pool.filter(ch => ch.support_tools !== 0)
+    if (toolSupportedPool.length > 0) pool = toolSupportedPool
+  }
+
+  if (pool.length === 0) return c.json({ error: { message: 'No enabled channels configured or supporting this request (Vision/Tools)', type: 'server_error' } }, 503)
 
   // Model-based routing: prefer channels whose configured model matches the user's request.
   // Falls back to the full enabled pool if no channel matches (fully backward-compatible).
@@ -327,7 +357,7 @@ app.post('/v1/chat/completions', async c => {
         return true
       }).map(m => {
         let newM = { ...m }
-        // 4. OpenAI's new 'developer' role often breaks older proxies; fallback to 'system'
+    // 4. OpenAI's new 'developer' role often breaks older proxies; fallback to 'system'
         if (newM.role === 'developer') newM.role = 'system'
         // 5. Prevent empty user messages (some models throw 400 for empty user content)
         if (newM.role === 'user' && (newM.content === '' || newM.content === null)) {
@@ -335,6 +365,12 @@ app.post('/v1/chat/completions', async c => {
         }
         return newM
       })
+    }
+
+    // 6. Strip tools if channel does not support them
+    if (ch.support_tools === 0) {
+      delete reqBody.tools
+      delete reqBody.tool_choice
     }
     // ---------------------------------------------------
 
@@ -360,13 +396,28 @@ app.post('/v1/chat/completions', async c => {
         const ts = Math.floor(Date.now() / 1000)
         let errMsgInfo = ''
         if (res.status === 429) {
-          errMsgInfo = JSON.stringify({ message: 'Rate limited (429)', url, request: JSON.stringify(reqBody).slice(0, 1000), response: errText.slice(0, 1000) })
+          errMsgInfo = JSON.stringify({ message: 'Rate limited (429)', url, request: JSON.stringify(reqBody).slice(0, 4000), response: errText.slice(0, 4000) })
           c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET last_429=?,last_error_msg=?,last_error_at=? WHERE id=?').bind(ts, errMsgInfo, ts, ch.id).run())
         } else if (res.status === 401 || res.status === 403) {
-          errMsgInfo = JSON.stringify({ message: `Auth failed (${res.status})`, url, request: JSON.stringify(reqBody).slice(0, 1000), response: errText.slice(0, 1000) })
+          errMsgInfo = JSON.stringify({ message: `Auth failed (${res.status})`, url, request: JSON.stringify(reqBody).slice(0, 4000), response: errText.slice(0, 4000) })
           c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=5,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsgInfo, ts, ch.id).run())
         } else {
-          errMsgInfo = JSON.stringify({ message: `HTTP ${res.status}`, url, request: JSON.stringify(reqBody).slice(0, 1000), response: errText.slice(0, 1000) })
+          // Intelligent logic: auto-detect and update max_tokens or support_tools from error messages
+          if (res.status === 400 || res.status === 413) {
+            // Check context length
+            const tokMatch = errText.match(/max(?:imum)?\s*(?:context\s*length|tokens?)\s*(?:is|of|:)?\s*(\d+)/i)
+            if (tokMatch && tokMatch[1]) {
+              const maxTok = parseInt(tokMatch[1], 10)
+              if (maxTok > 0) c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET max_tokens=? WHERE id=?').bind(maxTok, ch.id).run())
+            }
+            // Check tool support
+            if (errText.toLowerCase().includes('tools') || errText.toLowerCase().includes('function')) {
+              if (errText.toLowerCase().includes('not support') || errText.toLowerCase().includes('unsupported')) {
+                c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET support_tools=0 WHERE id=?').bind(ch.id).run())
+              }
+            }
+          }
+          errMsgInfo = JSON.stringify({ message: `HTTP ${res.status}`, url, request: JSON.stringify(reqBody).slice(0, 4000), response: errText.slice(0, 4000) })
           c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsgInfo, ts, ch.id).run())
         }
         pool = pool.filter(p => p.id !== ch.id); continue
@@ -421,7 +472,7 @@ app.post('/v1/chat/completions', async c => {
     } catch (e) {
       clearTimeout(timeoutId)
       const baseMsg = e.name === 'AbortError' ? 'Request timeout (28s)' : (e.message || 'Network error')
-      const errMsgInfo = JSON.stringify({ message: baseMsg, url, request: JSON.stringify(reqBody).slice(0, 1000), response: '' })
+      const errMsgInfo = JSON.stringify({ message: baseMsg, url, request: JSON.stringify(reqBody).slice(0, 4000), response: '' })
       const ts = Math.floor(Date.now() / 1000)
       c.executionCtx.waitUntil(c.env.DB.prepare('UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=? WHERE id=?').bind(errMsgInfo, ts, ch.id).run())
       pool = pool.filter(p => p.id !== ch.id)
