@@ -1,6 +1,6 @@
 # 🚀 API Gateway
 
-OpenAI 相容格式的 API 分流服務，可佈署於 **Cloudflare Workers**，使用 hono 框架構建。支援多渠道路由、負載平衡、回應內容過濾。
+OpenAI 與 Anthropic 相容格式的 API 分流服務，可佈署於 **Cloudflare Workers**，使用 hono 框架構建。支援多渠道路由、負載平衡、回應內容過濾。
 
 ---
 

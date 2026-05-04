@@ -200,13 +200,16 @@ export default function (clearCache) {
       .spinner-border { width: 3rem; height: 3rem; color: white; }
       .stat-card { border-left: 4px solid var(--bs-primary); }
       .table-responsive { border-radius: 12px; overflow: hidden; }
-      @media (max-width: 576px) {
-        .navbar-brand { font-size: 1rem; }
-        .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
-        .card-header span { font-size: 0.85rem; }
-        .input-group-text { font-size: 0.7rem; }
-      }
-    </style>
+        @media (max-width: 576px) {
+          .navbar-brand { font-size: 1rem; }
+          .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+          .card-header span { font-size: 0.85rem; }
+          .input-group-text { font-size: 0.7rem; }
+        }
+        .badge-openai { border: 1px solid #000 !important; background-color: #fff !important; color: #000 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
+        .badge-anthropic { border: 1px solid #d97757 !important; background-color: #1a1a1a !important; color: #d97757 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
+        [data-bs-theme="dark"] .badge-openai { border-color: #fff !important; }
+      </style>
   </head>
   <body>
     <div id="loading-overlay"><div class="spinner-border text-light" role="status"></div></div>
@@ -268,12 +271,13 @@ export default function (clearCache) {
           </div>
           <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small text-nowrap">
             <thead class="table-light"><tr class="text-uppercase text-muted small" style="letter-spacing: 0.5px;">
+              <th style="width: 60px" class="border-0 cursor-pointer" onclick="toggleSort('id')">ID <i id="sort-id" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 80px" class="border-0">ON/OFF</th>
-              <th style="width: 60px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('id')">ID <i id="sort-id" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 80px" class="border-0 cursor-pointer" onclick="toggleSort('provider')">TYPE <i id="sort-provider" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
-              <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i> <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="點擊模型名稱可直接複製。圖像請求將優先分發至 Vision 標註頻道。"></i></th>
-              <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i> <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="權重範圍 1-100，數值越高被選中的機率越大。"></i></th>
-              <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i> <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="點擊狀態標籤可查看詳細錯誤記錄。"></i></th>
+              <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 150px" class="text-center border-0">Actions</th>
             </tr></thead>
             <tbody id="channel-list"></tbody>
@@ -314,9 +318,12 @@ export default function (clearCache) {
       <div class="modal-body p-3 p-md-4">
         <input type="hidden" id="ch-idx" />
         <input type="hidden" id="ch-id" />
-        <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
+        <div class="row g-2 mb-2">
+          <div class="col-8"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
+          <div class="col-4"><label class="form-label mini-label fw-bold">Type</label><select id="ch-provider" class="form-select form-select-sm"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></div>
+        </div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">API Key</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
-        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="text" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" /></div>
+        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="text" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" /></div>
         <div class="mb-2">
           <label class="form-label mini-label fw-bold">Model</label>
           <div class="input-group input-group-sm">
@@ -514,7 +521,7 @@ export default function (clearCache) {
         const filtered = display.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
 
         // Update sort icons
-        ['id','name','model','weight','status'].forEach(k => {
+        ['id','name','model','weight','status','provider'].forEach(k => {
           const icon = document.getElementById('sort-' + k);
           if (!icon) return;
           icon.className = 'bi bi-arrow-down-up opacity-25';
@@ -536,9 +543,13 @@ export default function (clearCache) {
           else if (now - (c.last_429 || 0) < cooldown) h = '<span class="badge bg-info health-badge" title="Cooldown active" onclick="showDebug(' + realIdx + ')">冷卻</span>';
           else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
+          const providerBadge = c.provider === 'anthropic'
+            ? '<span class="badge badge-anthropic">Anthropic</span>'
+            : '<span class="badge badge-openai">OpenAI</span>';
           return '<tr>' +
+            '<td class="text-muted small">' + (c.id || '-') + '</td>' +
             '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
-            '<td class="d-none d-sm-table-cell text-muted small">' + (c.id || '-') + '</td>' +
+            '<td>' + providerBadge + '</td>' +
             '<td class="fw-bold">' + c.name + '</td>' +
             '<td><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
             '<td class="d-none d-sm-table-cell">' + c.weight + '</td>' +
@@ -605,9 +616,9 @@ export default function (clearCache) {
         await api('/admin/api/filters', 'POST', filters); alert('Filters Saved'); renderFilters();
       };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
-      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
+      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
         checkFetchModelsBtn();
         chModal.show();
       };
@@ -642,8 +653,9 @@ export default function (clearCache) {
         const weight = parseInt(weightInput.value);
         if (isNaN(weight) || weight < 1 || weight > 100) return alert('Weight must be between 1 and 100');
         const url = document.getElementById('ch-url').value.trim().replace(new RegExp('/+$'), '');
+        if (!url) return alert('Base URL is required');
         const prev = idx !== '' ? channels[idx] : null;
-        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: 'openai', model: document.getElementById('ch-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
+        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
         if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats();
       };
       const delChannel = (idx) => { if (confirm('Delete?')) { channels.splice(idx, 1); renderChannels(); renderStats(); } };
