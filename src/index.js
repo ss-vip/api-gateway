@@ -330,18 +330,43 @@ function transformStream(readable, filters, responseModel, fromProtocol, toProto
   return r
 }
 
+// Rate limit counters storage (in-memory, persisted to D1 on cache refresh)
+let rateLimitCache = { data: {}, ts: 0 }
+
 async function loadCache(env) {
   const ttl = cache.data?.channels?.some(ch => ch.rpm_limit > 0 || ch.rpd_limit > 0) ? 10000 : 30000
+  // Save current rate limits before refresh
+  const needsSave = cache.data && Date.now() - cache.ts >= ttl
+  if (needsSave) {
+    saveRateLimits(env)
+  }
   if (cache.data && Date.now() - cache.ts < ttl) return cache.data
   if (!cacheFlight) {
     cacheFlight = Promise.all([
       env.DB.prepare('SELECT * FROM channels WHERE is_enabled=1').all(),
       env.DB.prepare('SELECT * FROM filters WHERE is_enabled=1').all(),
       env.DB.prepare('SELECT * FROM config WHERE id=1').first(),
-    ]).then(([ch, fl, cf]) => {
+    ]).then(async ([ch, fl, cf]) => {
+      // Restore rate limit counters from in-memory cache
+      const nowSec = Math.floor(Date.now() / 1000)
+      const channels = ch.results || []
+      for (const ch of channels) {
+        const saved = rateLimitCache.data[ch.id]
+        if (saved) {
+          // Restore counters if not expired (within 60s for RPM, 86400s for RPD)
+          if (nowSec - saved.rpm_reset_at < 60) {
+            ch.rpm_count = saved.rpm_count
+            ch.rpm_reset_at = saved.rpm_reset_at
+          }
+          if (nowSec - saved.rpd_reset_at < 86400) {
+            ch.rpd_count = saved.rpd_count
+            ch.rpd_reset_at = saved.rpd_reset_at
+          }
+        }
+      }
       cache = {
         data: {
-          channels: ch.results || [],
+          channels,
           filters: fl.results || [],
           config: cf || { client_token: 'sk-test123456', cooldown_time: 300 },
         },
@@ -354,9 +379,32 @@ async function loadCache(env) {
   return cacheFlight
 }
 
-// /v1/models: dynamically return deduplicated models from all enabled channels.
-// This lets IDE tools see the actual models available and do model-based selection.
-// Falls back to 'openai' if no channels have a model configured.
+// Save rate limit counters to D1 (called on cache refresh)
+async function saveRateLimits(env) {
+  if (!cache.data?.channels) return
+  const nowSec = Math.floor(Date.now() / 1000)
+  const updates = []
+  for (const ch of cache.data.channels) {
+    if (ch.rpm_limit > 0 || ch.rpd_limit > 0) {
+      // Save to in-memory cache
+      rateLimitCache.data[ch.id] = {
+        rpm_count: ch.rpm_count || 0,
+        rpm_reset_at: ch.rpm_reset_at || nowSec,
+        rpd_count: ch.rpd_count || 0,
+        rpd_reset_at: ch.rpd_reset_at || nowSec,
+      }
+      // Batch write to D1
+      updates.push(env.DB.prepare(
+        'UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?'
+      ).bind(ch.rpm_count || 0, ch.rpm_reset_at || nowSec, ch.rpd_count || 0, ch.rpd_reset_at || nowSec, ch.id))
+    }
+  }
+  if (updates.length > 0) {
+    env.DB.batch(updates).catch(() => {})
+  }
+}
+
+// /v1/models: dynamically return deduplicated models from all enabled channels. Falls back to 'openai'.
 app.get('/v1/models', async c => {
   let channels = []
   try { const d = await loadCache(c.env); channels = d?.channels || [] } catch (e) { channels = cache.data?.channels || [] }

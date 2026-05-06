@@ -1,11 +1,12 @@
+-- DROP TABLE IF EXISTS channels, filters, config;
+
 CREATE TABLE IF NOT EXISTS channels (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT,
   base_url TEXT,
   api_key TEXT,
-  provider TEXT DEFAULT 'openai', -- openai | anthropic
+  provider TEXT DEFAULT 'openai',
   model TEXT,
-  model_name TEXT,
   weight INTEGER DEFAULT 1,
   rpm_limit INTEGER DEFAULT 0,
   rpd_limit INTEGER DEFAULT 0,
@@ -28,7 +29,7 @@ CREATE TABLE IF NOT EXISTS channels (
 CREATE TABLE IF NOT EXISTS filters (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   text TEXT NOT NULL,
-  mode INTEGER DEFAULT 1, -- 1: truncate, 0: delete
+  mode INTEGER DEFAULT 1,
   is_enabled INTEGER DEFAULT 1
 );
 

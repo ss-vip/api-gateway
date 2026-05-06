@@ -1,24 +1,73 @@
 import { Hono } from 'hono'
 import { html } from 'hono/html'
+import { timingSafeEqual } from 'hono/utils/buffer'
 
 export default function (clearCache) {
   const app = new Hono()
 
-  const DEFAULTS = { token: 'sk-test123456', pass: 'adm123456', cooldown: 300 }
+  // 預設配置
+  const DEFAULTS = { token: 'sk-test123456', cooldown: 300 }
 
+  // 獲取管理員密碼 (從資料庫)
   const getAdminPass = async (c) => {
     try {
       const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first()
-      return cf?.admin_password || c.env.ADMIN_PASSWORD || DEFAULTS.pass
+      return cf?.admin_password || null
     } catch (e) {
-      return c.env.ADMIN_PASSWORD || DEFAULTS.pass
+      return null
     }
   }
 
-  app.use('/admin/api/*', async (c, next) => {
+  // 檢查是否已設定密碼
+  const hasAdminPass = async (c) => {
     const pass = await getAdminPass(c)
-    if (!pass) return await next()
-    if (c.req.header("X-Admin-Token") !== pass) return c.json({ error: "Unauthorized" }, 401)
+    return pass !== null && pass !== ''
+  }
+
+  // 密碼哈希函數 (salt + SHA-256)
+  const hashPassword = async (password) => {
+    const encoder = new TextEncoder()
+    const salt = crypto.getRandomValues(new Uint8Array(16))
+    const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('')
+    const data = encoder.encode(password + saltHex)
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+    const hashArray = Array.from(new Uint8Array(hashBuffer))
+    return saltHex + ':' + hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+  }
+
+  // 密碼驗證函數
+  const verifyPassword = async (password, storedHash) => {
+    if (!storedHash || storedHash.length < 32) return false
+    const parts = storedHash.split(':')
+    if (parts.length !== 2) return false
+    const saltHex = parts[0]
+    const storedHashHex = parts[1]
+    const encoder = new TextEncoder()
+    const data = encoder.encode(password + saltHex)
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+    const inputHashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('')
+    return timingSafeEqual(inputHashHex, storedHashHex, (s) => s)
+  }
+
+  app.use('/admin/api/*', async (c, next) => {
+    // 公開端點不需要認證
+    const path = c.req.path
+    if (path === '/admin/api/auth-status' || path === '/admin/api/config' || path === '/admin/api/verify-token') {
+      return await next()
+    }
+    const storedHash = await getAdminPass(c)
+    // 若尚未設定密碼，允許設定密碼的 API
+    if (!storedHash) {
+      if (path === '/admin/api/admin-pass') {
+        return await next()
+      }
+      return c.json({ error: "請先設定密碼" }, 403)
+    }
+    const inputToken = c.req.header("X-Admin-Token")
+    if (!inputToken) return c.json({ error: "Unauthorized" }, 401)
+    // 驗證 token (可能是原始密碼或哈希值)
+    const isValid = await verifyPassword(inputToken, storedHash) || inputToken === storedHash
+    if (!isValid) return c.json({ error: "Unauthorized" }, 401)
     await next()
   })
 
@@ -70,14 +119,30 @@ export default function (clearCache) {
     return c.json({ token: cf?.client_token || DEFAULTS.token, cooldown: cf?.cooldown_time || DEFAULTS.cooldown })
   })
 
+  // 檢查是否需要設定密碼
+  app.get('/admin/api/auth-status', async c => {
+    const hasPass = await hasAdminPass(c)
+    return c.json({ needsSetup: !hasPass })
+  })
+
+  // 驗證 token（用於保持登入狀態）
+  app.post('/admin/api/verify-token', async c => {
+    const { token } = await c.req.json()
+    if (!token) return c.json({ valid: false }, 400)
+    const storedHash = await getAdminPass(c)
+    if (!storedHash) return c.json({ valid: false }, 403)
+    const isValid = await verifyPassword(token, storedHash)
+    return c.json({ valid: isValid })
+  })
+
   app.post('/admin/api/config', async c => {
     const b = await c.req.json()
     const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first()
-    const currentPass = await getAdminPass(c)
     if (ex) {
       await c.env.DB.prepare(`UPDATE config SET client_token=?,cooldown_time=? WHERE id=1`).bind(b.token || DEFAULTS.token, parseInt(b.cooldown) || DEFAULTS.cooldown).run()
     } else {
-      await c.env.DB.prepare(`INSERT INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,?,?)`).bind(b.token || DEFAULTS.token, currentPass, parseInt(b.cooldown) || DEFAULTS.cooldown).run()
+      // 初始化 config，密碼為空（用戶需設定）
+      await c.env.DB.prepare(`INSERT INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,NULL,?)`).bind(b.token || DEFAULTS.token, parseInt(b.cooldown) || DEFAULTS.cooldown).run()
     }
     clearCache()
     return c.json({ ok: true })
@@ -86,11 +151,13 @@ export default function (clearCache) {
   app.post('/admin/api/admin-pass', async c => {
     const { pass } = await c.req.json()
     if (!pass) return c.json({ error: 'Password required' }, 400)
+    if (pass.length < 6 || pass.length > 20) return c.json({ error: 'Password must be 6-20 characters' }, 400)
+    const hashedPass = await hashPassword(pass)
     const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first()
     if (ex) {
-      await c.env.DB.prepare(`UPDATE config SET admin_password=? WHERE id=1`).bind(pass).run()
+      await c.env.DB.prepare(`UPDATE config SET admin_password=? WHERE id=1`).bind(hashedPass).run()
     } else {
-      await c.env.DB.prepare(`INSERT INTO config (id,admin_password) VALUES (1,?)`).bind(pass).run()
+      await c.env.DB.prepare(`INSERT INTO config (id,admin_password) VALUES (1,?)`).bind(hashedPass).run()
     }
     clearCache()
     return c.json({ ok: true })
@@ -120,37 +187,66 @@ export default function (clearCache) {
     return c.json({ ok: true })
   })
 
-  app.post('/admin/login', async c => {
-    const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
-    const banKey = `ban:${ip}`, failKey = `fail:${ip}`
-    try {
-      const banned = await c.env.KV.get(banKey)
-      if (banned) return c.json({ error: '登入嘗試過多，IP 已暫時封鎖，請 1 小時後再試' }, 429)
-    } catch (e) { }
-    const { password } = await c.req.json()
-    const pass = await getAdminPass(c)
-    if (password === pass) {
-      try { await c.env.KV.delete(failKey) } catch (e) { }
-      return c.json({ ok: true })
-    }
-    try {
-      const failData = await c.env.KV.get(failKey, 'json') || { count: 0 }
-      failData.count++
-      if (failData.count >= 5) {
-        await c.env.KV.put(banKey, '1', { expirationTtl: 3600 })
-        await c.env.KV.delete(failKey)
-        return c.json({ error: 'IP 已被封鎖 1 小時（連續失敗 5 次）' }, 429)
-      }
-      await c.env.KV.put(failKey, JSON.stringify(failData), { expirationTtl: 900 })
-    } catch (e) { }
-    return c.json({ error: '密碼錯誤' }, 401)
-  })
+app.post('/admin/login', async (c) => {
+  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
+  const host = c.req.header('Host') || 'localhost'
+  const banKey = `login-ban:${ip}`, failKey = `login-fail:${ip}`
+  const BAN_DURATION = 900
+  const MAX_FAILURES = 10
+
+  const cache = caches.default
+  const banCacheKey = new Request(`https://${host}/_internal/${banKey}`)
+  const banResponse = await cache.match(banCacheKey)
+  if (banResponse) return c.json({ error: '嘗試過多，請 15 分鐘後再试' }, 429)
+
+  const { password } = await c.req.json()
+  if (!password) return c.json({ error: '密碼 required' }, 400)
+
+  const storedHash = await getAdminPass(c)
+  if (!storedHash) {
+    return c.json({ error: '尚未設定密碼' }, 403)
+  }
+
+  const isMatch = await verifyPassword(password, storedHash)
+
+  if (isMatch) {
+    c.executionCtx.waitUntil(
+      cache.delete(banCacheKey).catch(() => {}),
+      cache.delete(new Request(`https://${host}/_internal/${failKey}`)).catch(() => {})
+    )
+    return c.json({ ok: true })
+  }
+
+  const failCacheKey = new Request(`https://${host}/_internal/${failKey}`)
+  const failResponse = await cache.match(failCacheKey)
+  let failCount = 1
+  if (failResponse) {
+    const failData = await failResponse.json().catch(() => ({ count: 1 }))
+    failCount = (failData.count || 0) + 1
+  }
+
+  if (failCount >= MAX_FAILURES) {
+    c.executionCtx.waitUntil(
+      cache.put(banCacheKey, new Response('banned', { status: 429 })).catch(() => {}),
+      cache.delete(failCacheKey).catch(() => {})
+    )
+    return c.json({ error: 'IP 已被封鎖 15 分鐘' }, 429)
+  }
+
+  c.executionCtx.waitUntil(
+    cache.put(failCacheKey, new Response(JSON.stringify({ count: failCount }), {
+      headers: { 'Cache-Control': `max-age=${BAN_DURATION}` }
+    })).catch(() => {})
+  )
+
+  return c.json({ error: '密碼錯誤' }, 401)
+})
 
   app.post('/admin/api/reset', async c => {
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
       c.env.DB.prepare("DELETE FROM filters"),
-      c.env.DB.prepare("INSERT OR REPLACE INTO config (id, client_token, admin_password, cooldown_time) VALUES (1, ?, ?, ?)").bind(DEFAULTS.token, DEFAULTS.pass, DEFAULTS.cooldown)
+      c.env.DB.prepare("UPDATE config SET client_token=?, cooldown_time=? WHERE id=1").bind(DEFAULTS.token, DEFAULTS.cooldown)
     ])
     clearCache()
     return c.json({ ok: true })
@@ -185,21 +281,27 @@ export default function (clearCache) {
   <html lang="zh-TW" data-bs-theme="light">
   <head>
     <meta charset="UTF-8" /><title>API Gateway</title><meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%23FFC107' viewBox='0 0 16 16'%3E%3Cpath d='M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L5.99 9.5H3a.5.5 0 0 1-.372-.834l8-8.5a.5.5 0 0 1 .423-.198z'/%3E%3C/svg%3E">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
+    <link href="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.css" rel="stylesheet" />
     <style>
       body { background: var(--bs-tertiary-bg); font-family: system-ui, -apple-system, sans-serif; transition: 0.3s; }
-      .card { border: none; box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.075); border-radius: 12px; }
-      #login-view, #admin-view { display: none; }
+      .card { border: 0; box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.075); border-radius: 0.75rem; }
+      #login-view, #setup-view, #admin-view { display: none; }
       .navbar { backdrop-filter: blur(10px); background: rgba(var(--bs-body-bg-rgb), 0.8) !important; }
-      .form-switch .form-check-input { cursor: pointer; }
-      .badge { font-weight: 600; letter-spacing: 0.5px; padding: 0.4em 0.8em; }
-      .font-monospace { font-family: "Fira Code", monospace !important; }
+      .form-switch .form-check-input { cursor: pointer; margin-top: 0; }
+      .form-check { min-height: auto; padding-top: 0; padding-bottom: 0; }
+      .table td, .table th { vertical-align: middle; padding: 0.5rem; }
+      .badge { font-weight: 600; letter-spacing: 0.5px; }
       .health-badge { cursor: help; }
-      #loading-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 9999; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
-      .spinner-border { width: 3rem; height: 3rem; color: white; }
-      .stat-card { border-left: 4px solid var(--bs-primary); }
-      .table-responsive { border-radius: 12px; overflow: hidden; }
+      #loading-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 9999; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+      #loading-overlay.show { display: flex; overflow: hidden; }
+      body.loading { overflow: hidden; }
+      .notyf { z-index: 10000 !important; }
+      .modal-backdrop { transition: none; }
+      .stat-card { border-start: 4px solid var(--bs-primary); }
+      .table-responsive { border-radius: 0.75rem; overflow: hidden; }
         @media (max-width: 576px) {
           .navbar-brand { font-size: 1rem; }
           .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
@@ -216,18 +318,26 @@ export default function (clearCache) {
     <div id="login-view" class="container py-5 mt-5">
       <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
         <h4 class="fw-bold mb-4">API Gateway</h4>
-        <form id="loginForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">ADMIN PASSWORD</label><input type="password" id="login-pass" class="form-control" /></div><button type="submit" class="btn btn-primary w-100 fw-bold py-2">LOGIN</button></form>
+        <form id="loginForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">ADMIN PASSWORD</label><input type="password" id="login-pass" class="form-control" minlength="6" maxlength="20" required /></div><button type="submit" class="btn btn-primary w-100 fw-bold py-2">LOGIN</button></form>
+      </div></div></div></div>
+    </div>
+
+    <div id="setup-view" class="container py-5 mt-5">
+      <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
+        <h4 class="fw-bold mb-4">API Gateway</h4>
+        <p class="text-muted small mb-3">請設定管理員密碼</p>
+        <form id="setupForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">NEW PASSWORD</label><input type="password" id="setup-pass" class="form-control" minlength="6" maxlength="20" required /></div><button type="submit" class="btn btn-success w-100 fw-bold py-2">SET PASSWORD</button></form>
       </div></div></div></div>
     </div>
 
     <div id="admin-view">
       <nav class="navbar navbar-expand border-bottom sticky-top mb-4 py-2"><div class="container">
-        <a class="navbar-brand fw-bold text-primary" href="javascript:location.reload()">Gateway</a>
+        <a class="navbar-brand fw-bold text-primary" href="javascript:location.reload()">API Gateway</a>
         <div class="ms-auto d-flex gap-2 align-items-center">
           <div class="dropdown">
             <button class="btn btn-sm btn-outline-primary dropdown-toggle fw-bold" data-bs-toggle="dropdown">TOOLS</button>
             <ul class="dropdown-menu dropdown-menu-end shadow border-0">
-              <li><button class="dropdown-item py-2 small" onclick="passModal.show()"><i class="bi bi-shield-lock me-2"></i>Update Pass</button></li>
+              <li><button class="dropdown-item py-2 small" onclick="passModal.show()"><i class="bi bi-shield-lock me-2"></i>Change PW</button></li>
               <li><button class="dropdown-item py-2 small" onclick="exportJson()"><i class="bi bi-download me-2"></i>Export JSON</button></li>
               <li><label class="dropdown-item py-2 small mb-0 cursor-pointer" style="cursor:pointer"><i class="bi bi-upload me-2"></i>Import JSON<input type="file" onchange="importJson(event)" style="display:none" /></label></li>
               <li><hr class="dropdown-divider"></li>
@@ -253,7 +363,7 @@ export default function (clearCache) {
           </div>
           <div class="card-body pt-0">
             <div class="row g-2">
-              <div class="col-md-8"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">TOKEN</span><input type="text" id="cfg-token" class="form-control font-monospace" /><button class="btn btn-outline-secondary" onclick="copyToken()"><i class="bi bi-copy"></i></button></div></div>
+              <div class="col-md-8"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">TOKEN</span><input type="text" id="cfg-token" class="form-control" /><button class="btn btn-outline-secondary" onclick="copyToken()"><i class="bi bi-copy"></i></button></div></div>
               <div class="col-md-4"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">429 Cooldown (s)</span><input type="number" id="cfg-cooldown" class="form-control" /></div></div>
             </div>
           </div>
@@ -273,11 +383,11 @@ export default function (clearCache) {
             <thead class="table-light"><tr class="text-uppercase text-muted small" style="letter-spacing: 0.5px;">
               <th style="width: 60px" class="border-0 cursor-pointer" onclick="toggleSort('id')">ID <i id="sort-id" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 80px" class="border-0">ON/OFF</th>
-              <th style="width: 80px" class="border-0 cursor-pointer" onclick="toggleSort('provider')">TYPE <i id="sort-provider" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 80px" class="border-0 cursor-pointer" onclick="toggleSort('provider')">TYPE <i class="bi bi-info-circle" title="目標接收格式"></i> <i id="sort-provider" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
-              <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
-              <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
-              <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i class="bi bi-info-circle" title="優先調用相符的模型名、視覺、工具使用"></i> <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-info-circle" title="大值優先"></i> <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i class="bi bi-info-circle" title="多次錯誤的不健康渠道將被跳過調用，可以手動重置狀態"></i> <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 150px" class="text-center border-0">Actions</th>
             </tr></thead>
             <tbody id="channel-list"></tbody>
@@ -288,12 +398,12 @@ export default function (clearCache) {
             <span>Filters</span>
             <div class="d-flex gap-2"><button onclick="addFilter()" class="btn btn-outline-info btn-sm px-3 fw-bold">ADD</button><button onclick="saveAllFilters()" class="btn btn-info btn-sm px-3 fw-bold">SAVE ALL</button></div>
           </div>
-          <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small">
+          <div class="table-responsive"><table class="table table-hover mb-0 text-center small">
             <thead class="table-light"><tr>
-              <th>ON/OFF</th>
-              <th>Keyword <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="輸入要過濾的關鍵字（1–30 字元）。"></i></th>
-              <th class="d-none d-sm-table-cell" style="width: 120px;">Mode <i class="bi bi-info-circle" data-bs-toggle="tooltip" title="Truncate: 刪除該關鍵字及其後的所有內容；Delete: 僅刪除匹配的關鍵字本身。"></i></th>
-              <th>Actions</th>
+              <th style="width: 80px" class="align-middle">ON/OFF</th>
+              <th class="align-middle">Keyword <i class="bi bi-info-circle" title="要過濾的關鍵字"></i></th>
+              <th style="width: 120px" class="d-none d-sm-table-cell align-middle">Mode <i class="bi bi-info-circle" title="Truncate: 切除關鍵字及其後內容；Delete: 僅刪除關鍵字"></i></th>
+              <th style="width: 60px" class="align-middle">Actions</th>
             </tr></thead>
             <tbody id="filter-list"></tbody>
           </table></div>
@@ -302,8 +412,8 @@ export default function (clearCache) {
     </div>
 
     <div class="modal fade" id="passModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
-      <div class="modal-header border-0 pb-0"><h5 class="fw-bold">Update Admin Pass</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button></div>
-      <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" /></div>
+      <div class="modal-header border-0 pb-0"><h5 class="fw-bold">New Login Password</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button></div>
+      <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minlength="6" maxlength="20" required /></div>
       <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
     </div></div></div>
 
@@ -319,11 +429,11 @@ export default function (clearCache) {
         <input type="hidden" id="ch-idx" />
         <input type="hidden" id="ch-id" />
         <div class="row g-2 mb-2">
-          <div class="col-8"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" /></div>
+          <div class="col-8"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
           <div class="col-4"><label class="form-label mini-label fw-bold">Type</label><select id="ch-provider" class="form-select form-select-sm"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></div>
         </div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">API Key</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
-        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="text" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" /></div>
+        <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required /></div>
         <div class="mb-2">
           <label class="form-label mini-label fw-bold">Model</label>
           <div class="input-group input-group-sm">
@@ -333,13 +443,13 @@ export default function (clearCache) {
         </div>
         <div class="row g-2 mb-2">
           <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" /></div>
-          <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" value="0" /></div>
+          <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" value="0" /></div>
         </div>
         <div class="row g-1 mb-2">
-          <div class="col-3"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" value="0" /></div>
-          <div class="col-3"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" value="0" /></div>
-          <div class="col-3"><label class="form-label mini-label fw-bold">TPM</label><input type="number" id="ch-tpm" class="form-control form-control-sm p-1" value="0" /></div>
-          <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" value="0" /></div>
+          <div class="col-3"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
+          <div class="col-3"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
+          <div class="col-3"><label class="form-label mini-label fw-bold">TPM</label><input type="number" id="ch-tpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
+          <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
         </div>
         <div class="row g-2 mt-3 pt-2 border-top">
           <div class="col-4 d-flex flex-column align-items-center">
@@ -368,11 +478,11 @@ export default function (clearCache) {
         <div class="d-flex justify-content-between align-items-center mb-2">
           <span id="debug-time" class="text-muted fw-bold" style="font-size:0.8rem"></span>
         </div>
-        <div class="mb-2"><label class="form-label mini-label">Error Message</label><input type="text" id="debug-msg" class="form-control form-control-sm font-monospace text-danger" readonly /></div>
-        <div class="mb-2" id="debug-url-wrapper"><label class="form-label mini-label">Target URL</label><input type="text" id="debug-url" class="form-control form-control-sm font-monospace" readonly /></div>
+        <div class="mb-2"><label class="form-label mini-label">Error Message</label><input type="text" id="debug-msg" class="form-control form-control-sm text-danger" readonly /></div>
+        <div class="mb-2" id="debug-url-wrapper"><label class="form-label mini-label">Target URL</label><input type="text" id="debug-url" class="form-control form-control-sm" readonly /></div>
         <div class="row g-2" id="debug-req-res-wrapper">
-          <div class="col-12"><label class="form-label mini-label">Request Payload</label><textarea id="debug-req" class="form-control form-control-sm font-monospace" rows="5" readonly style="font-size:0.7rem"></textarea></div>
-          <div class="col-12"><label class="form-label mini-label">Response Data</label><textarea id="debug-res" class="form-control form-control-sm font-monospace" rows="5" readonly style="font-size:0.7rem"></textarea></div>
+          <div class="col-12"><label class="form-label mini-label">Request Payload</label><textarea id="debug-req" class="form-control form-control-sm" rows="5" readonly style="font-size:0.7rem"></textarea></div>
+          <div class="col-12"><label class="form-label mini-label">Response Data</label><textarea id="debug-res" class="form-control form-control-sm" rows="5" readonly style="font-size:0.7rem"></textarea></div>
         </div>
       </div>
     </div></div></div>
@@ -388,27 +498,109 @@ export default function (clearCache) {
     <style>.mini-label { font-size: 0.65rem; margin-bottom: 2px; text-transform: uppercase; color: var(--bs-secondary); }</style>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.js"></script>
     <script>
+      const notyf = new Notyf({
+        position: { x: 'right', y: 'bottom' },
+        ripple: true,
+        dismissible: true,
+        duration: 2500
+      });
+      const toast = (msg, type = 'primary') => {
+        if (type === 'danger') notyf.error(msg);
+        else notyf.success(msg);
+      };
+      const confirm = (msg, onOk) => { if (window.confirm(msg)) onOk(); };
       let chModal, passModal, debugModal, modelsModal, channels = [], filters = [], cooldown = 300, refreshTimer = null, lastChannelsStr = '';
       let sortKey = null, sortOrder = 0; // 0: none, 1: asc, 2: desc
-      const loading = (s) => document.getElementById('loading-overlay').style.display = s ? 'flex' : 'none';
+      let loadingTimer = null;
+      const loading = (s) => {
+        const el = document.getElementById('loading-overlay');
+        if (s) {
+          el.classList.add('show');
+          document.body.classList.add('loading');
+          clearTimeout(loadingTimer);
+        } else {
+          loadingTimer = setTimeout(() => {
+            el.classList.remove('show');
+            document.body.classList.remove('loading');
+          }, 500);
+        }
+      };
       const api = async (u, m='GET', b=null, showLoader=true) => {
         if (showLoader) loading(true);
         const r = await fetch(u, { method: m, headers: { 'Content-Type': 'application/json', 'X-Admin-Token': sessionStorage.getItem('adminToken') || '' }, body: b ? JSON.stringify(b) : null });
         if (showLoader) loading(false);
         if (r.status === 401) { showLogin(); return null; }
-        if (!r.ok) { const err = await r.json(); alert(err.error || 'Request Failed'); return null; }
+        if (!r.ok) { const err = await r.json(); toast(err.error || 'Request Failed', 'danger'); return null; }
         return r.json();
       };
-      const showLogin = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('login-view').style.display = 'block'; };
-      const showAdmin = () => { document.getElementById('login-view').style.display = 'none'; document.getElementById('admin-view').style.display = 'block'; init(); };
-      const logout = () => { sessionStorage.removeItem('adminToken'); location.reload(); };
+      const showLogin = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('login-view').style.display = 'block'; };
+      const showSetup = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'block'; };
+      const showAdmin = () => { document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('admin-view').style.display = 'block'; init(); };
+      const logout = () => { sessionStorage.removeItem('adminToken'); sessionStorage.removeItem('adminLoggedIn'); location.reload(); };
       const toggleTheme = () => { const t = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun'; localStorage.setItem('theme', t); };
-      const copyToken = () => { const t = document.getElementById('cfg-token'); t.select(); document.execCommand('copy'); alert('Token Copied'); };
+      const copyToken = () => { const t = document.getElementById('cfg-token'); t.select(); document.execCommand('copy'); toast('Token 已複製', 'success'); };
       const esc = (s) => String(s || "").replace(/[\\"\\n\\r\\t]/g, ' ').replace(/"/g, '&quot;');
       const initTooltips = () => { [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].map(el => new bootstrap.Tooltip(el)); };
 
-      document.getElementById('loginForm').onsubmit = async (e) => { e.preventDefault(); const p = document.getElementById('login-pass').value; loading(true); try { const r = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: p }) }); loading(false); if (r.ok) { sessionStorage.setItem('adminToken', p); showAdmin(); } else { const err = await r.json(); alert(err.error || '密碼錯誤'); } } catch(err) { loading(false); alert('網絡或資料庫異常，請確保已執行 D1 初始化'); } };
+      document.getElementById('loginForm').onsubmit = async (e) => {
+        e.preventDefault()
+        const p = document.getElementById('login-pass').value
+        if (!p) return toast('請輸入密碼', 'warning')
+        loading(true)
+        try {
+          const r = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: p }) })
+          const data = await r.json()
+          loading(false)
+          if (r.ok) {
+            // 存儲密碼（用於 API 認證）+ 登入標記
+            sessionStorage.setItem('adminToken', p)
+            sessionStorage.setItem('adminLoggedIn', '1')
+            showAdmin()
+          } else {
+            toast(data.error || '密碼錯誤', 'danger')
+          }
+        } catch(err) {
+          loading(false)
+          toast('網絡或資料庫異常，請確保已執行 D1 初始化', 'danger')
+        }
+      }
+
+      document.getElementById('setupForm').onsubmit = async (e) => {
+        e.preventDefault()
+        const p = document.getElementById('setup-pass').value
+        if (!p) return toast('請輸入密碼', 'warning')
+        if (p.length < 6 || p.length > 20) return toast('密碼需 6-20 個字', 'warning')
+        loading(true)
+        try {
+          // 先設定密碼
+          const r = await fetch('/admin/api/admin-pass', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pass: p })
+          })
+          if (!r.ok) {
+            loading(false)
+            const err = await r.json()
+            toast(err.error || '設定失敗', 'danger')
+            return
+          }
+          // 設定成功後自動登入
+          const loginRes = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: p }) })
+          loading(false)
+          if (loginRes.ok) {
+            sessionStorage.setItem('adminToken', p)
+            sessionStorage.setItem('adminLoggedIn', '1')
+            showAdmin()
+          } else {
+            showLogin()
+          }
+        } catch(err) {
+          loading(false)
+          toast('網絡或資料庫異常', 'danger')
+        }
+      }
 
       const init = async () => {
         const cfg = await api('/admin/api/config'); if (!cfg) return;
@@ -484,7 +676,7 @@ export default function (clearCache) {
         html +=
           '<div class="col-12">' +
             '<div class="card border-0 shadow-sm">' +
-              '<div class="card-body p-3">' +
+              '<div class="card-body p-3" title="僅對有設定 RPM 的渠道做統計">' +
                 rpdContent +
               '</div>' +
             '</div>' +
@@ -547,22 +739,22 @@ export default function (clearCache) {
             ? '<span class="badge badge-anthropic">Anthropic</span>'
             : '<span class="badge badge-openai">OpenAI</span>';
           return '<tr>' +
-            '<td class="text-muted small">' + (c.id || '-') + '</td>' +
-            '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
-            '<td>' + providerBadge + '</td>' +
-            '<td class="fw-bold">' + c.name + '</td>' +
-            '<td><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
-            '<td class="d-none d-sm-table-cell">' + c.weight + '</td>' +
-            '<td>' + h + '</td>' +
-            '<td>' +
+            '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>' +
+            '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
+            '<td class="align-middle">' + providerBadge + '</td>' +
+            '<td class="fw-bold align-middle">' + c.name + '</td>' +
+            '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
+            '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>' +
+            '<td class="align-middle">' + h + '</td>' +
+            '<td class="align-middle">' +
               '<div class="d-none d-md-flex justify-content-center gap-1">' +
-                '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-0 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>' +
-                '<button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-0 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>' +
-                '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-0 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>' +
-                '<button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-0 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>' +
+                '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>' +
+                '<button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>' +
+                '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-1 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>' +
+                '<button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>' +
               '</div>' +
               '<div class="d-md-none dropdown">' +
-                '<button class="btn btn-sm btn-light py-0 px-2" type="button" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>' +
+                '<button class="btn btn-sm btn-light py-1 px-2" type="button" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>' +
                 '<ul class="dropdown-menu dropdown-menu-end shadow border-0">' +
                   '<li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small">Edit</button></li>' +
                   '<li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>' +
@@ -572,48 +764,50 @@ export default function (clearCache) {
               '</div>' +
             '</td>' +
           '</tr>';
-        }).join('') || '<tr><td colspan="7" class="py-4 text-muted">No channels.</td></tr>';
+        }).join('') || '<tr><td colspan="8" class="py-4 text-muted">No channels.</td></tr>';
         initTooltips();
       };
 
       const copyModelName = (name) => {
         if (!name) return;
         const tmp = document.createElement('textarea'); tmp.value = name; document.body.appendChild(tmp); tmp.select(); document.execCommand('copy'); document.body.removeChild(tmp);
-        alert('Model ID copied to clipboard: ' + name);
+        toast('Model ID 已複製: ' + name, 'success');
       };
 
       const resetHealth = async (id) => {
-        if (!id) return alert('Please save channels first');
-        if (!confirm('確定重置該渠道健康狀態？')) return;
-        await api('/admin/api/channels/' + id + '/reset-health', 'POST');
-        init();
+        if (!id) return toast('請先儲存渠道', 'warning');
+        confirm('確定重置該渠道健康狀態？', async () => {
+          await api('/admin/api/channels/' + id + '/reset-health', 'POST');
+          init();
+        });
       };
 
       const updateAdminPass = async () => {
         if (document.activeElement) document.activeElement.blur();
         const p = document.getElementById('new-admin-pass').value;
-        if (!p) return alert('Password required');
-        if (!confirm('更換密碼後將自動登出，確定？')) return;
-        await api('/admin/api/admin-pass', 'POST', { pass: p });
-        logout();
+        if (!p) return toast('請輸入密碼', 'warning');
+        confirm('更換密碼後將自動登出，確定？', async () => {
+          await api('/admin/api/admin-pass', 'POST', { pass: p });
+          logout();
+        });
       };
 
       const renderFilters = () => {
         document.getElementById('filter-list').innerHTML = filters.map((f, i) => '<tr>' +
-          '<td><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
-          '<td><input type="text" class="form-control form-control-sm font-monospace" maxlength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" data-bs-toggle="tooltip" title="長度限 1-30 字元"></td>' +
-          '<td class="d-none d-sm-table-cell"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
-          '<td><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-0 px-2"><i class="bi bi-trash"></i></button></td>' +
+          '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
+          '<td class="align-middle"><input type="text" class="form-control form-control-sm" maxlength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" title="長度限 1-30 字"></td>' +
+          '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
+          '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>' +
         '</tr>').join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
         initTooltips();
       };
 
-      const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, cooldown: document.getElementById('cfg-cooldown').value }); alert('Saved'); };
-      const saveAllChannels = async () => { await api('/admin/api/batch-channels', 'POST', channels); alert('Channels Saved'); init(); };
+      const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, cooldown: document.getElementById('cfg-cooldown').value }); toast('設定已儲存', 'success'); };
+      const saveAllChannels = async () => { await api('/admin/api/batch-channels', 'POST', channels); toast('渠道已儲存', 'success'); init(); };
       const saveAllFilters = async () => {
         const invalid = filters.filter(f => !f.text || f.text.trim().length === 0 || f.text.length > 30);
-        if (invalid.length > 0) return alert('過濾關鍵字長度須介於 1–30 字元，請修正後再儲存。');
-        await api('/admin/api/filters', 'POST', filters); alert('Filters Saved'); renderFilters();
+        if (invalid.length > 0) return toast('過濾關鍵字長度須介於 1–30 字，請修正後再儲存。', 'warning');
+        await api('/admin/api/filters', 'POST', filters); toast('過濾器已儲存', 'success'); renderFilters();
       };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
       const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
@@ -625,7 +819,7 @@ export default function (clearCache) {
 
       const showDebug = (idx) => {
         const c = channels[idx];
-        if (!c || !c.last_error_msg) return alert('No error info available.');
+        if (!c || !c.last_error_msg) return toast('無錯誤資訊', 'warning');
         document.getElementById('debug-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
         let parsed = null;
         try { parsed = JSON.parse(c.last_error_msg); } catch(e) {}
@@ -648,17 +842,17 @@ export default function (clearCache) {
         if (document.activeElement) document.activeElement.blur();
         const idx = document.getElementById('ch-idx').value;
         const name = document.getElementById('ch-name').value.trim();
-        if (!name) return alert('Name is required');
+        if (!name) return toast('請輸入名稱', 'warning');
         const weightInput = document.getElementById('ch-weight');
         const weight = parseInt(weightInput.value);
-        if (isNaN(weight) || weight < 1 || weight > 100) return alert('Weight must be between 1 and 100');
+        if (isNaN(weight) || weight < 1 || weight > 100) return toast('Weight 需介於 1-100', 'warning');
         const url = document.getElementById('ch-url').value.trim().replace(new RegExp('/+$'), '');
-        if (!url) return alert('Base URL is required');
+        if (!url) return toast('請輸入 Base URL', 'warning');
         const prev = idx !== '' ? channels[idx] : null;
         const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
-        if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats();
+        if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats(); toast(idx !== '' ? '已修改，請 SAVE ALL 儲存' : '已新增，請 SAVE ALL 儲存', 'success');
       };
-      const delChannel = (idx) => { if (confirm('Delete?')) { channels.splice(idx, 1); renderChannels(); renderStats(); } };
+      const delChannel = (idx) => { confirm('確定刪除此渠道？', () => { channels.splice(idx, 1); renderChannels(); renderStats(); }); };
       const copyChannel = (idx) => { const src = channels[idx]; channels.push({ ...src, name: src.name + ' (copy)', id: undefined, last_429: 0, consecutive_errors: 0, last_error_msg: '', last_error_at: 0 }); renderChannels(); renderStats(); };
       const toggleKeyVis = () => { const i = document.getElementById('ch-key'); i.type = i.type === 'password' ? 'text' : 'password'; };
 
@@ -725,7 +919,7 @@ export default function (clearCache) {
         renderChannels();
       };
 
-      const resetAllHealth = async () => { if (!confirm('重置所有渠道健康狀態？')) return; await api('/admin/api/channels/reset-all-health', 'POST'); init(); };
+      const resetAllHealth = async () => { confirm('重置所有渠道健康狀態？', async () => { await api('/admin/api/channels/reset-all-health', 'POST'); init(); }); };
       const exportJson = () => {
         const now = new Date(); const pad = (n) => String(n).padStart(2, '0');
         const ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
@@ -733,16 +927,41 @@ export default function (clearCache) {
         const b = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-' + ts + '.json'; a.click();
       };
-      const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (await api('/admin/api/import-all', 'POST', d)) { alert('Imported Successfully'); init(); } }; r.readAsText(e.target.files[0]); };
-      const resetSystem = async () => { if (confirm('Reset All?')) { await api('/admin/api/reset', 'POST'); location.reload(); } };
+      const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (await api('/admin/api/import-all', 'POST', d)) { toast('匯入成功', 'success'); init(); } }; r.readAsText(e.target.files[0]); };
+      const resetSystem = async () => { confirm('重置系統將清除所有頻道、過濾器與設定（不含密碼），確定？', async () => { await api('/admin/api/reset', 'POST'); location.reload(); }); };
       window.onload = async () => {
         const t = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
-        chModal = new bootstrap.Modal(document.getElementById('chModal'));
-        passModal = new bootstrap.Modal(document.getElementById('passModal'));
-        debugModal = new bootstrap.Modal(document.getElementById('debugModal'));
-        modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'));
-        const r = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: sessionStorage.getItem('adminToken') || '' }) });
-        if (r.ok) showAdmin(); else showLogin();
+        chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
+        passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
+        debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
+        modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
+        // 檢查是否需要設定密碼
+        const authRes = await fetch('/admin/api/auth-status')
+        const authData = await authRes.json()
+        if (authData.needsSetup) {
+          showSetup()
+        } else {
+          // 檢查是否已登入（用 verify-token 驗證）
+          const storedToken = sessionStorage.getItem('adminToken')
+          if (storedToken) {
+            const r = await fetch('/admin/api/verify-token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ token: storedToken })
+            })
+            const data = await r.json()
+            if (data.valid) {
+              sessionStorage.setItem('adminLoggedIn', '1')
+              showAdmin()
+            } else {
+              sessionStorage.removeItem('adminToken')
+              sessionStorage.removeItem('adminLoggedIn')
+              showLogin()
+            }
+          } else {
+            showLogin()
+          }
+        }
       };
     </script>
   </body>
