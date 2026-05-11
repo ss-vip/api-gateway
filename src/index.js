@@ -26,8 +26,7 @@ const clearCache = () => {
 app.route("/", dashboard(clearCache));
 
 const debug = (c, msg) => {
-  if (c.req.url.includes("//localhost") || c.req.url.includes("//127.0.0.1"))
-    console.log(msg);
+  if (c.env.DEBUG) console.log(msg);
 };
 
 function hasImage(messages = []) {
@@ -235,32 +234,33 @@ function a2oRequest(body) {
 }
 
 function o2aResponse(json, model) {
-  const content = [];
+  let content = "";
+  for (const block of json.content || []) {
+    if (block.type === "text") content += block.text;
+    else if (block.type === "thinking") content = `> [Thinking]\n> ${block.thinking}\n\n` + content;
+    else if (block.type === "tool_use") {
+      // Keep track for potential mapping, but o2aResponse currently handles text
+    }
+  }
   const choice = json.choices?.[0] || {};
   if (choice.message?.content)
-    content.push({ type: "text", text: choice.message.content });
+    content = choice.message.content;
   if (choice.message?.tool_calls) {
-    for (const tc of choice.message.tool_calls) {
-      content.push({
-        type: "tool_use",
-        id: tc.id,
-        name: tc.function.name,
-        input: attemptRepairJson(tc.function.arguments) || {},
-      });
-    }
+    // Tool calls handled below
   }
   return {
     id: json.id,
     type: "message",
     role: "assistant",
     model: model || json.model,
-    content,
+    content: [{ type: "text", text: content }],
     stop_reason:
       choice.finish_reason === "stop"
         ? "end_turn"
         : choice.finish_reason === "tool_calls"
           ? "tool_use"
           : choice.finish_reason,
+    stop_sequence: null,
     usage: {
       input_tokens: json.usage?.prompt_tokens || 0,
       output_tokens: json.usage?.completion_tokens || 0,
@@ -471,6 +471,9 @@ function transformStream(
     nextAnthropicIndex = 1;
   let openaiToolIndexMap = {},
     nextOpenaiIndex = 0;
+  let sentMessageStart = false;
+  let stoppedBlocks = new Set();
+  let textBlockIndex = 0;
 
   const send = async (data) => {
     if (typeof data === "object") data = JSON.stringify(data);
@@ -494,16 +497,22 @@ function transformStream(
           if (dataStr === "[DONE]") {
             const tail = filter.flush();
             if (tail) {
-              if (toProtocol === "anthropic")
+              if (toProtocol === "anthropic") {
+                if (!sentMessageStart) {
+                  sentMessageStart = true;
+                  await send({ type: "message_start", message: { id: messageId, type: "message", role: "assistant", model: responseModel, content: [], usage: { input_tokens: 0, output_tokens: 0 } } });
+                  await send({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+                }
                 await send({
                   type: "content_block_delta",
                   index: 0,
                   delta: { type: "text_delta", text: tail },
                 });
-              else
+              } else {
                 await send(
                   mkChunk({ content: tail }, null, responseModel, "openai"),
                 );
+              }
             }
             if (toProtocol === "openai") await send("[DONE]");
             continue;
@@ -511,6 +520,10 @@ function transformStream(
 
           try {
             const json = JSON.parse(dataStr);
+            if (json.type === "ping") {
+              if (toProtocol === "anthropic") await send(json);
+              continue;
+            }
             if (json.type === "error") {
               const errMsg = json.error?.message || "Unknown stream error";
               if (toProtocol === "anthropic") {
@@ -574,23 +587,54 @@ function transformStream(
               } else if (json.type === "message_delta") {
                 finishReason = json.delta?.stop_reason;
               }
+              // content_block_stop tracked for forwarding
             }
 
             let outContent = content ? filter.transform(content) : "";
             if (finishReason) outContent += filter.flush();
 
             if (toProtocol === "anthropic") {
-              if (fromProtocol === "anthropic" && !filters.length) {
-                await send(json);
+              if (fromProtocol === "anthropic") {
+                // Filter-aware pass-through: forward ALL events as-is,
+                // only intercept text_delta for content filtering.
+                // This naturally supports thinking blocks, tool_use, and all future event types.
+                if (json.type === "message_start") {
+                  if (responseModel) json.message = { ...json.message, model: responseModel };
+                  await send(json);
+                } else if (json.type === "content_block_delta" && json.delta?.type === "text_delta") {
+                  if (!filters.length) {
+                    await send(json);
+                  } else {
+                    const filtered = filter.transform(json.delta.text || "");
+                    if (filtered) {
+                      await send({ ...json, delta: { type: "text_delta", text: filtered } });
+                    }
+                  }
+                } else if (json.type === "content_block_stop" && textBlockIndex === json.index && filters.length) {
+                  // Flush filter buffer before closing the text block
+                  const tail = filter.flush();
+                  if (tail) {
+                    await send({ type: "content_block_delta", index: json.index, delta: { type: "text_delta", text: tail } });
+                  }
+                  await send(json);
+                } else if (json.type === "content_block_start" && json.content_block?.type === "text") {
+                  textBlockIndex = json.index;
+                  await send(json);
+                } else if (json.type === "message_delta" && filters.length) {
+                  // Safety flush in case content_block_stop didn't trigger
+                  const tail = filter.flush();
+                  if (tail && textBlockIndex >= 0) {
+                    await send({ type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: tail } });
+                  }
+                  await send(json);
+                } else {
+                  // Forward everything else as-is: thinking, tool_use, ping remnants, etc.
+                  await send(json);
+                }
               } else {
-                if (
-                  json.type === "message_start" ||
-                  (!json.type &&
-                    fromProtocol === "openai" &&
-                    !content &&
-                    !finishReason &&
-                    (!toolCalls || toolCalls.length === 0))
-                ) {
+                // openai → anthropic translation (full synthesis)
+                if (!sentMessageStart && (outContent || toolCalls || finishReason)) {
+                  sentMessageStart = true;
                   await send({
                     type: "message_start",
                     message: {
@@ -685,7 +729,9 @@ function transformStream(
                 }
               }
             }
-          } catch (e) { }
+          } catch (e) {
+            console.error("[Stream parse]", e.message, "raw:", trimmed?.slice(0, 200));
+          }
         }
       }
     } finally {
@@ -747,6 +793,7 @@ async function loadCache(env) {
         return cache.data;
       } catch (e) {
         cacheFlight = null;
+        console.error("[loadCache] D1 query failed:", e.message);
         throw e;
       }
     })();
@@ -827,6 +874,14 @@ function validateChatBody(body) {
   return null;
 }
 
+// Return protocol-appropriate error responses
+function errResponse(c, protocol, message, type, status) {
+  if (protocol === "anthropic") {
+    return c.json({ type: "error", error: { type, message } }, status);
+  }
+  return c.json({ error: { message, type } }, status);
+}
+
 // Build a clean upstream URL from a stored base_url.
 function buildUpstreamUrl(baseUrl, provider) {
   let base = (baseUrl || "").trim();
@@ -850,12 +905,7 @@ async function handleChatRequest(c, clientProtocol) {
     data = await loadCache(c.env);
   } catch (e) {
     if (!cache.data)
-      return c.json(
-        {
-          error: { message: "Database not initialized", type: "server_error" },
-        },
-        500,
-      );
+      return errResponse(c, clientProtocol, "Database not initialized", "server_error", 500);
     data = cache.data;
   }
 
@@ -865,28 +915,19 @@ async function handleChatRequest(c, clientProtocol) {
     ""
   ).replace("Bearer ", "");
   if (data.config.client_token && token !== data.config.client_token)
-    return c.json(
-      { error: { message: "Unauthorized", type: "authentication_error" } },
-      401,
-    );
+    return errResponse(c, clientProtocol, "Unauthorized", "authentication_error", 401);
 
   let body;
+  let rawBodyText;
   try {
-    body = JSON.parse(await c.req.text());
+    rawBodyText = await c.req.text();
+    body = JSON.parse(rawBodyText);
   } catch (e) {
-    return c.json(
-      {
-        error: { message: "Invalid JSON body", type: "invalid_request_error" },
-      },
-      400,
-    );
+    return errResponse(c, clientProtocol, "Invalid JSON body", "invalid_request_error", 400);
   }
   const validErr = validateChatBody(body);
   if (validErr)
-    return c.json(
-      { error: { message: validErr, type: "invalid_request_error" } },
-      400,
-    );
+    return errResponse(c, clientProtocol, validErr, "invalid_request_error", 400);
 
   const isVision = hasImage(body.messages);
   const isToolUse = !!(body.tools && body.tools.length > 0);
@@ -896,10 +937,8 @@ async function handleChatRequest(c, clientProtocol) {
     return true;
   });
 
-  const msgStr = JSON.stringify(body.messages || [])
-    .replace(/"data:image\/[^;]+;base64,[^"]+"/g, '""')
-    .replace(/"url":\s*"data:image\/[^;]+;base64,[^"]+"/g, '"url":""');
-  const estTokens = Math.floor(msgStr.length / 3.5);
+  // Estimate tokens from raw text length (avoids expensive re-serialization)
+  const estTokens = Math.floor(rawBodyText.length / 4);
   const tokenMatchedPool = pool.filter(
     (ch) => !ch.max_tokens || ch.max_tokens === 0 || estTokens <= ch.max_tokens,
   );
@@ -910,25 +949,23 @@ async function handleChatRequest(c, clientProtocol) {
     if (toolSupportedPool.length > 0) pool = toolSupportedPool;
   }
 
-  const originalModel = body.model;
   const requestedModel = (originalModel || "").trim().toLowerCase();
   if (requestedModel) {
-    const matched = pool.filter(
+    let matched = pool.filter(
       (ch) => (ch.model || "").trim().toLowerCase() === requestedModel,
     );
+    // Fuzzy match: if requested model name contains channel model name (handles versioned strings)
+    if (matched.length === 0) {
+      matched = pool.filter((ch) => {
+        const cm = (ch.model || "").trim().toLowerCase();
+        return cm && (requestedModel.includes(cm) || cm.includes(requestedModel));
+      }).sort((a, b) => (b.model?.length || 0) - (a.model?.length || 0));
+    }
     if (matched.length > 0) pool = matched;
   }
 
   if (pool.length === 0)
-    return c.json(
-      {
-        error: {
-          message: "No enabled channels supporting this request",
-          type: "server_error",
-        },
-      },
-      503,
-    );
+    return errResponse(c, clientProtocol, "No enabled channels supporting this request", "server_error", 503);
 
   const now = Math.floor(Date.now() / 1000);
   const availableCount = pool.filter((ch) => {
@@ -951,15 +988,7 @@ async function handleChatRequest(c, clientProtocol) {
   }).length;
 
   if (availableCount === 0)
-    return c.json(
-      {
-        error: {
-          message: "All channels are rate-limited",
-          type: "rate_limit_error",
-        },
-      },
-      429,
-    );
+    return errResponse(c, clientProtocol, "All channels are rate-limited", "rate_limit_error", 429);
 
   const isStream =
     body.stream === true || body.stream === "true" || body.stream === 1;
@@ -1011,26 +1040,32 @@ async function handleChatRequest(c, clientProtocol) {
       remainingTime * 1000,
     );
     const abortHandler = () => controller.abort();
-    c.req.raw.signal.addEventListener("abort", abortHandler);
+    c.req.raw.signal?.addEventListener("abort", abortHandler);
     try {
+      const upstreamHeaders = {
+        "Content-Type": "application/json",
+        "User-Agent": c.req.header("User-Agent") || "Claude-Code-Gateway/1.0"
+      };
+      if (targetProtocol === "anthropic") {
+        upstreamHeaders["x-api-key"] = ch.api_key;
+        upstreamHeaders["anthropic-version"] = "2023-06-01";
+        // Forward beta feature headers (thinking, computer use, etc.)
+        const clientBeta = c.req.header("anthropic-beta");
+        if (clientBeta) upstreamHeaders["anthropic-beta"] = clientBeta;
+      } else {
+        upstreamHeaders["Authorization"] = `Bearer ${ch.api_key}`;
+      }
       const res = await fetch(url, {
         method: "POST",
-        headers: {
-          Authorization:
-            targetProtocol === "openai" ? `Bearer ${ch.api_key}` : undefined,
-          "x-api-key": targetProtocol === "anthropic" ? ch.api_key : undefined,
-          "anthropic-version":
-            targetProtocol === "anthropic" ? "2023-06-01" : undefined,
-          "Content-Type": "application/json",
-        },
+        headers: upstreamHeaders,
         body: JSON.stringify(reqBody),
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
-      c.req.raw.signal.removeEventListener("abort", abortHandler);
+      c.req.raw.signal?.removeEventListener("abort", abortHandler);
 
-      if (!res.ok) {
-        const errText = await res.text();
+      if (!res.ok || !res.body) {
+        const errText = res.body ? await res.text() : "Empty upstream response";
         ts = Math.floor(Date.now() / 1000);
         cachedCh = data.channels.find((x) => x.id === ch.id);
 
@@ -1086,10 +1121,11 @@ async function handleChatRequest(c, clientProtocol) {
           }
         }
 
+        console.error(`[Upstream ${res.status}] ${ch.name} ${url}:`, errText.slice(0, 500));
         const debugInfo = JSON.stringify({
           message: errText.slice(0, 500),
           url: url,
-          request: JSON.stringify(reqBody).slice(0, 2000),
+          request: JSON.stringify({ model: reqBody.model, stream: reqBody.stream, tools: reqBody.tools?.length || 0, messages: reqBody.messages?.length || 0 }),
           response: errText.slice(0, 2000),
         });
 
@@ -1130,6 +1166,21 @@ async function handleChatRequest(c, clientProtocol) {
           }
         }
 
+        // Don't retry errors that will fail on every channel (body-level issues)
+        if (res.status >= 400 && res.status < 500 && res.status !== 429 && !maxTokensToLearn && !capabilityLearned) {
+          if (dbUpdates.length > 0)
+            c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
+          try {
+            const errJson = JSON.parse(errText);
+            if (clientProtocol === "anthropic" && !errJson.type) {
+              return c.json({ type: "error", error: { type: "upstream_error", message: errJson.error?.message || errText.slice(0, 500) } }, res.status);
+            }
+            return c.json(errJson, res.status);
+          } catch {
+            return errResponse(c, clientProtocol, errText.slice(0, 500), "upstream_error", res.status);
+          }
+        }
+
         if (ch.fallback_model) {
           const fallbackCh = {
             ...ch,
@@ -1152,6 +1203,14 @@ async function handleChatRequest(c, clientProtocol) {
           c.env.DB.prepare(
             "UPDATE channels SET consecutive_errors=0,last_error_at=0 WHERE id=?",
           ).bind(ch.id),
+        );
+      }
+      // Sync rate limit counters to D1 for cross-instance accuracy
+      if (cachedCh && (cachedCh.rpm_limit > 0 || cachedCh.rpd_limit > 0)) {
+        dbUpdates.push(
+          c.env.DB.prepare(
+            "UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?",
+          ).bind(cachedCh.rpm_count || 0, cachedCh.rpm_reset_at || 0, cachedCh.rpd_count || 0, cachedCh.rpd_reset_at || 0, ch.id),
         );
       }
 
@@ -1194,15 +1253,20 @@ async function handleChatRequest(c, clientProtocol) {
       return c.json(finalResponse);
     } catch (e) {
       clearTimeout(timeoutId);
-      c.req.raw.signal.removeEventListener("abort", abortHandler);
+      c.req.raw.signal?.removeEventListener("abort", abortHandler);
+
+      if (e.name === 'AbortError') {
+        return errResponse(c, clientProtocol, "Request aborted or timed out", "timeout_error", 408);
+      }
 
       ts = Math.floor(Date.now() / 1000);
       cachedCh = data.channels.find((x) => x.id === ch.id);
       const errMsg = e.message || "Network error / Timeout";
+      console.error(`[Network error] ${ch.name} ${url}:`, errMsg);
       const debugInfo = JSON.stringify({
         message: errMsg.slice(0, 500),
         url: url,
-        request: JSON.stringify(reqBody).slice(0, 2000),
+        request: JSON.stringify({ model: reqBody.model, stream: reqBody.stream, tools: reqBody.tools?.length || 0, messages: reqBody.messages?.length || 0 }),
         response: "",
       });
 
@@ -1234,12 +1298,8 @@ async function handleChatRequest(c, clientProtocol) {
   }
   if (dbUpdates.length > 0)
     c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
-  return c.json(
-    {
-      error: { message: "All upstream channels failed", type: "server_error" },
-    },
-    502,
-  );
+  console.error(`[Gateway] All channels failed for model=${body.model} pool=${pool.length}`);
+  return errResponse(c, clientProtocol, "All upstream channels failed", "server_error", 502);
 }
 
 app.post("/v1/chat/completions", async (c) => handleChatRequest(c, "openai"));

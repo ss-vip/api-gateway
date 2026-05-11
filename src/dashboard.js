@@ -324,10 +324,10 @@ export default function (clearCache) {
 
     if (isMatch) {
       c.executionCtx.waitUntil(
-        cache.delete(banCacheKey).catch(() => { }),
-        cache
-          .delete(new Request(`https://${host}/_internal/${failKey}`))
-          .catch(() => { }),
+        Promise.all([
+          cache.delete(banCacheKey).catch(() => { }),
+          cache.delete(new Request(`https://${host}/_internal/${failKey}`)).catch(() => { }),
+        ])
       );
       return c.json({ ok: true });
     }
@@ -342,10 +342,10 @@ export default function (clearCache) {
 
     if (failCount >= MAX_FAILURES) {
       c.executionCtx.waitUntil(
-        cache
-          .put(banCacheKey, new Response("banned", { status: 429 }))
-          .catch(() => { }),
-        cache.delete(failCacheKey).catch(() => { }),
+        Promise.all([
+          cache.put(banCacheKey, new Response("banned", { status: 429, headers: { "Cache-Control": `max-age=${BAN_DURATION}` } })).catch(() => { }),
+          cache.delete(failCacheKey).catch(() => { }),
+        ])
       );
       return c.json({ error: "IP 已被封鎖 15 分鐘" }, 429);
     }
