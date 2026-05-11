@@ -1,7 +1,5 @@
--- DROP TABLE IF EXISTS channels, filters, config;
-
 CREATE TABLE IF NOT EXISTS channels (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   name TEXT,
   base_url TEXT,
   api_key TEXT,
@@ -23,11 +21,12 @@ CREATE TABLE IF NOT EXISTS channels (
   last_error_at INTEGER DEFAULT 0,
   last_error_msg TEXT,
   max_tokens INTEGER DEFAULT 0,
-  support_tools INTEGER DEFAULT 1
+  support_tools INTEGER DEFAULT 1,
+  fallback_model TEXT
 );
 
 CREATE TABLE IF NOT EXISTS filters (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id INTEGER PRIMARY KEY,
   text TEXT NOT NULL,
   mode INTEGER DEFAULT 1,
   is_enabled INTEGER DEFAULT 1
@@ -37,5 +36,5 @@ CREATE TABLE IF NOT EXISTS config (
   id INTEGER PRIMARY KEY,
   client_token TEXT,
   admin_password TEXT,
-  cooldown_time INTEGER DEFAULT 300
+  recovery_period INTEGER DEFAULT 300
 );

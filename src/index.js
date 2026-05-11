@@ -26,7 +26,7 @@ const clearCache = () => {
 app.route("/", dashboard(clearCache));
 
 const debug = (c, msg) => {
-  if (c.req.url.includes("localhost") || c.req.url.includes("127.0.0.1"))
+  if (c.req.url.includes("//localhost") || c.req.url.includes("//127.0.0.1"))
     console.log(msg);
 };
 
@@ -135,13 +135,13 @@ function o2aRequest(body) {
     top_p: body.top_p,
     tools: body.tools
       ? body.tools.map((t) => ({
-        name: t.function.name,
-        description: t.function.description,
-        input_schema: t.function.parameters || {
-          type: "object",
-          properties: {},
-        },
-      }))
+          name: t.function.name,
+          description: t.function.description,
+          input_schema: t.function.parameters || {
+            type: "object",
+            properties: {},
+          },
+        }))
       : undefined,
   };
 }
@@ -223,13 +223,13 @@ function a2oRequest(body) {
     top_p: body.top_p,
     tools: body.tools
       ? body.tools.map((t) => ({
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.input_schema,
-        },
-      }))
+          type: "function",
+          function: {
+            name: t.name,
+            description: t.description,
+            parameters: t.input_schema,
+          },
+        }))
       : undefined,
   };
 }
@@ -314,13 +314,13 @@ function attemptRepairJson(str) {
   if (!str || str.length > 2_000_000) return null;
   try {
     return JSON.parse(str);
-  } catch (e) { }
+  } catch (e) {}
   let s = str.trim();
   if (s.startsWith("```json"))
     s = s.replace(/^```json\n?/, "").replace(/\n?```$/, "");
   try {
     return JSON.parse(s);
-  } catch (e) { }
+  } catch (e) {}
   try {
     let inString = false,
       output = "";
@@ -334,7 +334,7 @@ function attemptRepairJson(str) {
       }
     }
     return JSON.parse(output);
-  } catch (e) { }
+  } catch (e) {}
   return null;
 }
 
@@ -386,12 +386,12 @@ class RollingFilter {
   }
 }
 
-function selectChannel(channels, cooldownTime) {
+function selectChannel(channels, delay_period) {
   const now = Math.floor(Date.now() / 1000);
   const available = channels.filter((c) => {
     if (!c.is_enabled) return false;
     if (c.consecutive_errors >= 5) return now - (c.last_error_at || 0) > 604800;
-    if (now - (c.last_429 || 0) < cooldownTime) return false;
+    if (now - (c.last_429 || 0) < delay_period) return false;
     if (c.rpm_limit > 0) {
       const withinMin = now - (c.rpm_reset_at || 0) < 60;
       if (withinMin && (c.rpm_count || 0) >= c.rpm_limit) return false;
@@ -444,7 +444,7 @@ const mkChunk = (
     });
   }
   return JSON.stringify({
-    id: "chatcmpl-" + Math.random().toString(36).slice(2),
+    id: "chat_id-" + Math.random().toString(36).slice(2),
     object: "chat.completion.chunk",
     created: Math.floor(Date.now() / 1000),
     model,
@@ -466,7 +466,7 @@ function transformStream(
     encoder = new TextEncoder();
   const filter = new RollingFilter(filters);
   let buf = "",
-    messageId = "msg_" + Math.random().toString(36).slice(2);
+    messageId = "response_id_" + Math.random().toString(36).slice(2);
   let anthropicToolIndexMap = {},
     nextAnthropicIndex = 1;
   let openaiToolIndexMap = {},
@@ -685,13 +685,13 @@ function transformStream(
                 }
               }
             }
-          } catch (e) { }
+          } catch (e) {}
         }
       }
     } finally {
       try {
         writer.close();
-      } catch (e) { }
+      } catch (e) {}
     }
   })();
   return r;
@@ -712,7 +712,7 @@ async function loadCache(env) {
   if (!cacheFlight) {
     cacheFlight = (async () => {
       if (needsSave) {
-        await saveRateLimits(env).catch(() => { });
+        await saveRateLimits(env).catch(() => {});
       }
       try {
         const [ch, fl, cf] = await Promise.all([
@@ -739,7 +739,7 @@ async function loadCache(env) {
           data: {
             channels,
             filters: fl.results || [],
-            config: cf || { client_token: "sk-test123456", cooldown_time: 300 },
+            config: cf || { client_token: "sk-test123456", recovery_period: 300 },
           },
           ts: Date.now(),
         };
@@ -783,11 +783,11 @@ async function saveRateLimits(env) {
     }
   }
   if (updates.length > 0) {
-    env.DB.batch(updates).catch(() => { });
+    env.DB.batch(updates).catch(() => {});
   }
 }
 
-// /v1/models: dynamically return deduplicated models from all enabled channels. Falls back to 'openai'.
+// /v1/models: dynamically return deduplicated models
 app.get("/v1/models", async (c) => {
   let channels = [];
   try {
@@ -932,9 +932,10 @@ async function handleChatRequest(c, clientProtocol) {
 
   const now = Math.floor(Date.now() / 1000);
   const availableCount = pool.filter((ch) => {
-    if (ch.consecutive_errors >= 5 && now - (ch.last_error_at || 0) <= 604800)
+    // 快速自癒：將錯誤冷卻時間從一週縮短為 30 分鐘，實現無人值守的可用性
+    if (ch.consecutive_errors >= 5 && now - (ch.last_error_at || 0) <= 1800)
       return false;
-    if (now - (ch.last_429 || 0) < data.config.cooldown_time) return false;
+    if (now - (ch.last_429 || 0) < data.config.recovery_period) return false;
     if (
       ch.rpm_limit > 0 &&
       now - (ch.rpm_reset_at || 0) < 60 &&
@@ -967,8 +968,9 @@ async function handleChatRequest(c, clientProtocol) {
 
   for (let i = 0, maxTries = Math.min(pool.length, 5); i < maxTries; i++) {
     // 增加微小隨機延遲 (Jittered Backoff)，防止重試風暴導致上游 API 觸發惡意攻擊防禦
-    if (i > 0) await new Promise((r) => setTimeout(r, 150 + Math.random() * 200));
-    const ch = selectChannel(pool, data.config.cooldown_time);
+    if (i > 0)
+      await new Promise((r) => setTimeout(r, 150 + Math.random() * 200));
+    const ch = selectChannel(pool, data.config.recovery_period);
     if (!ch) break;
     const targetProtocol = ch.provider || "openai";
     const url = buildUpstreamUrl(ch.base_url, targetProtocol);
@@ -1088,20 +1090,29 @@ async function handleChatRequest(c, clientProtocol) {
           message: errText.slice(0, 500),
           url: url,
           request: JSON.stringify(reqBody).slice(0, 2000),
-          response: errText.slice(0, 2000)
+          response: errText.slice(0, 2000),
         });
 
-        if (res.status === 429) {
+        const isHardQuota = errText.match(/quota|limit|exhausted|credit|weekly|billing|insufficient/i);
+        const retryAfter = res.headers.get("Retry-After");
+
+        if (res.status === 429 || isHardQuota) {
+          let customDelay = ts + data.config.recovery_period;
+          if (isHardQuota) {
+            customDelay = ts + 604800;
+          } else if (retryAfter) {
+            const seconds = parseInt(retryAfter, 10);
+            if (!isNaN(seconds)) customDelay = ts + seconds;
+          }
+
           if (cachedCh) {
-            cachedCh.last_429 = ts;
+            cachedCh.last_429 = customDelay;
             cachedCh.last_error_msg = debugInfo;
           }
           dbUpdates.push(
-            c.env.DB.prepare("UPDATE channels SET last_429=?, last_error_msg=? WHERE id=?").bind(
-              ts,
-              debugInfo,
-              ch.id,
-            ),
+            c.env.DB.prepare(
+              "UPDATE channels SET last_429=?, last_error_msg=? WHERE id=?",
+            ).bind(customDelay, debugInfo, ch.id),
           );
         } else if (!maxTokensToLearn && !capabilityLearned) {
           // Don't count auto-discovery as a consecutive error
@@ -1119,7 +1130,18 @@ async function handleChatRequest(c, clientProtocol) {
             );
           }
         }
-        pool = pool.filter((p) => p.id !== ch.id);
+
+        if (ch.fallback_model) {
+          const fallbackCh = {
+            ...ch,
+            model: ch.fallback_model,
+            fallback_model: null,
+            is_fallback: true,
+          };
+          pool = pool.map((p) => (p.id === ch.id ? fallbackCh : p));
+        } else {
+          pool = pool.filter((p) => p.id !== ch.id);
+        }
         continue;
       }
 
@@ -1136,7 +1158,7 @@ async function handleChatRequest(c, clientProtocol) {
 
       if (isStream) {
         if (dbUpdates.length > 0)
-          c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
+          c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => {}));
         const responseModel = originalModel || ch.model || undefined;
         return new Response(
           transformStream(
@@ -1169,7 +1191,7 @@ async function handleChatRequest(c, clientProtocol) {
       else if (originalModel) finalResponse.model = originalModel;
 
       if (dbUpdates.length > 0)
-        c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
+        c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => {}));
       return c.json(finalResponse);
     } catch (e) {
       clearTimeout(timeoutId);
@@ -1182,7 +1204,7 @@ async function handleChatRequest(c, clientProtocol) {
         message: errMsg.slice(0, 500),
         url: url,
         request: JSON.stringify(reqBody).slice(0, 2000),
-        response: ""
+        response: "",
       });
 
       if (cachedCh) {
@@ -1198,11 +1220,21 @@ async function handleChatRequest(c, clientProtocol) {
         );
       }
 
-      pool = pool.filter((p) => p.id !== ch.id);
+      if (ch.fallback_model) {
+        const fallbackCh = {
+          ...ch,
+          model: ch.fallback_model,
+          fallback_model: null,
+          is_fallback: true,
+        };
+        pool = pool.map((p) => (p.id === ch.id ? fallbackCh : p));
+      } else {
+        pool = pool.filter((p) => p.id !== ch.id);
+      }
     }
   }
   if (dbUpdates.length > 0)
-    c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
+    c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => {}));
   return c.json(
     {
       error: { message: "All upstream channels failed", type: "server_error" },

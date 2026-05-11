@@ -6,7 +6,7 @@ export default function (clearCache) {
   const app = new Hono();
 
   // 預設配置
-  const DEFAULTS = { token: "sk-test123456", cooldown: 300 };
+  const DEFAULTS = { token: "sk-test123456", delay_period: 300 };
 
   // 獲取管理員密碼 (從資料庫)
   const getAdminPass = async (c) => {
@@ -100,7 +100,7 @@ export default function (clearCache) {
       c.env.DB.prepare("DELETE FROM channels"),
       ...channels.map((ch) =>
         c.env.DB.prepare(
-          `INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
           ch.name,
           ch.base_url || "",
@@ -120,6 +120,7 @@ export default function (clearCache) {
           ch.tpd_limit || 0,
           ch.max_tokens || 0,
           ch.support_tools !== false ? 1 : 0,
+          ch.fallback_model || "",
         ),
       ),
     ]);
@@ -173,7 +174,7 @@ export default function (clearCache) {
     ).first();
     return c.json({
       token: cf?.client_token || DEFAULTS.token,
-      cooldown: cf?.cooldown_time || DEFAULTS.cooldown,
+      recovery_period: cf?.recovery_period || DEFAULTS.delay_period,
     });
   });
 
@@ -200,21 +201,21 @@ export default function (clearCache) {
     ).first();
     if (ex) {
       await c.env.DB.prepare(
-        `UPDATE config SET client_token=?,cooldown_time=? WHERE id=1`,
+        `UPDATE config SET client_token=?,recovery_period=? WHERE id=1`,
       )
         .bind(
           b.token || DEFAULTS.token,
-          parseInt(b.cooldown) || DEFAULTS.cooldown,
+          parseInt(b.recovery_period) || DEFAULTS.delay_period,
         )
         .run();
     } else {
       // 初始化 config，密碼為空（用戶需設定）
       await c.env.DB.prepare(
-        `INSERT INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,NULL,?)`,
+        `INSERT INTO config (id,client_token,admin_password,recovery_period) VALUES (1,?,NULL,?)`,
       )
         .bind(
           b.token || DEFAULTS.token,
-          parseInt(b.cooldown) || DEFAULTS.cooldown,
+          parseInt(b.recovery_period) || DEFAULTS.delay_period,
         )
         .run();
     }
@@ -292,11 +293,11 @@ export default function (clearCache) {
       const currentPass = await getAdminPass(c);
       batch.push(
         c.env.DB.prepare(
-          `INSERT OR REPLACE INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,?,?)`,
+          `INSERT OR REPLACE INTO config (id,client_token,admin_password,recovery_period) VALUES (1,?,?,?)`,
         ).bind(
           d.config.token || DEFAULTS.token,
           currentPass,
-          parseInt(d.config.cooldown) || DEFAULTS.cooldown,
+          parseInt(d.config.recovery_period) || DEFAULTS.delay_period,
         ),
       );
     }
@@ -379,8 +380,8 @@ export default function (clearCache) {
       c.env.DB.prepare("DELETE FROM channels"),
       c.env.DB.prepare("DELETE FROM filters"),
       c.env.DB.prepare(
-        "UPDATE config SET client_token=?, cooldown_time=? WHERE id=1",
-      ).bind(DEFAULTS.token, DEFAULTS.cooldown),
+        "UPDATE config SET client_token=?, recovery_period=? WHERE id=1",
+      ).bind(DEFAULTS.token, DEFAULTS.delay_period),
     ]);
     clearCache();
     return c.json({ ok: true });
@@ -414,17 +415,21 @@ export default function (clearCache) {
   <html lang="zh-TW" data-bs-theme="light">
   <head>
     <meta charset="UTF-8" /><title>API Gateway</title><meta name="viewport" content="width=device-width, initial-scale=1" />
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%23FFC107' viewBox='0 0 16 16'%3E%3Cpath d='M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L5.99 9.5H3a.5.5 0 0 1-.372-.834l8-8.5a.5.5 0 0 1 .423-.198z'/%3E%3C/svg%3E">
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0iI0ZGQzEwNyIgdmlld0JveD0iMCAwIDE2IDE2Ij48cGF0aCBkPSJNMTEuMjUxLjA2OGEuNS41IDAgMCAxIC4yMjcuNThMOS42NzcgNi41SDEzYS41LjUgMCAwIDEgLjM2NC44NDNsLTggOC41YS41LjUgMCAwIDEtLjg0Mi0uNDlMNS45OSA5LjVIM2EuNS41IDAgMCAxLS4zNzItLjgzNGw4LTguNWEuNS41IDAgMCAxIC40MjMtLjE5OHoiLz48L3N2Zz4=">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
     <link href="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.css" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" />
     <style>
+      :root {
+        --bs-body-font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+      }
       body {
         background: var(--bs-tertiary-bg);
-        font-family: system-ui, -apple-system, sans-serif;
-        transition: 0.3s;
+        transition: background-color 0.2s, color 0.2s;
+        min-height: 100vh;
+        overflow: hidden; /* 初始鎖定捲軸，防止跳動 */
       }
-      .card { border: 0; box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.075); border-radius: 0.75rem; }
       #login-view, #setup-view, #admin-view { display: none; }
       .navbar { backdrop-filter: blur(10px); background: rgba(var(--bs-body-bg-rgb), 0.8) !important; }
       .form-switch .form-check-input { cursor: pointer; margin-top: 0; }
@@ -432,21 +437,10 @@ export default function (clearCache) {
       .table td, .table th { vertical-align: middle; padding: 0.5rem; }
       .badge { font-weight: 600; letter-spacing: 0.5px; }
       .health-badge { cursor: help; }
-      #loading-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 9999; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
-      #loading-overlay.show { display: flex; overflow: hidden; }
+      #loading-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 9999; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+      #loading-overlay.hide { display: none; }
       body.loading { overflow: hidden; }
-.notyf { z-index: 10000 !important; }
-      .modal-open {
-        padding-right: 0 !important;
-        overflow-y: scroll !important;
-      }
-      .modal {
-        padding-right: 0 !important;
-      }
-      .modal-backdrop {
-        position: fixed;
-        inset: 0;
-      }
+      .notyf { z-index: 10000 !important; }
       .stat-card { border-start: 4px solid var(--bs-primary); }
       .table-responsive { border-radius: 0.75rem; overflow: hidden; }
         @media (max-width: 576px) {
@@ -457,7 +451,10 @@ export default function (clearCache) {
         }
         .badge-openai { border: 1px solid #000 !important; background-color: #fff !important; color: #000 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
         .badge-anthropic { border: 1px solid #d97757 !important; background-color: #1a1a1a !important; color: #d97757 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
-        [data-bs-theme="dark"] .badge-openai { border-color: #fff !important; }
+        .badge-deepseek { border: 1px solid #2d5db1 !important; background-color: #2d5db1 !important; color: #fff !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
+        [data-bs-theme="dark"] .badge-openai { border-color: #fff !important; background-color: #222 !important; color: #fff !important; }
+        [data-bs-theme="dark"] .badge-anthropic { border-color: #d97757 !important; }
+        [data-bs-theme="dark"] .badge-deepseek { border-color: #4a8dfd !important; background-color: #1e3a8a !important; }
       </style>
   </head>
   <body>
@@ -465,7 +462,7 @@ export default function (clearCache) {
     <div id="login-view" class="container py-5 mt-5">
       <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
         <h4 class="fw-bold mb-4">API Gateway</h4>
-        <form id="loginForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">ADMIN PASSWORD</label><input type="password" id="login-pass" class="form-control" minlength="6" maxlength="20" required /></div><button type="submit" class="btn btn-primary w-100 fw-bold py-2">LOGIN</button></form>
+        <form id="loginForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">ADMIN PASSWORD</label><input type="password" id="login-pass" class="form-control" minlength="6" maxLength="20" required /></div><button type="submit" class="btn btn-primary w-100 fw-bold py-2">LOGIN</button></form>
       </div></div></div></div>
     </div>
 
@@ -473,7 +470,7 @@ export default function (clearCache) {
       <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
         <h4 class="fw-bold mb-4">API Gateway</h4>
         <p class="text-muted small mb-3">請設定管理員密碼</p>
-        <form id="setupForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">NEW PASSWORD</label><input type="password" id="setup-pass" class="form-control" minlength="6" maxlength="20" required /></div><button type="submit" class="btn btn-success w-100 fw-bold py-2">SET PASSWORD</button></form>
+        <form id="setupForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">NEW PASSWORD</label><input type="password" id="setup-pass" class="form-control" minlength="6" maxLength="20" required /></div><button type="submit" class="btn btn-success w-100 fw-bold py-2">SET PASSWORD</button></form>
       </div></div></div></div>
     </div>
 
@@ -511,7 +508,7 @@ export default function (clearCache) {
           <div class="card-body pt-0">
             <div class="row g-2">
               <div class="col-md-8"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">TOKEN</span><input type="text" id="cfg-token" class="form-control" /><button class="btn btn-outline-secondary" onclick="copyToken()"><i class="bi bi-copy"></i></button></div></div>
-              <div class="col-md-4"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">429 Cooldown (s)</span><input type="number" id="cfg-cooldown" class="form-control" /></div></div>
+              <div class="col-md-4"><div class="input-group input-group-sm"><span class="input-group-text fw-bold small">Recovery Delay (s)</span><input type="number" id="cfg-recovery-period" class="form-control" /></div></div>
             </div>
           </div>
         </div>
@@ -563,7 +560,7 @@ export default function (clearCache) {
 
     <div class="modal fade" id="passModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
       <div class="modal-header border-0 pb-0"><h5 class="fw-bold">New Login Password</h5><button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button></div>
-      <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minlength="6" maxlength="20" required /></div>
+      <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minlength="6" maxLength="20" required /></div>
       <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
     </div></div></div>
 
@@ -583,13 +580,20 @@ export default function (clearCache) {
           <div class="col-8"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
           <div class="col-4"><label class="form-label mini-label fw-bold">Type</label><select id="ch-provider" class="form-select form-select-sm"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></div>
         </div>
-        <div class="mb-2"><label class="form-label mini-label fw-bold">API Key</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
+        <div class="mb-2"><label class="form-label mini-label fw-bold">API Key *</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" required /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required /></div>
         <div class="mb-2">
-          <label class="form-label mini-label fw-bold">Model</label>
+          <label class="form-label mini-label fw-bold">Primary Model *</label>
           <div class="input-group input-group-sm">
-            <input type="text" id="ch-model" class="form-control form-control-sm" />
-            <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models" onclick="fetchModels()" disabled>FETCH</button>
+            <input type="text" id="ch-model" class="form-control form-control-sm" required />
+            <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models-primary" onclick="fetchModels('primary')" disabled>FETCH</button>
+          </div>
+        </div>
+        <div class="mb-2">
+          <label class="form-label mini-label fw-bold">Secondary Model <span class="text-muted fw-normal" style="font-size:0.6rem">Fallback, Optional</span></label>
+          <div class="input-group input-group-sm">
+            <input type="text" id="ch-fallback-model" class="form-control form-control-sm" />
+            <button class="btn btn-outline-secondary fw-bold" type="button" id="btn-fetch-models-fallback" onclick="fetchModels('fallback')" disabled>FETCH</button>
           </div>
         </div>
         <div class="row g-2 mb-2">
@@ -605,7 +609,7 @@ export default function (clearCache) {
         <div class="row g-2 mt-3 pt-2 border-top">
           <div class="col-4 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-vision">👁️ Vision</label>
-            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision"></div>
+            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
           </div>
           <div class="col-4 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-tools">🔧 Tools</label>
@@ -663,20 +667,21 @@ export default function (clearCache) {
         else notyf.success(msg);
       };
       const confirm = (msg, onOk) => { if (window.confirm(msg)) onOk(); };
-      let chModal, passModal, debugModal, modelsModal, channels = [], filters = [], cooldown = 300, refreshTimer = null, lastChannelsStr = '';
+      let chModal, passModal, debugModal, modelsModal, channels = [], filters = [], delay_period = 300, refreshTimer = null, lastChannelsStr = '';
       let sortKey = null, sortOrder = 0; // 0: none, 1: asc, 2: desc
       let loadingTimer = null;
       const loading = (s) => {
         const el = document.getElementById('loading-overlay');
         if (s) {
-          el.classList.add('show');
+          el.classList.remove('hide');
           document.body.classList.add('loading');
           clearTimeout(loadingTimer);
         } else {
           loadingTimer = setTimeout(() => {
-            el.classList.remove('show');
+            el.classList.add('hide');
             document.body.classList.remove('loading');
-          }, 500);
+            document.body.style.overflow = ''; // 確保初始鎖定被解除
+          }, 0);
         }
       };
       const api = async (u, m='GET', b=null, showLoader=true) => {
@@ -687,15 +692,14 @@ export default function (clearCache) {
         if (!r.ok) { const err = await r.json(); toast(err.error || 'Request Failed', 'danger'); return null; }
         return r.json();
       };
-      const showLogin = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('login-view').style.display = 'block'; };
-      const showSetup = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'block'; };
-      const showAdmin = () => { document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('admin-view').style.display = 'block'; init(); };
+      const showLogin = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('login-view').style.display = 'block'; loading(false); };
+      const showSetup = () => { document.getElementById('admin-view').style.display = 'none'; document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'block'; loading(false); };
+      const showAdmin = () => { document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('admin-view').style.display = 'block'; init(); loading(false); };
       const logout = () => { sessionStorage.removeItem('adminToken'); sessionStorage.removeItem('adminLoggedIn'); location.reload(); };
       const toggleTheme = () => { const t = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun'; localStorage.setItem('theme', t); };
       const copyToken = () => { const t = document.getElementById('cfg-token'); t.select(); document.execCommand('copy'); toast('Token 已複製', 'success'); };
       const esc = (s) => String(s || "").replace(/[\\"\\n\\r\\t]/g, ' ').replace(/"/g, '&quot;');
       const initTooltips = () => { [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].map(el => new bootstrap.Tooltip(el)); };
-
       document.getElementById('loginForm').onsubmit = async (e) => {
         e.preventDefault()
         const p = document.getElementById('login-pass').value
@@ -755,12 +759,12 @@ export default function (clearCache) {
       }
 
       const init = async () => {
-        const cfg = await api('/admin/api/config'); if (!cfg) return;
-        document.getElementById('cfg-token').value = cfg.token; document.getElementById('cfg-cooldown').value = cfg.cooldown; cooldown = cfg.cooldown;
-        const initData = await api('/admin/api');
+        const cfg = await api('/admin/api/config', 'GET', null, false); if (!cfg) return;
+        document.getElementById('cfg-token').value = cfg.token; document.getElementById('cfg-recovery-period').value = cfg.recovery_period; delay_period = cfg.recovery_period;
+        const initData = await api('/admin/api', 'GET', null, false);
         if (initData) { channels = initData; lastChannelsStr = JSON.stringify(channels); }
-        filters = await api('/admin/api/filters');
-        renderStats(); renderChannels(); renderFilters(); initTooltips();
+        filters = await api('/admin/api/filters', 'GET', null, false);
+        renderStats(); renderChannels(); renderFilters();
         if (!refreshTimer) refreshTimer = setInterval(async () => {
           const d = await api('/admin/api', 'GET', null, false);
           if (d) {
@@ -779,8 +783,8 @@ export default function (clearCache) {
         const now = Math.floor(Date.now() / 1000);
         const total = channels.length;
         const enabled = channels.filter(c => c.is_enabled).length;
-        const cooling = channels.filter(c => c.is_enabled && (now - (c.last_429 || 0) < cooldown)).length;
-        const error = channels.filter(c => c.is_enabled && c.consecutive_errors >= 5).length;
+        const cooling = channels.filter(c => c.is_enabled && (now - (c.last_429 || 0) < delay_period)).length;
+        const error = channels.filter(c => c.is_enabled && c.consecutive_errors >= 5 && (now - (c.last_error_at || 0) <= 1800)).length;
         const unstable = channels.filter(c => c.is_enabled && c.consecutive_errors > 0 && c.consecutive_errors < 5).length;
         const healthy = enabled - cooling - error - unstable;
         const rpdChannels = channels.filter(c => c.is_enabled && c.rpd_limit > 0);
@@ -793,7 +797,7 @@ export default function (clearCache) {
           { label: 'Active', val: healthy, textClass: 'text-success' },
           { label: 'Unstable', val: unstable, textClass: 'text-warning' },
           { label: 'Error', val: error, textClass: 'text-danger' },
-          { label: 'Cooling', val: cooling, textClass: 'text-info' },
+          { label: 'Recovery', val: cooling, textClass: 'text-info' },
         ];
 
         let html = '<div class="row g-3 mb-3">';
@@ -849,8 +853,8 @@ export default function (clearCache) {
           display.sort((a, b) => {
             let vA, vB;
             if (sortKey === 'status') {
-              vA = a.consecutive_errors >= 5 ? 2 : (now - (a.last_429 || 0) < cooldown ? 1 : 0);
-              vB = b.consecutive_errors >= 5 ? 2 : (now - (b.last_429 || 0) < cooldown ? 1 : 0);
+              vA = a.consecutive_errors >= 5 ? 2 : (now - (a.last_429 || 0) < delay_period ? 1 : 0);
+              vB = b.consecutive_errors >= 5 ? 2 : (now - (b.last_429 || 0) < delay_period ? 1 : 0);
             } else {
               vA = a[sortKey]; vB = b[sortKey];
             }
@@ -881,15 +885,17 @@ export default function (clearCache) {
           try { hoverMsg = JSON.parse(hoverMsg).message || hoverMsg; } catch(e) {}
           let h = '<span class="badge bg-success health-badge">正常</span>';
           if (c.consecutive_errors >= 5) {
-            if (now - (c.last_error_at || 0) > 604800) h = '<span class="badge bg-secondary health-badge" title="Observed (Retry soon)" onclick="showDebug(' + realIdx + ')">觀察</span>';
+            if (now - (c.last_error_at || 0) > 1800) h = '<span class="badge bg-secondary health-badge" title="Observed (Retry soon)" onclick="showDebug(' + realIdx + ')">觀察</span>';
             else h = '<span class="badge bg-danger health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">異常</span>';
           }
-          else if (now - (c.last_429 || 0) < cooldown) h = '<span class="badge bg-info health-badge" title="Cooldown active" onclick="showDebug(' + realIdx + ')">冷卻</span>';
+          else if (now - (c.last_429 || 0) < delay_period) h = '<span class="badge bg-info health-badge" title="Recovery active" onclick="showDebug(' + realIdx + ')">冷卻</span>';
           else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
           const providerBadge = c.provider === 'anthropic'
             ? '<span class="badge badge-anthropic">Anthropic</span>'
-            : '<span class="badge badge-openai">OpenAI</span>';
+            : (c.model||'').toLowerCase().includes('deepseek')
+              ? '<span class="badge badge-deepseek">DeepSeek</span>'
+              : '<span class="badge badge-openai">OpenAI</span>';
           return '<tr>' +
             '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>' +
             '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
@@ -947,14 +953,14 @@ export default function (clearCache) {
       const renderFilters = () => {
         document.getElementById('filter-list').innerHTML = filters.map((f, i) => '<tr>' +
           '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
-          '<td class="align-middle"><input type="text" class="form-control form-control-sm" maxlength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" title="長度限 1-30 字"></td>' +
+          '<td class="align-middle"><input type="text" class="form-control form-control-sm" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value" title="長度限 1-30 字"></td>' +
           '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
           '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>' +
         '</tr>').join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
         initTooltips();
       };
 
-      const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, cooldown: document.getElementById('cfg-cooldown').value }); toast('設定已儲存', 'success'); };
+      const saveConfig = async () => { await api('/admin/api/config', 'POST', { token: document.getElementById('cfg-token').value, recovery_period: document.getElementById('cfg-recovery-period').value }); toast('設定已儲存', 'success'); };
       const saveAllChannels = async () => { await api('/admin/api/batch-channels', 'POST', channels); toast('渠道已儲存', 'success'); init(); };
       const saveAllFilters = async () => {
         const invalid = filters.filter(f => !f.text || f.text.trim().length === 0 || f.text.length > 30);
@@ -962,9 +968,9 @@ export default function (clearCache) {
         await api('/admin/api/filters', 'POST', filters); toast('過濾器已儲存', 'success'); renderFilters();
       };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
-      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
+      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model','ch-fallback-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-fallback-model').value = c.fallback_model || ''; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
         checkFetchModelsBtn();
         chModal.show();
       };
@@ -1001,7 +1007,7 @@ export default function (clearCache) {
         const url = document.getElementById('ch-url').value.trim().replace(new RegExp('/+$'), '');
         if (!url) return toast('請輸入 Base URL', 'warning');
         const prev = idx !== '' ? channels[idx] : null;
-        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
+        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, fallback_model: document.getElementById('ch-fallback-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
         if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats(); toast(idx !== '' ? '已修改，請 SAVE ALL 儲存' : '已新增，請 SAVE ALL 儲存', 'success');
       };
       const delChannel = (idx) => { confirm('確定刪除此渠道？', () => { channels.splice(idx, 1); renderChannels(); renderStats(); }); };
@@ -1009,28 +1015,43 @@ export default function (clearCache) {
       const toggleKeyVis = () => { const i = document.getElementById('ch-key'); i.type = i.type === 'password' ? 'text' : 'password'; };
 
       let fetchedModels = [];
+      let currentModelTarget = 'primary';
       const checkFetchModelsBtn = () => {
         const url = document.getElementById('ch-url').value.trim();
-        document.getElementById('btn-fetch-models').disabled = url.length === 0;
+        const isDisabled = url.length === 0;
+        document.getElementById('btn-fetch-models-primary').disabled = isDisabled;
+        document.getElementById('btn-fetch-models-fallback').disabled = isDisabled;
       };
-      const fetchModels = async () => {
+      const fetchModels = async (target = 'primary') => {
+        currentModelTarget = target;
+        const btnId = target === 'primary' ? 'btn-fetch-models-primary' : 'btn-fetch-models-fallback';
+        const btn = document.getElementById(btnId);
+        const originalContent = btn.innerHTML;
+
         const url = document.getElementById('ch-url').value.trim();
         const key = document.getElementById('ch-key').value.trim();
         if (!url) return;
-        const data = await api('/admin/api/proxy-models', 'POST', { url, key });
-        if (data && data.data) {
-          fetchedModels = data.data;
-          document.getElementById('model-search').value = '';
-          renderModelList();
-          chModal.hide();
-          modelsModal.show();
-        } else if (data && Array.isArray(data)) {
-          // Fallback for some non-standard APIs
-          fetchedModels = data.map(m => typeof m === 'string' ? { id: m } : m);
-          document.getElementById('model-search').value = '';
-          renderModelList();
-          chModal.hide();
-          modelsModal.show();
+
+        // 切換按鈕為 Loading 狀態 (不使用全局遮罩，避免畫面跳動)
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>';
+
+        try {
+          // 第二層彈出視窗設計：呼叫 api 時 showLoader 設為 false
+          const data = await api('/admin/api/proxy-models', 'POST', { url, key }, false);
+          if (data && (data.data || Array.isArray(data))) {
+            fetchedModels = data.data || (Array.isArray(data) ? data.map(m => typeof m === 'string' ? { id: m } : m) : []);
+            document.getElementById('model-search').value = '';
+            renderModelList();
+            chModal.hide();
+            modelsModal.show();
+          }
+        } catch (e) {
+          toast('獲取模型失敗: ' + e.message, 'danger');
+        } finally {
+          // 恢復按鈕狀態
+          btn.disabled = false;
+          btn.innerHTML = originalContent;
         }
       };
       const renderModelList = () => {
@@ -1047,20 +1068,27 @@ export default function (clearCache) {
       };
       const selectModel = (m) => {
         const id = (m.id || m.name || '').toLowerCase();
-        document.getElementById('ch-model').value = m.id || m.name;
-        if (m.max_tokens) document.getElementById('ch-tokens').value = m.max_tokens;
-        if (m.rpm) document.getElementById('ch-rpm').value = m.rpm;
-        if (m.rpd) document.getElementById('ch-rpd').value = m.rpd;
-        if (m.tpm) document.getElementById('ch-tpm').value = m.tpm;
-        if (m.tpd) document.getElementById('ch-tpd').value = m.tpd;
+        if (currentModelTarget === 'primary') {
+          document.getElementById('ch-model').value = m.id || m.name;
+          if (m.max_tokens) document.getElementById('ch-tokens').value = m.max_tokens;
+          if (m.rpm) document.getElementById('ch-rpm').value = m.rpm;
+          if (m.rpd) document.getElementById('ch-rpd').value = m.rpd;
+          if (m.tpm) document.getElementById('ch-tpm').value = m.tpm;
+          if (m.tpd) document.getElementById('ch-tpd').value = m.tpd;
 
-        // Auto-detect Vision support from model name
-        if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo')) {
-          document.getElementById('ch-vision').checked = true;
+          // Auto-detect Vision/Tools support from model name
+          if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo') || id.includes('deepseek')) {
+            document.getElementById('ch-vision').checked = true;
+            document.getElementById('ch-tools').checked = true;
+          } else {
+            document.getElementById('ch-vision').checked = false;
+            document.getElementById('ch-tools').checked = false;
+          }
         } else {
-          document.getElementById('ch-vision').checked = false;
+          document.getElementById('ch-fallback-model').value = m.id || m.name;
         }
         modelsModal.hide();
+        chModal.show();
       };
 
       const toggleSort = (key) => {
@@ -1077,60 +1105,68 @@ export default function (clearCache) {
       const exportJson = () => {
         const now = new Date(); const pad = (n) => String(n).padStart(2, '0');
         const ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
-        const data = { channels, filters, config: { token: document.getElementById('cfg-token').value, cooldown: document.getElementById('cfg-cooldown').value } };
+        const data = { channels, filters, config: { token: document.getElementById('cfg-token').value, recovery_period: document.getElementById('cfg-recovery-period').value } };
         const b = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-' + ts + '.json'; a.click();
       };
       const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (await api('/admin/api/import-all', 'POST', d)) { toast('匯入成功', 'success'); init(); } }; r.readAsText(e.target.files[0]); };
       const resetSystem = async () => { confirm('重置系統將清除所有頻道、過濾器與設定（不含密碼），確定？', async () => { await api('/admin/api/reset', 'POST'); location.reload(); }); };
-      window.onload = async () => {
-        const t = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
-        chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
-        passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
-        debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
-        modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
-        // Restore chModal when modelsModal closes
-        modelsModal._element.addEventListener('hidden.bs.modal', () => { chModal.show(); });
-        // GoTop button visibility
-        const goTopBtn = document.getElementById('go-top-btn');
-        const updateGoTop = () => {
-          const hasModal = document.body.classList.contains('modal-open');
-          goTopBtn.style.display = (!hasModal && window.scrollY > 200) ? 'block' : 'none';
-        };
-        window.addEventListener('scroll', updateGoTop);
-        // Hide GoTop when modal opens
-        [chModal, passModal, debugModal, modelsModal].forEach(m => {
-          m._element.addEventListener('shown.bs.modal', updateGoTop);
-          m._element.addEventListener('hidden.bs.modal', updateGoTop);
-        });
+      const checkAuth = async () => {
         // 檢查是否需要設定密碼
-        const authRes = await fetch('/admin/api/auth-status')
-        const authData = await authRes.json()
-        if (authData.needsSetup) {
-          showSetup()
-        } else {
-          // 檢查是否已登入（用 verify-token 驗證）
-          const storedToken = sessionStorage.getItem('adminToken')
+        try {
+          const authRes = await fetch('/admin/api/auth-status');
+          const authData = await authRes.json();
+          if (authData.needsSetup) {
+            showSetup();
+            return;
+          }
+
+          const storedToken = sessionStorage.getItem('adminToken');
           if (storedToken) {
             const r = await fetch('/admin/api/verify-token', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ token: storedToken })
-            })
-            const data = await r.json()
+            });
+            const data = await r.json();
             if (data.valid) {
-              sessionStorage.setItem('adminLoggedIn', '1')
-              showAdmin()
+              sessionStorage.setItem('adminLoggedIn', '1');
+              showAdmin();
             } else {
-              sessionStorage.removeItem('adminToken')
-              sessionStorage.removeItem('adminLoggedIn')
-              showLogin()
+              sessionStorage.removeItem('adminToken');
+              sessionStorage.removeItem('adminLoggedIn');
+              showLogin();
             }
           } else {
-            showLogin()
+            showLogin();
           }
+        } catch (e) {
+          showLogin();
         }
       };
+
+      window.onload = () => {
+        const t = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
+        chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
+        passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
+        debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
+        modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
+        modelsModal._element.addEventListener('hidden.bs.modal', () => { chModal.show(); });
+        const goTopBtn = document.getElementById('go-top-btn');
+        const updateGoTop = () => { const hasModal = document.body.classList.contains('modal-open'); goTopBtn.style.display = (!hasModal && window.scrollY > 200) ? 'block' : 'none'; };
+        window.addEventListener('scroll', updateGoTop);
+        [chModal, passModal, debugModal, modelsModal].forEach(m => { m._element.addEventListener('shown.bs.modal', updateGoTop); m._element.addEventListener('hidden.bs.modal', updateGoTop); });
+
+        // 執行驗證
+        checkAuth();
+      };
+
+      // 快速路徑：如果 Session 已登入，立即顯示 Admin 介面，減少閃爍感
+      if (sessionStorage.getItem('adminLoggedIn') === '1') {
+        document.addEventListener('DOMContentLoaded', () => {
+          document.getElementById('admin-view').style.display = 'block';
+        });
+      }
     </script>
   </body>
   </html>`;
