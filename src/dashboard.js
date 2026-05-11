@@ -5,10 +5,8 @@ import { timingSafeEqual } from "hono/utils/buffer";
 export default function (clearCache) {
   const app = new Hono();
 
-  // 預設配置
   const DEFAULTS = { token: "sk-test123456", delay_period: 300 };
 
-  // 獲取管理員密碼 (從資料庫)
   const getAdminPass = async (c) => {
     try {
       const cf = await c.env.DB.prepare(
@@ -20,13 +18,11 @@ export default function (clearCache) {
     }
   };
 
-  // 檢查是否已設定密碼
   const hasAdminPass = async (c) => {
     const pass = await getAdminPass(c);
     return pass !== null && pass !== "";
   };
 
-  // 密碼哈希函數 (salt + SHA-256)
   const hashPassword = async (password) => {
     const encoder = new TextEncoder();
     const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -43,7 +39,6 @@ export default function (clearCache) {
     );
   };
 
-  // 密碼驗證函數
   const verifyPassword = async (password, storedHash) => {
     if (!storedHash || storedHash.length < 32) return false;
     const parts = storedHash.split(":");
@@ -60,7 +55,6 @@ export default function (clearCache) {
   };
 
   app.use("/admin/api/*", async (c, next) => {
-    // 公開端點不需要認證
     const path = c.req.path;
     if (
       path === "/admin/api/auth-status" ||
@@ -70,7 +64,6 @@ export default function (clearCache) {
       return await next();
     }
     const storedHash = await getAdminPass(c);
-    // 若尚未設定密碼，允許設定密碼的 API
     if (!storedHash) {
       if (path === "/admin/api/admin-pass") {
         return await next();
@@ -79,7 +72,6 @@ export default function (clearCache) {
     }
     const inputToken = c.req.header("X-Admin-Token");
     if (!inputToken) return c.json({ error: "Unauthorized" }, 401);
-    // 驗證 token (可能是原始密碼或哈希值)
     const isValid =
       (await verifyPassword(inputToken, storedHash)) ||
       inputToken === storedHash;
@@ -178,13 +170,11 @@ export default function (clearCache) {
     });
   });
 
-  // 檢查是否需要設定密碼
   app.get("/admin/api/auth-status", async (c) => {
     const hasPass = await hasAdminPass(c);
     return c.json({ needsSetup: !hasPass });
   });
 
-  // 驗證 token（用於保持登入狀態）
   app.post("/admin/api/verify-token", async (c) => {
     const { token } = await c.req.json();
     if (!token) return c.json({ valid: false }, 400);
@@ -209,7 +199,6 @@ export default function (clearCache) {
         )
         .run();
     } else {
-      // 初始化 config，密碼為空（用戶需設定）
       await c.env.DB.prepare(
         `INSERT INTO config (id,client_token,admin_password,recovery_period) VALUES (1,?,NULL,?)`,
       )
@@ -428,8 +417,8 @@ export default function (clearCache) {
         background: var(--bs-tertiary-bg);
         transition: background-color 0.2s, color 0.2s;
         min-height: 100vh;
-        overflow: hidden; /* 初始鎖定捲軸，防止跳動 */
       }
+      body.loading { overflow: hidden; }
       #login-view, #setup-view, #admin-view { display: none; }
       .navbar { backdrop-filter: blur(10px); background: rgba(var(--bs-body-bg-rgb), 0.8) !important; }
       .form-switch .form-check-input { cursor: pointer; margin-top: 0; }
@@ -439,7 +428,6 @@ export default function (clearCache) {
       .health-badge { cursor: help; }
       #loading-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 9999; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
       #loading-overlay.hide { display: none; }
-      body.loading { overflow: hidden; }
       .notyf { z-index: 10000 !important; }
       .stat-card { border-start: 4px solid var(--bs-primary); }
       .table-responsive { border-radius: 0.75rem; overflow: hidden; }
@@ -457,12 +445,12 @@ export default function (clearCache) {
         [data-bs-theme="dark"] .badge-deepseek { border-color: #4a8dfd !important; background-color: #1e3a8a !important; }
       </style>
   </head>
-  <body>
+  <body class="loading">
     <div id="loading-overlay"><div class="spinner-border text-light" role="status"></div></div>
     <div id="login-view" class="container py-5 mt-5">
       <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
         <h4 class="fw-bold mb-4">API Gateway</h4>
-        <form id="loginForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">ADMIN PASSWORD</label><input type="password" id="login-pass" class="form-control" minlength="6" maxLength="20" required /></div><button type="submit" class="btn btn-primary w-100 fw-bold py-2">LOGIN</button></form>
+        <form id="loginForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">ADMIN PASSWORD</label><input type="password" id="login-pass" class="form-control" minLength="6" maxLength="20" required /></div><button type="submit" class="btn btn-primary w-100 fw-bold py-2">LOGIN</button></form>
       </div></div></div></div>
     </div>
 
@@ -470,7 +458,7 @@ export default function (clearCache) {
       <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
         <h4 class="fw-bold mb-4">API Gateway</h4>
         <p class="text-muted small mb-3">請設定管理員密碼</p>
-        <form id="setupForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">NEW PASSWORD</label><input type="password" id="setup-pass" class="form-control" minlength="6" maxLength="20" required /></div><button type="submit" class="btn btn-success w-100 fw-bold py-2">SET PASSWORD</button></form>
+        <form id="setupForm"><div class="mb-4 text-start"><label class="form-label small fw-bold">NEW PASSWORD</label><input type="password" id="setup-pass" class="form-control" minLength="6" maxLength="20" required /></div><button type="submit" class="btn btn-success w-100 fw-bold py-2">SET PASSWORD</button></form>
       </div></div></div></div>
     </div>
 
@@ -560,7 +548,7 @@ export default function (clearCache) {
 
     <div class="modal fade" id="passModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
       <div class="modal-header border-0 pb-0"><h5 class="fw-bold">New Login Password</h5><button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button></div>
-      <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minlength="6" maxLength="20" required /></div>
+      <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minLength="6" maxLength="20" required /></div>
       <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
     </div></div></div>
 
@@ -586,6 +574,7 @@ export default function (clearCache) {
           <label class="form-label mini-label fw-bold">Primary Model *</label>
           <div class="input-group input-group-sm">
             <input type="text" id="ch-model" class="form-control form-control-sm" required />
+            <button class="btn btn-outline-secondary" type="button" onclick="clearInput('ch-model')" title="Clear"><i class="bi bi-x-lg"></i></button>
             <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models-primary" onclick="fetchModels('primary')" disabled>FETCH</button>
           </div>
         </div>
@@ -593,6 +582,7 @@ export default function (clearCache) {
           <label class="form-label mini-label fw-bold">Secondary Model <span class="text-muted fw-normal" style="font-size:0.6rem">Fallback, Optional</span></label>
           <div class="input-group input-group-sm">
             <input type="text" id="ch-fallback-model" class="form-control form-control-sm" />
+            <button class="btn btn-outline-secondary" type="button" onclick="clearInput('ch-fallback-model')" title="Clear"><i class="bi bi-x-lg"></i></button>
             <button class="btn btn-outline-secondary fw-bold" type="button" id="btn-fetch-models-fallback" onclick="fetchModels('fallback')" disabled>FETCH</button>
           </div>
         </div>
@@ -680,7 +670,6 @@ export default function (clearCache) {
           loadingTimer = setTimeout(() => {
             el.classList.add('hide');
             document.body.classList.remove('loading');
-            document.body.style.overflow = ''; // 確保初始鎖定被解除
           }, 0);
         }
       };
@@ -710,7 +699,6 @@ export default function (clearCache) {
           const data = await r.json()
           loading(false)
           if (r.ok) {
-            // 存儲密碼（用於 API 認證）+ 登入標記
             sessionStorage.setItem('adminToken', p)
             sessionStorage.setItem('adminLoggedIn', '1')
             showAdmin()
@@ -730,7 +718,6 @@ export default function (clearCache) {
         if (p.length < 6 || p.length > 20) return toast('密碼需 6-20 個字', 'warning')
         loading(true)
         try {
-          // 先設定密碼
           const r = await fetch('/admin/api/admin-pass', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -742,7 +729,6 @@ export default function (clearCache) {
             toast(err.error || '設定失敗', 'danger')
             return
           }
-          // 設定成功後自動登入
           const loginRes = await fetch('/admin/login', { method: 'POST', body: JSON.stringify({ password: p }) })
           loading(false)
           if (loginRes.ok) {
@@ -802,7 +788,6 @@ export default function (clearCache) {
 
         let html = '<div class="row g-3 mb-3">';
 
-        // Basic metrics
         html += stats.map(s =>
           '<div class="col-6 col-md-auto flex-grow-1">' +
             '<div class="card border-0 shadow-sm h-100">' +
@@ -848,7 +833,6 @@ export default function (clearCache) {
         const query = document.getElementById('ch-search').value.toLowerCase();
         let display = [...channels];
 
-        // Sorting logic
         if (sortKey && sortOrder > 0) {
           display.sort((a, b) => {
             let vA, vB;
@@ -868,7 +852,6 @@ export default function (clearCache) {
 
         const filtered = display.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
 
-        // Update sort icons
         ['id','name','model','weight','status','provider'].forEach(k => {
           const icon = document.getElementById('sort-' + k);
           if (!icon) return;
@@ -931,6 +914,7 @@ export default function (clearCache) {
         const tmp = document.createElement('textarea'); tmp.value = name; document.body.appendChild(tmp); tmp.select(); document.execCommand('copy'); document.body.removeChild(tmp);
         toast('Model ID 已複製: ' + name, 'success');
       };
+      const clearInput = (id) => { document.getElementById(id).value = ''; };
 
       const resetHealth = async (id) => {
         if (!id) return toast('請先儲存渠道', 'warning');
@@ -1032,12 +1016,10 @@ export default function (clearCache) {
         const key = document.getElementById('ch-key').value.trim();
         if (!url) return;
 
-        // 切換按鈕為 Loading 狀態 (不使用全局遮罩，避免畫面跳動)
         btn.disabled = true;
         btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>';
 
         try {
-          // 第二層彈出視窗設計：呼叫 api 時 showLoader 設為 false
           const data = await api('/admin/api/proxy-models', 'POST', { url, key }, false);
           if (data && (data.data || Array.isArray(data))) {
             fetchedModels = data.data || (Array.isArray(data) ? data.map(m => typeof m === 'string' ? { id: m } : m) : []);
@@ -1049,7 +1031,6 @@ export default function (clearCache) {
         } catch (e) {
           toast('獲取模型失敗: ' + e.message, 'danger');
         } finally {
-          // 恢復按鈕狀態
           btn.disabled = false;
           btn.innerHTML = originalContent;
         }
@@ -1076,7 +1057,6 @@ export default function (clearCache) {
           if (m.tpm) document.getElementById('ch-tpm').value = m.tpm;
           if (m.tpd) document.getElementById('ch-tpd').value = m.tpd;
 
-          // Auto-detect Vision/Tools support from model name
           if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo') || id.includes('deepseek')) {
             document.getElementById('ch-vision').checked = true;
             document.getElementById('ch-tools').checked = true;
@@ -1112,7 +1092,6 @@ export default function (clearCache) {
       const importJson = (e) => { const r = new FileReader(); r.onload = async (ev) => { const d = JSON.parse(ev.target.result); if (await api('/admin/api/import-all', 'POST', d)) { toast('匯入成功', 'success'); init(); } }; r.readAsText(e.target.files[0]); };
       const resetSystem = async () => { confirm('重置系統將清除所有頻道、過濾器與設定（不含密碼），確定？', async () => { await api('/admin/api/reset', 'POST'); location.reload(); }); };
       const checkAuth = async () => {
-        // 檢查是否需要設定密碼
         try {
           const authRes = await fetch('/admin/api/auth-status');
           const authData = await authRes.json();
@@ -1120,7 +1099,6 @@ export default function (clearCache) {
             showSetup();
             return;
           }
-
           const storedToken = sessionStorage.getItem('adminToken');
           if (storedToken) {
             const r = await fetch('/admin/api/verify-token', {
@@ -1161,7 +1139,6 @@ export default function (clearCache) {
         checkAuth();
       };
 
-      // 快速路徑：如果 Session 已登入，立即顯示 Admin 介面，減少閃爍感
       if (sessionStorage.getItem('adminLoggedIn') === '1') {
         document.addEventListener('DOMContentLoaded', () => {
           document.getElementById('admin-view').style.display = 'block';

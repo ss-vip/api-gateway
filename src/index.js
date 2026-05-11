@@ -135,13 +135,13 @@ function o2aRequest(body) {
     top_p: body.top_p,
     tools: body.tools
       ? body.tools.map((t) => ({
-          name: t.function.name,
-          description: t.function.description,
-          input_schema: t.function.parameters || {
-            type: "object",
-            properties: {},
-          },
-        }))
+        name: t.function.name,
+        description: t.function.description,
+        input_schema: t.function.parameters || {
+          type: "object",
+          properties: {},
+        },
+      }))
       : undefined,
   };
 }
@@ -223,13 +223,13 @@ function a2oRequest(body) {
     top_p: body.top_p,
     tools: body.tools
       ? body.tools.map((t) => ({
-          type: "function",
-          function: {
-            name: t.name,
-            description: t.description,
-            parameters: t.input_schema,
-          },
-        }))
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.input_schema,
+        },
+      }))
       : undefined,
   };
 }
@@ -314,13 +314,13 @@ function attemptRepairJson(str) {
   if (!str || str.length > 2_000_000) return null;
   try {
     return JSON.parse(str);
-  } catch (e) {}
+  } catch (e) { }
   let s = str.trim();
   if (s.startsWith("```json"))
     s = s.replace(/^```json\n?/, "").replace(/\n?```$/, "");
   try {
     return JSON.parse(s);
-  } catch (e) {}
+  } catch (e) { }
   try {
     let inString = false,
       output = "";
@@ -334,7 +334,7 @@ function attemptRepairJson(str) {
       }
     }
     return JSON.parse(output);
-  } catch (e) {}
+  } catch (e) { }
   return null;
 }
 
@@ -390,7 +390,7 @@ function selectChannel(channels, delay_period) {
   const now = Math.floor(Date.now() / 1000);
   const available = channels.filter((c) => {
     if (!c.is_enabled) return false;
-    if (c.consecutive_errors >= 5) return now - (c.last_error_at || 0) > 604800;
+    if (c.consecutive_errors >= 5) return now - (c.last_error_at || 0) > 1800;
     if (now - (c.last_429 || 0) < delay_period) return false;
     if (c.rpm_limit > 0) {
       const withinMin = now - (c.rpm_reset_at || 0) < 60;
@@ -685,13 +685,13 @@ function transformStream(
                 }
               }
             }
-          } catch (e) {}
+          } catch (e) { }
         }
       }
     } finally {
       try {
         writer.close();
-      } catch (e) {}
+      } catch (e) { }
     }
   })();
   return r;
@@ -712,7 +712,7 @@ async function loadCache(env) {
   if (!cacheFlight) {
     cacheFlight = (async () => {
       if (needsSave) {
-        await saveRateLimits(env).catch(() => {});
+        await saveRateLimits(env).catch(() => { });
       }
       try {
         const [ch, fl, cf] = await Promise.all([
@@ -754,7 +754,7 @@ async function loadCache(env) {
   return cacheFlight;
 }
 
-// Save rate limit counters to D1 (called on cache refresh)
+// Save rate limit counters to D1
 async function saveRateLimits(env) {
   if (!cache.data?.channels) return;
   const nowSec = Math.floor(Date.now() / 1000);
@@ -783,11 +783,11 @@ async function saveRateLimits(env) {
     }
   }
   if (updates.length > 0) {
-    env.DB.batch(updates).catch(() => {});
+    env.DB.batch(updates).catch(() => { });
   }
 }
 
-// /v1/models: dynamically return deduplicated models
+// dynamically return deduplicated models
 app.get("/v1/models", async (c) => {
   let channels = [];
   try {
@@ -932,7 +932,6 @@ async function handleChatRequest(c, clientProtocol) {
 
   const now = Math.floor(Date.now() / 1000);
   const availableCount = pool.filter((ch) => {
-    // 快速自癒：將錯誤冷卻時間從一週縮短為 30 分鐘，實現無人值守的可用性
     if (ch.consecutive_errors >= 5 && now - (ch.last_error_at || 0) <= 1800)
       return false;
     if (now - (ch.last_429 || 0) < data.config.recovery_period) return false;
@@ -967,9 +966,10 @@ async function handleChatRequest(c, clientProtocol) {
   const dbUpdates = [];
 
   for (let i = 0, maxTries = Math.min(pool.length, 5); i < maxTries; i++) {
-    // 增加微小隨機延遲 (Jittered Backoff)，防止重試風暴導致上游 API 觸發惡意攻擊防禦
     if (i > 0)
       await new Promise((r) => setTimeout(r, 150 + Math.random() * 200));
+
+    let ts, cachedCh;
     const ch = selectChannel(pool, data.config.recovery_period);
     if (!ch) break;
     const targetProtocol = ch.provider || "openai";
@@ -1031,8 +1031,8 @@ async function handleChatRequest(c, clientProtocol) {
 
       if (!res.ok) {
         const errText = await res.text();
-        const ts = Math.floor(Date.now() / 1000);
-        const cachedCh = data.channels.find((x) => x.id === ch.id);
+        ts = Math.floor(Date.now() / 1000);
+        cachedCh = data.channels.find((x) => x.id === ch.id);
 
         let maxTokensToLearn = null;
         const openaiMatch = errText.match(
@@ -1093,7 +1093,7 @@ async function handleChatRequest(c, clientProtocol) {
           response: errText.slice(0, 2000),
         });
 
-        const isHardQuota = errText.match(/quota|limit|exhausted|credit|weekly|billing|insufficient/i);
+        const isHardQuota = errText.match(/quota.?exceed|insufficient.?quota|insufficient.?credit|weekly.?limit|billing.?inactive|plan.?limit/i);
         const retryAfter = res.headers.get("Retry-After");
 
         if (res.status === 429 || isHardQuota) {
@@ -1115,7 +1115,6 @@ async function handleChatRequest(c, clientProtocol) {
             ).bind(customDelay, debugInfo, ch.id),
           );
         } else if (!maxTokensToLearn && !capabilityLearned) {
-          // Don't count auto-discovery as a consecutive error
           if (cachedCh) {
             cachedCh.consecutive_errors =
               (cachedCh.consecutive_errors || 0) + 1;
@@ -1145,7 +1144,7 @@ async function handleChatRequest(c, clientProtocol) {
         continue;
       }
 
-      const cachedCh = data.channels.find((x) => x.id === ch.id);
+      cachedCh = data.channels.find((x) => x.id === ch.id);
       updateRateCounters(cachedCh, Math.floor(Date.now() / 1000));
       if (cachedCh && cachedCh.consecutive_errors > 0) {
         cachedCh.consecutive_errors = 0;
@@ -1158,7 +1157,7 @@ async function handleChatRequest(c, clientProtocol) {
 
       if (isStream) {
         if (dbUpdates.length > 0)
-          c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => {}));
+          c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
         const responseModel = originalModel || ch.model || undefined;
         return new Response(
           transformStream(
@@ -1191,14 +1190,14 @@ async function handleChatRequest(c, clientProtocol) {
       else if (originalModel) finalResponse.model = originalModel;
 
       if (dbUpdates.length > 0)
-        c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => {}));
+        c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
       return c.json(finalResponse);
     } catch (e) {
       clearTimeout(timeoutId);
       c.req.raw.signal.removeEventListener("abort", abortHandler);
 
-      const ts = Math.floor(Date.now() / 1000);
-      const cachedCh = data.channels.find((x) => x.id === ch.id);
+      ts = Math.floor(Date.now() / 1000);
+      cachedCh = data.channels.find((x) => x.id === ch.id);
       const errMsg = e.message || "Network error / Timeout";
       const debugInfo = JSON.stringify({
         message: errMsg.slice(0, 500),
@@ -1234,7 +1233,7 @@ async function handleChatRequest(c, clientProtocol) {
     }
   }
   if (dbUpdates.length > 0)
-    c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => {}));
+    c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
   return c.json(
     {
       error: { message: "All upstream channels failed", type: "server_error" },
