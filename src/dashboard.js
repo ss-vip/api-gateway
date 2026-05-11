@@ -439,10 +439,8 @@ export default function (clearCache) {
         }
         .badge-openai { border: 1px solid #000 !important; background-color: #fff !important; color: #000 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
         .badge-anthropic { border: 1px solid #d97757 !important; background-color: #1a1a1a !important; color: #d97757 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
-        .badge-deepseek { border: 1px solid #2d5db1 !important; background-color: #2d5db1 !important; color: #fff !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
         [data-bs-theme="dark"] .badge-openai { border-color: #fff !important; background-color: #222 !important; color: #fff !important; }
         [data-bs-theme="dark"] .badge-anthropic { border-color: #d97757 !important; }
-        [data-bs-theme="dark"] .badge-deepseek { border-color: #4a8dfd !important; background-color: #1e3a8a !important; }
       </style>
   </head>
   <body class="loading">
@@ -571,7 +569,7 @@ export default function (clearCache) {
         <div class="mb-2"><label class="form-label mini-label fw-bold">API Key *</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" required /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required /></div>
         <div class="mb-2">
-          <label class="form-label mini-label fw-bold">Primary Model *</label>
+          <label class="form-label mini-label fw-bold">Primary Model * <i class="bi bi-info-circle" title="若該渠道的主要模型與請求的模型相符將優先調用"></i></label>
           <div class="input-group input-group-sm">
             <input type="text" id="ch-model" class="form-control form-control-sm" required />
             <button class="btn btn-outline-secondary" type="button" onclick="clearInput('ch-model')" title="Clear"><i class="bi bi-x-lg"></i></button>
@@ -579,7 +577,7 @@ export default function (clearCache) {
           </div>
         </div>
         <div class="mb-2">
-          <label class="form-label mini-label fw-bold">Secondary Model <span class="text-muted fw-normal" style="font-size:0.6rem">Fallback, Optional</span></label>
+          <label class="form-label mini-label fw-bold">Secondary Model <span class="text-muted fw-normal" style="font-size:0.6rem">Fallback, Optional <i class="bi bi-info-circle" title="當主要模型調用失敗時，會改用次要模型，若本渠道勾選支援視覺或工具，則調用次要模型時也會視為支援"></i></th></span></label>
           <div class="input-group input-group-sm">
             <input type="text" id="ch-fallback-model" class="form-control form-control-sm" />
             <button class="btn btn-outline-secondary" type="button" onclick="clearInput('ch-fallback-model')" title="Clear"><i class="bi bi-x-lg"></i></button>
@@ -876,9 +874,7 @@ export default function (clearCache) {
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
           const providerBadge = c.provider === 'anthropic'
             ? '<span class="badge badge-anthropic">Anthropic</span>'
-            : (c.model||'').toLowerCase().includes('deepseek')
-              ? '<span class="badge badge-deepseek">DeepSeek</span>'
-              : '<span class="badge badge-openai">OpenAI</span>';
+            : '<span class="badge badge-openai">OpenAI</span>';
           return '<tr>' +
             '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>' +
             '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
@@ -1057,7 +1053,7 @@ export default function (clearCache) {
           if (m.tpm) document.getElementById('ch-tpm').value = m.tpm;
           if (m.tpd) document.getElementById('ch-tpd').value = m.tpd;
 
-          if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo') || id.includes('deepseek')) {
+          if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo')) {
             document.getElementById('ch-vision').checked = true;
             document.getElementById('ch-tools').checked = true;
           } else {
