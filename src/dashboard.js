@@ -1,281 +1,414 @@
-import { Hono } from 'hono'
-import { html } from 'hono/html'
-import { timingSafeEqual } from 'hono/utils/buffer'
+import { Hono } from "hono";
+import { html } from "hono/html";
+import { timingSafeEqual } from "hono/utils/buffer";
 
 export default function (clearCache) {
-  const app = new Hono()
+  const app = new Hono();
 
   // 預設配置
-  const DEFAULTS = { token: 'sk-test123456', cooldown: 300 }
+  const DEFAULTS = { token: "sk-test123456", cooldown: 300 };
 
   // 獲取管理員密碼 (從資料庫)
   const getAdminPass = async (c) => {
     try {
-      const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first()
-      return cf?.admin_password || null
+      const cf = await c.env.DB.prepare(
+        "SELECT admin_password FROM config WHERE id=1",
+      ).first();
+      return cf?.admin_password || null;
     } catch (e) {
-      return null
+      return null;
     }
-  }
+  };
 
   // 檢查是否已設定密碼
   const hasAdminPass = async (c) => {
-    const pass = await getAdminPass(c)
-    return pass !== null && pass !== ''
-  }
+    const pass = await getAdminPass(c);
+    return pass !== null && pass !== "";
+  };
 
   // 密碼哈希函數 (salt + SHA-256)
   const hashPassword = async (password) => {
-    const encoder = new TextEncoder()
-    const salt = crypto.getRandomValues(new Uint8Array(16))
-    const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('')
-    const data = encoder.encode(password + saltHex)
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-    const hashArray = Array.from(new Uint8Array(hashBuffer))
-    return saltHex + ':' + hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
-  }
+    const encoder = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const saltHex = Array.from(salt)
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    const data = encoder.encode(password + saltHex);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return (
+      saltHex +
+      ":" +
+      hashArray.map((b) => b.toString(16).padStart(2, "0")).join("")
+    );
+  };
 
   // 密碼驗證函數
   const verifyPassword = async (password, storedHash) => {
-    if (!storedHash || storedHash.length < 32) return false
-    const parts = storedHash.split(':')
-    if (parts.length !== 2) return false
-    const saltHex = parts[0]
-    const storedHashHex = parts[1]
-    const encoder = new TextEncoder()
-    const data = encoder.encode(password + saltHex)
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-    const inputHashHex = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('')
-    return timingSafeEqual(inputHashHex, storedHashHex, (s) => s)
-  }
+    if (!storedHash || storedHash.length < 32) return false;
+    const parts = storedHash.split(":");
+    if (parts.length !== 2) return false;
+    const saltHex = parts[0];
+    const storedHashHex = parts[1];
+    const encoder = new TextEncoder();
+    const data = encoder.encode(password + saltHex);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const inputHashHex = Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    return timingSafeEqual(inputHashHex, storedHashHex, (s) => s);
+  };
 
-  app.use('/admin/api/*', async (c, next) => {
+  app.use("/admin/api/*", async (c, next) => {
     // 公開端點不需要認證
-    const path = c.req.path
-    if (path === '/admin/api/auth-status' || path === '/admin/api/config' || path === '/admin/api/verify-token') {
-      return await next()
+    const path = c.req.path;
+    if (
+      path === "/admin/api/auth-status" ||
+      path === "/admin/api/config" ||
+      path === "/admin/api/verify-token"
+    ) {
+      return await next();
     }
-    const storedHash = await getAdminPass(c)
+    const storedHash = await getAdminPass(c);
     // 若尚未設定密碼，允許設定密碼的 API
     if (!storedHash) {
-      if (path === '/admin/api/admin-pass') {
-        return await next()
+      if (path === "/admin/api/admin-pass") {
+        return await next();
       }
-      return c.json({ error: "請先設定密碼" }, 403)
+      return c.json({ error: "請先設定密碼" }, 403);
     }
-    const inputToken = c.req.header("X-Admin-Token")
-    if (!inputToken) return c.json({ error: "Unauthorized" }, 401)
+    const inputToken = c.req.header("X-Admin-Token");
+    if (!inputToken) return c.json({ error: "Unauthorized" }, 401);
     // 驗證 token (可能是原始密碼或哈希值)
-    const isValid = await verifyPassword(inputToken, storedHash) || inputToken === storedHash
-    if (!isValid) return c.json({ error: "Unauthorized" }, 401)
-    await next()
-  })
+    const isValid =
+      (await verifyPassword(inputToken, storedHash)) ||
+      inputToken === storedHash;
+    if (!isValid) return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  });
 
-  app.get('/admin/api', async c => {
-    const { results } = await c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all()
-    return c.json(results || [])
-  })
+  app.get("/admin/api", async (c) => {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM channels ORDER BY id",
+    ).all();
+    return c.json(results || []);
+  });
 
-  app.post('/admin/api/batch-channels', async c => {
-    const channels = await c.req.json()
+  app.post("/admin/api/batch-channels", async (c) => {
+    const channels = await c.req.json();
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
-      ...channels.map(ch => c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0, ch.max_tokens || 0, ch.support_tools !== false ? 1 : 0))
-    ])
-    clearCache()
-    return c.json({ ok: true })
-  })
+      ...channels.map((ch) =>
+        c.env.DB.prepare(
+          `INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(
+          ch.name,
+          ch.base_url || "",
+          ch.api_key || "",
+          ch.provider || "openai",
+          ch.model || "",
+          ch.weight || 1,
+          ch.is_enabled ? 1 : 0,
+          ch.is_vision ? 1 : 0,
+          ch.last_429 || 0,
+          ch.consecutive_errors || 0,
+          ch.last_error_msg || "",
+          ch.last_error_at || 0,
+          ch.rpm_limit || 0,
+          ch.rpd_limit || 0,
+          ch.tpm_limit || 0,
+          ch.tpd_limit || 0,
+          ch.max_tokens || 0,
+          ch.support_tools !== false ? 1 : 0,
+        ),
+      ),
+    ]);
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.post('/admin/api/channels/:id/reset-health', async c => {
-    const id = c.req.param('id')
-    await c.env.DB.prepare("UPDATE channels SET last_429=0,consecutive_errors=0,last_error_msg='',last_error_at=0 WHERE id=?").bind(id).run()
-    clearCache()
-    return c.json({ ok: true })
-  })
+  app.post("/admin/api/channels/:id/reset-health", async (c) => {
+    const id = c.req.param("id");
+    await c.env.DB.prepare(
+      "UPDATE channels SET last_429=0,consecutive_errors=0,last_error_msg='',last_error_at=0 WHERE id=?",
+    )
+      .bind(id)
+      .run();
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.post('/admin/api/channels/reset-all-health', async c => {
-    await c.env.DB.prepare("UPDATE channels SET last_429=0,consecutive_errors=0,last_error_msg='',last_error_at=0").run()
-    clearCache()
-    return c.json({ ok: true })
-  })
+  app.post("/admin/api/channels/reset-all-health", async (c) => {
+    await c.env.DB.prepare(
+      "UPDATE channels SET last_429=0,consecutive_errors=0,last_error_msg='',last_error_at=0",
+    ).run();
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.get('/admin/api/filters', async c => {
-    const { results } = await c.env.DB.prepare("SELECT * FROM filters ORDER BY id").all()
-    return c.json(results || [])
-  })
+  app.get("/admin/api/filters", async (c) => {
+    const { results } = await c.env.DB.prepare(
+      "SELECT * FROM filters ORDER BY id",
+    ).all();
+    return c.json(results || []);
+  });
 
-  app.post('/admin/api/filters', async c => {
-    const filters = await c.req.json()
+  app.post("/admin/api/filters", async (c) => {
+    const filters = await c.req.json();
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM filters"),
-      ...filters.map(f => c.env.DB.prepare(`INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)`).bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0))
-    ])
-    clearCache()
-    return c.json({ ok: true })
-  })
+      ...filters.map((f) =>
+        c.env.DB.prepare(
+          `INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)`,
+        ).bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0),
+      ),
+    ]);
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.get('/admin/api/config', async c => {
-    const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first()
-    return c.json({ token: cf?.client_token || DEFAULTS.token, cooldown: cf?.cooldown_time || DEFAULTS.cooldown })
-  })
+  app.get("/admin/api/config", async (c) => {
+    const cf = await c.env.DB.prepare(
+      "SELECT * FROM config WHERE id=1",
+    ).first();
+    return c.json({
+      token: cf?.client_token || DEFAULTS.token,
+      cooldown: cf?.cooldown_time || DEFAULTS.cooldown,
+    });
+  });
 
   // 檢查是否需要設定密碼
-  app.get('/admin/api/auth-status', async c => {
-    const hasPass = await hasAdminPass(c)
-    return c.json({ needsSetup: !hasPass })
-  })
+  app.get("/admin/api/auth-status", async (c) => {
+    const hasPass = await hasAdminPass(c);
+    return c.json({ needsSetup: !hasPass });
+  });
 
   // 驗證 token（用於保持登入狀態）
-  app.post('/admin/api/verify-token', async c => {
-    const { token } = await c.req.json()
-    if (!token) return c.json({ valid: false }, 400)
-    const storedHash = await getAdminPass(c)
-    if (!storedHash) return c.json({ valid: false }, 403)
-    const isValid = await verifyPassword(token, storedHash)
-    return c.json({ valid: isValid })
-  })
+  app.post("/admin/api/verify-token", async (c) => {
+    const { token } = await c.req.json();
+    if (!token) return c.json({ valid: false }, 400);
+    const storedHash = await getAdminPass(c);
+    if (!storedHash) return c.json({ valid: false }, 403);
+    const isValid = await verifyPassword(token, storedHash);
+    return c.json({ valid: isValid });
+  });
 
-  app.post('/admin/api/config', async c => {
-    const b = await c.req.json()
-    const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first()
+  app.post("/admin/api/config", async (c) => {
+    const b = await c.req.json();
+    const ex = await c.env.DB.prepare(
+      "SELECT id FROM config WHERE id=1",
+    ).first();
     if (ex) {
-      await c.env.DB.prepare(`UPDATE config SET client_token=?,cooldown_time=? WHERE id=1`).bind(b.token || DEFAULTS.token, parseInt(b.cooldown) || DEFAULTS.cooldown).run()
+      await c.env.DB.prepare(
+        `UPDATE config SET client_token=?,cooldown_time=? WHERE id=1`,
+      )
+        .bind(
+          b.token || DEFAULTS.token,
+          parseInt(b.cooldown) || DEFAULTS.cooldown,
+        )
+        .run();
     } else {
       // 初始化 config，密碼為空（用戶需設定）
-      await c.env.DB.prepare(`INSERT INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,NULL,?)`).bind(b.token || DEFAULTS.token, parseInt(b.cooldown) || DEFAULTS.cooldown).run()
+      await c.env.DB.prepare(
+        `INSERT INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,NULL,?)`,
+      )
+        .bind(
+          b.token || DEFAULTS.token,
+          parseInt(b.cooldown) || DEFAULTS.cooldown,
+        )
+        .run();
     }
-    clearCache()
-    return c.json({ ok: true })
-  })
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.post('/admin/api/admin-pass', async c => {
-    const { pass } = await c.req.json()
-    if (!pass) return c.json({ error: 'Password required' }, 400)
-    if (pass.length < 6 || pass.length > 20) return c.json({ error: 'Password must be 6-20 characters' }, 400)
-    const hashedPass = await hashPassword(pass)
-    const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first()
+  app.post("/admin/api/admin-pass", async (c) => {
+    const { pass } = await c.req.json();
+    if (!pass) return c.json({ error: "Password required" }, 400);
+    if (pass.length < 6 || pass.length > 20)
+      return c.json({ error: "Password must be 6-20 characters" }, 400);
+    const hashedPass = await hashPassword(pass);
+    const ex = await c.env.DB.prepare(
+      "SELECT id FROM config WHERE id=1",
+    ).first();
     if (ex) {
-      await c.env.DB.prepare(`UPDATE config SET admin_password=? WHERE id=1`).bind(hashedPass).run()
+      await c.env.DB.prepare(`UPDATE config SET admin_password=? WHERE id=1`)
+        .bind(hashedPass)
+        .run();
     } else {
-      await c.env.DB.prepare(`INSERT INTO config (id,admin_password) VALUES (1,?)`).bind(hashedPass).run()
+      await c.env.DB.prepare(
+        `INSERT INTO config (id,admin_password) VALUES (1,?)`,
+      )
+        .bind(hashedPass)
+        .run();
     }
-    clearCache()
-    return c.json({ ok: true })
-  })
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.post('/admin/api/import-all', async c => {
-    const d = await c.req.json()
-    const batch = []
+  app.post("/admin/api/import-all", async (c) => {
+    const d = await c.req.json();
+    const batch = [];
     if (d.channels) {
-      batch.push(c.env.DB.prepare("DELETE FROM channels"))
-      d.channels.forEach(ch => {
-        batch.push(c.env.DB.prepare(`INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(ch.name, ch.base_url || "", ch.api_key || "", ch.provider || "openai", ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0, ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0, ch.rpm_limit || 0, ch.rpd_limit || 0, ch.tpm_limit || 0, ch.tpd_limit || 0, ch.max_tokens || 0, ch.support_tools !== false ? 1 : 0))
-      })
+      batch.push(c.env.DB.prepare("DELETE FROM channels"));
+      d.channels.forEach((ch) => {
+        batch.push(
+          c.env.DB.prepare(
+            `INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).bind(
+            ch.name,
+            ch.base_url || "",
+            ch.api_key || "",
+            ch.provider || "openai",
+            ch.model || "",
+            ch.weight || 1,
+            ch.is_enabled ? 1 : 0,
+            ch.is_vision ? 1 : 0,
+            ch.last_429 || 0,
+            ch.consecutive_errors || 0,
+            ch.last_error_msg || "",
+            ch.last_error_at || 0,
+            ch.rpm_limit || 0,
+            ch.rpd_limit || 0,
+            ch.tpm_limit || 0,
+            ch.tpd_limit || 0,
+            ch.max_tokens || 0,
+            ch.support_tools !== false ? 1 : 0,
+          ),
+        );
+      });
     }
     if (d.filters) {
-      batch.push(c.env.DB.prepare("DELETE FROM filters"))
-      d.filters.forEach(f => {
-        batch.push(c.env.DB.prepare(`INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)`).bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0))
-      })
+      batch.push(c.env.DB.prepare("DELETE FROM filters"));
+      d.filters.forEach((f) => {
+        batch.push(
+          c.env.DB.prepare(
+            `INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)`,
+          ).bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0),
+        );
+      });
     }
     if (d.config) {
-      const currentPass = await getAdminPass(c)
-      batch.push(c.env.DB.prepare(`INSERT OR REPLACE INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,?,?)`).bind(d.config.token || DEFAULTS.token, currentPass, parseInt(d.config.cooldown) || DEFAULTS.cooldown))
+      const currentPass = await getAdminPass(c);
+      batch.push(
+        c.env.DB.prepare(
+          `INSERT OR REPLACE INTO config (id,client_token,admin_password,cooldown_time) VALUES (1,?,?,?)`,
+        ).bind(
+          d.config.token || DEFAULTS.token,
+          currentPass,
+          parseInt(d.config.cooldown) || DEFAULTS.cooldown,
+        ),
+      );
     }
-    if (batch.length > 0) await c.env.DB.batch(batch)
-    clearCache()
-    return c.json({ ok: true })
-  })
+    if (batch.length > 0) await c.env.DB.batch(batch);
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-app.post('/admin/login', async (c) => {
-  const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || 'unknown'
-  const host = c.req.header('Host') || 'localhost'
-  const banKey = `login-ban:${ip}`, failKey = `login-fail:${ip}`
-  const BAN_DURATION = 900
-  const MAX_FAILURES = 10
+  app.post("/admin/login", async (c) => {
+    const ip =
+      c.req.header("CF-Connecting-IP") ||
+      c.req.header("X-Forwarded-For") ||
+      "unknown";
+    const host = c.req.header("Host") || "localhost";
+    const banKey = `login-ban:${ip}`,
+      failKey = `login-fail:${ip}`;
+    const BAN_DURATION = 900;
+    const MAX_FAILURES = 10;
 
-  const cache = caches.default
-  const banCacheKey = new Request(`https://${host}/_internal/${banKey}`)
-  const banResponse = await cache.match(banCacheKey)
-  if (banResponse) return c.json({ error: '嘗試過多，請 15 分鐘後再试' }, 429)
+    const cache = caches.default;
+    const banCacheKey = new Request(`https://${host}/_internal/${banKey}`);
+    const banResponse = await cache.match(banCacheKey);
+    if (banResponse)
+      return c.json({ error: "嘗試過多，請 15 分鐘後再试" }, 429);
 
-  const { password } = await c.req.json()
-  if (!password) return c.json({ error: '密碼 required' }, 400)
+    const { password } = await c.req.json();
+    if (!password) return c.json({ error: "密碼 required" }, 400);
 
-  const storedHash = await getAdminPass(c)
-  if (!storedHash) {
-    return c.json({ error: '尚未設定密碼' }, 403)
-  }
+    const storedHash = await getAdminPass(c);
+    if (!storedHash) {
+      return c.json({ error: "尚未設定密碼" }, 403);
+    }
 
-  const isMatch = await verifyPassword(password, storedHash)
+    const isMatch = await verifyPassword(password, storedHash);
 
-  if (isMatch) {
+    if (isMatch) {
+      c.executionCtx.waitUntil(
+        cache.delete(banCacheKey).catch(() => { }),
+        cache
+          .delete(new Request(`https://${host}/_internal/${failKey}`))
+          .catch(() => { }),
+      );
+      return c.json({ ok: true });
+    }
+
+    const failCacheKey = new Request(`https://${host}/_internal/${failKey}`);
+    const failResponse = await cache.match(failCacheKey);
+    let failCount = 1;
+    if (failResponse) {
+      const failData = await failResponse.json().catch(() => ({ count: 1 }));
+      failCount = (failData.count || 0) + 1;
+    }
+
+    if (failCount >= MAX_FAILURES) {
+      c.executionCtx.waitUntil(
+        cache
+          .put(banCacheKey, new Response("banned", { status: 429 }))
+          .catch(() => { }),
+        cache.delete(failCacheKey).catch(() => { }),
+      );
+      return c.json({ error: "IP 已被封鎖 15 分鐘" }, 429);
+    }
+
     c.executionCtx.waitUntil(
-      cache.delete(banCacheKey).catch(() => {}),
-      cache.delete(new Request(`https://${host}/_internal/${failKey}`)).catch(() => {})
-    )
-    return c.json({ ok: true })
-  }
+      cache
+        .put(
+          failCacheKey,
+          new Response(JSON.stringify({ count: failCount }), {
+            headers: { "Cache-Control": `max-age=${BAN_DURATION}` },
+          }),
+        )
+        .catch(() => { }),
+    );
 
-  const failCacheKey = new Request(`https://${host}/_internal/${failKey}`)
-  const failResponse = await cache.match(failCacheKey)
-  let failCount = 1
-  if (failResponse) {
-    const failData = await failResponse.json().catch(() => ({ count: 1 }))
-    failCount = (failData.count || 0) + 1
-  }
+    return c.json({ error: "密碼錯誤" }, 401);
+  });
 
-  if (failCount >= MAX_FAILURES) {
-    c.executionCtx.waitUntil(
-      cache.put(banCacheKey, new Response('banned', { status: 429 })).catch(() => {}),
-      cache.delete(failCacheKey).catch(() => {})
-    )
-    return c.json({ error: 'IP 已被封鎖 15 分鐘' }, 429)
-  }
-
-  c.executionCtx.waitUntil(
-    cache.put(failCacheKey, new Response(JSON.stringify({ count: failCount }), {
-      headers: { 'Cache-Control': `max-age=${BAN_DURATION}` }
-    })).catch(() => {})
-  )
-
-  return c.json({ error: '密碼錯誤' }, 401)
-})
-
-  app.post('/admin/api/reset', async c => {
+  app.post("/admin/api/reset", async (c) => {
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
       c.env.DB.prepare("DELETE FROM filters"),
-      c.env.DB.prepare("UPDATE config SET client_token=?, cooldown_time=? WHERE id=1").bind(DEFAULTS.token, DEFAULTS.cooldown)
-    ])
-    clearCache()
-    return c.json({ ok: true })
-  })
+      c.env.DB.prepare(
+        "UPDATE config SET client_token=?, cooldown_time=? WHERE id=1",
+      ).bind(DEFAULTS.token, DEFAULTS.cooldown),
+    ]);
+    clearCache();
+    return c.json({ ok: true });
+  });
 
-  app.post('/admin/api/proxy-models', async c => {
-    const { url, key } = await c.req.json()
-    if (!url) return c.json({ error: 'URL is required' }, 400)
+  app.post("/admin/api/proxy-models", async (c) => {
+    const { url, key } = await c.req.json();
+    if (!url) return c.json({ error: "URL is required" }, 400);
     try {
-      let fetchUrl = url.trim().replace(/\/+$/, '')
-      if (!fetchUrl.endsWith('/v1') && !fetchUrl.includes('/v1/')) {
-        fetchUrl += '/v1/models'
-      } else if (fetchUrl.endsWith('/chat/completions')) {
-        fetchUrl = fetchUrl.replace('/chat/completions', '/models')
+      let fetchUrl = url.trim().replace(/\/+$/, "");
+      if (!fetchUrl.endsWith("/v1") && !fetchUrl.includes("/v1/")) {
+        fetchUrl += "/v1/models";
+      } else if (fetchUrl.endsWith("/chat/completions")) {
+        fetchUrl = fetchUrl.replace("/chat/completions", "/models");
       } else {
-        fetchUrl += '/models'
+        fetchUrl += "/models";
       }
 
       const res = await fetch(fetchUrl, {
-        headers: { 'Authorization': key ? `Bearer ${key}` : '' }
-      })
-      if (!res.ok) return c.json({ error: 'Failed to fetch: ' + res.status })
-      const data = await res.json()
-      return c.json(data)
+        headers: { Authorization: key ? `Bearer ${key}` : "" },
+      });
+      if (!res.ok) return c.json({ error: "Failed to fetch: " + res.status });
+      const data = await res.json();
+      return c.json(data);
     } catch (e) {
-      return c.json({ error: 'Failed to fetch: ' + e.message })
+      return c.json({ error: "Failed to fetch: " + e.message });
     }
-  })
-
+  });
 
   const UI_SHELL = html`<!DOCTYPE html>
   <html lang="zh-TW" data-bs-theme="light">
@@ -286,7 +419,11 @@ app.post('/admin/login', async (c) => {
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
     <link href="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.css" rel="stylesheet" />
     <style>
-      body { background: var(--bs-tertiary-bg); font-family: system-ui, -apple-system, sans-serif; transition: 0.3s; }
+      body {
+        background: var(--bs-tertiary-bg);
+        font-family: system-ui, -apple-system, sans-serif;
+        transition: 0.3s;
+      }
       .card { border: 0; box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.075); border-radius: 0.75rem; }
       #login-view, #setup-view, #admin-view { display: none; }
       .navbar { backdrop-filter: blur(10px); background: rgba(var(--bs-body-bg-rgb), 0.8) !important; }
@@ -298,8 +435,18 @@ app.post('/admin/login', async (c) => {
       #loading-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 9999; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
       #loading-overlay.show { display: flex; overflow: hidden; }
       body.loading { overflow: hidden; }
-      .notyf { z-index: 10000 !important; }
-      .modal-backdrop { transition: none; }
+.notyf { z-index: 10000 !important; }
+      .modal-open {
+        padding-right: 0 !important;
+        overflow-y: scroll !important;
+      }
+      .modal {
+        padding-right: 0 !important;
+      }
+      .modal-backdrop {
+        position: fixed;
+        inset: 0;
+      }
       .stat-card { border-start: 4px solid var(--bs-primary); }
       .table-responsive { border-radius: 0.75rem; overflow: hidden; }
         @media (max-width: 576px) {
@@ -410,9 +557,12 @@ app.post('/admin/login', async (c) => {
         </div>
       </div>
     </div>
+    <button id="go-top-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" class="btn btn-primary position-fixed bottom-0 end-0 m-3 rounded-circle p-2" style="width:40px;height:40px;z-index:1060;display:none;" title="Go Top" tabindex="-1"><i class="bi bi-arrow-up"></i></button>
+      </div>
+    </div>
 
     <div class="modal fade" id="passModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
-      <div class="modal-header border-0 pb-0"><h5 class="fw-bold">New Login Password</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button></div>
+      <div class="modal-header border-0 pb-0"><h5 class="fw-bold">New Login Password</h5><button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button></div>
       <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minlength="6" maxlength="20" required /></div>
       <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
     </div></div></div>
@@ -423,8 +573,9 @@ app.post('/admin/login', async (c) => {
           <h5 class="fw-bold small mb-0">Channel Editor</h5>
           <span id="ch-id-badge" class="badge bg-secondary" style="display:none"></span>
         </div>
-        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button>
+        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
+      <form id="ch-form" onsubmit="event.preventDefault(); applyChannel();">
       <div class="modal-body p-3 p-md-4">
         <input type="hidden" id="ch-idx" />
         <input type="hidden" id="ch-id" />
@@ -442,7 +593,7 @@ app.post('/admin/login', async (c) => {
           </div>
         </div>
         <div class="row g-2 mb-2">
-          <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" /></div>
+          <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" required /></div>
           <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" value="0" /></div>
         </div>
         <div class="row g-1 mb-2">
@@ -466,13 +617,14 @@ app.post('/admin/login', async (c) => {
           </div>
         </div>
       </div>
-      <div class="modal-footer border-0 pt-0"><button onclick="applyChannel()" class="btn btn-primary w-100 fw-bold">APPLY</button></div>
+      <div class="modal-footer border-0 pt-0"><button type="submit" class="btn btn-primary w-100 fw-bold">APPLY</button></div>
+      </form>
     </div></div></div>
 
     <div class="modal fade" id="debugModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg"><div class="modal-content">
       <div class="modal-header border-0 pb-0">
         <h5 class="fw-bold small mb-0">Debug Info (Last Error)</h5>
-        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close" onclick="this.blur()"></button>
+        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body p-3 p-md-4">
         <div class="d-flex justify-content-between align-items-center mb-2">
@@ -676,7 +828,7 @@ app.post('/admin/login', async (c) => {
         html +=
           '<div class="col-12">' +
             '<div class="card border-0 shadow-sm">' +
-              '<div class="card-body p-3" title="僅對有設定 RPM 的渠道做統計">' +
+              '<div class="card-body p-3" title="所有已設定 RPD 的渠道加總統計">' +
                 rpdContent +
               '</div>' +
             '</div>' +
@@ -870,12 +1022,14 @@ app.post('/admin/login', async (c) => {
           fetchedModels = data.data;
           document.getElementById('model-search').value = '';
           renderModelList();
+          chModal.hide();
           modelsModal.show();
         } else if (data && Array.isArray(data)) {
           // Fallback for some non-standard APIs
           fetchedModels = data.map(m => typeof m === 'string' ? { id: m } : m);
           document.getElementById('model-search').value = '';
           renderModelList();
+          chModal.hide();
           modelsModal.show();
         }
       };
@@ -935,6 +1089,20 @@ app.post('/admin/login', async (c) => {
         passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
         debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
         modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
+        // Restore chModal when modelsModal closes
+        modelsModal._element.addEventListener('hidden.bs.modal', () => { chModal.show(); });
+        // GoTop button visibility
+        const goTopBtn = document.getElementById('go-top-btn');
+        const updateGoTop = () => {
+          const hasModal = document.body.classList.contains('modal-open');
+          goTopBtn.style.display = (!hasModal && window.scrollY > 200) ? 'block' : 'none';
+        };
+        window.addEventListener('scroll', updateGoTop);
+        // Hide GoTop when modal opens
+        [chModal, passModal, debugModal, modelsModal].forEach(m => {
+          m._element.addEventListener('shown.bs.modal', updateGoTop);
+          m._element.addEventListener('hidden.bs.modal', updateGoTop);
+        });
         // 檢查是否需要設定密碼
         const authRes = await fetch('/admin/api/auth-status')
         const authData = await authRes.json()
@@ -965,10 +1133,10 @@ app.post('/admin/login', async (c) => {
       };
     </script>
   </body>
-  </html>`
+  </html>`;
 
-  app.get('/admin', c => c.html(UI_SHELL))
-  app.get('/', c => c.redirect('/admin'))
+  app.get("/admin", (c) => c.html(UI_SHELL));
+  app.get("/", (c) => c.redirect("/admin"));
 
-  return app
+  return app;
 }
