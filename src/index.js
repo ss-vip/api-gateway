@@ -44,7 +44,7 @@ function hasImage(messages = []) {
 
 // --- Protocol Translators ---
 
-function o2aRequest(body) {
+function o2aRequest(body, targetModel) {
   const messages = [];
   let system = "";
   for (const m of body.messages || []) {
@@ -120,7 +120,7 @@ function o2aRequest(body) {
     mergedMessages.unshift({ role: "user", content: " " });
 
   return {
-    model: body.model,
+    model: targetModel || body.model,
     messages: mergedMessages,
     system: system || undefined,
     max_tokens: body.max_tokens || 4096,
@@ -145,7 +145,7 @@ function o2aRequest(body) {
   };
 }
 
-function a2oRequest(body) {
+function a2oRequest(body, targetModel) {
   const messages = [];
   if (body.system) {
     if (typeof body.system === "string")
@@ -213,7 +213,7 @@ function a2oRequest(body) {
     }
   }
   return {
-    model: body.model,
+    model: targetModel || body.model,
     messages,
     max_tokens: body.max_tokens,
     stop: body.stop_sequences,
@@ -843,24 +843,14 @@ app.get("/v1/models", async (c) => {
   } catch (e) {
     channels = cache.data?.channels || [];
   }
-  const seen = new Set();
-  const models = [];
-  for (const ch of channels) {
-    const id = (ch.model || "").trim();
-    if (id && !seen.has(id)) {
-      seen.add(id);
-      models.push(id);
-    }
-  }
-  if (models.length === 0) models.push("openai");
   return c.json({
     object: "list",
-    data: models.map((id) => ({
-      id,
+    data: [{
+      id: "openai",
       object: "model",
       created: Math.floor(Date.now() / 1000),
       owned_by: "gateway",
-    })),
+    }],
   });
 });
 
@@ -949,12 +939,14 @@ async function handleChatRequest(c, clientProtocol) {
     if (toolSupportedPool.length > 0) pool = toolSupportedPool;
   }
 
+  const originalModel = body.model;
   const requestedModel = (originalModel || "").trim().toLowerCase();
-  if (requestedModel) {
+  
+  if (requestedModel && requestedModel !== "openai") {
     let matched = pool.filter(
       (ch) => (ch.model || "").trim().toLowerCase() === requestedModel,
     );
-    // Fuzzy match: if requested model name contains channel model name (handles versioned strings)
+    // Fuzzy match: if requested model name contains channel model name
     if (matched.length === 0) {
       matched = pool.filter((ch) => {
         const cm = (ch.model || "").trim().toLowerCase();
@@ -1010,11 +1002,11 @@ async function handleChatRequest(c, clientProtocol) {
 
     // --- Translation Logic ---
     let reqBody = { ...body };
-    if (ch.model) reqBody.model = ch.model;
     if (clientProtocol === "openai" && targetProtocol === "anthropic")
-      reqBody = o2aRequest(reqBody);
+      reqBody = o2aRequest(reqBody, ch.model);
     else if (clientProtocol === "anthropic" && targetProtocol === "openai")
-      reqBody = a2oRequest(reqBody);
+      reqBody = a2oRequest(reqBody, ch.model);
+    else if (ch.model) reqBody.model = ch.model;
 
     // Common sanitization
     if (targetProtocol === "openai" && Array.isArray(reqBody.messages)) {
