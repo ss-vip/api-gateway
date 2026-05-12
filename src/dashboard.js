@@ -72,16 +72,14 @@ export default function (clearCache) {
     }
     const inputToken = c.req.header("X-Admin-Token");
     if (!inputToken) return c.json({ error: "Unauthorized" }, 401);
-    const isValid =
-      (await verifyPassword(inputToken, storedHash)) ||
-      inputToken === storedHash;
+    const isValid = await verifyPassword(inputToken, storedHash);
     if (!isValid) return c.json({ error: "Unauthorized" }, 401);
     await next();
   });
 
   app.get("/admin/api", async (c) => {
     const { results } = await c.env.DB.prepare(
-      "SELECT * FROM channels ORDER BY id",
+      "SELECT id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at, max_tokens, support_tools, response_time, fallback_model FROM channels ORDER BY id",
     ).all();
     return c.json(results || []);
   });
@@ -92,13 +90,13 @@ export default function (clearCache) {
       c.env.DB.prepare("DELETE FROM channels"),
       ...channels.map((ch) =>
         c.env.DB.prepare(
-          `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
           ch.id || null,
           ch.name,
           ch.base_url || "",
           ch.api_key || "",
-          ch.provider || "openai",
+          "openai",
           ch.model || "",
           ch.weight || 1,
           ch.is_enabled ? 1 : 0,
@@ -109,11 +107,8 @@ export default function (clearCache) {
           ch.last_error_at || 0,
           ch.rpm_limit || 0,
           ch.rpd_limit || 0,
-          ch.tpm_limit || 0,
-          ch.tpd_limit || 0,
           ch.max_tokens || 0,
           ch.support_tools ? 1 : 0,
-          ch.support_stream ? 1 : 0,
           ch.response_time || 0,
           ch.fallback_model || "",
         ),
@@ -144,7 +139,7 @@ export default function (clearCache) {
 
   app.get("/admin/api/filters", async (c) => {
     const { results } = await c.env.DB.prepare(
-      "SELECT * FROM filters ORDER BY id",
+      "SELECT id, text, mode, is_enabled FROM filters ORDER BY id",
     ).all();
     return c.json(results || []);
   });
@@ -164,13 +159,15 @@ export default function (clearCache) {
   });
 
   app.get("/admin/api/config", async (c) => {
-    const cf = await c.env.DB.prepare(
-      "SELECT * FROM config WHERE id=1",
-    ).first();
-    return c.json({
-      token: cf?.client_token || DEFAULTS.token,
-      recovery_period: cf?.recovery_period || DEFAULTS.delay_period,
-    });
+    try {
+      const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
+      return c.json({
+        token: cf?.client_token || DEFAULTS.token,
+        recovery_period: cf?.recovery_period || DEFAULTS.delay_period,
+      });
+    } catch (e) {
+      return c.json({ token: DEFAULTS.token, recovery_period: DEFAULTS.delay_period });
+    }
   });
 
   app.get("/admin/api/auth-status", async (c) => {
@@ -192,27 +189,51 @@ export default function (clearCache) {
     const ex = await c.env.DB.prepare(
       "SELECT id FROM config WHERE id=1",
     ).first();
-    if (ex) {
-      await c.env.DB.prepare(
-        `UPDATE config SET client_token=?,recovery_period=? WHERE id=1`,
-      )
-        .bind(
-          b.token || DEFAULTS.token,
-          parseInt(b.recovery_period) || DEFAULTS.delay_period,
-        )
-        .run();
-    } else {
-      await c.env.DB.prepare(
-        `INSERT INTO config (id,client_token,admin_password,recovery_period) VALUES (1,?,NULL,?)`,
-      )
-        .bind(
-          b.token || DEFAULTS.token,
-          parseInt(b.recovery_period) || DEFAULTS.delay_period,
-        )
-        .run();
+    try {
+      if (ex) {
+        await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period)
+          .run();
+      } else {
+        await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period)
+          .run();
+      }
+    } catch (e) {
+      // If column is missing, try to add it and retry once
+      if (e.message.includes("no such column")) {
+        await c.env.DB.prepare("ALTER TABLE config ADD COLUMN recovery_period INTEGER DEFAULT 300").run().catch(()=>{});
+        return await c.env.DB.prepare(ex ? "UPDATE config SET client_token=?, recovery_period=? WHERE id=1" : "INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period)
+          .run()
+          .then(() => { clearCache(); return c.json({ ok: true }); })
+          .catch(e2 => c.json({ error: e2.message }, 500));
+      }
+      return c.json({ error: e.message }, 500);
     }
     clearCache();
     return c.json({ ok: true });
+  });
+
+  app.post("/admin/api/proxy-models", async (c) => {
+    const { url, key } = await c.req.json();
+    if (!url) return c.json({ error: "Missing URL" }, 400);
+    let target = url.trim().replace(/\/+$/, "");
+    if (!target.endsWith("/models")) {
+      if (target.endsWith("/chat/completions")) target = target.replace("/chat/completions", "/models");
+      else if (target.includes("/v1")) target = target.split("/v1")[0] + "/v1/models";
+      else target = target + "/v1/models";
+    }
+    try {
+      const res = await fetch(target, {
+        headers: { "Authorization": `Bearer ${key}` }
+      });
+      if (!res.ok) return c.json({ error: `Upstream error: ${res.status}` }, res.status);
+      const data = await res.json();
+      return c.json(data);
+    } catch (e) {
+      return c.json({ error: e.message }, 500);
+    }
   });
 
   app.post("/admin/api/admin-pass", async (c) => {
@@ -247,13 +268,13 @@ export default function (clearCache) {
       d.channels.forEach((ch) => {
         batch.push(
           c.env.DB.prepare(
-            `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools, support_stream, response_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).bind(
             ch.id || null,
             ch.name,
             ch.base_url || "",
             ch.api_key || "",
-            ch.provider || "openai",
+            "openai",
             ch.model || "",
             ch.weight || 1,
             ch.is_enabled ? 1 : 0,
@@ -264,12 +285,10 @@ export default function (clearCache) {
             ch.last_error_at || 0,
             ch.rpm_limit || 0,
             ch.rpd_limit || 0,
-            ch.tpm_limit || 0,
-            ch.tpd_limit || 0,
             ch.max_tokens || 0,
             ch.support_tools ? 1 : 0,
-            ch.support_stream ? 1 : 0,
             ch.response_time || 0,
+            ch.fallback_model || "",
           ),
         );
       });
@@ -297,6 +316,18 @@ export default function (clearCache) {
       );
     }
     if (batch.length > 0) await c.env.DB.batch(batch);
+    clearCache();
+    return c.json({ ok: true });
+  });
+
+  app.post("/admin/api/reset", async (c) => {
+    const currentPass = await getAdminPass(c);
+    await c.env.DB.batch([
+      c.env.DB.prepare("DELETE FROM channels"),
+      c.env.DB.prepare("DELETE FROM filters"),
+      c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
+        .bind(DEFAULTS.token, DEFAULTS.delay_period),
+    ]);
     clearCache();
     return c.json({ ok: true });
   });
@@ -370,50 +401,14 @@ export default function (clearCache) {
     return c.json({ error: "密碼錯誤" }, 401);
   });
 
-  app.post("/admin/api/reset", async (c) => {
-    await c.env.DB.batch([
-      c.env.DB.prepare("DELETE FROM channels"),
-      c.env.DB.prepare("DELETE FROM filters"),
-      c.env.DB.prepare(
-        "UPDATE config SET client_token=?, recovery_period=? WHERE id=1",
-      ).bind(DEFAULTS.token, DEFAULTS.delay_period),
-    ]);
-    clearCache();
-    return c.json({ ok: true });
-  });
-
-  app.post("/admin/api/proxy-models", async (c) => {
-    const { url, key } = await c.req.json();
-    if (!url) return c.json({ error: "URL is required" }, 400);
-    try {
-      let fetchUrl = url.trim().replace(/\/+$/, "");
-      if (!fetchUrl.endsWith("/v1") && !fetchUrl.includes("/v1/")) {
-        fetchUrl += "/v1/models";
-      } else if (fetchUrl.endsWith("/chat/completions")) {
-        fetchUrl = fetchUrl.replace("/chat/completions", "/models");
-      } else {
-        fetchUrl += "/models";
-      }
-
-      const res = await fetch(fetchUrl, {
-        headers: { Authorization: key ? `Bearer ${key}` : "" },
-      });
-      if (!res.ok) return c.json({ error: "Failed to fetch: " + res.status });
-      const data = await res.json();
-      return c.json(data);
-    } catch (e) {
-      return c.json({ error: "Failed to fetch: " + e.message });
-    }
-  });
-
   const UI_SHELL = html`<!DOCTYPE html>
   <html lang="zh-TW" data-bs-theme="light">
   <head>
     <meta charset="UTF-8" /><title>API Gateway</title><meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxNiIgaGVpZ2h0PSIxNiIgZmlsbD0iI0ZGQzEwNyIgdmlld0JveD0iMCAwIDE2IDE2Ij48cGF0aCBkPSJNMTEuMjUxLjA2OGEuNS41IDAgMCAxIC4yMjcuNThMOS42NzcgNi41SDEzYS41LjUgMCAwIDEgLjM2NC44NDNsLTggOC41YS41LjUgMCAwIDEtLjg0Mi0uNDlMNS45OSA5LjVIM2EuNS41IDAgMCAxLS4zNzItLjgzNGw4LTguNWEuNS41IDAgMCAxIC40MjMtLjE5OHoiLz48L3N2Zz4=">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" />
-    <link href="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.css" rel="stylesheet" />
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous" />
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet" integrity="sha384-XGjxtQfXaH2tnPFa9x+ruJTuLE3Aa6LhHSWRr1XeTyhezb4abCG4ccI5AkVDxqC+" crossorigin="anonymous" />
+    <link href="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.css" rel="stylesheet" integrity="sha384-snpJ3knpH6avB6cP1vPkNdmRzCYaCpom/3TNOyvo189BiogXYXQfXkyYpZ2/xADs" crossorigin="anonymous" />
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" />
     <style>
       :root {
@@ -437,16 +432,14 @@ export default function (clearCache) {
       .notyf { z-index: 10000 !important; }
       .stat-card { border-start: 4px solid var(--bs-primary); }
       .table-responsive { border-radius: 0.75rem; overflow: hidden; }
-        @media (max-width: 576px) {
-          .navbar-brand { font-size: 1rem; }
-          .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
-          .card-header span { font-size: 0.85rem; }
-          .input-group-text { font-size: 0.7rem; }
-        }
-        .badge-openai { border: 1px solid #000 !important; background-color: #fff !important; color: #000 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
-        .badge-anthropic { border: 1px solid #d97757 !important; background-color: #1a1a1a !important; color: #d97757 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
-        [data-bs-theme="dark"] .badge-openai { border-color: #fff !important; background-color: #222 !important; color: #fff !important; }
-        [data-bs-theme="dark"] .badge-anthropic { border-color: #d97757 !important; }
+      @media (max-width: 576px) {
+        .navbar-brand { font-size: 1rem; }
+        .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+        .card-header span { font-size: 0.85rem; }
+        .input-group-text { font-size: 0.7rem; }
+      }
+      .badge-openai { border: 1px solid #000 !important; background-color: #fff !important; color: #000 !important; font-size: 0.5rem; padding: 1px 3px; font-weight: 800; letter-spacing: 0.5px; vertical-align: middle; }
+      [data-bs-theme="dark"] .badge-openai { border-color: #fff !important; background-color: #222 !important; color: #fff !important; }
       </style>
   </head>
   <body class="loading">
@@ -518,8 +511,12 @@ export default function (clearCache) {
           <div class="table-responsive"><table class="table table-hover mb-0 text-center align-middle small text-nowrap">
             <thead class="table-light"><tr class="text-uppercase text-muted small" style="letter-spacing: 0.5px;">
               <th style="width: 60px" class="border-0 cursor-pointer" onclick="toggleSort('id')">ID <i id="sort-id" class="bi bi-arrow-down-up opacity-25"></i></th>
-              <th style="width: 80px" class="border-0">ON/OFF</th>
-              <th style="width: 80px" class="border-0 cursor-pointer" onclick="toggleSort('provider')">TYPE <i class="bi bi-info-circle" title="目標接收格式"></i> <i id="sort-provider" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 110px" class="border-0">
+                <div class="d-flex align-items-center">
+                  <input type="checkbox" class="form-check-input me-2" id="master-toggle" title="全選/全取消" onclick="toggleAllChannels(this.checked)">
+                  <span class="cursor-pointer" onclick="toggleSort('is_enabled')">ON/OFF <i id="sort-is_enabled" class="bi bi-arrow-down-up opacity-25"></i></span>
+                </div>
+              </th>
               <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i class="bi bi-info-circle" title="優先調用相符的模型名、視覺、工具使用"></i> <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-info-circle" title="大值優先"></i> <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
@@ -569,10 +566,7 @@ export default function (clearCache) {
       <div class="modal-body p-3 p-md-4">
         <input type="hidden" id="ch-idx" />
         <input type="hidden" id="ch-id" />
-        <div class="row g-2 mb-2">
-          <div class="col-8"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
-          <div class="col-4"><label class="form-label mini-label fw-bold">Type</label><select id="ch-provider" class="form-select form-select-sm"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></div>
-        </div>
+        <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">API Key *</label><div class="input-group input-group-sm"><input type="password" id="ch-key" class="form-control form-control-sm" required /><button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button></div></div>
         <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required /></div>
         <div class="mb-2">
@@ -596,25 +590,19 @@ export default function (clearCache) {
           <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" value="0" /></div>
         </div>
         <div class="row g-1 mb-2">
-          <div class="col-3"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
-          <div class="col-3"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
-          <div class="col-3"><label class="form-label mini-label fw-bold">TPM</label><input type="number" id="ch-tpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
-          <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
+          <div class="col-6"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
+          <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
         </div>
         <div class="row g-2 mt-3 pt-2 border-top">
-          <div class="col-3 d-flex flex-column align-items-center">
+          <div class="col-4 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-vision">👁️ Vision</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
           </div>
-          <div class="col-3 d-flex flex-column align-items-center">
+          <div class="col-4 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-tools">🔧 Tools</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-tools" checked></div>
           </div>
-          <div class="col-3 d-flex flex-column align-items-center">
-            <label class="form-check-label small fw-bold mb-1" for="ch-stream">🌊 Stream</label>
-            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-stream" checked></div>
-          </div>
-          <div class="col-3 d-flex flex-column align-items-center">
+          <div class="col-4 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-enabled">✔️ Enabled</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
           </div>
@@ -652,8 +640,8 @@ export default function (clearCache) {
 
     <style>.mini-label { font-size: 0.65rem; margin-bottom: 2px; text-transform: uppercase; color: var(--bs-secondary); }</style>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.js" integrity="sha384-uuNfwJfjOG2ukYi4eAB11/t3lP4Zjf75a3UhgkLzEpiX8JpJfacpG7Ye+0tiVMxT" crossorigin="anonymous"></script>
     <script>
       const notyf = new Notyf({
         position: { x: 'right', y: 'bottom' },
@@ -695,8 +683,11 @@ export default function (clearCache) {
       const showAdmin = () => { document.getElementById('login-view').style.display = 'none'; document.getElementById('setup-view').style.display = 'none'; document.getElementById('admin-view').style.display = 'block'; init(); loading(false); };
       const logout = () => { sessionStorage.removeItem('adminToken'); sessionStorage.removeItem('adminLoggedIn'); location.reload(); };
       const toggleTheme = () => { const t = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'; document.documentElement.setAttribute('data-bs-theme', t); document.getElementById('theme-icon').className = t === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun'; localStorage.setItem('theme', t); };
-      const copyToken = () => { const t = document.getElementById('cfg-token'); t.select(); document.execCommand('copy'); toast('Token 已複製', 'success'); };
-      const esc = (s) => String(s || "").replace(/[\\"\\n\\r\\t]/g, ' ').replace(/"/g, '&quot;');
+      const copyToken = () => { const t = document.getElementById('cfg-token'); navigator.clipboard.writeText(t.value).then(() => toast('Token 已複製', 'success')).catch(() => { t.select(); document.execCommand('copy'); toast('Token 已複製', 'success'); }); };
+      const esc = (s) => {
+        const htmlMap = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' };
+        return String(s || "").replace(/[\\\\"'\\n\\r\\t&<>]/g, ch => htmlMap[ch] || ' ');
+      };
       const initTooltips = () => { [...document.querySelectorAll('[data-bs-toggle="tooltip"]')].map(el => new bootstrap.Tooltip(el)); };
       document.getElementById('loginForm').onsubmit = async (e) => {
         e.preventDefault()
@@ -849,7 +840,7 @@ export default function (clearCache) {
 
         const filtered = display.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
 
-        ['id','name','model','weight','status','provider','response_time'].forEach(k => {
+        ['id','name','model','weight','status','is_enabled','response_time'].forEach(k => {
           const icon = document.getElementById('sort-' + k);
           if (!icon) return;
           icon.className = 'bi bi-arrow-down-up opacity-25';
@@ -871,15 +862,12 @@ export default function (clearCache) {
           else if (now - (c.last_429 || 0) < delay_period) h = '<span class="badge bg-info health-badge" title="Recovery active" onclick="showDebug(' + realIdx + ')">冷卻</span>';
           else if (c.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
           else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
-          const providerBadge = c.provider === 'anthropic'
-            ? '<span class="badge badge-anthropic">Anthropic</span>'
-            : '<span class="badge badge-openai">OpenAI</span>';
+          const providerBadge = '<span class="badge badge-openai">OpenAI</span>';
           return '<tr>' +
             '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>' +
             '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
-            '<td class="align-middle">' + providerBadge + '</td>' +
-            '<td class="fw-bold align-middle">' + c.name + '</td>' +
-            '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + (c.support_stream !== 0?' 🌊':'') + '</td>' +
+            '<td class="fw-bold align-middle">' + esc(c.name) + '</td>' +
+            '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
             '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>' +
             '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>' +
             '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>' +
@@ -907,8 +895,10 @@ export default function (clearCache) {
 
       const copyModelName = (name) => {
         if (!name) return;
-        const tmp = document.createElement('textarea'); tmp.value = name; document.body.appendChild(tmp); tmp.select(); document.execCommand('copy'); document.body.removeChild(tmp);
-        toast('Model ID 已複製: ' + name, 'success');
+        navigator.clipboard.writeText(name).then(() => toast('Model ID 已複製: ' + name, 'success')).catch(() => {
+          const tmp = document.createElement('textarea'); tmp.value = name; document.body.appendChild(tmp); tmp.select(); document.execCommand('copy'); document.body.removeChild(tmp);
+          toast('Model ID 已複製: ' + name, 'success');
+        });
       };
       const clearInput = (id) => { document.getElementById(id).value = ''; };
 
@@ -950,20 +940,21 @@ export default function (clearCache) {
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
       const openChannelModal = () => {
         document.getElementById('ch-idx').value = '';
-        // Pre-calculate next available ID for UX
         const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
         let nextId = 1; while (existingIds.includes(nextId)) nextId++;
         document.getElementById('ch-id').value = nextId;
         const b = document.getElementById('ch-id-badge'); b.textContent = 'NEW #' + nextId; b.style.display = '';
         ['ch-name','ch-key','ch-url','ch-model','ch-fallback-model'].forEach(i=>document.getElementById(i).value='');
-        document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50;
-        ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0);
-        document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false;
-        document.getElementById('ch-tools').checked=true; document.getElementById('ch-stream').checked=true;
-        checkFetchModelsBtn(); chModal.show();
+        document.getElementById('ch-weight').value = 50;
+        ['ch-rpm','ch-rpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0);
+        document.getElementById('ch-enabled').checked = true;
+        document.getElementById('ch-vision').checked = false;
+        document.getElementById('ch-tools').checked = true;
+        checkFetchModelsBtn();
+        chModal.show();
       };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-fallback-model').value = c.fallback_model || ''; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-stream').checked = c.support_stream !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-fallback-model').value = c.fallback_model || ''; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
         checkFetchModelsBtn();
         chModal.show();
       };
@@ -975,10 +966,10 @@ export default function (clearCache) {
         let parsed = null;
         try { parsed = JSON.parse(c.last_error_msg); } catch(e) {}
         if (parsed && typeof parsed === 'object') {
-          document.getElementById('debug-msg').value = parsed.message || '';
+          document.getElementById('debug-msg').value = typeof parsed.message === 'object' ? JSON.stringify(parsed.message, null, 2) : (parsed.message || '');
           document.getElementById('debug-url').value = parsed.url || '';
-          document.getElementById('debug-req').value = parsed.request || '';
-          document.getElementById('debug-res').value = parsed.response || '';
+          document.getElementById('debug-req').value = typeof parsed.request === 'object' ? JSON.stringify(parsed.request, null, 2) : (parsed.request || '');
+          document.getElementById('debug-res').value = typeof parsed.response === 'object' ? JSON.stringify(parsed.response, null, 2) : (parsed.response || '');
           document.getElementById('debug-url-wrapper').style.display = 'block';
           document.getElementById('debug-req-res-wrapper').style.display = 'flex';
         } else {
@@ -1000,9 +991,35 @@ export default function (clearCache) {
         const url = document.getElementById('ch-url').value.trim().replace(new RegExp('/+$'), '');
         if (!url) return toast('請輸入 Base URL', 'warning');
         const prev = idx !== '' ? channels[idx] : null;
-        const id = parseInt(document.getElementById('ch-id').value) || undefined;
-        const b = { id, name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, fallback_model: document.getElementById('ch-fallback-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, support_stream: document.getElementById('ch-stream').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0, response_time: prev ? prev.response_time||0 : 0 };
-        if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats(); toast(idx !== '' ? '已修改，請 SAVE ALL 儲存' : '已新增，請 SAVE ALL 儲存', 'success');
+        const idValue = document.getElementById('ch-id').value;
+        const id = idValue ? parseInt(idValue) : undefined;
+        const b = {
+          id,
+          name,
+          api_key: document.getElementById('ch-key').value,
+          base_url: url,
+          provider: 'openai',
+          model: document.getElementById('ch-model').value,
+          fallback_model: document.getElementById('ch-fallback-model').value,
+          weight,
+          max_tokens: parseInt(document.getElementById('ch-tokens').value) || 0,
+          rpm_limit: parseInt(document.getElementById('ch-rpm').value) || 0,
+          rpd_limit: parseInt(document.getElementById('ch-rpd').value) || 0,
+          is_vision: document.getElementById('ch-vision').checked ? 1 : 0,
+          support_tools: document.getElementById('ch-tools').checked ? 1 : 0,
+          is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
+          last_429: prev ? prev.last_429||0 : 0,
+          consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
+          last_error_msg: prev ? prev.last_error_msg||'' : '',
+          last_error_at: prev ? prev.last_error_at||0 : 0,
+          response_time: prev ? prev.response_time||0 : 0,
+          rpm_count: prev ? prev.rpm_count||0 : 0,
+          rpm_reset_at: prev ? prev.rpm_reset_at||0 : 0,
+          rpd_count: prev ? prev.rpd_count||0 : 0,
+          rpd_reset_at: prev ? prev.rpd_reset_at||0 : 0
+        };
+        if (idx !== '') channels[parseInt(idx)] = b; else channels.push(b);
+        chModal.hide(); renderChannels(); renderStats(); toast(idx !== '' ? '已修改，請 SAVE ALL 儲存' : '已新增，請 SAVE ALL 儲存', 'success');
       };
       const delChannel = (idx) => { confirm('確定刪除此渠道？', () => { channels.splice(idx, 1); renderChannels(); renderStats(); }); };
       const copyChannel = (idx) => { const src = channels[idx]; channels.push({ ...src, name: src.name + ' (copy)', id: undefined, last_429: 0, consecutive_errors: 0, last_error_msg: '', last_error_at: 0 }); renderChannels(); renderStats(); };
@@ -1064,8 +1081,6 @@ export default function (clearCache) {
           if (m.max_tokens) document.getElementById('ch-tokens').value = m.max_tokens;
           if (m.rpm) document.getElementById('ch-rpm').value = m.rpm;
           if (m.rpd) document.getElementById('ch-rpd').value = m.rpd;
-          if (m.tpm) document.getElementById('ch-tpm').value = m.tpm;
-          if (m.tpd) document.getElementById('ch-tpd').value = m.tpd;
 
           if (id.includes('vision') || id.includes('claude-3') || id.includes('gpt-4o') || id.includes('gemini-1.5') || id.includes('gemini-exp') || id.includes('gpt-4-turbo')) {
             document.getElementById('ch-vision').checked = true;
@@ -1091,6 +1106,12 @@ export default function (clearCache) {
         renderChannels();
       };
 
+      const toggleAllChannels = (val) => {
+        channels.forEach(c => c.is_enabled = val);
+        renderChannels();
+        renderStats();
+        toast(val ? '已開啟所有渠道' : '已關閉所有渠道', 'info');
+      };
       const resetAllHealth = async () => { confirm('重置所有渠道健康狀態？', async () => { await api('/admin/api/channels/reset-all-health', 'POST'); init(); }); };
 
       const refreshHealthOnly = async () => {
@@ -1098,13 +1119,20 @@ export default function (clearCache) {
         try {
           const res = await api('/admin/api', 'GET', null, false);
           if (!res) return;
-          const newChannels = res;
           const now = Math.floor(Date.now() / 1000);
-          newChannels.forEach(nc => {
+          res.forEach(nc => {
             const realIdx = channels.findIndex(c => c.id === nc.id);
             if (realIdx !== -1) {
-              channels[realIdx] = { ...channels[realIdx], ...nc };
               const oc = channels[realIdx];
+              // Surgical updates only
+              oc.last_429 = nc.last_429;
+              oc.consecutive_errors = nc.consecutive_errors;
+              oc.last_error_at = nc.last_error_at;
+              oc.last_error_msg = nc.last_error_msg;
+              oc.response_time = nc.response_time;
+              oc.rpd_count = nc.rpd_count;
+              oc.rpd_reset_at = nc.rpd_reset_at;
+
               const healthEl = document.getElementById('ch-health-' + oc.id);
               if (healthEl) {
                 let h = '<span class="badge bg-success health-badge">正常</span>';
@@ -1133,7 +1161,38 @@ export default function (clearCache) {
       const exportJson = () => {
         const now = new Date(); const pad = (n) => String(n).padStart(2, '0');
         const ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
-        const data = { channels, filters, config: { token: document.getElementById('cfg-token').value, recovery_period: document.getElementById('cfg-recovery-period').value } };
+
+        // Use whitelist to keep JSON extremely clean
+        const cleanChannels = channels.map(c => ({
+          name: c.name,
+          base_url: c.base_url,
+          api_key: c.api_key,
+          model: c.model,
+          fallback_model: c.fallback_model || "",
+          weight: c.weight || 50,
+          is_enabled: c.is_enabled ? 1 : 0,
+          is_vision: c.is_vision ? 1 : 0,
+          rpm_limit: c.rpm_limit || 0,
+          rpd_limit: c.rpd_limit || 0,
+          max_tokens: c.max_tokens || 0,
+          support_tools: c.support_tools !== 0 ? 1 : 0,
+          provider: 'openai'
+        }));
+
+        const cleanFilters = filters.map(f => ({
+          text: f.text,
+          mode: f.mode || 1,
+          is_enabled: f.is_enabled ? 1 : 0
+        }));
+
+        const data = {
+          channels: cleanChannels,
+          filters: cleanFilters,
+          config: {
+            token: document.getElementById('cfg-token').value,
+            recovery_period: document.getElementById('cfg-recovery-period').value
+          }
+        };
         const b = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
         const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-' + ts + '.json'; a.click();
       };

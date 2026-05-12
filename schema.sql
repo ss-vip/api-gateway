@@ -8,8 +8,6 @@ CREATE TABLE IF NOT EXISTS channels (
   weight INTEGER DEFAULT 1,
   rpm_limit INTEGER DEFAULT 0,
   rpd_limit INTEGER DEFAULT 0,
-  tpm_limit INTEGER DEFAULT 0,
-  tpd_limit INTEGER DEFAULT 0,
   rpm_count INTEGER DEFAULT 0,
   rpm_reset_at INTEGER DEFAULT 0,
   rpd_count INTEGER DEFAULT 0,
@@ -22,7 +20,6 @@ CREATE TABLE IF NOT EXISTS channels (
   last_error_msg TEXT,
   max_tokens INTEGER DEFAULT 0,
   support_tools INTEGER DEFAULT 1,
-  support_stream INTEGER DEFAULT 1,
   response_time INTEGER DEFAULT 0,
   fallback_model TEXT
 );
@@ -40,3 +37,7 @@ CREATE TABLE IF NOT EXISTS config (
   admin_password TEXT,
   recovery_period INTEGER DEFAULT 300
 );
+
+CREATE INDEX IF NOT EXISTS idx_channels_enabled ON channels(is_enabled);
+CREATE INDEX IF NOT EXISTS idx_channels_id ON channels(id);
+CREATE INDEX IF NOT EXISTS idx_filters_enabled ON filters(is_enabled);

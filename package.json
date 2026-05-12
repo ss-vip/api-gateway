@@ -9,7 +9,7 @@
     "deploy": "npx wrangler d1 execute DB --remote --file=./schema.sql && npx wrangler deploy",
     "reset-db": "node -e \"require('fs').rmSync('.wrangler/state/v3/d1', {recursive:true, force:true})\"",
     "reset-pw": "npx wrangler d1 execute DB --local --command \"UPDATE config SET admin_password=NULL WHERE id=1\"",
-    "reset-remote-db": "npx wrangler d1 execute DB --remote --command \"DROP TABLE IF EXISTS channels, filters, config;\" && npx wrangler d1 execute DB --remote --file=./schema.sql",
+    "reset-remote-db": "npx wrangler d1 execute DB --remote --command \"DROP TABLE IF EXISTS channels; DROP TABLE IF EXISTS filters; DROP TABLE IF EXISTS config;\" && npx wrangler d1 execute DB --remote --file=./schema.sql",
     "reset-remote-pw": "npx wrangler d1 execute DB --remote --command \"UPDATE config SET admin_password=NULL WHERE id=1\""
   },
   "dependencies": {
