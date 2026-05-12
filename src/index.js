@@ -29,6 +29,10 @@ const debug = (c, msg) => {
   if (c.env.DEBUG) console.log(msg);
 };
 
+function sanitizeToolName(n) {
+  return (n || "").trim().replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) || "unnamed_tool";
+}
+
 function hasImage(messages = []) {
   return messages.some(
     (m) =>
@@ -134,7 +138,7 @@ function o2aRequest(body, targetModel) {
     top_p: body.top_p,
     tools: body.tools
       ? body.tools.map((t) => ({
-        name: t.function.name,
+        name: sanitizeToolName(t.function.name),
         description: t.function.description,
         input_schema: t.function.parameters || {
           type: "object",
@@ -159,9 +163,11 @@ function a2oRequest(body, targetModel) {
   for (const m of body.messages || []) {
     if (Array.isArray(m.content)) {
       let textContent = [],
-        tool_calls = [];
+        tool_calls = [],
+        toolResults = [];
       for (const c of m.content) {
-        if (c.type === "text") textContent.push({ type: "text", text: c.text });
+        if (c.type === "text") textContent.push(c.text);
+        else if (c.type === "thinking") textContent.push(`> [Thinking]\n> ${c.thinking}`);
         else if (c.type === "image")
           textContent.push({
             type: "image_url",
@@ -179,8 +185,8 @@ function a2oRequest(body, targetModel) {
                 typeof c.input === "string" ? c.input : JSON.stringify(c.input),
             },
           });
-        else if (c.type === "tool_result")
-          messages.push({
+        else if (c.type === "tool_result") {
+          toolResults.push({
             role: "tool",
             tool_call_id: c.tool_use_id,
             content:
@@ -188,49 +194,129 @@ function a2oRequest(body, targetModel) {
                 ? c.content
                 : JSON.stringify(c.content),
           });
+        }
       }
-      if (
-        textContent.length > 0 ||
-        tool_calls.length > 0 ||
-        (m.role === "assistant" &&
-          textContent.length === 0 &&
-          tool_calls.length === 0)
-      ) {
+
+      if (toolResults.length > 0) {
+        toolResults.forEach((tr, idx) => {
+          if (idx === toolResults.length - 1 && textContent.length > 0) {
+            const extra = textContent.map(t => typeof t === 'string' ? t : JSON.stringify(t)).join("\n");
+            tr.content = (tr.content || "") + "\n\n" + extra;
+          }
+          messages.push(tr);
+        });
+      } else if (textContent.length > 0 || tool_calls.length > 0) {
         const newMsg = {
           role: m.role,
           content:
-            textContent.length === 1 && textContent[0].type === "text"
-              ? textContent[0].text
+            textContent.length === 1 && typeof textContent[0] === "string"
+              ? textContent[0]
               : textContent.length > 0
                 ? textContent
                 : "",
         };
-        if (tool_calls.length > 0) newMsg.tool_calls = tool_calls;
+        if (tool_calls.length > 0) {
+          newMsg.tool_calls = tool_calls;
+          if (!newMsg.content) newMsg.content = " ";
+        }
         messages.push(newMsg);
+      } else if (m.role === "assistant" && textContent.length === 0 && tool_calls.length === 0) {
+        messages.push({ role: "assistant", content: " " });
       }
     } else {
       messages.push({ role: m.role, content: m.content });
     }
   }
+
+  const finalTools = body.tools
+    ? body.tools.map((t) => ({
+      type: "function",
+      function: {
+        name: sanitizeToolName(t.name),
+        description: t.description,
+        parameters: t.input_schema,
+      },
+    }))
+    : undefined;
+
   return {
     model: targetModel || body.model,
-    messages,
+    messages: normalizeOpenAIMessages(messages, finalTools),
     max_tokens: body.max_tokens,
     stop: body.stop_sequences,
     stream: body.stream,
     temperature: body.temperature,
     top_p: body.top_p,
-    tools: body.tools
-      ? body.tools.map((t) => ({
-        type: "function",
-        function: {
-          name: t.name,
-          description: t.description,
-          parameters: t.input_schema,
-        },
-      }))
-      : undefined,
+    tools: finalTools,
   };
+}
+
+function normalizeOpenAIMessages(messages, currentTools = []) {
+  if (!messages || messages.length === 0) return messages;
+  const final = [];
+  const map = {};
+
+  // 0. 建立當前可用工具的快速索引
+  const availableToolNames = Array.isArray(currentTools)
+    ? currentTools.map(t => sanitizeToolName(t.function?.name || t.name))
+    : [];
+  const fallback = availableToolNames[0] || "ai_tool";
+
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    const role = (m.role === "developer" || m.role === "system") ? "system" : m.role;
+
+    if (role === "assistant" && m.tool_calls) {
+      for (let j = 0; j < m.tool_calls.length; j++) {
+        const tc = m.tool_calls[j];
+        if (tc.function) {
+          tc.function.name = sanitizeToolName(tc.function.name);
+          map[tc.id] = tc.function.name;
+        }
+      }
+    } else if (role === "tool") {
+      // 優先序：1. 歷史記錄對照 2. 目前已有的名稱(洗滌後) 3. 嘗試從工具池匹配 4. 第一個工具兜底
+      if (m.tool_call_id && map[m.tool_call_id]) {
+        m.name = map[m.tool_call_id];
+      } else if (m.name) {
+        m.name = sanitizeToolName(m.name);
+      } else {
+        // 如果連名稱都沒有且 ID 也對不上，通常是歷史被截斷了，嘗試從當前工具池找
+        m.name = fallback;
+      }
+    }
+
+    const last = final[final.length - 1];
+    if (last) {
+      if (last.role === role && role !== "system" && role !== "tool") {
+        last.content = (last.content || "") + "\n\n" + (m.content || "");
+        if (role === "assistant" && m.tool_calls) {
+          last.tool_calls = (last.tool_calls || []).concat(m.tool_calls);
+        }
+        continue;
+      }
+      if (last.role === "tool" && role === "user") {
+        last.content = (last.content || "") + "\n\n" + (m.content || "");
+        continue;
+      }
+    }
+
+    if (role === "system") {
+      if (final.length > 0 && final[0].role === "system") {
+        final[0].content += "\n\n" + (m.content || "");
+      } else {
+        final.unshift({ role: "system", content: m.content || "" });
+      }
+      continue;
+    }
+
+    const newMsg = { role, content: m.content || (role === "assistant" || role === "user" ? " " : "") };
+    if (m.tool_calls) newMsg.tool_calls = m.tool_calls;
+    if (m.tool_call_id) newMsg.tool_call_id = m.tool_call_id;
+    if (m.name) newMsg.name = m.name;
+    final.push(newMsg);
+  }
+  return final;
 }
 
 function o2aResponse(json, model) {
@@ -245,6 +331,8 @@ function o2aResponse(json, model) {
   const choice = json.choices?.[0] || {};
   if (choice.message?.content)
     content = choice.message.content;
+  if (choice.message?.thought)
+    content = `> [Thinking]\n> ${choice.message.thought}\n\n` + content;
   if (choice.message?.tool_calls) {
     // Tool calls handled below
   }
@@ -390,31 +478,31 @@ function selectChannel(channels, delay_period) {
   const now = Math.floor(Date.now() / 1000);
   const available = channels.filter((c) => {
     if (!c.is_enabled) return false;
-    if (c.consecutive_errors >= 5) return now - (c.last_error_at || 0) > 1800;
-    if (now - (c.last_429 || 0) < delay_period) return false;
-    if (c.rpm_limit > 0) {
-      const withinMin = now - (c.rpm_reset_at || 0) < 60;
-      if (withinMin && (c.rpm_count || 0) >= c.rpm_limit) return false;
-    }
-    if (c.rpd_limit > 0) {
-      const withinDay = now - (c.rpd_reset_at || 0) < 86400;
-      if (withinDay && (c.rpd_count || 0) >= c.rpd_limit) return false;
-    }
+    if (c.consecutive_errors >= 5 && now - (c.last_error_at || 0) <= 1800) return false;
+    if (c.last_429 > now) return false;
+    if (c.rpm_limit > 0 && now - (c.rpm_reset_at || 0) < 60 && (c.rpm_count || 0) >= c.rpm_limit) return false;
+    if (c.rpd_limit > 0 && now - (c.rpd_reset_at || 0) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) return false;
     return true;
   });
   if (available.length === 0) return null;
-  const totalWeight = available.reduce(
-    (sum, c) => sum + Math.max(0, c.weight || 0),
-    0,
-  );
-  if (totalWeight <= 0)
-    return available[Math.floor(Math.random() * available.length)];
-  let r = Math.random() * totalWeight;
-  for (const c of available) {
-    r -= Math.max(0, c.weight || 0);
+
+  // 負載均衡優化：權重優先，同權重下 rpm_count 較小者優先
+  available.sort((a, b) => {
+    const wa = a.weight || 1, wb = b.weight || 1;
+    if (wa !== wb) return wb - wa;
+    return (a.rpm_count || 0) - (b.rpm_count || 0);
+  });
+
+  // 為了保持隨機性避免集體轉向，我們在前 3 個最優選中進行隨機
+  const top = available.slice(0, 3);
+  let totalW = 0;
+  for (const c of top) totalW += Math.max(1, c.weight || 0);
+  let r = Math.random() * totalW;
+  for (const c of top) {
+    r -= Math.max(1, c.weight || 0);
     if (r <= 0) return c;
   }
-  return available[0];
+  return top[0];
 }
 
 function updateRateCounters(cachedCh, nowSec) {
@@ -466,14 +554,14 @@ function transformStream(
     encoder = new TextEncoder();
   const filter = new RollingFilter(filters);
   let buf = "",
-    messageId = "response_id_" + Math.random().toString(36).slice(2);
+    messageId = "msg_" + Math.random().toString(36).slice(2);
   let anthropicToolIndexMap = {},
     nextAnthropicIndex = 1;
   let openaiToolIndexMap = {},
     nextOpenaiIndex = 0;
   let sentMessageStart = false;
-  let stoppedBlocks = new Set();
   let textBlockIndex = 0;
+  let accumulatedUsage = { input_tokens: 0, output_tokens: 0 };
 
   const send = async (data) => {
     if (typeof data === "object") data = JSON.stringify(data);
@@ -500,18 +588,12 @@ function transformStream(
               if (toProtocol === "anthropic") {
                 if (!sentMessageStart) {
                   sentMessageStart = true;
-                  await send({ type: "message_start", message: { id: messageId, type: "message", role: "assistant", model: responseModel, content: [], usage: { input_tokens: 0, output_tokens: 0 } } });
+                  await send({ type: "message_start", message: { id: messageId, type: "message", role: "assistant", model: responseModel, content: [], usage: accumulatedUsage } });
                   await send({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
                 }
-                await send({
-                  type: "content_block_delta",
-                  index: 0,
-                  delta: { type: "text_delta", text: tail },
-                });
+                await send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: tail } });
               } else {
-                await send(
-                  mkChunk({ content: tail }, null, responseModel, "openai"),
-                );
+                await send(mkChunk({ content: tail }, null, responseModel, "openai"));
               }
             }
             if (toProtocol === "openai") await send("[DONE]");
@@ -524,70 +606,81 @@ function transformStream(
               if (toProtocol === "anthropic") await send(json);
               continue;
             }
-            if (json.type === "error") {
-              const errMsg = json.error?.message || "Unknown stream error";
+            if (json.type === "error" || json.error) {
+              const errMsg = json.error?.message || json.message || "Unknown stream error";
               if (toProtocol === "anthropic") {
-                await send({
-                  type: "content_block_delta",
-                  index: 0,
-                  delta: {
-                    type: "text_delta",
-                    text: `\n\n[Upstream Error: ${errMsg}]`,
-                  },
-                });
+                if (!sentMessageStart) {
+                  sentMessageStart = true;
+                  await send({ type: "message_start", message: { id: messageId, type: "message", role: "assistant", model: responseModel, content: [], usage: accumulatedUsage } });
+                }
+                await send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `\n\n[Upstream Error: ${errMsg}]` } });
                 await send({ type: "message_stop" });
               } else {
-                await send(
-                  mkChunk(
-                    { content: `\n\n[Upstream Error: ${errMsg}]` },
-                    "stop",
-                    responseModel,
-                    "openai",
-                  ),
-                );
+                await send(mkChunk({ content: `\n\n[Upstream Error: ${errMsg}]` }, "stop", responseModel, "openai"));
                 await send("[DONE]");
               }
               continue;
             }
-            let content = "",
-              finishReason = null,
-              toolCalls = null;
+
+            if (json.usage) {
+              accumulatedUsage.input_tokens = json.usage.prompt_tokens || accumulatedUsage.input_tokens;
+              accumulatedUsage.output_tokens = json.usage.completion_tokens || accumulatedUsage.output_tokens;
+            }
+
+            let content = "", finishReason = null, toolCalls = null;
 
             if (fromProtocol === "openai") {
               const choice = json.choices?.[0];
-              content = choice?.delta?.content || "";
+              content = (choice?.delta?.content || "") + (choice?.delta?.thought || "");
               finishReason = choice?.finish_reason;
               toolCalls = choice?.delta?.tool_calls;
+
+              if (toolCalls) {
+                toolCalls.forEach(tc => {
+                  if (tc.function?.name && toolMap[tc.function.name]) {
+                    tc.function.name = toolMap[tc.function.name];
+                  }
+                });
+              }
+
+              // Immediate message_start for Anthropic clients
+              if (toProtocol === "anthropic" && !sentMessageStart) {
+                sentMessageStart = true;
+                await send({
+                  type: "message_start",
+                  message: {
+                    id: messageId,
+                    type: "message",
+                    role: "assistant",
+                    model: responseModel,
+                    content: [],
+                    usage: accumulatedUsage,
+                  },
+                });
+                await send({
+                  type: "content_block_start",
+                  index: 0,
+                  content_block: { type: "text", text: "" },
+                });
+              }
             } else {
-              if (json.type === "content_block_delta") {
-                if (json.delta?.type === "text_delta")
-                  content = json.delta?.text || "";
+              if (json.type === "message_start") {
+                accumulatedUsage = json.message?.usage || accumulatedUsage;
+              } else if (json.type === "content_block_delta") {
+                if (json.delta?.type === "text_delta") content = json.delta?.text || "";
                 else if (json.delta?.type === "input_json_delta") {
                   const oIdx = anthropicToolIndexMap[json.index] ?? 0;
-                  toolCalls = [
-                    {
-                      index: oIdx,
-                      function: { arguments: json.delta.partial_json },
-                    },
-                  ];
+                  toolCalls = [{ index: oIdx, function: { arguments: json.delta.partial_json } }];
                 }
-              } else if (
-                json.type === "content_block_start" &&
-                json.content_block?.type === "tool_use"
-              ) {
+              } else if (json.type === "content_block_start" && json.content_block?.type === "tool_use") {
                 anthropicToolIndexMap[json.index] = nextOpenaiIndex++;
-                toolCalls = [
-                  {
-                    index: anthropicToolIndexMap[json.index],
-                    id: json.content_block.id,
-                    type: "function",
-                    function: { name: json.content_block.name, arguments: "" },
-                  },
-                ];
+                toolCalls = [{ index: anthropicToolIndexMap[json.index], id: json.content_block.id, type: "function", function: { name: json.content_block.name, arguments: "" } }];
               } else if (json.type === "message_delta") {
                 finishReason = json.delta?.stop_reason;
+                if (json.usage) {
+                  accumulatedUsage.output_tokens = json.usage.output_tokens || accumulatedUsage.output_tokens;
+                }
               }
-              // content_block_stop tracked for forwarding
             }
 
             let outContent = content ? filter.transform(content) : "";
@@ -595,112 +688,53 @@ function transformStream(
 
             if (toProtocol === "anthropic") {
               if (fromProtocol === "anthropic") {
-                // Filter-aware pass-through: forward ALL events as-is,
-                // only intercept text_delta for content filtering.
-                // This naturally supports thinking blocks, tool_use, and all future event types.
                 if (json.type === "message_start") {
                   if (responseModel) json.message = { ...json.message, model: responseModel };
                   await send(json);
                 } else if (json.type === "content_block_delta" && json.delta?.type === "text_delta") {
-                  if (!filters.length) {
-                    await send(json);
-                  } else {
+                  if (!filters.length) await send(json);
+                  else {
                     const filtered = filter.transform(json.delta.text || "");
-                    if (filtered) {
-                      await send({ ...json, delta: { type: "text_delta", text: filtered } });
-                    }
+                    if (filtered) await send({ ...json, delta: { type: "text_delta", text: filtered } });
                   }
                 } else if (json.type === "content_block_stop" && textBlockIndex === json.index && filters.length) {
-                  // Flush filter buffer before closing the text block
                   const tail = filter.flush();
-                  if (tail) {
-                    await send({ type: "content_block_delta", index: json.index, delta: { type: "text_delta", text: tail } });
-                  }
+                  if (tail) await send({ type: "content_block_delta", index: json.index, delta: { type: "text_delta", text: tail } });
                   await send(json);
                 } else if (json.type === "content_block_start" && json.content_block?.type === "text") {
                   textBlockIndex = json.index;
                   await send(json);
-                } else if (json.type === "message_delta" && filters.length) {
-                  // Safety flush in case content_block_stop didn't trigger
-                  const tail = filter.flush();
-                  if (tail && textBlockIndex >= 0) {
-                    await send({ type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: tail } });
-                  }
+                } else if (json.type === "message_delta") {
+                  const tail = filters.length ? filter.flush() : "";
+                  if (tail && textBlockIndex >= 0) await send({ type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: tail } });
                   await send(json);
                 } else {
-                  // Forward everything else as-is: thinking, tool_use, ping remnants, etc.
                   await send(json);
                 }
               } else {
-                // openai → anthropic translation (full synthesis)
-                if (!sentMessageStart && (outContent || toolCalls || finishReason)) {
-                  sentMessageStart = true;
-                  await send({
-                    type: "message_start",
-                    message: {
-                      id: messageId,
-                      type: "message",
-                      role: "assistant",
-                      model: responseModel,
-                      content: [],
-                      usage: { input_tokens: 0, output_tokens: 0 },
-                    },
-                  });
-                  await send({
-                    type: "content_block_start",
-                    index: 0,
-                    content_block: { type: "text", text: "" },
-                  });
-                }
-                if (outContent)
-                  await send({
-                    type: "content_block_delta",
-                    index: 0,
-                    delta: { type: "text_delta", text: outContent },
-                  });
+                // openai → anthropic
+                if (outContent) await send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: outContent } });
                 if (toolCalls) {
                   for (const tc of toolCalls) {
                     if (tc.id && tc.function?.name) {
                       openaiToolIndexMap[tc.index] = nextAnthropicIndex++;
-                      await send({
-                        type: "content_block_start",
-                        index: openaiToolIndexMap[tc.index],
-                        content_block: {
-                          type: "tool_use",
-                          id: tc.id,
-                          name: tc.function.name,
-                          input: {},
-                        },
-                      });
+                      await send({ type: "content_block_start", index: openaiToolIndexMap[tc.index], content_block: { type: "tool_use", id: tc.id, name: tc.function.name, input: {} } });
                     }
                     if (tc.function?.arguments) {
-                      await send({
-                        type: "content_block_delta",
-                        index: openaiToolIndexMap[tc.index],
-                        delta: {
-                          type: "input_json_delta",
-                          partial_json: tc.function.arguments,
-                        },
-                      });
+                      await send({ type: "content_block_delta", index: openaiToolIndexMap[tc.index], delta: { type: "input_json_delta", partial_json: tc.function.arguments } });
                     }
                   }
                 }
                 if (finishReason) {
                   await send({ type: "content_block_stop", index: 0 });
-                  for (const v of Object.values(openaiToolIndexMap))
-                    await send({ type: "content_block_stop", index: v });
+                  for (const v of Object.values(openaiToolIndexMap)) await send({ type: "content_block_stop", index: v });
                   await send({
                     type: "message_delta",
                     delta: {
-                      stop_reason:
-                        finishReason === "stop"
-                          ? "end_turn"
-                          : finishReason === "tool_calls"
-                            ? "tool_use"
-                            : finishReason,
+                      stop_reason: finishReason === "stop" ? "end_turn" : finishReason === "tool_calls" ? "tool_use" : finishReason,
                       stop_sequence: null,
                     },
-                    usage: { output_tokens: 0 },
+                    usage: { output_tokens: accumulatedUsage.output_tokens },
                   });
                   await send({ type: "message_stop" });
                 }
@@ -713,37 +747,35 @@ function transformStream(
                 const delta = {};
                 if (outContent) delta.content = outContent;
                 if (toolCalls) delta.tool_calls = toolCalls;
-                if (delta.content || delta.tool_calls || finishReason) {
-                  await send(
-                    mkChunk(
+                if (delta.content || delta.tool_calls || finishReason || json.usage) {
+                  const chunk = {
+                    id: json.id || "chatcmpl-" + Math.random().toString(36).slice(2),
+                    object: "chat.completion.chunk",
+                    created: json.created || Math.floor(Date.now() / 1000),
+                    model: responseModel,
+                    choices: [{
+                      index: 0,
                       delta,
-                      finishReason === "end_turn"
-                        ? "stop"
-                        : finishReason === "tool_use"
-                          ? "tool_calls"
-                          : finishReason,
-                      responseModel,
-                      "openai",
-                    ),
-                  );
+                      finish_reason: finishReason === "end_turn" ? "stop" : finishReason === "tool_use" ? "tool_calls" : finishReason
+                    }]
+                  };
+                  if (json.usage) chunk.usage = json.usage;
+                  await send(chunk);
                 }
               }
             }
           } catch (e) {
-            console.error("[Stream parse]", e.message, "raw:", trimmed?.slice(0, 200));
+            console.error("[Stream parse]", e.message, "raw:", dataStr?.slice(0, 100));
           }
         }
       }
     } finally {
-      try {
-        writer.close();
-      } catch (e) { }
+      try { writer.close(); } catch (e) { }
     }
   })();
   return r;
 }
 
-// Rate limit counters storage (in-memory, persisted to D1 on cache refresh)
 let rateLimitCache = { data: {}, ts: 0 };
 
 async function loadCache(env) {
@@ -801,7 +833,6 @@ async function loadCache(env) {
   return cacheFlight;
 }
 
-// Save rate limit counters to D1
 async function saveRateLimits(env) {
   if (!cache.data?.channels) return;
   const nowSec = Math.floor(Date.now() / 1000);
@@ -834,7 +865,6 @@ async function saveRateLimits(env) {
   }
 }
 
-// dynamically return deduplicated models
 app.get("/v1/models", async (c) => {
   let channels = [];
   try {
@@ -864,7 +894,6 @@ function validateChatBody(body) {
   return null;
 }
 
-// Return protocol-appropriate error responses
 function errResponse(c, protocol, message, type, status) {
   if (protocol === "anthropic") {
     return c.json({ type: "error", error: { type, message } }, status);
@@ -872,7 +901,6 @@ function errResponse(c, protocol, message, type, status) {
   return c.json({ error: { message, type } }, status);
 }
 
-// Build a clean upstream URL from a stored base_url.
 function buildUpstreamUrl(baseUrl, provider) {
   let base = (baseUrl || "").trim();
   if (!base) return null;
@@ -890,6 +918,9 @@ function buildUpstreamUrl(baseUrl, provider) {
 }
 
 async function handleChatRequest(c, clientProtocol) {
+  // 初始併發抖動：錯開並行請求，避免集體撞 Key
+  await new Promise(r => setTimeout(r, Math.random() * 80));
+
   let data;
   try {
     data = await loadCache(c.env);
@@ -921,6 +952,8 @@ async function handleChatRequest(c, clientProtocol) {
 
   const isVision = hasImage(body.messages);
   const isToolUse = !!(body.tools && body.tools.length > 0);
+  const isStream =
+    body.stream === true || body.stream === "true" || body.stream === 1;
   let pool = data.channels.filter((ch) => {
     if (ch.is_enabled !== 1) return false;
     if (isVision && ch.is_vision !== 1) return false;
@@ -939,9 +972,14 @@ async function handleChatRequest(c, clientProtocol) {
     if (toolSupportedPool.length > 0) pool = toolSupportedPool;
   }
 
+  if (isStream) {
+    const streamSupportedPool = pool.filter((ch) => ch.support_stream !== 0);
+    if (streamSupportedPool.length > 0) pool = streamSupportedPool;
+  }
+
   const originalModel = body.model;
   const requestedModel = (originalModel || "").trim().toLowerCase();
-  
+
   if (requestedModel && requestedModel !== "openai") {
     let matched = pool.filter(
       (ch) => (ch.model || "").trim().toLowerCase() === requestedModel,
@@ -963,7 +1001,7 @@ async function handleChatRequest(c, clientProtocol) {
   const availableCount = pool.filter((ch) => {
     if (ch.consecutive_errors >= 5 && now - (ch.last_error_at || 0) <= 1800)
       return false;
-    if (now - (ch.last_429 || 0) < data.config.recovery_period) return false;
+    if (ch.last_429 > now) return false;
     if (
       ch.rpm_limit > 0 &&
       now - (ch.rpm_reset_at || 0) < 60 &&
@@ -982,9 +1020,15 @@ async function handleChatRequest(c, clientProtocol) {
   if (availableCount === 0)
     return errResponse(c, clientProtocol, "All channels are rate-limited", "rate_limit_error", 429);
 
-  const isStream =
-    body.stream === true || body.stream === "true" || body.stream === 1;
   const dbUpdates = [];
+
+  const toolMap = {};
+  if (body.tools) {
+    body.tools.forEach(t => {
+      const name = t.function?.name || t.name;
+      if (name) toolMap[sanitizeToolName(name)] = name;
+    });
+  }
 
   for (let i = 0, maxTries = Math.min(pool.length, 5); i < maxTries; i++) {
     if (i > 0)
@@ -1000,13 +1044,17 @@ async function handleChatRequest(c, clientProtocol) {
       continue;
     }
 
-    // --- Translation Logic ---
     let reqBody = { ...body };
-    if (clientProtocol === "openai" && targetProtocol === "anthropic")
-      reqBody = o2aRequest(reqBody, ch.model);
-    else if (clientProtocol === "anthropic" && targetProtocol === "openai")
+    if (clientProtocol === "anthropic" && targetProtocol === "openai")
       reqBody = a2oRequest(reqBody, ch.model);
-    else if (ch.model) reqBody.model = ch.model;
+    else if (clientProtocol === "openai" && targetProtocol === "anthropic")
+      reqBody = o2aRequest(reqBody, ch.model);
+    else {
+      if (ch.model) reqBody.model = ch.model;
+      if (targetProtocol === "openai") {
+        reqBody.messages = normalizeOpenAIMessages(reqBody.messages, reqBody.tools);
+      }
+    }
 
     // Common sanitization
     if (targetProtocol === "openai" && Array.isArray(reqBody.messages)) {
@@ -1024,12 +1072,20 @@ async function handleChatRequest(c, clientProtocol) {
     );
 
     const timeElapsed = Date.now() / 1000 - now;
-    const remainingTime = 29 - timeElapsed;
-    if (remainingTime <= 2) break;
+    const totalRemaining = 29 - timeElapsed;
+    if (totalRemaining <= 2) break;
+
+    // Smart Timeout: If we have multiple channels, give this try a shorter slice (e.g. 15s)
+    // so we have a chance to failover to another channel if this one is slow.
+    let tryTimeout = totalRemaining;
+    if (i < maxTries - 1) {
+      tryTimeout = Math.min(totalRemaining, 15);
+    }
+
     const controller = new AbortController();
     const timeoutId = setTimeout(
       () => controller.abort(),
-      remainingTime * 1000,
+      tryTimeout * 1000,
     );
     const abortHandler = () => controller.abort();
     c.req.raw.signal?.addEventListener("abort", abortHandler);
@@ -1038,21 +1094,51 @@ async function handleChatRequest(c, clientProtocol) {
         "Content-Type": "application/json",
         "User-Agent": c.req.header("User-Agent") || "Claude-Code-Gateway/1.0"
       };
+
+      // Forward client's Anthropic headers if present
+      const clientVersion = c.req.header("anthropic-version");
+      const clientBeta = c.req.header("anthropic-beta");
+
       if (targetProtocol === "anthropic") {
         upstreamHeaders["x-api-key"] = ch.api_key;
-        upstreamHeaders["anthropic-version"] = "2023-06-01";
-        // Forward beta feature headers (thinking, computer use, etc.)
-        const clientBeta = c.req.header("anthropic-beta");
+        upstreamHeaders["anthropic-version"] = clientVersion || "2023-06-01";
         if (clientBeta) upstreamHeaders["anthropic-beta"] = clientBeta;
       } else {
         upstreamHeaders["Authorization"] = `Bearer ${ch.api_key}`;
       }
+
+      // Optimization: Direct pass-through if protocols match and no filters
+      const hasFilters = data.filters && data.filters.some(f => f.is_enabled);
+      if (clientProtocol === targetProtocol && !hasFilters && !ch.model && !isStream) {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: upstreamHeaders,
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        c.req.raw.signal?.removeEventListener("abort", abortHandler);
+
+        if (res.ok) {
+          const resClone = res.clone();
+          const resJson = await res.json().catch(() => null);
+          if (resJson) {
+            if (originalModel) resJson.model = originalModel;
+            return c.json(resJson);
+          }
+          return resClone;
+        }
+        // Fall through to error handling if not OK
+      }
+
+      const startTime = Date.now();
       const res = await fetch(url, {
         method: "POST",
         headers: upstreamHeaders,
         body: JSON.stringify(reqBody),
         signal: controller.signal,
       });
+      const latency = Date.now() - startTime;
       clearTimeout(timeoutId);
       c.req.raw.signal?.removeEventListener("abort", abortHandler);
 
@@ -1121,13 +1207,26 @@ async function handleChatRequest(c, clientProtocol) {
           response: errText.slice(0, 2000),
         });
 
-        const isHardQuota = errText.match(/quota.?exceed|insufficient.?quota|insufficient.?credit|weekly.?limit|billing.?inactive|plan.?limit/i);
+        const isHardQuota = errText.match(/insufficient.?quota|insufficient.?credit|billing.?inactive|plan.?limit/i);
+        const isWeeklyLimit = errText.match(/weekly.?limit/i);
+        const isDailyLimit = errText.match(/daily.?limit|daily.?quota/i);
+        const isGeneralQuota = errText.match(/quota.?exceed|rate.?limit.?exceed/i);
         const retryAfter = res.headers.get("Retry-After");
 
-        if (res.status === 429 || isHardQuota) {
-          let customDelay = ts + data.config.recovery_period;
+        const is503 = res.status === 503;
+        if (res.status === 429 || is503 || isHardQuota || isWeeklyLimit || isDailyLimit || isGeneralQuota) {
+          let customDelay = ts + (is503 ? 60 : data.config.recovery_period);
           if (isHardQuota) {
-            customDelay = ts + 604800;
+            customDelay = ts + 2592000; // 30 days for billing/hard quota issues
+          } else if (isWeeklyLimit) {
+            customDelay = ts + 604800; // 7 days
+          } else if (isDailyLimit) {
+            // Calculate seconds until next day UTC 00:00 as a safe bet, or just 24h
+            const tomorrow = new Date();
+            tomorrow.setUTCHours(24, 0, 0, 0);
+            customDelay = Math.floor(tomorrow.getTime() / 1000);
+          } else if (isGeneralQuota) {
+            customDelay = ts + 86400; // 24h for general "quota exceeded" if not specified
           } else if (retryAfter) {
             const seconds = parseInt(retryAfter, 10);
             if (!isNaN(seconds)) customDelay = ts + seconds;
@@ -1158,21 +1257,12 @@ async function handleChatRequest(c, clientProtocol) {
           }
         }
 
-        // Don't retry errors that will fail on every channel (body-level issues)
-        if (res.status >= 400 && res.status < 500 && res.status !== 429 && !maxTokensToLearn && !capabilityLearned) {
-          if (dbUpdates.length > 0)
-            c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
-          try {
-            const errJson = JSON.parse(errText);
-            if (clientProtocol === "anthropic" && !errJson.type) {
-              return c.json({ type: "error", error: { type: "upstream_error", message: errJson.error?.message || errText.slice(0, 500) } }, res.status);
-            }
-            return c.json(errJson, res.status);
-          } catch {
-            return errResponse(c, clientProtocol, errText.slice(0, 500), "upstream_error", res.status);
-          }
-        }
+        // If we get an error, log it and try the NEXT channel in the loop.
+        // We only return immediately if we've run out of tries or it's a specific fatal error.
+        if (dbUpdates.length > 0)
+          c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
 
+        // Capability learning (vision/tools) is still important to keep
         if (ch.fallback_model) {
           const fallbackCh = {
             ...ch,
@@ -1198,12 +1288,21 @@ async function handleChatRequest(c, clientProtocol) {
         );
       }
       // Sync rate limit counters to D1 for cross-instance accuracy
-      if (cachedCh && (cachedCh.rpm_limit > 0 || cachedCh.rpd_limit > 0)) {
-        dbUpdates.push(
-          c.env.DB.prepare(
-            "UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?",
-          ).bind(cachedCh.rpm_count || 0, cachedCh.rpm_reset_at || 0, cachedCh.rpd_count || 0, cachedCh.rpd_reset_at || 0, ch.id),
-        );
+      if (cachedCh) {
+        cachedCh.response_time = latency;
+        if (cachedCh.rpm_limit > 0 || cachedCh.rpd_limit > 0) {
+          dbUpdates.push(
+            c.env.DB.prepare(
+              "UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=?, response_time=? WHERE id=?",
+            ).bind(cachedCh.rpm_count || 0, cachedCh.rpm_reset_at || 0, cachedCh.rpd_count || 0, cachedCh.rpd_reset_at || 0, latency, ch.id),
+          );
+        } else {
+          dbUpdates.push(
+            c.env.DB.prepare(
+              "UPDATE channels SET response_time=? WHERE id=?",
+            ).bind(latency, ch.id),
+          );
+        }
       }
 
       if (isStream) {
@@ -1232,13 +1331,30 @@ async function handleChatRequest(c, clientProtocol) {
       let json = attemptRepairJson(resText);
       if (!json) continue;
 
-      // --- Response Translation ---
       let finalResponse = json;
-      if (targetProtocol === "openai" && clientProtocol === "anthropic")
+      if (clientProtocol === "anthropic" && !json.type) {
         finalResponse = o2aResponse(json, originalModel);
-      else if (targetProtocol === "anthropic" && clientProtocol === "openai")
+      } else if (targetProtocol === "anthropic" && clientProtocol === "openai") {
         finalResponse = a2oResponse(json, originalModel);
-      else if (originalModel) finalResponse.model = originalModel;
+      } else if (originalModel) {
+        finalResponse.model = originalModel;
+      }
+
+      // Restore original tool names
+      if (finalResponse.choices?.[0]?.message?.tool_calls) {
+        finalResponse.choices[0].message.tool_calls.forEach(tc => {
+          if (tc.function?.name && toolMap[tc.function.name]) {
+            tc.function.name = toolMap[tc.function.name];
+          }
+        });
+      }
+      if (finalResponse.content) {
+        finalResponse.content.forEach(c => {
+          if (c.type === 'tool_use' && toolMap[c.name]) {
+            c.name = toolMap[c.name];
+          }
+        });
+      }
 
       if (dbUpdates.length > 0)
         c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
@@ -1248,7 +1364,41 @@ async function handleChatRequest(c, clientProtocol) {
       c.req.raw.signal?.removeEventListener("abort", abortHandler);
 
       if (e.name === 'AbortError') {
-        return errResponse(c, clientProtocol, "Request aborted or timed out", "timeout_error", 408);
+        ts = Math.floor(Date.now() / 1000);
+        cachedCh = data.channels.find((x) => x.id === ch.id);
+        const debugInfo = JSON.stringify({
+          message: "Upstream Timeout (29s Limit reached)",
+          url: url,
+          request: JSON.stringify({
+            model: reqBody.model,
+            stream: reqBody.stream,
+            messages: reqBody.messages?.map(m => ({ role: m.role, content: typeof m.content === 'string' ? (m.content.slice(0, 100) + '...') : (Array.isArray(m.content) ? `[${m.content.length} blocks]` : typeof m.content) })),
+            tools: reqBody.tools?.length || 0
+          }),
+          response: "The request was aborted because the upstream took too long to respond (>29s).",
+        });
+        if (cachedCh) {
+          cachedCh.consecutive_errors = (cachedCh.consecutive_errors || 0) + 1;
+          cachedCh.last_error_at = ts;
+          cachedCh.last_error_msg = debugInfo;
+          cachedCh.response_time = 30000;
+        }
+        dbUpdates.push(
+          c.env.DB.prepare(
+            "UPDATE channels SET consecutive_errors=consecutive_errors+1,last_error_msg=?,last_error_at=?,response_time=30000 WHERE id=?",
+          ).bind(debugInfo, ts, ch.id),
+        );
+        if (dbUpdates.length > 0)
+          c.executionCtx.waitUntil(c.env.DB.batch(dbUpdates).catch(() => { }));
+
+        // If we have more tries and time left, CONTINUE to next channel instead of returning 408
+        const nowAfter = Date.now() / 1000;
+        if (i < maxTries - 1 && (29 - (nowAfter - now)) > 5) {
+          pool = pool.filter((p) => p.id !== ch.id);
+          continue;
+        }
+
+        return errResponse(c, clientProtocol, "Request timed out (Upstream too slow)", "timeout_error", 408);
       }
 
       ts = Math.floor(Date.now() / 1000);
@@ -1258,7 +1408,12 @@ async function handleChatRequest(c, clientProtocol) {
       const debugInfo = JSON.stringify({
         message: errMsg.slice(0, 500),
         url: url,
-        request: JSON.stringify({ model: reqBody.model, stream: reqBody.stream, tools: reqBody.tools?.length || 0, messages: reqBody.messages?.length || 0 }),
+        request: JSON.stringify({
+          model: reqBody.model,
+          stream: reqBody.stream,
+          messages: reqBody.messages?.map(m => ({ role: m.role, content: typeof m.content === 'string' ? (m.content.slice(0, 100) + '...') : (Array.isArray(m.content) ? `[${m.content.length} blocks]` : typeof m.content) })),
+          tools: reqBody.tools?.map(t => t.function?.name || t.name)
+        }),
         response: "",
       });
 

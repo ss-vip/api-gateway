@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS channels (
   last_error_msg TEXT,
   max_tokens INTEGER DEFAULT 0,
   support_tools INTEGER DEFAULT 1,
+  support_stream INTEGER DEFAULT 1,
+  response_time INTEGER DEFAULT 0,
   fallback_model TEXT
 );
 

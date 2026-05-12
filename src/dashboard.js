@@ -92,8 +92,9 @@ export default function (clearCache) {
       c.env.DB.prepare("DELETE FROM channels"),
       ...channels.map((ch) =>
         c.env.DB.prepare(
-          `INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         ).bind(
+          ch.id || null,
           ch.name,
           ch.base_url || "",
           ch.api_key || "",
@@ -111,7 +112,9 @@ export default function (clearCache) {
           ch.tpm_limit || 0,
           ch.tpd_limit || 0,
           ch.max_tokens || 0,
-          ch.support_tools !== false ? 1 : 0,
+          ch.support_tools ? 1 : 0,
+          ch.support_stream ? 1 : 0,
+          ch.response_time || 0,
           ch.fallback_model || "",
         ),
       ),
@@ -244,8 +247,9 @@ export default function (clearCache) {
       d.channels.forEach((ch) => {
         batch.push(
           c.env.DB.prepare(
-            `INSERT INTO channels (name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_tokens, support_tools, support_stream, response_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           ).bind(
+            ch.id || null,
             ch.name,
             ch.base_url || "",
             ch.api_key || "",
@@ -263,7 +267,9 @@ export default function (clearCache) {
             ch.tpm_limit || 0,
             ch.tpd_limit || 0,
             ch.max_tokens || 0,
-            ch.support_tools !== false ? 1 : 0,
+            ch.support_tools ? 1 : 0,
+            ch.support_stream ? 1 : 0,
+            ch.response_time || 0,
           ),
         );
       });
@@ -517,6 +523,7 @@ export default function (clearCache) {
               <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i class="bi bi-info-circle" title="優先調用相符的模型名、視覺、工具使用"></i> <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-info-circle" title="大值優先"></i> <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
+              <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('response_time')">Latency <i class="bi bi-info-circle" title="上次響應延遲"></i> <i id="sort-response_time" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i class="bi bi-info-circle" title="多次錯誤的不健康渠道將被跳過調用，可以手動重置狀態"></i> <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i></th>
               <th style="width: 150px" class="text-center border-0">Actions</th>
             </tr></thead>
@@ -595,15 +602,19 @@ export default function (clearCache) {
           <div class="col-3"><label class="form-label mini-label fw-bold">TPD</label><input type="number" id="ch-tpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
         </div>
         <div class="row g-2 mt-3 pt-2 border-top">
-          <div class="col-4 d-flex flex-column align-items-center">
+          <div class="col-3 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-vision">👁️ Vision</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
           </div>
-          <div class="col-4 d-flex flex-column align-items-center">
+          <div class="col-3 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-tools">🔧 Tools</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-tools" checked></div>
           </div>
-          <div class="col-4 d-flex flex-column align-items-center">
+          <div class="col-3 d-flex flex-column align-items-center">
+            <label class="form-check-label small fw-bold mb-1" for="ch-stream">🌊 Stream</label>
+            <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-stream" checked></div>
+          </div>
+          <div class="col-3 d-flex flex-column align-items-center">
             <label class="form-check-label small fw-bold mb-1" for="ch-enabled">✔️ Enabled</label>
             <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
           </div>
@@ -749,25 +760,13 @@ export default function (clearCache) {
         if (initData) { channels = initData; lastChannelsStr = JSON.stringify(channels); }
         filters = await api('/admin/api/filters', 'GET', null, false);
         renderStats(); renderChannels(); renderFilters();
-        if (!refreshTimer) refreshTimer = setInterval(async () => {
-          const d = await api('/admin/api', 'GET', null, false);
-          if (d) {
-            const dStr = JSON.stringify(d);
-            if (dStr !== lastChannelsStr) {
-              lastChannelsStr = dStr;
-              channels = d;
-              renderStats();
-              renderChannels();
-            }
-          }
-        }, 30000);
       };
 
       const renderStats = () => {
         const now = Math.floor(Date.now() / 1000);
         const total = channels.length;
         const enabled = channels.filter(c => c.is_enabled).length;
-        const cooling = channels.filter(c => c.is_enabled && (now - (c.last_429 || 0) < delay_period)).length;
+        const cooling = channels.filter(c => c.is_enabled && (c.last_429 > now)).length;
         const error = channels.filter(c => c.is_enabled && c.consecutive_errors >= 5 && (now - (c.last_error_at || 0) <= 1800)).length;
         const unstable = channels.filter(c => c.is_enabled && c.consecutive_errors > 0 && c.consecutive_errors < 5).length;
         const healthy = enabled - cooling - error - unstable;
@@ -850,7 +849,7 @@ export default function (clearCache) {
 
         const filtered = display.filter(c => c.name.toLowerCase().includes(query) || (c.model||'').toLowerCase().includes(query));
 
-        ['id','name','model','weight','status','provider'].forEach(k => {
+        ['id','name','model','weight','status','provider','response_time'].forEach(k => {
           const icon = document.getElementById('sort-' + k);
           if (!icon) return;
           icon.className = 'bi bi-arrow-down-up opacity-25';
@@ -880,9 +879,10 @@ export default function (clearCache) {
             '<td class="align-middle"><div class="form-check form-switch d-inline-block justify-content-center"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
             '<td class="align-middle">' + providerBadge + '</td>' +
             '<td class="fw-bold align-middle">' + c.name + '</td>' +
-            '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
+            '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(&quot;' + esc(c.model||'') + '&quot;)" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + (c.support_stream !== 0?' 🌊':'') + '</td>' +
             '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>' +
-            '<td class="align-middle">' + h + '</td>' +
+            '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>' +
+            '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>' +
             '<td class="align-middle">' +
               '<div class="d-none d-md-flex justify-content-center gap-1">' +
                 '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>' +
@@ -948,9 +948,22 @@ export default function (clearCache) {
         await api('/admin/api/filters', 'POST', filters); toast('過濾器已儲存', 'success'); renderFilters();
       };
       const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
-      const openChannelModal = () => { document.getElementById('ch-idx').value = ''; document.getElementById('ch-id').value = ''; const b = document.getElementById('ch-id-badge'); b.textContent = ''; b.style.display = 'none'; ['ch-name','ch-key','ch-url','ch-model','ch-fallback-model'].forEach(i=>document.getElementById(i).value=''); document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50; ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0); document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false; document.getElementById('ch-tools').checked=true; checkFetchModelsBtn(); chModal.show(); };
+      const openChannelModal = () => {
+        document.getElementById('ch-idx').value = '';
+        // Pre-calculate next available ID for UX
+        const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
+        let nextId = 1; while (existingIds.includes(nextId)) nextId++;
+        document.getElementById('ch-id').value = nextId;
+        const b = document.getElementById('ch-id-badge'); b.textContent = 'NEW #' + nextId; b.style.display = '';
+        ['ch-name','ch-key','ch-url','ch-model','ch-fallback-model'].forEach(i=>document.getElementById(i).value='');
+        document.getElementById('ch-provider').value = 'openai'; document.getElementById('ch-weight').value=50;
+        ['ch-rpm','ch-rpd','ch-tpm','ch-tpd','ch-tokens'].forEach(i=>document.getElementById(i).value=0);
+        document.getElementById('ch-enabled').checked=true; document.getElementById('ch-vision').checked=false;
+        document.getElementById('ch-tools').checked=true; document.getElementById('ch-stream').checked=true;
+        checkFetchModelsBtn(); chModal.show();
+      };
       const editChannel = (idx) => {
-        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-fallback-model').value = c.fallback_model || ''; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+        const c = channels[idx]; document.getElementById('ch-idx').value = idx; document.getElementById('ch-id').value = c.id || ''; const badge = document.getElementById('ch-id-badge'); if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; } else { badge.textContent = ''; badge.style.display = 'none'; } document.getElementById('ch-name').value = c.name; document.getElementById('ch-provider').value = c.provider || 'openai'; document.getElementById('ch-key').value = c.api_key; document.getElementById('ch-url').value = c.base_url; document.getElementById('ch-model').value = c.model; document.getElementById('ch-fallback-model').value = c.fallback_model || ''; document.getElementById('ch-weight').value = c.weight; document.getElementById('ch-tokens').value = c.max_tokens || 0; document.getElementById('ch-rpm').value = c.rpm_limit || 0; document.getElementById('ch-rpd').value = c.rpd_limit || 0; document.getElementById('ch-tpm').value = c.tpm_limit || 0; document.getElementById('ch-tpd').value = c.tpd_limit || 0; document.getElementById('ch-vision').checked = c.is_vision == 1; document.getElementById('ch-tools').checked = c.support_tools !== 0; document.getElementById('ch-stream').checked = c.support_stream !== 0; document.getElementById('ch-enabled').checked = c.is_enabled == 1;
         checkFetchModelsBtn();
         chModal.show();
       };
@@ -987,7 +1000,8 @@ export default function (clearCache) {
         const url = document.getElementById('ch-url').value.trim().replace(new RegExp('/+$'), '');
         if (!url) return toast('請輸入 Base URL', 'warning');
         const prev = idx !== '' ? channels[idx] : null;
-        const b = { name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, fallback_model: document.getElementById('ch-fallback-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0 };
+        const id = parseInt(document.getElementById('ch-id').value) || undefined;
+        const b = { id, name, api_key: document.getElementById('ch-key').value, base_url: url, provider: document.getElementById('ch-provider').value, model: document.getElementById('ch-model').value, fallback_model: document.getElementById('ch-fallback-model').value, weight: weight, max_tokens: parseInt(document.getElementById('ch-tokens').value), rpm_limit: parseInt(document.getElementById('ch-rpm').value), rpd_limit: parseInt(document.getElementById('ch-rpd').value), tpm_limit: parseInt(document.getElementById('ch-tpm').value), tpd_limit: parseInt(document.getElementById('ch-tpd').value), is_vision: document.getElementById('ch-vision').checked, support_tools: document.getElementById('ch-tools').checked ? 1 : 0, support_stream: document.getElementById('ch-stream').checked ? 1 : 0, is_enabled: document.getElementById('ch-enabled').checked, last_429: prev ? prev.last_429||0 : 0, consecutive_errors: prev ? prev.consecutive_errors||0 : 0, last_error_msg: prev ? prev.last_error_msg||'' : '', last_error_at: prev ? prev.last_error_at||0 : 0, response_time: prev ? prev.response_time||0 : 0 };
         if (idx !== '') channels[idx] = b; else channels.push(b); chModal.hide(); renderChannels(); renderStats(); toast(idx !== '' ? '已修改，請 SAVE ALL 儲存' : '已新增，請 SAVE ALL 儲存', 'success');
       };
       const delChannel = (idx) => { confirm('確定刪除此渠道？', () => { channels.splice(idx, 1); renderChannels(); renderStats(); }); };
@@ -1078,6 +1092,44 @@ export default function (clearCache) {
       };
 
       const resetAllHealth = async () => { confirm('重置所有渠道健康狀態？', async () => { await api('/admin/api/channels/reset-all-health', 'POST'); init(); }); };
+
+      const refreshHealthOnly = async () => {
+        if (document.body.classList.contains('modal-open')) return;
+        try {
+          const res = await api('/admin/api', 'GET', null, false);
+          if (!res) return;
+          const newChannels = res;
+          const now = Math.floor(Date.now() / 1000);
+          newChannels.forEach(nc => {
+            const realIdx = channels.findIndex(c => c.id === nc.id);
+            if (realIdx !== -1) {
+              channels[realIdx] = { ...channels[realIdx], ...nc };
+              const oc = channels[realIdx];
+              const healthEl = document.getElementById('ch-health-' + oc.id);
+              if (healthEl) {
+                let h = '<span class="badge bg-success health-badge">正常</span>';
+                if (oc.consecutive_errors >= 5) {
+                  if (now - (oc.last_error_at || 0) > 1800) h = '<span class="badge bg-secondary health-badge" title="觀察中" onclick="showDebug(' + realIdx + ')">觀察</span>';
+                  else h = '<span class="badge bg-danger health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">異常</span>';
+                }
+                else if (oc.last_429 > now) h = '<span class="badge bg-info health-badge" title="冷卻中" onclick="showDebug(' + realIdx + ')">冷卻</span>';
+                else if (oc.consecutive_errors > 0) h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
+                else if (oc.rpd_limit > 0 && (now - (oc.rpd_reset_at || 0)) < 86400 && (oc.rpd_count || 0) >= oc.rpd_limit) h = '<span class="badge bg-dark health-badge" title="RPD 限額">限額</span>';
+                healthEl.innerHTML = h;
+              }
+              const latencyEl = document.getElementById('ch-latency-' + oc.id);
+              if (latencyEl) latencyEl.textContent = oc.response_time ? (oc.response_time + 'ms') : '-';
+            }
+          });
+          renderStats();
+        } catch (e) {}
+      };
+
+      const startAutoRefresh = () => {
+        if (refreshTimer) clearInterval(refreshTimer);
+        refreshTimer = setInterval(refreshHealthOnly, 15000);
+      };
+
       const exportJson = () => {
         const now = new Date(); const pad = (n) => String(n).padStart(2, '0');
         const ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
@@ -1106,6 +1158,7 @@ export default function (clearCache) {
             if (data.valid) {
               sessionStorage.setItem('adminLoggedIn', '1');
               showAdmin();
+              startAutoRefresh();
             } else {
               sessionStorage.removeItem('adminToken');
               sessionStorage.removeItem('adminLoggedIn');
