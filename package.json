@@ -3,20 +3,11 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "setup": "npx wrangler d1 execute DB --local --file=./schema.sql",
-    "dev": "npx wrangler dev",
-    "start": "npm i && npm run setup && npm run dev",
-    "deploy": "npx wrangler d1 execute DB --remote --file=./schema.sql && npx wrangler deploy",
-    "reset-db": "node -e \"require('fs').rmSync('.wrangler/state/v3/d1', {recursive:true, force:true})\"",
-    "reset-pw": "npx wrangler d1 execute DB --local --command \"UPDATE config SET admin_password=NULL WHERE id=1\"",
-    "reset-remote-db": "npx wrangler d1 execute DB --remote --command \"DROP TABLE IF EXISTS channels; DROP TABLE IF EXISTS filters; DROP TABLE IF EXISTS config;\" && npx wrangler d1 execute DB --remote --file=./schema.sql",
-    "reset-remote-pw": "npx wrangler d1 execute DB --remote --command \"UPDATE config SET admin_password=NULL WHERE id=1\""
+    "start": "node --expose-gc src/index.js",
+    "dev": "node --expose-gc --watch src/index.js"
   },
   "dependencies": {
-    "hono": "^4.12.18"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260511.1",
-    "wrangler": "^4.90.0"
+    "hono": "^4.12.18",
+    "@hono/node-server": "^2.0.2"
   }
 }

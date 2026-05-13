@@ -1,15 +1,12 @@
-// ============================================================
-// OpenAI Provider — Canonical Format
-// This is the default/fallback provider
-// ============================================================
+// OpenAI Provider (預設)
 
 import { SKIP, DONE } from "./index.js";
 
 const provider = {
   name: "openai",
 
-  // ---- URL Building ---- //
-  buildUrl(baseUrl) {
+  // ---- URL Building (model param unused — OpenAI uses body, not URL) ---- //
+  buildUrl(baseUrl, _model) {
     let base = (baseUrl || "").trim().replace(/\/+$/, "");
     if (!base) return null;
     if (base.endsWith("/chat/completions")) return base;
@@ -31,6 +28,10 @@ const provider = {
   // ---- Stream Line Processing (upstream SSE → canonical events) ---- //
   processStreamLine(rawLine) {
     const trimmed = rawLine.trim();
+
+    // SSE comments (lines starting with ":") — skip
+    if (trimmed.startsWith(":") || trimmed.length === 0) return SKIP;
+
     if (!trimmed.startsWith("data:")) return SKIP;
 
     const dataStr = trimmed.startsWith("data: ")
@@ -38,6 +39,10 @@ const provider = {
       : trimmed.slice(5).trim();
 
     if (dataStr === "[DONE]") return DONE;
+
+    // Non-JSON data lines (e.g., upstream heartbeat ": heartbeat")
+    // — parse strictly; if not JSON, treat as a ping
+    if (dataStr.length > 0 && dataStr[0] !== "{" && dataStr[0] !== "[") return SKIP;
 
     try {
       const parsed = JSON.parse(dataStr);

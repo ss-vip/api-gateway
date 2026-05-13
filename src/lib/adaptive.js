@@ -232,3 +232,10 @@ export function getAdaptiveState(id) {
   const s = state.get(id);
   return s ? { ...s, blockedParams: s.blockedParams ? [...s.blockedParams] : null } : null;
 }
+
+// 清除已不存在的渠道之學習資料（避免記憶體堆積）
+export function cleanupState(validIds) {
+  for (const id of state.keys()) {
+    if (!validIds.has(id)) state.delete(id);
+  }
+}

@@ -1,10 +1,6 @@
-// ============================================================
-// Admin UI — HTML Shell with embedded SPA frontend
-// ============================================================
 import { Hono } from "hono";
-import { html } from "hono/html";
 
-export const UI_SHELL = html`<!DOCTYPE html>
+export const UI_SHELL = `<!DOCTYPE html>
 <html lang="zh-TW" data-bs-theme="light">
 <head>
   <meta charset="UTF-8" />
@@ -41,7 +37,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div id="loading-overlay"><div class="spinner-border text-light" role="status"></div></div>
+  <div id="loading-overlay" class="hide"><div class="spinner-border text-light" role="status"></div></div>
 
   <!-- Login View -->
   <div id="login-view" class="container py-5 mt-5">
@@ -122,6 +118,16 @@ export const UI_SHELL = html`<!DOCTYPE html>
                 <span class="input-group-text fw-bold small">Recovery Delay (s)</span>
                 <input type="number" id="cfg-recovery-period" class="form-control" />
               </div>
+            </div>
+          </div>
+          <div class="row g-2 mt-1">
+            <div class="col-12">
+              <div class="input-group input-group-sm">
+                <span class="input-group-text fw-bold small">DB Sync URL</span>
+                <input type="url" id="cfg-db-sync-url" class="form-control" placeholder="https://my-worker.workers.dev/api/sync-state (optional)" />
+                <button class="btn btn-outline-secondary" onclick="loadFromSync()" title="Load from DB Sync URL"><i class="bi bi-download"></i></button>
+              </div>
+              <div class="form-text text-muted mt-1" style="font-size:0.75rem">若填寫，每次儲存時會同步寫入到遠端 D1 資料庫</div>
             </div>
           </div>
         </div>
@@ -310,15 +316,17 @@ export const UI_SHELL = html`<!DOCTYPE html>
     // ================================================================
 
     // ---- Notifications ---- //
-    const notyf = new Notyf({
-      position: { x: 'right', y: 'bottom' },
-      ripple: true,
-      dismissible: true,
-      duration: 2500,
-    });
+    let _notyf = null;
+    const getNotyf = () => {
+      if (!_notyf && typeof Notyf !== 'undefined') {
+        _notyf = new Notyf({ position: { x: 'right', y: 'bottom' }, ripple: true, dismissible: true, duration: 2500 });
+      }
+      return _notyf;
+    };
     const toast = (msg, type) => {
-      if (type === 'danger') notyf.error(msg);
-      else notyf.success(msg);
+      const n = getNotyf();
+      if (!n) { alert(msg); return; }
+      if (type === 'danger') n.error(msg); else n.success(msg);
     };
     const confirmAction = (msg, onOk) => { if (window.confirm(msg)) onOk(); };
 
@@ -335,6 +343,8 @@ export const UI_SHELL = html`<!DOCTYPE html>
       if (show) {
         pendingRequests++;
         el.classList.remove('hide');
+        // Fail-safe: force hide after 10s if stuck
+        setTimeout(() => { if (pendingRequests > 0) { pendingRequests = 0; el.classList.add('hide'); } }, 10000);
       } else {
         pendingRequests = Math.max(0, pendingRequests - 1);
         if (pendingRequests === 0) el.classList.add('hide');
@@ -353,18 +363,18 @@ export const UI_SHELL = html`<!DOCTYPE html>
           },
           body: b ? JSON.stringify(b) : null,
         });
-        if (showLoader) loading(false);
         if (r.status === 401) { showLogin(); return null; }
         if (!r.ok) {
-          const err = await r.json();
+          const err = await r.json().catch(() => ({}));
           toast(err.error || 'Request Failed', 'danger');
           return null;
         }
-        return r.json();
+        return await r.json();
       } catch (e) {
-        if (showLoader) loading(false);
         toast('Network error: ' + e.message, 'danger');
         return null;
+      } finally {
+        if (showLoader) loading(false);
       }
     };
 
@@ -424,6 +434,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
       try {
         const r = await fetch('/admin/login', {
           method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password: p }),
         });
         const data = await r.json();
@@ -462,6 +473,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
         }
         const loginRes = await fetch('/admin/login', {
           method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ password: p }),
         });
         loading(false);
@@ -486,6 +498,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
       if (!cfg) return;
       document.getElementById('cfg-token').value = cfg.token;
       document.getElementById('cfg-recovery-period').value = cfg.recovery_period;
+      if (document.getElementById('cfg-db-sync-url')) document.getElementById('cfg-db-sync-url').value = cfg.db_sync_url || '';
       delay_period = cfg.recovery_period;
 
       const initData = await api('/admin/api', 'GET', null, false);
@@ -608,7 +621,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
         let h = '<span class="badge bg-success health-badge">正常</span>';
         if (c.consecutive_errors >= 5) {
           if (now - (c.last_error_at || 0) > 1800)
-            h = '<span class="badge bg-secondary health-badge" title="Observed (Retry soon)" onclick="showDebug(' + realIdx + ')">觀察</span>';
+            h = '<span class="badge bg-secondary health-badge" title="觀察中" onclick="showDebug(' + realIdx + ')">觀察</span>';
           else
             h = '<span class="badge bg-danger health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">異常</span>';
         } else if (now - (c.last_429 || 0) < delay_period) {
@@ -619,33 +632,40 @@ export const UI_SHELL = html`<!DOCTYPE html>
           h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
         }
 
-        const providerBadge = '<span class="badge badge-openai">OpenAI</span>';
-        return '<tr>' +
-          '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>' +
-          '<td class="align-middle"><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (c.is_enabled?'checked':'') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>' +
-          '<td class="fw-bold align-middle">' + esc(c.name) + '</td>' +
-          '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + esc(c.model||'') + '\')" title="點擊複製">' + (c.model || '-') + '</code> ' + (c.is_vision?'👁️':'') + (c.support_tools !== 0?' 🔧':'') + '</td>' +
-          '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>' +
-          '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>' +
-          '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>' +
-          '<td class="align-middle">' +
-            '<div class="d-none d-md-flex justify-content-center gap-1">' +
-              '<button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>' +
-              '<button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>' +
-              '<button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-1 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>' +
-              '<button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>' +
-            '</div>' +
-            '<div class="d-md-none dropdown">' +
-              '<button class="btn btn-sm btn-light py-1 px-2" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>' +
-              '<ul class="dropdown-menu dropdown-menu-end shadow border-0">' +
-                '<li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small">Edit</button></li>' +
-                '<li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>' +
-                '<li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small">Copy</button></li>' +
-                '<li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small text-danger">Delete</button></li>' +
-              '</ul>' +
-            '</div>' +
-          '</td>' +
-        '</tr>';
+        const visionIcon = c.is_vision ? " \u{1F441}\u{FE0F}" : "";
+        const toolsIcon = (c.support_tools !== 0) ? " \u{1F527}" : "";
+        const modelName = esc(c.model || "");
+        const displayName = (c.model || "-");
+
+        let row = '<tr>';
+        row += '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>';
+        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block">';
+        row += '<input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()">';
+        row += '</div></td>';
+        row += '<td class="fw-bold align-middle">' + esc(c.name) + '</td>';
+        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + toolsIcon + '</td>';
+        row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
+        row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
+        row += '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>';
+        row += '<td class="align-middle">';
+        row += '  <div class="d-none d-md-flex justify-content-center gap-1">';
+        row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
+        row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
+        row += '    <button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-1 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>';
+        row += '    <button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>';
+        row += '  </div>';
+        row += '  <div class="d-md-none dropdown">';
+        row += '    <button class="btn btn-sm btn-light py-1 px-2" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>';
+        row += '    <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
+        row += '      <li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small">Edit</button></li>';
+        row += '      <li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>';
+        row += '      <li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small">Copy</button></li>';
+        row += '      <li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small text-danger">Delete</button></li>';
+        row += '    </ul>';
+        row += '  </div>';
+        row += '</td>';
+        row += '</tr>';
+        return row;
       }).join('') || '<tr><td colspan="8" class="py-4 text-muted">No channels.</td></tr>';
       initTooltips();
     };
@@ -687,28 +707,79 @@ export const UI_SHELL = html`<!DOCTYPE html>
     // Filters
     // ================================================================
     const renderFilters = () => {
-      document.getElementById('filter-list').innerHTML = filters.map((f, i) =>
-        '<tr>' +
-          '<td class="align-middle"><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled?'checked':'') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>' +
-          '<td class="align-middle"><input type="text" class="form-control form-control-sm" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>' +
-          '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode==1?'selected':'') + '>Truncate</option><option value="0" ' + (f.mode==0?'selected':'') + '>Delete</option></select></td>' +
-          '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>' +
-        '</tr>'
-      ).join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
+      document.getElementById('filter-list').innerHTML = filters.map((f, i) => {
+        let row = '<tr>';
+        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
+        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>';
+        row += '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
+        row += '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
+        row += '</tr>';
+        return row;
+      }).join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
       initTooltips();
+    };
+
+    // ---- DB Sync ---- //
+    const getDbSyncUrl = () => document.getElementById('cfg-db-sync-url')?.value?.trim();
+
+    const syncToRemote = async () => {
+      const url = getDbSyncUrl();
+      if (!url || !url.startsWith('http')) return;
+      const base = url.replace(/\/+$/, '');
+      const token = sessionStorage.getItem('adminToken') || '';
+      try {
+        const [chRes, cfgRes] = await Promise.all([
+          fetch('/admin/api/export'),
+          fetch('/admin/api/config'),
+        ]);
+        const full = await chRes.json();
+        full.config = await cfgRes.json();
+        const r = await fetch(base + '/admin/api/import-all', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
+          body: JSON.stringify(full),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        toast('已同步至遠端資料庫', 'success');
+      } catch (e) {
+        toast('同步失敗: ' + e.message, 'warning');
+      }
+    };
+
+    const loadFromSync = async () => {
+      const url = getDbSyncUrl();
+      if (!url || !url.startsWith('http')) return toast('請先設定 DB Sync URL', 'warning');
+      if (!confirm('從遠端載入資料會覆蓋目前本地設定，確定？')) return;
+      const base = url.replace(/\/+$/, '');
+      const token = sessionStorage.getItem('adminToken') || '';
+      try {
+        const r = await fetch(base + '/admin/api/export', {
+          headers: { 'X-Admin-Token': token },
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const data = await r.json();
+        await api('/admin/api/import-all', 'POST', data);
+        toast('已從遠端載入 ' + (data.channels?.length || 0) + ' 個渠道', 'success');
+        init();
+      } catch (e) {
+        toast('載入失敗: ' + e.message, 'warning');
+      }
     };
 
     const saveConfig = async () => {
       await api('/admin/api/config', 'POST', {
         token: document.getElementById('cfg-token').value,
         recovery_period: document.getElementById('cfg-recovery-period').value,
+        db_sync_url: getDbSyncUrl(),
       });
       toast('設定已儲存', 'success');
+      syncToRemote();
     };
 
     const saveAllChannels = async () => {
       await api('/admin/api/batch-channels', 'POST', channels);
       toast('渠道已儲存', 'success');
+      syncToRemote();
       init();
     };
 
@@ -717,6 +788,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
       if (invalid.length > 0) return toast('過濾關鍵字長度須介於 1–30 字', 'warning');
       await api('/admin/api/filters', 'POST', filters);
       toast('過濾器已儲存', 'success');
+      syncToRemote();
       renderFilters();
     };
 
@@ -751,7 +823,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
       if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; }
       else { badge.textContent = ''; badge.style.display = 'none'; }
       document.getElementById('ch-name').value = c.name || '';
-      document.getElementById('ch-key').value = c.api_key || ''; // masked from server
+      document.getElementById('ch-key').value = c.api_key || ''; 
       document.getElementById('ch-url').value = c.base_url || '';
       document.getElementById('ch-model').value = c.model || '';
       document.getElementById('ch-fallback-model').value = c.fallback_model || '';
@@ -904,13 +976,20 @@ export const UI_SHELL = html`<!DOCTYPE html>
 
     const renderModelList = () => {
       const q = document.getElementById('model-search').value.toLowerCase();
-      const list = fetchedModels.filter(m => (m.id||m.name||'').toLowerCase().includes(q));
+      const list = fetchedModels.filter(m => (m.id || m.name || '').toLowerCase().includes(q));
       document.getElementById('models-list').innerHTML = list.map(m => {
+        const idName = m.id || m.name;
+        const safeId = esc(idName);
+        const maxTokens = m.max_tokens || 0;
+        const rpm = m.rpm || 0;
+        const rpd = m.rpd || 0;
+
         let limitText = '';
         if (m.max_tokens) limitText += 'MaxTokens: ' + m.max_tokens + ' ';
         if (m.rpm) limitText += 'RPM: ' + m.rpm + ' ';
         const subText = limitText ? '<br><small class="text-muted">' + limitText + '</small>' : '';
-        return '<button class="list-group-item list-group-item-action py-2" onclick="selectModel(\'' + esc(m.id||m.name) + '\', ' + (m.max_tokens||0) + ', ' + (m.rpm||0) + ', ' + (m.rpd||0) + ')"><strong>' + esc(m.id||m.name) + '</strong>' + subText + '</button>';
+
+        return '<button class="list-group-item list-group-item-action py-2" onclick="selectModel(\'' + safeId + '\', ' + maxTokens + ', ' + rpm + ', ' + rpd + ')"><strong>' + safeId + '</strong>' + subText + '</button>';
       }).join('') || '<div class="p-3 text-center text-muted">No models found</div>';
     };
 
@@ -921,7 +1000,6 @@ export const UI_SHELL = html`<!DOCTYPE html>
         if (maxTokens) document.getElementById('ch-tokens').value = maxTokens;
         if (rpm) document.getElementById('ch-rpm').value = rpm;
         if (rpd) document.getElementById('ch-rpd').value = rpd;
-        // Auto-detect vision/tools support
         const visionKeywords = ['vision', 'claude-3', 'gpt-4o', 'gemini-1.5', 'gemini-exp', 'gpt-4-turbo'];
         const hasVision = visionKeywords.some(k => id.includes(k));
         document.getElementById('ch-vision').checked = hasVision;
@@ -999,7 +1077,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
           if (latencyEl) latencyEl.textContent = oc.response_time ? (oc.response_time + 'ms') : '-';
         });
         renderStats();
-      } catch (e) { /* silent refresh failure */ }
+      } catch (e) { }
     };
 
     const startAutoRefresh = () => {
@@ -1051,6 +1129,7 @@ export const UI_SHELL = html`<!DOCTYPE html>
         if (await api('/admin/api/import-all', 'POST', d)) {
           toast('匯入成功', 'success');
           init();
+          syncToRemote();
         }
       };
       r.readAsText(e.target.files[0]);
@@ -1063,10 +1142,9 @@ export const UI_SHELL = html`<!DOCTYPE html>
       });
     };
 
-    // ================================================================
-    // [Q-5 FIX] Auth Check — no FOUC: all views start hidden
-    // ================================================================
+    // ---- Auth Check ---- //
     const checkAuth = async () => {
+      loading(true);
       try {
         const authRes = await fetch('/admin/api/auth-status');
         const authData = await authRes.json();
@@ -1099,27 +1177,25 @@ export const UI_SHELL = html`<!DOCTYPE html>
 
     // ---- Window Load ---- //
     window.onload = () => {
-      const theme = localStorage.getItem('theme') || 'light';
-      document.documentElement.setAttribute('data-bs-theme', theme);
-      document.getElementById('theme-icon').className = theme === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
-
-      chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
-      passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
-      debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
-      modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
-      modelsModal._element.addEventListener('hidden.bs.modal', () => { chModal.show(); });
-
-      const goTopBtn = document.getElementById('go-top-btn');
-      const updateGoTop = () => {
-        goTopBtn.style.display = (!document.body.classList.contains('modal-open') && window.scrollY > 200) ? 'block' : 'none';
-      };
-      window.addEventListener('scroll', updateGoTop);
-      [chModal, passModal, debugModal, modelsModal].forEach(m => {
-        m._element.addEventListener('shown.bs.modal', updateGoTop);
-        m._element.addEventListener('hidden.bs.modal', updateGoTop);
-      });
-
-      // [Q-5 FIX] No eager show of admin view — always go through checkAuth
+      try {
+        const theme = localStorage.getItem('theme') || 'light';
+        document.documentElement.setAttribute('data-bs-theme', theme);
+        document.getElementById('theme-icon').className = theme === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
+        chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
+        passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
+        debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
+        modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
+        modelsModal._element.addEventListener('hidden.bs.modal', () => { chModal.show(); });
+        const goTopBtn = document.getElementById('go-top-btn');
+        const updateGoTop = () => {
+          goTopBtn.style.display = (!document.body.classList.contains('modal-open') && window.scrollY > 200) ? 'block' : 'none';
+        };
+        window.addEventListener('scroll', updateGoTop);
+        [chModal, passModal, debugModal, modelsModal].forEach(m => {
+          m._element.addEventListener('shown.bs.modal', updateGoTop);
+          m._element.addEventListener('hidden.bs.modal', updateGoTop);
+        });
+      } catch (e) { console.error('[init]', e); }
       checkAuth();
     };
   </script>
@@ -1128,8 +1204,6 @@ export const UI_SHELL = html`<!DOCTYPE html>
 
 export default function () {
   const ui = new Hono();
-
   ui.get("/", (c) => c.html(UI_SHELL));
-
   return ui;
 }

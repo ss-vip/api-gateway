@@ -1,56 +1,22 @@
-// ============================================================
-// Dashboard Authentication
-// PBKDF2 password hashing + constant-time verification
-// Designed for Workers 10ms CPU budget: 1,000 iterations ≈ 2ms
-// ============================================================
-import { timingSafeEqual } from "hono/utils/buffer";
+// Dashboard 認證 (SHA-256, 輕量)
 
-const PBKDF2_ITERATIONS = 1_000;
 const PW_MIN_LENGTH = 6;
 const PW_MAX_LENGTH = 20;
 
 export { PW_MIN_LENGTH, PW_MAX_LENGTH };
 
-// ---- Password Hashing (PBKDF2, Workers Web Crypto API) ---- //
+// ---- Password Hashing (SHA-256, ~0.01ms CPU) ---- //
 export async function hashPassword(password) {
-  const encoder = new TextEncoder();
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const key = await crypto.subtle.importKey(
-    "raw", encoder.encode(password), { name: "PBKDF2" }, false, ["deriveBits"]
-  );
-  const hashBuffer = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
-    key, 256
-  );
-  const saltHex = bytesToHex(salt);
-  const hashHex = bytesToHex(new Uint8Array(hashBuffer));
-  return saltHex + ":" + hashHex;
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  return bytesToHex(new Uint8Array(hash));
 }
 
-// ---- Password Verification (constant-time) ---- //
+// ---- Password Verification (SHA-256 comparison) ---- //
 export async function verifyPassword(password, storedHash) {
-  if (!storedHash || storedHash.length < 32) return false;
-  const parts = storedHash.split(":");
-  if (parts.length !== 2) return false;
-  const [saltHex, storedHashHex] = parts;
-
-  const encoder = new TextEncoder();
-  const salt = hexToBytes(saltHex);
-  const key = await crypto.subtle.importKey(
-    "raw", encoder.encode(password), { name: "PBKDF2" }, false, ["deriveBits"]
-  );
-  const hashBuffer = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt, iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
-    key, 256
-  );
-  const inputHashHex = bytesToHex(new Uint8Array(hashBuffer));
-
-  // Constant-time: hash both inputs to guarantee equal length
-  const hashEq = async (s) => {
-    const buf = await crypto.subtle.digest("SHA-256", encoder.encode(s));
-    return bytesToHex(new Uint8Array(buf));
-  };
-  return timingSafeEqual(inputHashHex, storedHashHex, hashEq);
+  if (!storedHash || storedHash.length !== 64) return false;
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  const inputHashHex = bytesToHex(new Uint8Array(hash));
+  return inputHashHex === storedHash;
 }
 
 // ---- DB Helpers ---- //
@@ -71,8 +37,4 @@ export async function hasAdminPass(c) {
 // ---- Internal helpers ---- //
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function hexToBytes(hex) {
-  return new Uint8Array(hex.match(/.{2}/g).map((b) => parseInt(b, 16)));
 }

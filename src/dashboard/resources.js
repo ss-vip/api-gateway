@@ -125,9 +125,13 @@ export default function (clearCache) {
   api.get("/config", async (c) => {
     try {
       const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
-      return c.json({ token: cf?.client_token || DEFAULTS.token, recovery_period: cf?.recovery_period || DEFAULTS.delay_period });
+      return c.json({
+        token: cf?.client_token || DEFAULTS.token,
+        recovery_period: cf?.recovery_period || DEFAULTS.delay_period,
+        db_sync_url: cf?.db_sync_url || "",
+      });
     } catch (e) {
-      return c.json({ token: DEFAULTS.token, recovery_period: DEFAULTS.delay_period });
+      return c.json({ token: DEFAULTS.token, recovery_period: DEFAULTS.delay_period, db_sync_url: "" });
     }
   });
 
@@ -153,11 +157,11 @@ export default function (clearCache) {
     const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first();
     try {
       if (ex) {
-        await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
-          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period).run();
+        await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=?, db_sync_url=? WHERE id=1")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period, b.db_sync_url || "").run();
       } else {
-        await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
-          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period).run();
+        await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period, db_sync_url) VALUES (1, ?, ?, ?)")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period, b.db_sync_url || "").run();
       }
     } catch (e) {
       return c.json({ error: e.message }, 500);
@@ -202,6 +206,21 @@ export default function (clearCache) {
   // ================================================================
   // Import / Export / Reset
   // ================================================================
+
+  // GET /export: dump full state as JSON (backup / migrate / sync)
+  api.get("/export", async (c) => {
+    const [channels, filters] = await Promise.all([
+      c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
+      c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
+    ]);
+    const config = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
+    // Include raw api_key (masking breaks sync). Admin UI download uses separate display.
+    return c.json({
+      channels: channels.results || [],
+      filters: filters.results || [],
+      config: config ? { token: config.client_token, recovery_period: config.recovery_period, db_sync_url: config.db_sync_url || "" } : {},
+    });
+  });
 
   api.post("/import-all", async (c) => {
     const d = await c.req.json();
