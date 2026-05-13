@@ -1,5 +1,8 @@
-.log
-.DS_Store
 node_modules
 dist
+.log
+.DS_Store
+.dev.vars
 temp
+db.json
+*.tmp

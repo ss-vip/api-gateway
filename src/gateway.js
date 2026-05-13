@@ -1,6 +1,5 @@
 // API Gateway — 轉發核心
-import { log } from "./lib/logger.js";
-import { getProvider, SKIP, DONE } from "./lib/providers/index.js";
+import { getProvider, detectProvider, SKIP, DONE } from "./lib/providers/index.js";
 import {
   parseRetryAfter, record429, record503, recordError, recordSuccess, computeCooldown,
   parseErrorForLearning, extractBlockedParam, learnFromError,
@@ -74,7 +73,7 @@ async function flushDirtyRateCounters(env) {
   );
 
   await safeBatch(env.DB, updates).catch((e) =>
-    log("WARN", "rate", "flush failed", { error: e.message, count: updates.length })
+    console.error("[rate] flush failed:", e.message, "count:", updates.length)
   );
   lastDirtyFlush = Date.now();
 }
@@ -103,7 +102,7 @@ async function flushDirtyHealth(env) {
     )
   );
   await safeBatch(env.DB, updates).catch((e) =>
-    log("WARN", "health", "flush failed", { error: e.message, count: updates.length })
+    console.error("[health] flush failed:", e.message, "count:", updates.length)
   );
 }
 
@@ -444,9 +443,9 @@ function transformStream(readable, filters, responseModel, provider) {
   if (!hasFilters && !responseModel) {
     tier0Passthrough(readable, encoder, writer);
   } else if (!hasFilters && responseModel) {
-    tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => log("WARN", "stream", "tier1 error", { error: e.message }));
-  } else {
-    tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => log("WARN", "stream", "tier2 error", { error: e.message }));
+tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => console.error("[stream] tier1:", e.message));
+    } else {
+    tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => console.error("[stream] tier2:", e.message));
   }
   return out;
 }
@@ -515,7 +514,7 @@ async function loadCache(env) {
         };
         return cache.data;
       } catch (e) {
-        log("WARN", "cache", "load failed", { error: e.message });
+        console.error("[cache] load failed:", e.message);
         if (cache.data) return cache.data;
         throw e;
       }
@@ -561,7 +560,7 @@ async function handleChatRequest(c) {
     while (pool.length > 0) {
       const ch = selectChannel(pool);
       if (!ch) return errResponse(c, "Rate limited or cooldown", "rate_limit_error", 429);
-      const provider = getProvider(ch.provider);
+      const provider = getProvider(detectProvider(ch.base_url));
       const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
       const url = provider.buildUrl(ch.base_url, effectiveModel);
       if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
@@ -606,7 +605,7 @@ async function handleChatRequest(c) {
     }
     return errResponse(c, "All exhausted", "server_error", 503);
   } catch (e) {
-    log("ERROR", "gateway", "unhandled", { error: e.message });
+    console.error("[gateway] unhandled:", e.message);
     return errResponse(c, "Internal Error", "server_error", 500);
   }
 }
@@ -615,7 +614,7 @@ export function clearCache() {
   cache.data = null;
   cache.ts = 0;
   rateLimitCache = { data: {}, ts: 0 };
-  log("INFO", "gateway", "cache cleared");
+  console.log("[gateway] cache cleared");
 }
 
 export default function registerGateway(app) {

@@ -45,7 +45,7 @@ export default function (clearCache) {
 
   api.get("/", async (c) => {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, name, base_url, provider, model, weight,
+      `SELECT id, name, base_url, model, weight,
               is_enabled, is_vision, last_429, consecutive_errors,
               last_error_msg, last_error_at,
               rpm_limit, rpd_limit, rpm_count, rpm_reset_at,
@@ -70,9 +70,9 @@ export default function (clearCache) {
       const apiKey = isMaskedKey(ch.api_key) ? existingKeys[ch.id] || ch.api_key : ch.api_key || "";
       batch.push(
         c.env.DB.prepare(
-          `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
-          ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.provider || "openai",
+          ch.id || null, ch.name || "", ch.base_url || "", apiKey,
           ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
           ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
           ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
@@ -128,10 +128,9 @@ export default function (clearCache) {
       return c.json({
         token: cf?.client_token || DEFAULTS.token,
         recovery_period: cf?.recovery_period || DEFAULTS.delay_period,
-        db_sync_url: cf?.db_sync_url || "",
       });
     } catch (e) {
-      return c.json({ token: DEFAULTS.token, recovery_period: DEFAULTS.delay_period, db_sync_url: "" });
+      return c.json({ token: DEFAULTS.token, recovery_period: DEFAULTS.delay_period });
     }
   });
 
@@ -157,11 +156,11 @@ export default function (clearCache) {
     const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first();
     try {
       if (ex) {
-        await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=?, db_sync_url=? WHERE id=1")
-          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period, b.db_sync_url || "").run();
+        await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period).run();
       } else {
-        await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period, db_sync_url) VALUES (1, ?, ?, ?)")
-          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period, b.db_sync_url || "").run();
+        await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
+          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.delay_period).run();
       }
     } catch (e) {
       return c.json({ error: e.message }, 500);
@@ -218,7 +217,7 @@ export default function (clearCache) {
     return c.json({
       channels: channels.results || [],
       filters: filters.results || [],
-      config: config ? { token: config.client_token, recovery_period: config.recovery_period, db_sync_url: config.db_sync_url || "" } : {},
+      config: config ? { token: config.client_token, recovery_period: config.recovery_period } : {},
     });
   });
 
@@ -238,9 +237,9 @@ export default function (clearCache) {
         const apiKey = isMaskedKey(ch.api_key) ? existingKeys[ch.id] || ch.api_key : ch.api_key || "";
         batch.push(
           c.env.DB.prepare(
-            `INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
-          ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.provider || "openai",
+          ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
             ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
             ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,

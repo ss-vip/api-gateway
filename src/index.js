@@ -24,24 +24,35 @@ app.use("*", async (c, next) => {
   try { await next(); } finally { activeRequests--; }
 });
 
-// ---- 記憶體監控 + 垃圾清理（每 30 秒）---- //
-setInterval(() => {
+// ---- 惰性 GC：有請求進來時才檢查記憶體 ---- //
+let lastGc = 0;
+let lastCleanup = 0;
+function maybeGc() {
   const rss = Math.round(process.memoryUsage().rss / 1024 / 1024);
   if (rss > 400) {
     console.warn("[gc] high memory: " + rss + "MB");
     if (typeof global.gc === "function") global.gc();
   }
-  // 清除已刪除渠道的 adaptive 學習資料
-  cleanupState(new Set((_db.data.channels || []).map((c) => c.id)));
-}, 30000);
+}
+// 中間件：每 300 秒懶惰檢查記憶體 + 清除已刪除渠道的 adaptive 資料
+app.use("*", async (c, next) => {
+  try {
+    const now = Date.now();
+    if (now - lastGc > 300_000) { lastGc = now; maybeGc(); }
+    if (now - lastCleanup > 600_000) { lastCleanup = now;
+      cleanupState(new Set((_db.data?.channels || []).map((/** @type {any} */ ch) => ch.id)));
+    }
+  } catch (e) {}
+  await next();
+});
 
 // ---- 優雅關機 ---- //
-const shutdown = (sig) => { console.log("[exit] " + sig); _db.save(); process.exit(0); };
+const shutdown = (/** @type {string} */ sig) => { console.log("[exit] " + sig); _db.save(); process.exit(0); };
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ---- 共用中間層 ---- //
-app.use("*", (c, next) => {
+app.use("*", (/** @type {any} */ c, next) => {
   c.env = Object.assign(c.env || {}, { DB: c.env?.DB || _db });
   return next();
 });
@@ -57,21 +68,23 @@ app.use("*", cors({
 registerGateway(app);
 app.route("/admin", createDashboardApp(clearCache));
 app.get("/", (c) => c.redirect("/admin"));
+app.get("/health", (c) => c.json({
+  ok: true, uptime: process.uptime(), mem: Math.round(process.memoryUsage().rss / 1024 / 1024), channels: _db?.data?.channels?.length || 0,
+}));
 
 export default app;
 
 // ---- 啟動 ---- //
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const PORT = 7860;
-  const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
-    console.log("gateway running on :" + info.port);
-  });
-  server.on("error", (e) => {
-    if (e.code === "EADDRINUSE") {
-      console.error("[port] " + PORT + " in use, please check other processes");
-    } else {
-      console.error("[port] " + e.message);
-    }
-    process.exit(1);
-  });
-}
+const PORT = parseInt(process.env.PORT || "7860", 10);
+const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
+  console.log("gateway running on :" + info.port + " (" + process.pid + ")");
+  console.log("[routes] /health | /admin | /v1/chat/completions");
+});
+server.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    console.error("[port] " + PORT + " in use");
+  } else {
+    console.error("[port] " + e.message);
+  }
+  process.exit(1);
+});

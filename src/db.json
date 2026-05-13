@@ -6,8 +6,8 @@
     "client_token": "sk-test123456",
     "admin_password": "",
     "recovery_period": 300,
-    "db_sync_url": "",
     "created_at": 0,
-    "updated_at": 0
+    "updated_at": 1778683380,
+    "db_sync_url": ""
   }
 }

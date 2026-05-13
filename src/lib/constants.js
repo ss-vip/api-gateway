@@ -19,9 +19,12 @@ export const RPM_WINDOW_SECONDS = 60;
 export const RPD_WINDOW_SECONDS = 86400;
 
 // ---- Request Timeouts & Retries (free tier: minimize CPU & D1 writes) ---- //
-export const REQUEST_TIMEOUT_SECONDS = 15;
-export const TOTAL_TIMEOUT_SECONDS = 25;
-export const STREAM_IDLE_TIMEOUT_MS = 30_000;
+export const REQUEST_TIMEOUT_SECONDS = 120;
+export const TOTAL_TIMEOUT_SECONDS = 300;
+export const MAX_RETRIES = 5;
+export const RETRY_DELAY_BASE_MS = 200;
+export const RETRY_DELAY_VARIANCE_MS = 300;
+export const STREAM_IDLE_TIMEOUT_MS = 60_000;
 
 // ---- Cache (free tier: minimize D1 reads) ---- //
 export const CACHE_TTL_RATE_MS = 60_000;  // 60s: reduce D1 reads by 6× vs 10s

@@ -1,6 +1,6 @@
 // JsonDB — 記憶體資料庫 + 自動存檔
 // 介面相容 D1: prepare().bind().all() / first() / run()
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 const DEFAULT_CONFIG = {
@@ -8,7 +8,6 @@ const DEFAULT_CONFIG = {
   client_token: "sk-test123456",
   admin_password: "",
   recovery_period: 300,
-  db_sync_url: "",
   created_at: 0,
   updated_at: 0,
 };
@@ -67,7 +66,10 @@ export class JsonDB {
     try {
       const dir = dirname(this._filePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      writeFileSync(this._filePath, JSON.stringify(this.data, null, 2), "utf-8");
+      // Atomic write: write to tmp then rename (prevents corruption on crash)
+      const tmpPath = this._filePath + ".tmp";
+      writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), "utf-8");
+      renameSync(tmpPath, this._filePath);
     } catch (e) {
       console.error("[JsonDB] save failed:", e.message);
     }
@@ -263,28 +265,26 @@ export class JsonDB {
   }
 
   _insertChannels(sql, params) {
-    // INSERT INTO channels (id, name, base_url, api_key, provider, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     const id = params[0] !== null && params[0] !== undefined ? params[0] : this._nextId.channel++;
     const ch = {
       id,
       name: params[1] || "",
       base_url: params[2] || "",
       api_key: params[3] || "",
-      provider: params[4] || "openai",
-      model: params[5] || "",
-      weight: params[6] || 1,
-      is_enabled: params[7] !== undefined ? params[7] : 1,
-      is_vision: params[8] || 0,
-      last_429: params[9] || 0,
-      consecutive_errors: params[10] || 0,
-      last_error_msg: params[11] || "",
-      last_error_at: params[12] || 0,
-      rpm_limit: params[13] || 0,
-      rpd_limit: params[14] || 0,
-      max_tokens: params[15] || 0,
-      support_tools: params[16] !== undefined ? params[16] : 1,
-      response_time: params[17] || 0,
-      fallback_model: params[18] || "",
+      model: params[4] || "",
+      weight: params[5] || 1,
+      is_enabled: params[6] !== undefined ? params[6] : 1,
+      is_vision: params[7] || 0,
+      last_429: params[8] || 0,
+      consecutive_errors: params[9] || 0,
+      last_error_msg: params[10] || "",
+      last_error_at: params[11] || 0,
+      rpm_limit: params[12] || 0,
+      rpd_limit: params[13] || 0,
+      max_tokens: params[14] || 0,
+      support_tools: params[15] !== undefined ? params[15] : 1,
+      response_time: params[16] || 0,
+      fallback_model: params[17] || "",
       created_at: Math.floor(Date.now() / 1000),
       updated_at: Math.floor(Date.now() / 1000),
     };
@@ -342,11 +342,6 @@ export class JsonDB {
           cfg.admin_password = params[1];
           cfg.recovery_period = params[3];
         }
-      } else if (sqlLower.includes("db_sync_url")) {
-        // INSERT INTO config (id, client_token, recovery_period, db_sync_url) VALUES (1, ?, ?, ?)
-        cfg.client_token = params[0] || "sk-test123456";
-        cfg.recovery_period = parseInt(params[1]) || 300;
-        cfg.db_sync_url = params[2] || "";
       } else if (sqlLower.includes("client_token")) {
         cfg.client_token = params[0];
         if (params.length >= 2) cfg.recovery_period = parseInt(params[1]) || 300;
@@ -363,10 +358,6 @@ export class JsonDB {
 
     if (lower.includes("admin_password")) {
       cfg.admin_password = params[0] || "";
-    } else if (lower.includes("db_sync_url")) {
-      cfg.client_token = params[0] || "sk-test123456";
-      cfg.recovery_period = parseInt(params[1]) || 300;
-      cfg.db_sync_url = params[2] || "";
     } else if (lower.includes("client_token")) {
       cfg.client_token = params[0] || "sk-test123456";
       cfg.recovery_period = parseInt(params[1]) || 300;
