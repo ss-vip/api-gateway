@@ -32,7 +32,7 @@ export default function (clearCache) {
 
   api.get("/", async (c) => {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, name, base_url, model, weight,
+      `SELECT id, name, base_url, api_key, model, weight,
               is_enabled, is_vision, last_429, consecutive_errors,
               last_error_msg, last_error_at,
               rpm_limit, rpd_limit, rpm_count, rpm_reset_at,
@@ -40,7 +40,7 @@ export default function (clearCache) {
               response_time, fallback_model
        FROM channels ORDER BY id`
     ).all();
-    return c.json((results || []).map((ch) => ({ ...ch, api_key: maskApiKey(ch.api_key || "") })));
+    return c.json(results || []);
   });
 
   api.post("/batch-channels", async (c) => {
