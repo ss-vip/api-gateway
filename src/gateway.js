@@ -563,16 +563,18 @@ async function handleChatRequest(c) {
       let responseTime = 0;
       try {
         const startTime = Date.now();
+        const requestBody = JSON.stringify(pBody);
+        const requestHeaders = {
+          "Content-Type": "application/json",
+          "User-Agent": "PostmanRuntime/7.36.0",
+          "Accept": "application/json",
+          Authorization: "Bearer " + ch.api_key,
+          ...pHeaders,
+        };
         const res = await fetch(url, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": "PostmanRuntime/7.36.0",
-            "Accept": "application/json",
-            Authorization: "Bearer " + ch.api_key,
-            ...pHeaders,
-          },
-          body: JSON.stringify(pBody),
+          headers: requestHeaders,
+          body: requestBody,
           signal: controller.signal,
         });
         responseTime = Date.now() - startTime;
@@ -580,6 +582,13 @@ async function handleChatRequest(c) {
         if (!res.ok) {
           const errBody = await res.text().catch(() => "");
           const errText = errBody || ("HTTP " + res.status);
+          // Diagnostic: log full request details on non-429 errors
+          if (res.status !== 429 && errBody) {
+            console.log("[diag] POST", url);
+            console.log("[diag] headers:", JSON.stringify(requestHeaders));
+            console.log("[diag] body:", requestBody.slice(0, 2000));
+            console.log("[diag] response:", res.status, errBody.slice(0, 500));
+          }
           if (res.status === 429) {
             record429(ch.id, parseRetryAfter(res));
             ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
@@ -595,7 +604,7 @@ async function handleChatRequest(c) {
           }
           ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
           ch.last_error_at = Math.floor(Date.now() / 1000);
-          ch.last_error_msg = errText;
+          ch.last_error_msg = JSON.stringify({ message: errText, url, request: pBody, response: errBody });
           ch.response_time = responseTime;
           healthDirtyChannels.add(ch.id);
           pool = pool.filter(p => p.id !== ch.id);
@@ -621,7 +630,7 @@ async function handleChatRequest(c) {
         recordError(ch.id);
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
-        ch.last_error_msg = e.message || "Request timeout or network error";
+        ch.last_error_msg = JSON.stringify({ message: e.message || "Request timeout or network error", url, request: pBody, response: "" });
         ch.response_time = responseTime || 0;
         healthDirtyChannels.add(ch.id);
         pool = pool.filter(p => p.id !== ch.id);

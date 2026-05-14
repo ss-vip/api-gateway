@@ -103,8 +103,12 @@ const ERROR_PATTERNS = [
 ];
 
 export function parseErrorForLearning(errText, status) {
-  if (status !== 400) return null;
   const lower = String(errText || "").toLowerCase();
+  // Detect Axum/500: auth extension missing (e.g. NVIDIA custom API)
+  if (status >= 500 && /missing request extension.*authorization.*bearer/i.test(lower)) {
+    return "authDefect";
+  }
+  if (status !== 400) return null;
   for (const p of ERROR_PATTERNS) {
     if (p.re.test(lower)) return p.key;
   }
