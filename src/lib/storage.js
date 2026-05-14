@@ -116,7 +116,7 @@ export class JsonDB {
         if (upper.includes("WHERE ID IN")) {
           rows = rows.filter((r) => params.includes(r.id));
         }
-        else if (upper.includes("IS_ENABLED=1") || upper.includes("IS_ENABLED = 1")) {
+        if (upper.includes("IS_ENABLED=1") || upper.includes("IS_ENABLED = 1")) {
           rows = rows.filter((r) => r.is_enabled === 1);
         }
 
@@ -186,41 +186,41 @@ export class JsonDB {
 
   _updateChannels(sql, params) {
     const lower = sql.toLowerCase();
-    let idx = 0;
-    const row = this.data.channels.find((c) => {
-      const whereIdx = Math.max(
-        sql.toUpperCase().lastIndexOf("WHERE ID="),
-        sql.toUpperCase().lastIndexOf("WHERE ID =")
-      );
-      const idIdx = params.length - 1;
-      return c.id === params[idIdx];
-    });
-    if (!row) return { success: true, meta: { changes: 0 } };
+    const hasWhere = sql.toUpperCase().includes("WHERE ID=") || sql.toUpperCase().includes("WHERE ID =");
+    const rows = hasWhere
+      ? this.data.channels.filter((c) => {
+          const idIdx = params.length - 1;
+          const idParam = params[idIdx];
+          return String(c.id) === String(idParam);
+        })
+      : this.data.channels;
 
-    if (lower.includes("rpm_count=")) {
-      row.rpm_count = params[0];
-      row.rpm_reset_at = params[1];
-      row.rpd_count = params[2];
-      row.rpd_reset_at = params[3];
-    } else if (lower.includes("consecutive_errors=")) {
-      row.consecutive_errors = params[0];
-      row.last_error_msg = params[1] || "";
-      row.last_error_at = params[2] || 0;
-      row.response_time = params[3] || 0;
-      if (params.length >= 5) row.last_429 = params[4] || 0;
-    } else if (lower.includes("last_429=0")) {
-      row.last_429 = 0;
-      row.consecutive_errors = 0;
-      row.last_error_msg = "";
-      row.last_error_at = 0;
-    } else if (lower.includes("response_time=")) {
-      row.consecutive_errors = 0;
-      row.response_time = params[0];
+    if (rows.length === 0) return { success: true, meta: { changes: 0 } };
+
+    for (const row of rows) {
+      if (lower.includes("rpm_count=")) {
+        row.rpm_count = params[0];
+        row.rpm_reset_at = params[1];
+        row.rpd_count = params[2];
+        row.rpd_reset_at = params[3];
+      } else if (lower.includes("last_429=0")) {
+        // Must check BEFORE "consecutive_errors=" because reset SQL has BOTH patterns
+        row.last_429 = 0;
+        row.consecutive_errors = 0;
+        row.last_error_msg = "";
+        row.last_error_at = 0;
+      } else if (lower.includes("consecutive_errors=")) {
+        row.consecutive_errors = params[0];
+        row.last_error_msg = params[1] || "";
+        row.last_error_at = params[2] || 0;
+        row.response_time = params[3] || 0;
+        if (params.length >= 5) row.last_429 = params[4] || 0;
+      }
+      row.updated_at = Math.floor(Date.now() / 1000);
     }
 
-    row.updated_at = Math.floor(Date.now() / 1000);
     this._markDirty();
-    return { success: true, meta: { changes: 1 } };
+    return { success: true, meta: { changes: rows.length } };
   }
 
   _insertChannels(sql, params) {

@@ -481,7 +481,7 @@
 
       const initData = await api('/admin/api', 'GET', null, false);
       if (initData) { channels = initData; lastChannelsStr = JSON.stringify(channels); }
-      filters = await api('/admin/api/filters', 'GET', null, false);
+      filters = (await api('/admin/api/filters', 'GET', null, false)) || [];
       renderStats();
       renderChannels();
       renderFilters();
@@ -718,7 +718,11 @@
       }).catch(() => {});
       await api('/admin/api/batch-channels', 'POST', channels).catch(() => {});
       const invalid = filters.filter(f => !f.text || f.text.trim().length === 0 || f.text.length > 30);
-      if (invalid.length === 0) await api('/admin/api/filters', 'POST', filters).catch(() => {});
+      if (invalid.length === 0) {
+        await api('/admin/api/filters', 'POST', filters).catch(() => {});
+      } else {
+        toast(invalid.length + ' 個過濾器關鍵字無效（1-30字），已跳過', 'warning');
+      }
       toast('全部已儲存', 'success');
       init();
     };
@@ -964,7 +968,7 @@
         if (!res) return;
         const now = Math.floor(Date.now() / 1000);
         res.forEach(nc => {
-          const realIdx = channels.findIndex(c => c.id === nc.id);
+          const realIdx = channels.findIndex(c => Number(c.id) === Number(nc.id));
           if (realIdx === -1) return;
           const oc = channels[realIdx];
           oc.last_429 = nc.last_429;

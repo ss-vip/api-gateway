@@ -2,6 +2,7 @@ import { getProvider, detectProvider, SKIP, DONE } from "./lib/providers/index.j
 import {
   parseRetryAfter, record429, recordError, recordSuccess,
   isVisionExcluded, isToolsExcluded,
+  parseErrorForLearning, learnFromError, extractBlockedParam,
 } from "./lib/adaptive.js";
 import {
   TOOL_NAME_MAX_LENGTH, FILTER_TEXT_MAX_LENGTH,
@@ -587,6 +588,11 @@ async function handleChatRequest(c) {
             return c.json({ error: { message: "Upstream rate limited" } }, 429);
           }
           recordError(ch.id);
+          const errPattern = parseErrorForLearning(errText, res.status);
+          if (errPattern) {
+            const blockedParam = errPattern === "unknownParam" ? extractBlockedParam(errText) : null;
+            learnFromError(ch.id, errPattern, blockedParam);
+          }
           ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
           ch.last_error_at = Math.floor(Date.now() / 1000);
           ch.last_error_msg = errText;

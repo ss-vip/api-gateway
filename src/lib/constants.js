@@ -16,7 +16,7 @@ export const CACHE_TTL_NORMAL_MS = 120_000;
 
 export const D1_BATCH_MAX = 100;
 export const RATE_PERSIST_THRESHOLD = 0.7;
-export const HEALTH_PERSIST_INTERVAL_MS = 60_000;
+export const HEALTH_PERSIST_INTERVAL_MS = 15_000;
 
 export const MAX_IMAGE_BASE64_BYTES = 5_242_880;
 
