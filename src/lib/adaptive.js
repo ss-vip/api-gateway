@@ -1,4 +1,4 @@
-import { COOLDOWN_MAX_SECONDS } from "./constants.js";
+import { BACKOFF_MAX_SECONDS } from "./constants.js";
 
 const state = new Map();
 
@@ -56,21 +56,21 @@ export function computeCooldown(chId, errorType) {
 function calc(avg, consecutive, base, minVal) {
   const exp = Math.min(consecutive, 4);
   const cd = avg ? avg * Math.pow(2, exp) : base * Math.pow(2, exp);
-  return Math.max(minVal, Math.min(Math.round(cd), COOLDOWN_MAX_SECONDS));
+  return Math.max(minVal, Math.min(Math.round(cd), BACKOFF_MAX_SECONDS));
 }
 
 export function record429(chId, retryAfter) {
   const s = get(chId);
   s.consecutive429s++; s.consecutiveErrors++;
   s.last429At = Date.now(); s.lastErrorAt = Date.now();
-  if (retryAfter > 0) s.avg429Recovery = runningAvg(s.avg429Recovery, Math.min(retryAfter, COOLDOWN_MAX_SECONDS), WEIGHT_RECENT);
+  if (retryAfter > 0) s.avg429Recovery = runningAvg(s.avg429Recovery, Math.min(retryAfter, BACKOFF_MAX_SECONDS), WEIGHT_RECENT);
 }
 
 export function record503(chId, retryAfter) {
   const s = get(chId);
   s.consecutive503s++; s.consecutiveErrors++;
   s.last503At = Date.now(); s.lastErrorAt = Date.now();
-  if (retryAfter > 0) s.avg503Recovery = runningAvg(s.avg503Recovery, Math.min(retryAfter, COOLDOWN_MAX_SECONDS), WEIGHT_RECENT);
+  if (retryAfter > 0) s.avg503Recovery = runningAvg(s.avg503Recovery, Math.min(retryAfter, BACKOFF_MAX_SECONDS), WEIGHT_RECENT);
 }
 
 export function recordError(chId) {
@@ -83,7 +83,7 @@ export function recordSuccess(chId) {
   const now = Date.now();
   if (s.consecutiveErrors > 0) {
     const recSec = Math.round((now - s.lastErrorAt) / 1000);
-    if (recSec >= 5 && recSec <= COOLDOWN_MAX_SECONDS) {
+    if (recSec >= 5 && recSec <= BACKOFF_MAX_SECONDS) {
       if (s.consecutive429s > 0) s.avg429Recovery = runningAvg(s.avg429Recovery, recSec, WEIGHT_RECENT);
       if (s.consecutive503s > 0) s.avg503Recovery = runningAvg(s.avg503Recovery, recSec, WEIGHT_RECENT);
       if (s.consecutiveErrors > 0) s.avgErrorRecovery = runningAvg(s.avgErrorRecovery, recSec, WEIGHT_RECENT);

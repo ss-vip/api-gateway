@@ -1,11 +1,11 @@
 import { getProvider, detectProvider, SKIP, DONE } from "./lib/providers/index.js";
 import {
-  parseRetryAfter, record429, record503, recordError, recordSuccess, computeCooldown,
-  parseErrorForLearning, extractBlockedParam, learnFromError,
-  isVisionExcluded, isToolsExcluded, requiresMaxTokens, getBlockedParams,
+  parseRetryAfter, record429, recordError, recordSuccess,
+  isVisionExcluded, isToolsExcluded,
 } from "./lib/adaptive.js";
 import {
-  COOLDOWN_ERROR_THRESHOLD, COOLDOWN_429_DEFAULT_SECONDS, COOLDOWN_MAX_SECONDS,
+  TOOL_NAME_MAX_LENGTH, FILTER_TEXT_MAX_LENGTH,
+  BACKOFF_ERROR_THRESHOLD, BACKOFF_429_SECONDS, BACKOFF_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
   REQUEST_TIMEOUT_SECONDS,
   CACHE_TTL_RATE_MS, CACHE_TTL_NORMAL_MS,
@@ -195,11 +195,11 @@ class RollingFilter {
 }
 
 function exponentialCooldown(consecutiveErrors) {
-  if (consecutiveErrors <= COOLDOWN_ERROR_THRESHOLD) return 0;
-  const exponent = Math.min(consecutiveErrors - COOLDOWN_ERROR_THRESHOLD, 4);
+  if (consecutiveErrors <= BACKOFF_ERROR_THRESHOLD) return 0;
+  const exponent = Math.min(consecutiveErrors - BACKOFF_ERROR_THRESHOLD, 4);
   return Math.min(
-    COOLDOWN_429_DEFAULT_SECONDS * Math.pow(2, exponent),
-    COOLDOWN_MAX_SECONDS
+    BACKOFF_429_SECONDS * Math.pow(2, exponent),
+    BACKOFF_MAX_SECONDS
   );
 }
 
@@ -207,7 +207,7 @@ function selectChannel(channels) {
   const now = Math.floor(Date.now() / 1000);
   const available = channels.filter((c) => {
     if (!c.is_enabled) return false;
-    if (c.consecutive_errors >= COOLDOWN_ERROR_THRESHOLD &&
+    if (c.consecutive_errors >= BACKOFF_ERROR_THRESHOLD &&
         now - (c.last_error_at || 0) <= exponentialCooldown(c.consecutive_errors)) return false;
     if (c.last_429 > now) return false;
     if (c.rpm_limit > 0 &&
@@ -426,12 +426,18 @@ function transformStream(readable, filters, responseModel, provider) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const hasFilters = filters && filters.length > 0;
-  if (!hasFilters && !responseModel) {
-    tier0Passthrough(readable, encoder, writer);
-  } else if (!hasFilters && responseModel) {
-tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => console.error("[stream] tier1:", e.message));
+  const closeWriter = () => { try { writer.close(); } catch (e) {} };
+  try {
+    if (!hasFilters && !responseModel) {
+      tier0Passthrough(readable, encoder, writer);
+    } else if (!hasFilters && responseModel) {
+      tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => { console.error("[stream] tier1:", e.message); closeWriter(); });
     } else {
-    tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => console.error("[stream] tier2:", e.message));
+      tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
+    }
+  } catch (e) {
+    console.error("[stream] setup error:", e.message);
+    closeWriter();
   }
   return out;
 }
@@ -493,7 +499,7 @@ async function loadCache(env) {
             filters: fl.results || [],
             config: {
               client_token: cf?.client_token || "sk-test123456",
-              recovery_period: parseInt(cf?.recovery_period) || COOLDOWN_429_DEFAULT_SECONDS,
+              recovery_period: parseInt(cf?.recovery_period) || BACKOFF_429_SECONDS,
             },
           },
           ts: Date.now(),
@@ -558,14 +564,21 @@ async function handleChatRequest(c) {
         const startTime = Date.now();
         const res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key, ...pHeaders },
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "PostmanRuntime/7.36.0",
+            "Accept": "application/json",
+            Authorization: "Bearer " + ch.api_key,
+            ...pHeaders,
+          },
           body: JSON.stringify(pBody),
           signal: controller.signal,
         });
         responseTime = Date.now() - startTime;
         clearTimeout(timeoutId);
         if (!res.ok) {
-          const errText = await res.text().catch(() => "Error");
+          const errBody = await res.text().catch(() => "");
+          const errText = errBody || ("HTTP " + res.status);
           if (res.status === 429) {
             record429(ch.id, parseRetryAfter(res));
             ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
