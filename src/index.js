@@ -14,6 +14,11 @@ const DB_PATH = resolve(__dirname, "db.json");
 
 const _db = new JsonDB(null, DB_PATH);
 
+app.use("*", async (c, next) => {
+  console.log("[request] " + c.req.method + " " + c.req.path + " source=" + (c.req.header("user-agent") || "?"));
+  await next();
+});
+
 let activeRequests = 0;
 app.use("*", async (c, next) => {
   if (activeRequests >= 50) return c.json({ error: "overload", type: "overload" }, 503);
@@ -60,6 +65,18 @@ app.get("/", (c) => c.redirect("/admin"));
 app.get("/health", (c) => c.json({
   ok: true, uptime: process.uptime(), mem: Math.round(process.memoryUsage().rss / 1024 / 1024), channels: _db?.data?.channels?.length || 0,
 }));
+
+app.notFound((c) => c.json({
+  error: "not_found",
+  path: c.req.path,
+  method: c.req.method,
+  message: "Route not found: " + c.req.method + " " + c.req.path,
+}, 404));
+
+app.onError((err, c) => {
+  console.error("[error]", err.message);
+  return c.json({ error: "internal_error", message: err.message }, 500);
+});
 
 export function shutdownDb() {
   _db.save();
