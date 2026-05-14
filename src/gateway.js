@@ -432,18 +432,7 @@ function transformStream(readable, filters, responseModel, provider) {
       tier0Passthrough(readable, encoder, writer);
     } else if (!hasFilters && responseModel) {
       tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => { console.error("[stream] tier1:", e.message); closeWriter(); });
-  const closeWriter = () => { try { writer.close(); } catch (e) {} };
-  try {
-    if (!hasFilters && !responseModel) {
-      tier0Passthrough(readable, encoder, writer);
-    } else if (!hasFilters && responseModel) {
-      tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => { console.error("[stream] tier1:", e.message); closeWriter(); });
     } else {
-      tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
-    }
-  } catch (e) {
-    console.error("[stream] setup error:", e.message);
-    closeWriter();
       tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
     }
   } catch (e) {
@@ -575,13 +564,6 @@ async function handleChatRequest(c) {
         const startTime = Date.now();
         const res = await fetch(url, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": "PostmanRuntime/7.36.0",
-            "Accept": "application/json",
-            Authorization: "Bearer " + ch.api_key,
-            ...pHeaders,
-          },
           headers: {
             "Content-Type": "application/json",
             "User-Agent": "PostmanRuntime/7.36.0",
