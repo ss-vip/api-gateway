@@ -5,6 +5,7 @@ import {
   isVisionExcluded, isToolsExcluded, requiresMaxTokens, getBlockedParams,
 } from "./lib/adaptive.js";
 import {
+  TOOL_NAME_MAX_LENGTH, FILTER_TEXT_MAX_LENGTH,
   COOLDOWN_ERROR_THRESHOLD, COOLDOWN_429_DEFAULT_SECONDS, COOLDOWN_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
   REQUEST_TIMEOUT_SECONDS,
@@ -426,12 +427,18 @@ function transformStream(readable, filters, responseModel, provider) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const hasFilters = filters && filters.length > 0;
-  if (!hasFilters && !responseModel) {
-    tier0Passthrough(readable, encoder, writer);
-  } else if (!hasFilters && responseModel) {
-tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => console.error("[stream] tier1:", e.message));
+  const closeWriter = () => { try { writer.close(); } catch (e) {} };
+  try {
+    if (!hasFilters && !responseModel) {
+      tier0Passthrough(readable, encoder, writer);
+    } else if (!hasFilters && responseModel) {
+      tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => { console.error("[stream] tier1:", e.message); closeWriter(); });
     } else {
-    tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => console.error("[stream] tier2:", e.message));
+      tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
+    }
+  } catch (e) {
+    console.error("[stream] setup error:", e.message);
+    closeWriter();
   }
   return out;
 }
@@ -558,7 +565,13 @@ async function handleChatRequest(c) {
         const startTime = Date.now();
         const res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key, ...pHeaders },
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent": "PostmanRuntime/7.36.0",
+            "Accept": "application/json",
+            Authorization: "Bearer " + ch.api_key,
+            ...pHeaders,
+          },
           body: JSON.stringify(pBody),
           signal: controller.signal,
         });

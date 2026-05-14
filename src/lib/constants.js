@@ -20,6 +20,6 @@ export const HEALTH_PERSIST_INTERVAL_MS = 60_000;
 
 export const MAX_IMAGE_BASE64_BYTES = 5_242_880;
 
-export const STREAM_MAX_DURATION_MS = 20_000;
+export const STREAM_MAX_DURATION_MS = 120_000;
 
 export const STREAM_BUF_MAX_BYTES = 524_288;

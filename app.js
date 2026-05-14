@@ -2,8 +2,8 @@ import { serve } from "@hono/node-server";
 import app, { shutdownDb } from "./src/index.js";
 
 const PORT = parseInt(process.env.PORT || "7860", 10);
-const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
-  console.log("[gateway] running on :" + info.port + " (" + process.pid + ")");
+const server = serve({ fetch: app.fetch, port: PORT }, () => {
+  console.log("[gateway] running on :" + PORT + " (" + process.pid + ")");
   console.log("[routes] /health | /admin | /v1/chat/completions");
 });
 
