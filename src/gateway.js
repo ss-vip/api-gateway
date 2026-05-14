@@ -547,6 +547,8 @@ async function handleChatRequest(c) {
     let pool = data.channels.filter((ch) => ch.is_enabled && (!hasVisionContent || ch.is_vision));
     if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
     pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && isToolsExcluded(ch.id)));
+    // Skip channels with max_tokens limit exceeded
+    if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
     pool.sort((a, b) => (b.model === originalModel ? 1 : 0) - (a.model === originalModel ? 1 : 0));
     while (pool.length > 0) {

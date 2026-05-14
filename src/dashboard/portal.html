@@ -1013,8 +1013,10 @@
       const pad = (n) => String(n).padStart(2, '0');
       const ts = now.getFullYear() + pad(now.getMonth()+1) + pad(now.getDate()) + '-' + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
       const cleanChannels = channels.map(c => ({
+        id: c.id,
         name: c.name,
         base_url: c.base_url,
+        api_key: c.api_key || "",
         model: c.model,
         fallback_model: c.fallback_model || "",
         weight: c.weight || 50,

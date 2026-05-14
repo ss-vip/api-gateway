@@ -45,16 +45,13 @@ export default function (clearCache) {
 
   api.post("/batch-channels", async (c) => {
     const channels = await c.req.json();
-    const maskedIds = channels.filter((ch) => ch.id != null && isMaskedKey(ch.api_key)).map((ch) => ch.id);
-    const existingKeys = {};
-    if (maskedIds.length > 0) {
-      const ph = maskedIds.map(() => "?").join(",");
-      const existing = await c.env.DB.prepare(`SELECT id, api_key FROM channels WHERE id IN (${ph})`).bind(...maskedIds).all();
-      for (const row of existing.results || []) existingKeys[row.id] = row.api_key;
-    }
+    // Fetch ALL current api_keys to prevent masked-key corruption
+    const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
+    const allKeys = {};
+    for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of channels) {
-      const apiKey = isMaskedKey(ch.api_key) ? existingKeys[ch.id] || ch.api_key : ch.api_key || "";
+      const apiKey = isMaskedKey(ch.api_key) ? (allKeys[ch.id] || "") : ch.api_key || "";
       batch.push(
         c.env.DB.prepare(
           `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
@@ -199,15 +196,11 @@ export default function (clearCache) {
     const batch = [];
     if (d.channels) {
       batch.push(c.env.DB.prepare("DELETE FROM channels"));
-      const maskedIds = d.channels.filter((ch) => ch.id != null && isMaskedKey(ch.api_key)).map((ch) => ch.id);
-      const existingKeys = {};
-      if (maskedIds.length > 0) {
-        const ph = maskedIds.map(() => "?").join(",");
-        const existing = await c.env.DB.prepare(`SELECT id, api_key FROM channels WHERE id IN (${ph})`).bind(...maskedIds).all();
-        for (const row of existing.results || []) existingKeys[row.id] = row.api_key;
-      }
+      const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
+      const allKeys = {};
+      for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
       for (const ch of d.channels) {
-        const apiKey = isMaskedKey(ch.api_key) ? existingKeys[ch.id] || ch.api_key : ch.api_key || "";
+        const apiKey = isMaskedKey(ch.api_key) ? (allKeys[ch.id] || "") : ch.api_key || "";
         batch.push(
           c.env.DB.prepare(
             `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`

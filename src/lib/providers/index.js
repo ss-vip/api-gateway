@@ -22,6 +22,8 @@ const HOST_RULES = [
 export function detectProvider(baseUrl) {
   if (!baseUrl) return "openai";
   const lower = baseUrl.toLowerCase();
+  // OpenAI-compatible endpoints (e.g. Google's /v1beta/openai)
+  if (lower.includes("/openai")) return "openai";
   for (const rule of HOST_RULES) {
     if (lower.includes(rule.pattern)) return rule.provider;
   }
