@@ -182,7 +182,7 @@ function runningAvg(current, newVal, weight) {
 
 export function getAdaptiveState(id) {
   const s = state.get(id);
-  return s ? { ...s, blockedParams: s.blockedParams ? [...s.blockedParams] : null } : null;
+  return s ? { ...s, blockedParams: s.blockedParams ? new Set(s.blockedParams) : null } : null;
 }
 
 export function cleanupState(validIds) {

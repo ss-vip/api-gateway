@@ -207,6 +207,7 @@ export class JsonDB {
       row.last_error_msg = params[1] || "";
       row.last_error_at = params[2] || 0;
       row.response_time = params[3] || 0;
+      if (params.length >= 5) row.last_429 = params[4] || 0;
     } else if (lower.includes("last_429=0")) {
       row.last_429 = 0;
       row.consecutive_errors = 0;

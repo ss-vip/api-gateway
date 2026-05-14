@@ -42,8 +42,11 @@
     if(e)e.classList.add('hide');
     document.body.classList.remove('loading');
     var l=document.getElementById('login-view'),s=document.getElementById('setup-view'),a=document.getElementById('admin-view');
-    if(l&&s&&a&&l.style.display!=='block'&&s.style.display!=='block'&&a.style.display!=='block')l.style.display='block';
-  },8000);
+    if(l&&s&&a&&l.style.display!=='block'&&s.style.display!=='block'&&a.style.display!=='block'){
+      l.style.display='block';
+      document.getElementById('login-pass')?.focus();
+    }
+  },15000);
   </script>
 
   <div id="login-view" class="container py-5 mt-5">
@@ -139,7 +142,7 @@
           <div class="d-flex gap-2">
             <button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button>
             <button onclick="resetAllHealth()" class="btn btn-outline-success btn-sm px-3 fw-bold">RESET ALL HEALTH</button>
-            <button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button>
+            <button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE</button>
           </div>
         </div>
         <div class="table-responsive">
@@ -171,7 +174,7 @@
           <span>Filters</span>
           <div class="d-flex gap-2">
             <button onclick="addFilter()" class="btn btn-outline-info btn-sm px-3 fw-bold">ADD</button>
-            <button onclick="saveAllFilters()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE ALL</button>
+            <button onclick="saveAllFilters()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE</button>
           </div>
         </div>
         <div class="table-responsive">
@@ -825,7 +828,7 @@
       chModal.hide();
       renderChannels();
       renderStats();
-      toast(idx !== '' ? '已修改，請 SAVE ALL 儲存' : '已新增，請 SAVE ALL 儲存', 'success');
+      toast(idx !== '' ? '已修改，請 SAVE 儲存' : '已新增，請 SAVE 儲存', 'success');
     };
 
     const delChannel = (idx) => {
@@ -1097,20 +1100,7 @@
       if (el) el.classList.add('hide');
       document.body.classList.remove('loading');
     };
-    const onloadFallback = () => {
-      const login = document.getElementById('login-view');
-      const setup = document.getElementById('setup-view');
-      const admin = document.getElementById('admin-view');
-      if (login && setup && admin &&
-          login.style.display !== 'block' &&
-          setup.style.display !== 'block' &&
-          admin.style.display !== 'block') {
-        login.style.display = 'block';
-      }
-      forceShow();
-    };
-    setTimeout(forceShow, 10000);
-    window.addEventListener('load', onloadFallback);
+    setTimeout(forceShow, 20000);
 
     window.onload = () => {
       try {

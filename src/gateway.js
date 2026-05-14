@@ -5,14 +5,12 @@ import {
   isVisionExcluded, isToolsExcluded, requiresMaxTokens, getBlockedParams,
 } from "./lib/adaptive.js";
 import {
-  TOOL_NAME_MAX_LENGTH, FILTER_TEXT_MAX_LENGTH,
-  COOLDOWN_ERROR_THRESHOLD, COOLDOWN_WINDOW_SECONDS,
-  COOLDOWN_429_DEFAULT_SECONDS, COOLDOWN_503_SECONDS, COOLDOWN_MAX_SECONDS,
+  COOLDOWN_ERROR_THRESHOLD, COOLDOWN_429_DEFAULT_SECONDS, COOLDOWN_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
-  REQUEST_TIMEOUT_SECONDS, TOTAL_TIMEOUT_SECONDS,
+  REQUEST_TIMEOUT_SECONDS,
   CACHE_TTL_RATE_MS, CACHE_TTL_NORMAL_MS,
   RATE_PERSIST_THRESHOLD, STREAM_IDLE_TIMEOUT_MS,
-  D1_BATCH_MAX, STREAM_BUF_MAX_BYTES, MAX_IMAGE_BASE64_BYTES, MAX_BODY_BYTES,
+  D1_BATCH_MAX, STREAM_BUF_MAX_BYTES, MAX_IMAGE_BASE64_BYTES,
   STREAM_MAX_DURATION_MS, HEALTH_PERSIST_INTERVAL_MS,
 } from "./lib/constants.js";
 
@@ -86,12 +84,13 @@ async function flushDirtyHealth(env) {
   if (toPersist.length === 0) return;
   const updates = toPersist.map((ch) =>
     env.DB.prepare(
-      "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=? WHERE id=?"
+      "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=?, last_429=? WHERE id=?"
     ).bind(
       ch.consecutive_errors || 0,
       ch.last_error_msg || "",
       ch.last_error_at || 0,
       ch.response_time || 0,
+      ch.last_429 || 0,
       ch.id
     )
   );
@@ -521,7 +520,6 @@ function errResponse(c, message, type, status) {
 }
 
 async function handleChatRequest(c) {
-  const requestStart = Math.floor(Date.now() / 1000);
   try {
     let data;
     try { data = await loadCache(c.env); } catch (e) {
@@ -555,6 +553,7 @@ async function handleChatRequest(c) {
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
+      let responseTime = 0;
       try {
         const startTime = Date.now();
         const res = await fetch(url, {
@@ -563,19 +562,34 @@ async function handleChatRequest(c) {
           body: JSON.stringify(pBody),
           signal: controller.signal,
         });
+        responseTime = Date.now() - startTime;
         clearTimeout(timeoutId);
         if (!res.ok) {
           const errText = await res.text().catch(() => "Error");
           if (res.status === 429) {
             record429(ch.id, parseRetryAfter(res));
+            ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
+            markDirty(ch.id);
+            healthDirtyChannels.add(ch.id);
             return c.json({ error: { message: "Upstream rate limited" } }, 429);
           }
           recordError(ch.id);
+          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+          ch.last_error_at = Math.floor(Date.now() / 1000);
+          ch.last_error_msg = errText;
+          ch.response_time = responseTime;
+          healthDirtyChannels.add(ch.id);
           pool = pool.filter(p => p.id !== ch.id);
           continue;
         }
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
         recordSuccess(ch.id);
+        // Update health metrics
+        ch.consecutive_errors = 0;
+        ch.last_error_msg = "";
+        ch.last_error_at = 0;
+        ch.response_time = responseTime;
+        healthDirtyChannels.add(ch.id);
         if (isStream) {
           return new Response(transformStream(res.body, data.filters, originalModel, provider), { headers: SSE_CHUNK_HEADERS });
         }
@@ -586,6 +600,11 @@ async function handleChatRequest(c) {
       } catch (e) {
         clearTimeout(timeoutId);
         recordError(ch.id);
+        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+        ch.last_error_at = Math.floor(Date.now() / 1000);
+        ch.last_error_msg = e.message || "Request timeout or network error";
+        ch.response_time = responseTime || 0;
+        healthDirtyChannels.add(ch.id);
         pool = pool.filter(p => p.id !== ch.id);
         continue;
       }

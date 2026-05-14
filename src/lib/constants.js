@@ -1,21 +1,14 @@
 export const TOOL_NAME_MAX_LENGTH = 64;
-export const MAX_JSON_REPAIR_SIZE = 50_000;
 export const FILTER_TEXT_MAX_LENGTH = 30;
 
 export const COOLDOWN_ERROR_THRESHOLD = 5;
-export const COOLDOWN_WINDOW_SECONDS = 1800;
 export const COOLDOWN_429_DEFAULT_SECONDS = 300;
-export const COOLDOWN_503_SECONDS = 60;
 export const COOLDOWN_MAX_SECONDS = 3600;
 
 export const RPM_WINDOW_SECONDS = 60;
 export const RPD_WINDOW_SECONDS = 86400;
 
 export const REQUEST_TIMEOUT_SECONDS = 120;
-export const TOTAL_TIMEOUT_SECONDS = 300;
-export const MAX_RETRIES = 5;
-export const RETRY_DELAY_BASE_MS = 200;
-export const RETRY_DELAY_VARIANCE_MS = 300;
 export const STREAM_IDLE_TIMEOUT_MS = 60_000;
 
 export const CACHE_TTL_RATE_MS = 60_000;
@@ -27,7 +20,6 @@ export const HEALTH_PERSIST_INTERVAL_MS = 60_000;
 
 export const MAX_IMAGE_BASE64_BYTES = 5_242_880;
 
-export const MAX_BODY_BYTES = 524_288;
 export const STREAM_MAX_DURATION_MS = 20_000;
 
 export const STREAM_BUF_MAX_BYTES = 524_288;

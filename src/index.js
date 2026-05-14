@@ -14,25 +14,21 @@ const DB_PATH = resolve(__dirname, "db.json");
 
 const _db = new JsonDB(null, DB_PATH);
 
-app.use("*", async (c, next) => {
-  console.log("[request] " + c.req.method + " " + c.req.path + " source=" + (c.req.header("user-agent") || "?"));
-  await next();
-});
-
 let activeRequests = 0;
 app.use("*", async (c, next) => {
-  if (activeRequests >= 50) return c.json({ error: "overload", type: "overload" }, 503);
+  if (activeRequests >= 30) return c.json({ error: "overload", type: "overload" }, 503);
   activeRequests++;
   try { await next(); } finally { activeRequests--; }
 });
 
 let lastGc = 0;
 let lastCleanup = 0;
+let gcCount = 0;
 function maybeGc() {
   const rss = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  if (rss > 400) {
-    console.warn("[gc] high memory: " + rss + "MB");
-    if (typeof global.gc === "function") global.gc();
+  if (rss > 150) {
+    if (typeof global.gc === "function") { global.gc(); gcCount++; }
+    if (rss > 250) console.warn("[gc] high memory: " + rss + "MB (total GC: " + gcCount + ")");
   }
 }
 
