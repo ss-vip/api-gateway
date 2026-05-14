@@ -1,7 +1,10 @@
 import { Hono } from "hono";
-import { verifyPassword, getAdminPass } from "./auth.js";
-import createResourcesApp from "./resources.js";
-import { UI_SHELL } from "./portal.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import createResourcesApp, { getAdminPass, verifyPassword } from "./resources.js";
+
+const _uiShell = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "portal.html"), "utf-8");
 
 const LOGIN_MAX_FAILURES = 10;
 const BAN_MS = 15 * 60 * 1000;
@@ -33,7 +36,7 @@ export default function (clearCache) {
 
   app.route("/api", createResourcesApp(clearCache));
 
-  app.get("/", (c) => c.html(UI_SHELL));
+  app.get("/", (c) => c.html(_uiShell));
 
   app.post("/login", async (c) => {
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || "unknown";

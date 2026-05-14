@@ -1,7 +1,7 @@
 import { getProvider, detectProvider, SKIP, DONE } from "./lib/providers/index.js";
 import {
   parseRetryAfter, record429, recordError, recordSuccess,
-  isVisionExcluded, isToolsExcluded,
+  isVisionExcluded, isToolsExcluded, getBlockedParams,
   parseErrorForLearning, learnFromError, extractBlockedParam,
 } from "./lib/adaptive.js";
 import {
@@ -44,7 +44,6 @@ function shouldPersistCounter(ch, nowSec) {
 async function flushDirtyRateCounters(env) {
   if (dirtyChannels.size === 0 || !cache.data?.channels) return;
   const nowSec = Math.floor(Date.now() / 1000);
-
   const toPersist = [];
   for (const ch of cache.data.channels) {
     if (dirtyChannels.has(ch.id) && shouldPersistCounter(ch, nowSec)) {
@@ -53,19 +52,14 @@ async function flushDirtyRateCounters(env) {
   }
   dirtyChannels.clear();
   if (toPersist.length === 0) return;
-
   const updates = toPersist.map((ch) =>
     env.DB.prepare(
       "UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?"
     ).bind(
-      ch.rpm_count || 0,
-      ch.rpm_reset_at || nowSec,
-      ch.rpd_count || 0,
-      ch.rpd_reset_at || nowSec,
-      ch.id
+      ch.rpm_count || 0, ch.rpm_reset_at || nowSec,
+      ch.rpd_count || 0, ch.rpd_reset_at || nowSec, ch.id
     )
   );
-
   await safeBatch(env.DB, updates).catch((e) =>
     console.error("[rate] flush failed:", e.message, "count:", updates.length)
   );
@@ -87,12 +81,8 @@ async function flushDirtyHealth(env) {
     env.DB.prepare(
       "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=?, last_429=? WHERE id=?"
     ).bind(
-      ch.consecutive_errors || 0,
-      ch.last_error_msg || "",
-      ch.last_error_at || 0,
-      ch.response_time || 0,
-      ch.last_429 || 0,
-      ch.id
+      ch.consecutive_errors || 0, ch.last_error_msg || "",
+      ch.last_error_at || 0, ch.response_time || 0, ch.last_429 || 0, ch.id
     )
   );
   await safeBatch(env.DB, updates).catch((e) =>
@@ -198,10 +188,7 @@ class RollingFilter {
 function exponentialCooldown(consecutiveErrors) {
   if (consecutiveErrors <= BACKOFF_ERROR_THRESHOLD) return 0;
   const exponent = Math.min(consecutiveErrors - BACKOFF_ERROR_THRESHOLD, 4);
-  return Math.min(
-    BACKOFF_429_SECONDS * Math.pow(2, exponent),
-    BACKOFF_MAX_SECONDS
-  );
+  return Math.min(BACKOFF_429_SECONDS * Math.pow(2, exponent), BACKOFF_MAX_SECONDS);
 }
 
 function selectChannel(channels) {
@@ -325,8 +312,7 @@ async function tier1ModelReplace(readable, encoder, writer, responseModel) {
       buf = lines.pop();
       for (const line of lines) {
         if (line.length === 0) { await writer.write(encoder.encode("\n")); continue; }
-        const modified = fastReplaceModel(line, responseModel);
-        await writer.write(encoder.encode(modified + "\n"));
+        await writer.write(encoder.encode(fastReplaceModel(line, responseModel) + "\n"));
       }
     }
   } catch (e) {
@@ -354,6 +340,7 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
   let buf = "";
   let lastActivity = Date.now();
   const streamStart = Date.now();
+  const streamState = provider.createStreamState ? provider.createStreamState() : null;
   const idleTimer = setInterval(() => {
     if (Date.now() - lastActivity > STREAM_IDLE_TIMEOUT_MS) {
       reader.cancel("Stream idle timeout").catch(() => {});
@@ -386,7 +373,7 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
       const lines = buf.split("\n");
       buf = lines.pop();
       for (const rawLine of lines) {
-        const event = provider.processStreamLine(rawLine);
+        const event = provider.processStreamLine(rawLine, streamState);
         if (event === SKIP) continue;
         if (event === DONE) {
           const tail = filter.flush();
@@ -430,7 +417,7 @@ function transformStream(readable, filters, responseModel, provider) {
   const closeWriter = () => { try { writer.close(); } catch (e) {} };
   try {
     if (!hasFilters && !responseModel) {
-      tier0Passthrough(readable, encoder, writer);
+      tier0Passthrough(readable, encoder, writer).catch((e) => { console.error("[stream] tier0:", e.message); closeWriter(); });
     } else if (!hasFilters && responseModel) {
       tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => { console.error("[stream] tier1:", e.message); closeWriter(); });
     } else {
@@ -547,18 +534,33 @@ async function handleChatRequest(c) {
     let pool = data.channels.filter((ch) => ch.is_enabled && (!hasVisionContent || ch.is_vision));
     if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
     pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && isToolsExcluded(ch.id)));
-    // Skip channels with max_tokens limit exceeded
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
     pool.sort((a, b) => (b.model === originalModel ? 1 : 0) - (a.model === originalModel ? 1 : 0));
     while (pool.length > 0) {
       const ch = selectChannel(pool);
       if (!ch) return errResponse(c, "Rate limited or cooldown", "rate_limit_error", 429);
-      const provider = getProvider(detectProvider(ch.base_url));
+      const providerName = ch.provider || detectProvider(ch.base_url);
+      const provider = getProvider(providerName);
       const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
-      const url = provider.buildUrl(ch.base_url, effectiveModel);
+      const url = provider.buildUrl(ch.base_url, effectiveModel, isStream);
       if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
       let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
+      const blocked = getBlockedParams(ch.id);
+      if (blocked && blocked.size > 0) {
+        for (const param of blocked) { delete reqBody[param]; }
+      }
+      let channelHeaders = {};
+      if (ch.headers && typeof ch.headers === "object") {
+        channelHeaders = { ...ch.headers };
+      } else if (ch.headers && typeof ch.headers === "string") {
+        try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
+      }
+      if (ch.provider_options && typeof ch.provider_options === "object") {
+        Object.assign(reqBody, ch.provider_options);
+      } else if (ch.provider_options && typeof ch.provider_options === "string") {
+        try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) {}
+      }
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
@@ -568,11 +570,14 @@ async function handleChatRequest(c) {
         const requestBody = JSON.stringify(pBody);
         const requestHeaders = {
           "Content-Type": "application/json",
-          "User-Agent": "PostmanRuntime/7.36.0",
+          "User-Agent": "api-gateway/1.0",
           "Accept": "application/json",
           Authorization: "Bearer " + ch.api_key,
           ...pHeaders,
+          ...channelHeaders,
         };
+        if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
+        if (requestHeaders["x-api-key"] === "") delete requestHeaders["x-api-key"];
         const res = await fetch(url, {
           method: "POST",
           headers: requestHeaders,
@@ -584,12 +589,9 @@ async function handleChatRequest(c) {
         if (!res.ok) {
           const errBody = await res.text().catch(() => "");
           const errText = errBody || ("HTTP " + res.status);
-          // Diagnostic: log full request details on non-429 errors
           if (res.status !== 429 && errBody) {
-            console.log("[diag] POST", url);
-            console.log("[diag] headers:", JSON.stringify(requestHeaders));
-            console.log("[diag] body:", requestBody.slice(0, 2000));
-            console.log("[diag] response:", res.status, errBody.slice(0, 500));
+            const errPreview = errBody.replace(/\n/g, " ").slice(0, 200);
+            console.log("[diag]", res.status, url.replace(/\/\/[^@]+@/, "//***@"), errPreview);
           }
           if (res.status === 429) {
             record429(ch.id, parseRetryAfter(res));
@@ -614,7 +616,6 @@ async function handleChatRequest(c) {
         }
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
         recordSuccess(ch.id);
-        // Update health metrics
         ch.consecutive_errors = 0;
         ch.last_error_msg = "";
         ch.last_error_at = 0;
@@ -646,6 +647,94 @@ async function handleChatRequest(c) {
   }
 }
 
+async function handleEmbeddings(c) {
+  try {
+    const data = await loadCache(c.env);
+    const token = (c.req.header("Authorization") || "").replace("Bearer ", "");
+    if (data.config.client_token && token !== data.config.client_token) {
+      return errResponse(c, "Unauthorized", "auth_error", 401);
+    }
+    let body;
+    try { body = await c.req.json(); } catch (e) {
+      return errResponse(c, "Invalid JSON", "invalid_request_error", 400);
+    }
+    if (!body.model || !body.input) {
+      return errResponse(c, "model and input required", "invalid_request_error", 400);
+    }
+    const pool = data.channels.filter((ch) => ch.is_enabled);
+    if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
+    const ch = selectChannel(pool);
+    if (!ch) return errResponse(c, "Rate limited", "rate_limit_error", 429);
+    const providerName = ch.provider || detectProvider(ch.base_url);
+    const provider = getProvider(providerName);
+    let base = (ch.base_url || "").trim().replace(/\/+$/, "");
+    if (!base.endsWith("/embeddings")) {
+      if (base.endsWith("/chat/completions")) base = base.replace("/chat/completions", "/embeddings");
+      else if (/\/v\d+$/.test(base)) base = `${base}/embeddings`;
+      else base = `${base}/v1/embeddings`;
+    }
+    const effectiveModel = ch.model || body.model;
+    const reqBody = { ...body, model: effectiveModel };
+    if (ch.provider_options && typeof ch.provider_options === "object") {
+      Object.assign(reqBody, ch.provider_options);
+    } else if (ch.provider_options && typeof ch.provider_options === "string") {
+      try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) {}
+    }
+    let channelHeaders = {};
+    if (ch.headers && typeof ch.headers === "object") {
+      channelHeaders = { ...ch.headers };
+    } else if (ch.headers && typeof ch.headers === "string") {
+      try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
+    try {
+      const requestHeaders = {
+        "Content-Type": "application/json",
+        "User-Agent": "api-gateway/1.0",
+        "Accept": "application/json",
+        Authorization: "Bearer " + ch.api_key,
+        ...channelHeaders,
+      };
+      if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
+      const res = await fetch(base, {
+        method: "POST",
+        headers: requestHeaders,
+        body: JSON.stringify(reqBody),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        recordError(ch.id);
+        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+        ch.last_error_at = Math.floor(Date.now() / 1000);
+        ch.last_error_msg = JSON.stringify({ message: errText, url: base });
+        healthDirtyChannels.add(ch.id);
+        return errResponse(c, "Upstream error: " + (errText || res.status), "upstream_error", res.status);
+      }
+      updateRateCounters(ch, Math.floor(Date.now() / 1000));
+      recordSuccess(ch.id);
+      ch.consecutive_errors = 0;
+      ch.last_error_msg = "";
+      healthDirtyChannels.add(ch.id);
+      const resText = await res.text();
+      return c.json(JSON.parse(resText));
+    } catch (e) {
+      clearTimeout(timeoutId);
+      recordError(ch.id);
+      ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+      ch.last_error_at = Math.floor(Date.now() / 1000);
+      ch.last_error_msg = JSON.stringify({ message: e.message || "Request timeout", url: base });
+      healthDirtyChannels.add(ch.id);
+      return errResponse(c, "Request failed: " + e.message, "upstream_error", 502);
+    }
+  } catch (e) {
+    console.error("[embeddings] unhandled:", e.message);
+    return errResponse(c, "Internal Error", "server_error", 500);
+  }
+}
+
 export function clearCache() {
   cache.data = null;
   cache.ts = 0;
@@ -664,4 +753,5 @@ export default function registerGateway(app) {
     }],
   }));
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
+  app.post("/v1/embeddings", async (c) => handleEmbeddings(c));
 }

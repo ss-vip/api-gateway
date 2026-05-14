@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -21,9 +22,7 @@ app.use("*", async (c, next) => {
   try { await next(); } finally { activeRequests--; }
 });
 
-let lastGc = 0;
-let lastCleanup = 0;
-let gcCount = 0;
+let lastGc = 0, lastCleanup = 0, gcCount = 0;
 function maybeGc() {
   const rss = Math.round(process.memoryUsage().rss / 1024 / 1024);
   if (rss > 150) {
@@ -47,6 +46,7 @@ app.use("*", (c, next) => {
   c.env = Object.assign(c.env || {}, { DB: c.env?.DB || _db });
   return next();
 });
+
 app.use("*", cors({
   origin: "*",
   allowHeaders: ["Content-Type", "Authorization", "X-Admin-Token"],
@@ -59,13 +59,13 @@ registerGateway(app);
 app.route("/admin", createDashboardApp(clearCache));
 app.get("/", (c) => c.redirect("/admin"));
 app.get("/health", (c) => c.json({
-  ok: true, uptime: process.uptime(), mem: Math.round(process.memoryUsage().rss / 1024 / 1024), channels: _db?.data?.channels?.length || 0,
+  ok: true, uptime: process.uptime(),
+  mem: Math.round(process.memoryUsage().rss / 1024 / 1024),
+  channels: _db?.data?.channels?.length || 0,
 }));
 
 app.notFound((c) => c.json({
-  error: "not_found",
-  path: c.req.path,
-  method: c.req.method,
+  error: "not_found", path: c.req.path, method: c.req.method,
   message: "Route not found: " + c.req.method + " " + c.req.path,
 }, 404));
 
@@ -77,5 +77,30 @@ app.onError((err, c) => {
 export function shutdownDb() {
   _db.save();
 }
+
+const PORT = parseInt(process.env.PORT || "7860", 10);
+const server = serve({ fetch: app.fetch, port: PORT }, () => {
+  console.log("[gateway] running on :" + PORT + " (" + process.pid + ")");
+});
+
+server.on("error", (e) => {
+  console.error("[port]", e.code === "EADDRINUSE" ? PORT + " in use" : e.message);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandled]", reason?.message || String(reason));
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaught]", err.message);
+  shutdownDb();
+  server.close(() => process.exit(1));
+});
+process.on("SIGTERM", () => {
+  console.log("[exit] SIGTERM"); shutdownDb(); server.close(() => process.exit(0));
+});
+process.on("SIGINT", () => {
+  console.log("[exit] SIGINT"); shutdownDb(); server.close(() => process.exit(0));
+});
 
 export default app;

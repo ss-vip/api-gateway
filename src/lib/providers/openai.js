@@ -3,7 +3,7 @@ import { SKIP, DONE } from "./index.js";
 const provider = {
   name: "openai",
 
-  buildUrl(baseUrl, _model) {
+  buildUrl(baseUrl, _model, _isStream) {
     let base = (baseUrl || "").trim().replace(/\/+$/, "");
     if (!base) return null;
     if (base.endsWith("/chat/completions")) return base;
@@ -11,8 +11,10 @@ const provider = {
     return `${base}/v1/chat/completions`;
   },
 
-  prepareRequest(body) {
-    return { body, headers: {} };
+  prepareRequest(body, channel) {
+    const headers = {};
+
+    return { body, headers };
   },
 
   parseResponse(text) {

@@ -73,7 +73,8 @@ export class JsonDB {
 
   _startAutoSave() {
     if (!this._filePath) return;
-    setInterval(() => { if (this._dirty) this._flush(); }, 60000);
+    const timer = setInterval(() => { if (this._dirty) this._flush(); }, 60000);
+    if (timer && typeof timer.unref === "function") timer.unref();
   }
 
   prepare(sql) {
@@ -204,7 +205,6 @@ export class JsonDB {
         row.rpd_count = params[2];
         row.rpd_reset_at = params[3];
       } else if (lower.includes("last_429=0")) {
-        // Must check BEFORE "consecutive_errors=" because reset SQL has BOTH patterns
         row.last_429 = 0;
         row.consecutive_errors = 0;
         row.last_error_msg = "";
@@ -225,6 +225,15 @@ export class JsonDB {
 
   _insertChannels(sql, params) {
     const id = params[0] !== null && params[0] !== undefined ? params[0] : this._nextId.channel++;
+    let headers = null;
+    if (params[18] !== undefined && params[18] !== null) {
+      try { headers = typeof params[18] === "string" ? JSON.parse(params[18]) : params[18]; } catch { headers = {}; }
+    }
+    let providerOptions = null;
+    if (params[19] !== undefined && params[19] !== null) {
+      try { providerOptions = typeof params[19] === "string" ? JSON.parse(params[19]) : params[19]; } catch { providerOptions = {}; }
+    }
+    const providerOverride = params[20] !== undefined ? params[20] : "";
     const ch = {
       id,
       name: params[1] || "",
@@ -244,6 +253,9 @@ export class JsonDB {
       support_tools: params[15] !== undefined ? params[15] : 1,
       response_time: params[16] || 0,
       fallback_model: params[17] || "",
+      headers,
+      provider_options: providerOptions,
+      provider: providerOverride,
       created_at: Math.floor(Date.now() / 1000),
       updated_at: Math.floor(Date.now() / 1000),
     };

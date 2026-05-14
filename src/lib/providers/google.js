@@ -3,20 +3,26 @@ import { SKIP, DONE } from "./index.js";
 let googleChunkId = 0;
 let googleToolCallId = 0;
 
+function nextChunkId() {
+  googleChunkId = googleChunkId >= 2147483647 ? 1 : googleChunkId + 1;
+  return googleChunkId;
+}
+function nextToolCallId() {
+  googleToolCallId = googleToolCallId >= 2147483647 ? 1 : googleToolCallId + 1;
+  return googleToolCallId;
+}
+
 function extractText(parts) {
   if (!parts || !Array.isArray(parts)) return "";
-  return parts
-    .filter((p) => p.text)
-    .map((p) => p.text)
-    .join("");
+  return parts.filter((p) => p.text).map((p) => p.text).join("");
 }
 
 function extractToolCalls(parts) {
   const fcs = (parts || []).filter((p) => p.functionCall);
   if (fcs.length === 0) return undefined;
-  return fcs.map((fc) => ({
-    index: 0,
-    id: `call_g_${++googleToolCallId}`,
+  return fcs.map((fc, i) => ({
+    index: i,
+    id: `call_g_${nextToolCallId()}`,
     type: "function",
     function: {
       name: fc.functionCall.name || "",
@@ -38,9 +44,7 @@ function finishReasonMap(reason) {
 }
 
 function openaiToGoogleParts(content) {
-  if (typeof content === "string") {
-    return [{ text: content }];
-  }
+  if (typeof content === "string") return [{ text: content }];
   if (Array.isArray(content)) {
     const parts = [];
     for (const c of content) {
@@ -48,14 +52,12 @@ function openaiToGoogleParts(content) {
         parts.push({ text: c.text });
       } else if (c.type === "image_url") {
         const dataUrl = c.image_url?.url || "";
-
         if (dataUrl.startsWith("data:")) {
           const commaIdx = dataUrl.indexOf(",");
           if (commaIdx === -1) { continue; }
           const header = dataUrl.slice(0, commaIdx);
           const base64Data = dataUrl.slice(commaIdx + 1);
-          const mimeType = header
-            .replace("data:", "").replace(";base64", "").replace(";utf8", "").trim() || "image/png";
+          const mimeType = header.replace("data:", "").replace(";base64", "").replace(";utf8", "").trim() || "image/png";
           parts.push({ inlineData: { mimeType, data: base64Data } });
         } else if (dataUrl.startsWith("http://") || dataUrl.startsWith("https://")) {
           const ext = dataUrl.split(".").pop()?.split("?")[0]?.toLowerCase() || "";
@@ -76,8 +78,10 @@ function buildFunctionCallParts(toolCalls) {
     const fn = tc.function || {};
     let args = {};
     if (fn.arguments) {
-      try { args = JSON.parse(fn.arguments); } catch {
-        try { args = JSON.parse(fn.arguments + (fn.arguments.endsWith('"') ? "" : '"')); } catch {}
+      if (typeof fn.arguments === "object") {
+        args = fn.arguments;
+      } else {
+        try { args = JSON.parse(fn.arguments); } catch { args = {}; }
       }
     }
     return { functionCall: { name: fn.name || "", args } };
@@ -87,17 +91,17 @@ function buildFunctionCallParts(toolCalls) {
 const provider = {
   name: "google",
 
-  buildUrl(baseUrl, model) {
+  buildUrl(baseUrl, model, isStream) {
     let base = (baseUrl || "").trim().replace(/\/+$/, "");
     if (!base) return null;
-    if (base.includes(":streamGenerateContent")) return base;
+    if (base.includes(":generateContent") || base.includes(":streamGenerateContent")) return base;
     const modelName = encodeURIComponent(model || "gemini-2.0-flash");
-    return `${base}/models/${modelName}:streamGenerateContent`;
+    const endpoint = isStream ? ":streamGenerateContent" : ":generateContent";
+    return `${base}/models/${modelName}${endpoint}`;
   },
 
-  prepareRequest(body) {
+  prepareRequest(body, channel) {
     const { messages, tools, stream, ...rest } = body;
-
     let systemInstruction = undefined;
     const contents = [];
 
@@ -107,30 +111,16 @@ const provider = {
         systemInstruction += (typeof m.content === "string" ? m.content : "") + "\n";
         continue;
       }
-
       const googleRole = m.role === "assistant" ? "model" : "user";
       const parts = [];
-
-      if (m.content) {
-        parts.push(...openaiToGoogleParts(m.content));
-      }
-
-      if (m.tool_calls) {
-        parts.push(...buildFunctionCallParts(m.tool_calls));
-      }
-
+      if (m.content) parts.push(...openaiToGoogleParts(m.content));
+      if (m.tool_calls) parts.push(...buildFunctionCallParts(m.tool_calls));
       if (m.role === "tool" || m.role === "function") {
         parts.push({
-          functionResponse: {
-            name: m.name || "unknown",
-            response: { response: m.content || "" },
-          },
+          functionResponse: { name: m.name || "unknown", response: { response: m.content || "" } },
         });
       }
-
-      if (parts.length > 0) {
-        contents.push({ role: googleRole, parts });
-      }
+      if (parts.length > 0) contents.push({ role: googleRole, parts });
     }
 
     const responseFormat = rest.response_format;
@@ -147,12 +137,10 @@ const provider = {
         toolConfig = { functionCallingConfig: { mode: "NONE" } };
       } else if (rest.tool_choice === "required" || rest.tool_choice === "forced") {
         toolConfig = { functionCallingConfig: { mode: "ANY" } };
-      } else if (typeof rest.tool_choice === "object" && rest.tool_choice.type === "function") {
+      } else if (typeof rest.tool_choice === "object") {
+        const fnName = rest.tool_choice.function?.name || rest.tool_choice.function;
         toolConfig = {
-          functionCallingConfig: {
-            mode: "ANY",
-            allowedFunctionNames: [rest.tool_choice.function?.name].filter(Boolean),
-          },
+          functionCallingConfig: { mode: "ANY", allowedFunctionNames: [fnName].filter(Boolean) },
         };
       }
     }
@@ -176,60 +164,50 @@ const provider = {
     };
 
     if (systemInstruction) {
-      googleBody.systemInstruction = {
-        parts: [{ text: systemInstruction.trim() }],
-      };
+      googleBody.systemInstruction = { parts: [{ text: systemInstruction.trim() }] };
     }
 
     if (tools && Array.isArray(tools)) {
-      googleBody.tools = [
-        {
-          functionDeclarations: tools.map((t) => ({
-            name: t.function?.name,
-            description: t.function?.description,
-            parameters: t.function?.parameters,
-          })),
-        },
-      ];
+      googleBody.tools = [{
+        functionDeclarations: tools.map((t) => ({
+          name: t.function?.name,
+          description: t.function?.description,
+          parameters: t.function?.parameters,
+        })),
+      }];
     }
 
-    return { body: googleBody, headers: {} };
+    const googleHeaders = channel?.api_key
+      ? { "X-Goog-Api-Key": channel.api_key, "Authorization": "" }
+      : {};
+
+    return { body: googleBody, headers: googleHeaders };
   },
 
   parseResponse(text) {
     const raw = JSON.parse(text);
-
     if (raw.error) return raw;
-
     const candidate = raw.candidates?.[0];
     if (!candidate) return { choices: [], object: "chat.completion" };
-
     const parts = candidate.content?.parts || [];
-
     return {
-      id: `chatcmpl-g-${++googleChunkId}`,
+      id: `chatcmpl-g-${nextChunkId()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
       model: raw.modelVersion || "unknown",
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: "assistant",
-            content: extractText(parts) || null,
-            ...(extractToolCalls(parts)
-              ? { tool_calls: extractToolCalls(parts) }
-              : {}),
-          },
-          finish_reason: finishReasonMap(candidate.finishReason),
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: extractText(parts) || null,
+          ...(extractToolCalls(parts) ? { tool_calls: extractToolCalls(parts) } : {}),
         },
-      ],
+        finish_reason: finishReasonMap(candidate.finishReason),
+      }],
       usage: {
         prompt_tokens: raw.usageMetadata?.promptTokenCount || 0,
         completion_tokens: raw.usageMetadata?.candidatesTokenCount || 0,
-        total_tokens:
-          (raw.usageMetadata?.promptTokenCount || 0) +
-          (raw.usageMetadata?.candidatesTokenCount || 0),
+        total_tokens: (raw.usageMetadata?.promptTokenCount || 0) + (raw.usageMetadata?.candidatesTokenCount || 0),
       },
     };
   },
@@ -237,46 +215,39 @@ const provider = {
   processStreamLine(rawLine) {
     const trimmed = rawLine.trim();
     if (!trimmed.startsWith("data:")) return SKIP;
-
-    const dataStr = trimmed.startsWith("data: ")
-      ? trimmed.slice(6).trim()
-      : trimmed.slice(5).trim();
-
+    const dataStr = trimmed.startsWith("data: ") ? trimmed.slice(6).trim() : trimmed.slice(5).trim();
     if (!dataStr || dataStr === "[DONE]") return DONE;
-
     try {
       const parsed = JSON.parse(dataStr);
-
       if (parsed.error) {
-        return {
-          _error: true,
-          message: parsed.error.message || "Google API error",
-        };
+        return { _error: true, message: parsed.error.message || "Google API error" };
       }
-
       const candidate = parsed.candidates?.[0];
       if (!candidate || !candidate.content) return SKIP;
-
       const parts = candidate.content?.parts || [];
       const text = extractText(parts);
       const toolCalls = extractToolCalls(parts);
       const finishReason = finishReasonMap(candidate.finishReason);
+      const usage = parsed.usageMetadata ? {
+        prompt_tokens: parsed.usageMetadata.promptTokenCount || 0,
+        completion_tokens: parsed.usageMetadata.candidatesTokenCount || 0,
+        total_tokens: parsed.usageMetadata.totalTokenCount || 0,
+      } : undefined;
 
       return {
-        id: `chatcmpl-g-${++googleChunkId}`,
+        id: `chatcmpl-g-${nextChunkId()}`,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: parsed.modelVersion,
-        choices: [
-          {
-            index: 0,
-            delta: {
-              ...(text ? { content: text } : {}),
-              ...(toolCalls ? { tool_calls: toolCalls } : {}),
-            },
-            finish_reason: finishReason,
+        model: parsed.modelVersion || "unknown",
+        choices: [{
+          index: 0,
+          delta: {
+            ...(text ? { content: text } : {}),
+            ...(toolCalls ? { tool_calls: toolCalls } : {}),
           },
-        ],
+          finish_reason: finishReason,
+        }],
+        ...(usage ? { usage } : {}),
       };
     } catch (e) {
       return SKIP;
@@ -284,7 +255,7 @@ const provider = {
   },
 
   isErrorResponse(parsed) {
-    return parsed && (parsed.error || !parsed.candidates);
+    return parsed && (parsed.error === true || (parsed.error && parsed.error !== null));
   },
 };
 

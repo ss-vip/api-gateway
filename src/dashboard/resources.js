@@ -1,5 +1,25 @@
 import { Hono } from "hono";
-import { getAdminPass, verifyPassword, hashPassword } from "./auth.js";
+
+function bytesToHex(bytes) {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function hashPassword(password) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  return bytesToHex(new Uint8Array(hash));
+}
+async function verifyPassword(password, storedHash) {
+  if (!storedHash || storedHash.length !== 64) return false;
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  return bytesToHex(new Uint8Array(hash)) === storedHash;
+}
+async function getAdminPass(c) {
+  try {
+    const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first();
+    return cf?.admin_password || null;
+  } catch { return null; }
+}
+
+export { getAdminPass, verifyPassword, hashPassword };
 
 const DEFAULTS = { token: "sk-test123456", delay_period: 300 };
 
@@ -37,7 +57,7 @@ export default function (clearCache) {
               last_error_msg, last_error_at,
               rpm_limit, rpd_limit, rpm_count, rpm_reset_at,
               rpd_count, rpd_reset_at, max_tokens, support_tools,
-              response_time, fallback_model
+              response_time, fallback_model, headers, provider_options, provider
        FROM channels ORDER BY id`
     ).all();
     return c.json(results || []);
@@ -45,22 +65,24 @@ export default function (clearCache) {
 
   api.post("/batch-channels", async (c) => {
     const channels = await c.req.json();
-    // Fetch ALL current api_keys to prevent masked-key corruption
     const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of channels) {
       const apiKey = isMaskedKey(ch.api_key) ? (allKeys[ch.id] || "") : ch.api_key || "";
+      const h = ch.headers ? (typeof ch.headers === "object" ? JSON.stringify(ch.headers) : ch.headers) : null;
+      const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
       batch.push(
         c.env.DB.prepare(
-          `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
           ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
           ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
           ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
-          ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || ""
+          ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || "",
+          h, po, ch.provider || ""
         )
       );
     }
@@ -166,7 +188,7 @@ export default function (clearCache) {
   api.post("/admin-pass", async (c) => {
     const { pass } = await c.req.json();
     if (!pass || pass.length < 6 || pass.length > 20)
-      return c.json({ error: "Password must be 6-20 characters" }, 400);
+      return c.json({ error: "密碼需 6-20 個字元" }, 400);
     const hashedPass = await hashPassword(pass);
     const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first();
     if (ex) {
@@ -201,15 +223,18 @@ export default function (clearCache) {
       for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
       for (const ch of d.channels) {
         const apiKey = isMaskedKey(ch.api_key) ? (allKeys[ch.id] || "") : ch.api_key || "";
+        const h = ch.headers ? (typeof ch.headers === "object" ? JSON.stringify(ch.headers) : ch.headers) : null;
+        const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
         batch.push(
           c.env.DB.prepare(
-            `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
             ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
             ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
-            ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || ""
+            ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || "",
+            h, po, ch.provider || ""
           )
         );
       }

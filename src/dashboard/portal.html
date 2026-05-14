@@ -125,7 +125,6 @@
               </div>
             </div>
           </div>
-
         </div>
       </div>
 
@@ -242,6 +241,15 @@
         <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" required /></div>
         <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" value="0" /></div>
       </div>
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Provider Override <span class="text-muted fw-normal" style="font-size:0.6rem">留空=自動偵測</span></label>
+        <select id="ch-provider" class="form-select form-select-sm">
+          <option value="">Auto Detect</option>
+          <option value="openai">OpenAI 相容</option>
+          <option value="google">Google Gemini (原生)</option>
+          <option value="anthropic">Anthropic Claude</option>
+        </select>
+      </div>
       <div class="row g-1 mb-2">
         <div class="col-6"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
         <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
@@ -259,6 +267,14 @@
           <label class="form-check-label small fw-bold mb-1" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
         </div>
+      </div>
+      <div class="mb-2 mt-2 pt-2 border-top">
+        <label class="form-label mini-label fw-bold">Custom Headers <span class="text-muted fw-normal" style="font-size:0.6rem">JSON, e.g. {"HTTP-Referer":"..."}</span></label>
+        <textarea id="ch-headers" class="form-control form-control-sm" rows="2" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"https://example.com","X-Title":"My App"}'></textarea>
+      </div>
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Provider Options <span class="text-muted fw-normal" style="font-size:0.6rem">JSON body overrides, e.g. {"provider":{"order":["OpenAI"]}}</span></label>
+        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="2" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
       </div>
     </div>
     <div class="modal-footer border-0 pt-0"><button type="submit" class="btn btn-primary w-100 fw-bold">APPLY</button></div>
@@ -614,7 +630,9 @@
         row += '<td class="align-middle"><div class="form-check form-switch d-inline-block">';
         row += '<input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()">';
         row += '</div></td>';
-        row += '<td class="fw-bold align-middle">' + esc(c.name) + '</td>';
+        const providerLabel = c.provider || (c.base_url ? (c.base_url.includes('googleapis') || c.base_url.includes('generativelanguage') ? 'Google' : c.base_url.includes('anthropic') ? 'Claude' : 'OpenAI') : '');
+        const providerBadge = providerLabel ? ' <span class="badge bg-secondary-subtle text-secondary-emphasis" style="font-size:0.55rem;vertical-align:middle">' + esc(providerLabel) + '</span>' : '';
+        row += '<td class="fw-bold align-middle">' + esc(c.name) + providerBadge + '</td>';
         row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + toolsIcon + '</td>';
         row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
         row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
@@ -689,11 +707,12 @@
     };
 
     const saveConfig = async () => {
-      await api('/admin/api/config', 'POST', {
-        token: document.getElementById('cfg-token').value,
-        recovery_period: document.getElementById('cfg-recovery-period').value,
-      });
-      toast('設定已儲存', 'success');
+      const token = document.getElementById('cfg-token').value;
+      const period = parseInt(document.getElementById('cfg-recovery-period').value) || 300;
+      if (await api('/admin/api/config', 'POST', { token, recovery_period: period })) {
+        toast('設定已儲存', 'success');
+        init();
+      }
     };
 
     const saveAllChannels = async () => {
@@ -742,6 +761,9 @@
       document.getElementById('ch-enabled').checked = true;
       document.getElementById('ch-vision').checked = false;
       document.getElementById('ch-tools').checked = true;
+      document.getElementById('ch-provider').value = '';
+      document.getElementById('ch-headers').value = '';
+      document.getElementById('ch-provider-options').value = '';
       checkFetchModelsBtn();
       chModal.show();
     };
@@ -765,6 +787,9 @@
       document.getElementById('ch-vision').checked = c.is_vision == 1;
       document.getElementById('ch-tools').checked = c.support_tools !== 0;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+      document.getElementById('ch-provider').value = c.provider || '';
+      document.getElementById('ch-headers').value = c.headers ? (typeof c.headers === 'object' ? JSON.stringify(c.headers, null, 2) : c.headers) : '';
+      document.getElementById('ch-provider-options').value = c.provider_options ? (typeof c.provider_options === 'object' ? JSON.stringify(c.provider_options, null, 2) : c.provider_options) : '';
       checkFetchModelsBtn();
       chModal.show();
     };
@@ -825,6 +850,9 @@
         rpm_reset_at: prev ? prev.rpm_reset_at||0 : 0,
         rpd_count: prev ? prev.rpd_count||0 : 0,
         rpd_reset_at: prev ? prev.rpd_reset_at||0 : 0,
+        provider: document.getElementById('ch-provider').value,
+        headers: parseJsonField('ch-headers'),
+        provider_options: parseJsonField('ch-provider-options'),
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -860,6 +888,12 @@
     const toggleKeyVis = () => {
       const i = document.getElementById('ch-key');
       i.type = i.type === 'password' ? 'text' : 'password';
+    };
+
+    const parseJsonField = (id) => {
+      const val = document.getElementById(id).value.trim();
+      if (!val) return null;
+      try { return JSON.parse(val); } catch (e) { return val; }
     };
 
     let fetchedModels = [];
@@ -1026,6 +1060,9 @@
         rpd_limit: c.rpd_limit || 0,
         max_tokens: c.max_tokens || 0,
         support_tools: c.support_tools !== 0 ? 1 : 0,
+        provider: c.provider || "",
+        headers: c.headers || null,
+        provider_options: c.provider_options || null,
       }));
       const cleanFilters = filters.map(f => ({ text: f.text, mode: f.mode || 1, is_enabled: f.is_enabled ? 1 : 0 }));
       const data = {
