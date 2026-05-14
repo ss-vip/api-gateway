@@ -605,6 +605,14 @@ export function clearCache() {
 }
 
 export default function registerGateway(app) {
-  app.get("/v1/models", (c) => c.json({ object: "list", data: [] }));
+  app.get("/v1/models", (c) => c.json({
+    object: "list",
+    data: [{
+      id: "openai",
+      object: "model",
+      created: 1735689600,
+      owned_by: "api-gateway",
+    }],
+  }));
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
 }

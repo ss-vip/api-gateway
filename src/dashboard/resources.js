@@ -14,7 +14,7 @@ function isMaskedKey(key) {
 export default function (clearCache) {
   const api = new Hono();
 
-  const PUBLIC_SUFFIXES = ["/auth-status", "/config", "/verify-token"];
+  const PUBLIC_SUFFIXES = ["/auth-status", "/verify-token"];
   api.use("*", async (c, next) => {
     const path = c.req.path;
     if (PUBLIC_SUFFIXES.some((s) => path.endsWith(s))) return await next();
