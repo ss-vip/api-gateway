@@ -6,3 +6,5 @@ dist
 temp
 db.json
 *.tmp
+pm2-*.log
+ecosystem.config.cjs

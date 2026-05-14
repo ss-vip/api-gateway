@@ -1,30 +1,46 @@
-// Dashboard — 管理後台路由
 import { Hono } from "hono";
 import { verifyPassword, getAdminPass } from "./auth.js";
 import createResourcesApp from "./resources.js";
 import { UI_SHELL } from "./portal.js";
 
 const LOGIN_MAX_FAILURES = 10;
-const BAN_MS = 15 * 60 * 1000; // 15 minutes
+const BAN_MS = 15 * 60 * 1000;
+const LOGIN_STATE_CLEANUP_INTERVAL = 300_000;
 
-// Simple in-memory login tracking (no caches.default dependency)
 const loginState = new Map();
+let lastCleanupTs = 0;
+
+function pruneLoginState() {
+  const now = Date.now();
+  for (const [ip, state] of loginState) {
+    if (state.banUntil > 0 && now >= state.banUntil) {
+      loginState.delete(ip);
+    }
+  }
+}
+
+function cleanupStaleLoginEntries() {
+  const now = Date.now();
+  if (now - lastCleanupTs < LOGIN_STATE_CLEANUP_INTERVAL) return;
+  lastCleanupTs = now;
+  if (loginState.size > 1000) {
+    pruneLoginState();
+  }
+}
 
 export default function (clearCache) {
   const app = new Hono();
 
-  // ---- REST API: /api/* (becomes /admin/api/*) ---- //
   app.route("/api", createResourcesApp(clearCache));
 
-  // ---- Portal: / (serves SPA HTML at /admin) ---- //
   app.get("/", (c) => c.html(UI_SHELL));
 
-  // ---- Login: POST /login (at /admin/login, outside API auth middleware) ---- //
   app.post("/login", async (c) => {
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || "unknown";
+    cleanupStaleLoginEntries();
+
     const state = loginState.get(ip) || { count: 0, banUntil: 0 };
 
-    // Check if currently banned
     if (Date.now() < state.banUntil) {
       return c.json({ error: "嘗試過多，請 15 分鐘後再试" }, 429);
     }
@@ -36,11 +52,10 @@ export default function (clearCache) {
     if (!storedHash) return c.json({ error: "尚未設定密碼" }, 403);
 
     if (await verifyPassword(password, storedHash)) {
-      loginState.delete(ip); // clear failures on success
+      loginState.delete(ip);
       return c.json({ ok: true });
     }
 
-    // Track failure
     const newCount = state.count + 1;
     if (newCount >= LOGIN_MAX_FAILURES) {
       loginState.set(ip, { count: 0, banUntil: Date.now() + BAN_MS });

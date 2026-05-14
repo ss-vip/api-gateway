@@ -1,21 +1,13 @@
 {
   "name": "api-gateway",
   "type": "module",
-  "main": "src/index.js",
+  "main": "app.js",
   "scripts": {
-    "start": "node --expose-gc src/index.js",
-    "dev": "node --expose-gc --watch src/index.js",
-    "serve": "pm2 start ecosystem.config.cjs --update-env",
-    "stop": "pm2 stop ecosystem.config.cjs",
-    "log": "pm2 logs api-gateway",
-    "save": "pm2 save",
-    "status": "pm2 status"
+    "start": "node --expose-gc app.js",
+    "dev": "node --expose-gc --watch app.js"
   },
   "dependencies": {
     "hono": "^4.12.18",
     "@hono/node-server": "^2.0.2"
-  },
-  "devDependencies": {
-    "pm2": "^5.4.2"
   }
 }

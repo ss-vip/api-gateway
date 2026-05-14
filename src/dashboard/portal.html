@@ -30,26 +30,22 @@
       .card-header span { font-size: 0.85rem; }
       .input-group-text { font-size: 0.7rem; }
     }
-    /* 獨立 spinner：不依賴 Bootstrap CSS */
     #loading-overlay .spinner-border { display: inline-block; width: 2rem; height: 2rem; border: 0.25em solid #fff; border-right-color: transparent; border-radius: 50%; animation: ldsp 0.75s linear infinite; }
     @keyframes ldsp { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
   <div id="loading-overlay"><div class="spinner-border text-light" role="status"></div></div>
-  <!-- Safety: CDN 不管多慢，8 秒後強制停止 loading -->
   <script>
   setTimeout(function(){
     var e=document.getElementById('loading-overlay');
     if(e)e.classList.add('hide');
     document.body.classList.remove('loading');
-    // fallback: 如果沒有任何 view 被 show，強制顯示 login
     var l=document.getElementById('login-view'),s=document.getElementById('setup-view'),a=document.getElementById('admin-view');
     if(l&&s&&a&&l.style.display!=='block'&&s.style.display!=='block'&&a.style.display!=='block')l.style.display='block';
   },8000);
   </script>
 
-  <!-- Login View -->
   <div id="login-view" class="container py-5 mt-5">
     <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
       <h4 class="fw-bold mb-4">API Gateway</h4>
@@ -63,7 +59,6 @@
     </div></div></div></div>
   </div>
 
-  <!-- Setup View -->
   <div id="setup-view" class="container py-5 mt-5">
     <div class="row justify-content-center pt-5"><div class="col-md-4"><div class="card p-4"><div class="card-body text-center">
       <h4 class="fw-bold mb-4">API Gateway</h4>
@@ -78,7 +73,6 @@
     </div></div></div></div>
   </div>
 
-  <!-- Admin View -->
   <div id="admin-view">
     <nav class="navbar navbar-expand border-bottom sticky-top mb-4 py-2">
       <div class="container">
@@ -103,13 +97,11 @@
     </nav>
 
     <div class="container pb-5">
-      <!-- System Status -->
       <div class="d-flex justify-content-between align-items-center mb-3 mt-2">
         <h5 class="fw-bold mb-0 text-uppercase text-secondary" style="font-size: 0.9rem; letter-spacing: 1px;">System Status</h5>
       </div>
       <div id="stat-content" class="mb-4"></div>
 
-      <!-- API Configuration -->
       <div class="card border-0 shadow-sm mb-4">
         <div class="card-header bg-transparent d-flex justify-content-between align-items-center py-3 border-0">
           <span class="text-muted small fw-bold text-uppercase">API Configuration</span>
@@ -135,7 +127,6 @@
         </div>
       </div>
 
-      <!-- Channels Table -->
       <div class="card mb-4 border-0 shadow-sm">
         <div class="card-header bg-transparent fw-bold d-flex justify-content-between align-items-center py-3 border-0">
           <div class="d-flex align-items-center gap-3 flex-grow-1">
@@ -175,7 +166,6 @@
         </div>
       </div>
 
-      <!-- Filters Table -->
       <div class="card border-0 shadow-sm">
         <div class="card-header bg-transparent fw-bold d-flex justify-content-between align-items-center py-3 border-0">
           <span>Filters</span>
@@ -203,7 +193,6 @@
 
   <button id="go-top-btn" onclick="window.scrollTo({top:0,behavior:'smooth'})" class="btn btn-primary position-fixed bottom-0 end-0 m-3 rounded-circle p-2" style="width:40px;height:40px;z-index:1060;display:none;" title="Go Top" tabindex="-1"><i class="bi bi-arrow-up"></i></button>
 
-  <!-- Modals -->
   <div class="modal fade" id="passModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-sm"><div class="modal-content">
     <div class="modal-header border-0 pb-0"><h5 class="fw-bold">New Login Password</h5><button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button></div>
     <div class="modal-body p-4"><input type="password" id="new-admin-pass" class="form-control" placeholder="New Password" minLength="6" maxLength="20" required /></div>
@@ -305,11 +294,6 @@
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/notyf@3.10.0/notyf.min.js" crossorigin="anonymous"></script>
   <script>
-    // ================================================================
-    // API Gateway Admin SPA — Frontend Logic
-    // ================================================================
-
-    // ---- Notifications ---- //
     let _notyf = null;
     const getNotyf = () => {
       if (!_notyf && typeof Notyf !== 'undefined') {
@@ -324,20 +308,21 @@
     };
     const confirmAction = (msg, onOk) => { if (window.confirm(msg)) onOk(); };
 
-    // ---- State ---- //
     let chModal, passModal, debugModal, modelsModal;
     let channels = [], filters = [], delay_period = 300;
     let refreshTimer = null, lastChannelsStr = '';
-    let sortKey = null, sortOrder = 0; // 0:none 1:asc 2:desc
+    let sortKey = null, sortOrder = 0;
     let pendingRequests = 0;
 
-    // ---- Loading Overlay with Request Counter ---- //
+    const dismissAllModals = () => {
+      [chModal, passModal, debugModal, modelsModal].forEach(m => { if (m) m.hide(); });
+    };
+
     const loading = (show) => {
       const el = document.getElementById('loading-overlay');
       if (show) {
         pendingRequests++;
         el.classList.remove('hide');
-        // Fail-safe: force hide after 10s if stuck
         setTimeout(() => { if (pendingRequests > 0) { pendingRequests = 0; el.classList.add('hide'); } }, 10000);
       } else {
         pendingRequests = Math.max(0, pendingRequests - 1);
@@ -345,7 +330,6 @@
       }
     };
 
-    // ---- API Helper ---- //
     const api = async (u, m='GET', b=null, showLoader=true) => {
       if (showLoader) loading(true);
       try {
@@ -357,7 +341,12 @@
           },
           body: b ? JSON.stringify(b) : null,
         });
-        if (r.status === 401) { showLogin(); return null; }
+        if (r.status === 401) {
+          dismissAllModals();
+          toast('登入階段已過期，請重新登入', 'warning');
+          showLogin();
+          return null;
+        }
         if (!r.ok) {
           const err = await r.json().catch(() => ({}));
           toast(err.error || 'Request Failed', 'danger');
@@ -372,7 +361,6 @@
       }
     };
 
-    // ---- View Switching ---- //
     const showLogin = () => {
       document.getElementById('admin-view').style.display = 'none';
       document.getElementById('setup-view').style.display = 'none';
@@ -410,7 +398,6 @@
         .catch(() => { t.select(); document.execCommand('copy'); toast('Token 已複製', 'success'); });
     };
 
-    // ---- HTML Escape ---- //
     const esc = (s) => {
       const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#x27;' };
       return String(s || '').replace(/[&<>"']/g, ch => map[ch] || '');
@@ -419,7 +406,6 @@
       document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => new bootstrap.Tooltip(el));
     };
 
-    // ---- Login Form ---- //
     document.getElementById('loginForm').onsubmit = async (e) => {
       e.preventDefault();
       const p = document.getElementById('login-pass').value;
@@ -446,7 +432,6 @@
       }
     };
 
-    // ---- Setup Form ---- //
     document.getElementById('setupForm').onsubmit = async (e) => {
       e.preventDefault();
       const p = document.getElementById('setup-pass').value;
@@ -484,9 +469,6 @@
       }
     };
 
-    // ================================================================
-    // Init
-    // ================================================================
     const init = async () => {
       const cfg = await api('/admin/api/config', 'GET', null, false);
       if (!cfg) return;
@@ -503,9 +485,6 @@
       renderFilters();
     };
 
-    // ================================================================
-    // Dashboard Stats
-    // ================================================================
     const renderStats = () => {
       const now = Math.floor(Date.now() / 1000);
       const total = channels.length;
@@ -566,9 +545,6 @@
       document.getElementById('stat-content').innerHTML = html;
     };
 
-    // ================================================================
-    // Channels Rendering
-    // ================================================================
     const renderChannels = () => {
       const now = Math.floor(Date.now() / 1000);
       const query = document.getElementById('ch-search').value.toLowerCase();
@@ -697,9 +673,6 @@
       });
     };
 
-    // ================================================================
-    // Filters
-    // ================================================================
     const renderFilters = () => {
       document.getElementById('filter-list').innerHTML = filters.map((f, i) => {
         let row = '<tr>';
@@ -712,11 +685,6 @@
       }).join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
       initTooltips();
     };
-
-    // ---- DB Sync ---- //
-
-
-
 
     const saveConfig = async () => {
       await api('/admin/api/config', 'POST', {
@@ -741,7 +709,6 @@
     };
 
     const saveEverything = async () => {
-      // 一次儲存所有區塊 (config + channels + filters)
       const cfgEl = document.getElementById('cfg-token');
       if (cfgEl) await api('/admin/api/config', 'POST', {
         token: cfgEl.value,
@@ -756,9 +723,6 @@
 
     const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
 
-    // ================================================================
-    // Channel CRUD
-    // ================================================================
     const openChannelModal = () => {
       document.getElementById('ch-idx').value = '';
       const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
@@ -784,7 +748,7 @@
       if (c.id) { badge.textContent = '#' + c.id; badge.style.display = ''; }
       else { badge.textContent = ''; badge.style.display = 'none'; }
       document.getElementById('ch-name').value = c.name || '';
-      document.getElementById('ch-key').value = c.api_key || ''; 
+      document.getElementById('ch-key').value = c.api_key || '';
       document.getElementById('ch-url').value = c.base_url || '';
       document.getElementById('ch-model').value = c.model || '';
       document.getElementById('ch-fallback-model').value = c.fallback_model || '';
@@ -892,9 +856,6 @@
       i.type = i.type === 'password' ? 'text' : 'password';
     };
 
-    // ================================================================
-    // Model Fetching
-    // ================================================================
     let fetchedModels = [];
     let currentModelTarget = 'primary';
 
@@ -970,9 +931,6 @@
       chModal.show();
     };
 
-    // ================================================================
-    // Sort, Toggle, Refresh
-    // ================================================================
     const toggleSort = (key) => {
       if (sortKey === key) {
         sortOrder = (sortOrder + 1) % 3;
@@ -1044,9 +1002,6 @@
       refreshTimer = setInterval(refreshHealthOnly, 15000);
     };
 
-    // ================================================================
-    // Export / Import / Reset
-    // ================================================================
     const exportJson = () => {
       const now = new Date();
       const pad = (n) => String(n).padStart(2, '0');
@@ -1099,10 +1054,7 @@
       });
     };
 
-    // ---- Auth Check (with timeout) ---- //
     const checkAuth = async () => {
-      // Page already starts with loading overlay visible.
-      // All show*() functions call loading(false) to hide it.
       const ac = new AbortController();
       const to = setTimeout(() => ac.abort(), 8000);
       try {
@@ -1137,7 +1089,6 @@
       }
     };
 
-    // ---- Safety: 強制隱藏 loading overlay ---- //
     let loaded = false;
     const forceShow = () => {
       if (loaded) return;
@@ -1147,7 +1098,6 @@
       document.body.classList.remove('loading');
     };
     const onloadFallback = () => {
-      // onload 觸發時如果還沒 show 任何 view → 強制 show login
       const login = document.getElementById('login-view');
       const setup = document.getElementById('setup-view');
       const admin = document.getElementById('admin-view');
@@ -1159,18 +1109,14 @@
       }
       forceShow();
     };
-    // 10 秒 safety net（fetch 卡住時）
     setTimeout(forceShow, 10000);
-    // onload 時也觸發（確保 loading=false）
     window.addEventListener('load', onloadFallback);
 
-    // ---- Window Load ---- //
     window.onload = () => {
       try {
         const theme = localStorage.getItem('theme') || 'light';
         document.documentElement.setAttribute('data-bs-theme', theme);
         document.getElementById('theme-icon').className = theme === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
-        // 模態框初始化失敗不影響主流程
         try {
           chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
           passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });

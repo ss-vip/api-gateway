@@ -1,12 +1,8 @@
-// ============================================================
-// Dashboard Resources — Channels / Filters / Config CRUD
-// ============================================================
 import { Hono } from "hono";
 import { getAdminPass, verifyPassword, hashPassword } from "./auth.js";
 
 const DEFAULTS = { token: "sk-test123456", delay_period: 300 };
 
-// ---- API Key Masking ---- //
 function maskApiKey(key) {
   if (!key || key.length < 8) return "****";
   return key.slice(0, 4) + "****" + key.slice(-4);
@@ -18,16 +14,11 @@ function isMaskedKey(key) {
 export default function (clearCache) {
   const api = new Hono();
 
-  // ================================================================
-  // Auth Middleware (protects all routes except public suffixes)
-  // ================================================================
   const PUBLIC_SUFFIXES = ["/auth-status", "/config", "/verify-token"];
   api.use("*", async (c, next) => {
     const path = c.req.path;
-    // Public paths always accessible (no auth needed for these)
     if (PUBLIC_SUFFIXES.some((s) => path.endsWith(s))) return await next();
     const storedHash = await getAdminPass(c);
-    // When no password is set, only /admin-pass is allowed
     if (!storedHash) {
       if (path.endsWith("/admin-pass")) return await next();
       return c.json({ error: "請先設定密碼" }, 403);
@@ -38,10 +29,6 @@ export default function (clearCache) {
       return c.json({ error: "Unauthorized" }, 401);
     await next();
   });
-
-  // ================================================================
-  // Channels
-  // ================================================================
 
   api.get("/", async (c) => {
     const { results } = await c.env.DB.prepare(
@@ -97,10 +84,6 @@ export default function (clearCache) {
     return c.json({ ok: true });
   });
 
-  // ================================================================
-  // Filters
-  // ================================================================
-
   api.get("/filters", async (c) => {
     const { results } = await c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all();
     return c.json(results || []);
@@ -117,10 +100,6 @@ export default function (clearCache) {
     clearCache();
     return c.json({ ok: true });
   });
-
-  // ================================================================
-  // Config & Auth Endpoints
-  // ================================================================
 
   api.get("/config", async (c) => {
     try {
@@ -202,18 +181,12 @@ export default function (clearCache) {
     return c.json({ ok: true });
   });
 
-  // ================================================================
-  // Import / Export / Reset
-  // ================================================================
-
-  // GET /export: dump full state as JSON (backup / migrate / sync)
   api.get("/export", async (c) => {
     const [channels, filters] = await Promise.all([
       c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
     ]);
     const config = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
-    // Include raw api_key (masking breaks sync). Admin UI download uses separate display.
     return c.json({
       channels: channels.results || [],
       filters: filters.results || [],

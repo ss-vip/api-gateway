@@ -14,7 +14,6 @@ export function getProviderNames() {
   return Object.keys(registry);
 }
 
-// ---- Auto-detect provider from channel base_url ---- //
 const HOST_RULES = [
   { pattern: "googleapis.com", provider: "google" },
   { pattern: "generativelanguage", provider: "google" },

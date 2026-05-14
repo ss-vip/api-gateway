@@ -1,26 +1,12 @@
-// ============================================================
-// Adaptive Learning Layer
-// Learns from upstream behavior — no hardcoded presets.
-// Tracks per-channel: rate limits, recovery patterns,
-// feature support (vision/tools/max_tokens/params).
-//
-// All state is in-memory (per-worker). Lost on cold start,
-// but quickly re-learns within each session.
-// ============================================================
-
 import { COOLDOWN_MAX_SECONDS } from "./constants.js";
 
-// ============================================================
-// Per-Channel State
-// ============================================================
 const state = new Map();
 
-const FEATURE_EXCLUDE_MS = 600_000; // 10 min feature exclusion
+const FEATURE_EXCLUDE_MS = 600_000;
 const WEIGHT_RECENT = 0.3;
 
 class AdaptiveState {
   constructor() {
-    // Rate limit recovery
     this.consecutive429s = 0;
     this.consecutive503s = 0;
     this.consecutiveErrors = 0;
@@ -32,16 +18,13 @@ class AdaptiveState {
     this.lastErrorAt = 0;
     this.lastSuccessAt = 0;
 
-    // Feature support (null = unknown, true/false = learned)
     this.vision = null;
     this.tools = null;
     this.requiresMaxTokens = null;
     this.requiresMaxTokensConfidence = 0;
 
-    // Blocked params: when a 400 says "unknown parameter: X"
-    this.blockedParams = null; // Set, lazily created
+    this.blockedParams = null;
 
-    // Feature exclusion timestamps (when not to use this channel)
     this.excludeVisionUntil = 0;
     this.excludeToolsUntil = 0;
   }
@@ -53,9 +36,6 @@ function get(id) {
   return s;
 }
 
-// ============================================================
-// Retry-After Header Parser
-// ============================================================
 export function parseRetryAfter(res) {
   const header = res.headers.get("Retry-After");
   if (!header) return null;
@@ -66,9 +46,6 @@ export function parseRetryAfter(res) {
   return null;
 }
 
-// ============================================================
-// Adaptive Cooldown
-// ============================================================
 export function computeCooldown(chId, errorType) {
   const s = get(chId);
   if (errorType === "429") return calc(s.avg429Recovery, s.consecutive429s, 300, 60);
@@ -82,9 +59,6 @@ function calc(avg, consecutive, base, minVal) {
   return Math.max(minVal, Math.min(Math.round(cd), COOLDOWN_MAX_SECONDS));
 }
 
-// ============================================================
-// Rate Limit Events
-// ============================================================
 export function record429(chId, retryAfter) {
   const s = get(chId);
   s.consecutive429s++; s.consecutiveErrors++;
@@ -119,11 +93,6 @@ export function recordSuccess(chId) {
   s.lastSuccessAt = now;
 }
 
-// ============================================================
-// Feature Support Learning
-// Learns from 400 error message patterns.
-// ============================================================
-
 const ERROR_PATTERNS = [
   { key: "maxTokens", re: /max[_-]?tokens\s+(is\s+)?(required|must\b)/i },
   { key: "noVision", re: /(image|picture|photo|visual|vision)\s+.*(not\s+support|unsupport|unrecognized|invalid)/i },
@@ -133,27 +102,23 @@ const ERROR_PATTERNS = [
   { key: "blockResponseFormat", re: /response_format.*(not\s+support|unsupport|unrecognized)/i },
 ];
 
-// Parse error text and extract matching pattern key + unknown param
 export function parseErrorForLearning(errText, status) {
   if (status !== 400) return null;
   const lower = String(errText || "").toLowerCase();
   for (const p of ERROR_PATTERNS) {
     if (p.re.test(lower)) return p.key;
   }
-  // Check for "unknown parameter" pattern (catch-all for any param)
   if (/\b(unknown|unexpected|unrecognized)\b.*\b(parameter|field|argument|param)\b/i.test(lower)) {
     return "unknownParam";
   }
   return null;
 }
 
-// Extract the specific parameter name from "Unknown parameter: 'xxx'" or "Unrecognized field 'xxx'"
 export function extractBlockedParam(errText) {
   const m = String(errText || "").match(/['"`](\w+)['"`]/);
   return m ? m[1] : null;
 }
 
-// Learn from a 400 error
 export function learnFromError(chId, patternKey, paramName) {
   const s = get(chId);
   const now = Date.now();
@@ -181,24 +146,17 @@ export function learnFromError(chId, patternKey, paramName) {
       if (!s.blockedParams) s.blockedParams = new Set();
       s.blockedParams.add("response_format");
       break;
-    // contextExceeded — informational, doesn't change routing
   }
 }
 
-// ============================================================
-// Feature Support Queries (called during pool building / request prep)
-// ============================================================
-
-// Should this channel be excluded for vision/image requests?
 export function isVisionExcluded(chId) {
   const s = state.get(chId);
   if (!s) return false;
-  if (s.vision === false) return true; // permanently learned
-  if (Date.now() < s.excludeVisionUntil) return true; // temporarily excluded
+  if (s.vision === false) return true;
+  if (Date.now() < s.excludeVisionUntil) return true;
   return false;
 }
 
-// Should this channel be excluded for tool-calling requests?
 export function isToolsExcluded(chId) {
   const s = state.get(chId);
   if (!s) return false;
@@ -207,33 +165,26 @@ export function isToolsExcluded(chId) {
   return false;
 }
 
-// Does this channel require max_tokens to be explicitly set?
 export function requiresMaxTokens(chId) {
   const s = state.get(chId);
   return s ? s.requiresMaxTokens === true : false;
 }
 
-// Get blocked params for this channel (params that cause 400)
 export function getBlockedParams(chId) {
   const s = state.get(chId);
   return s?.blockedParams;
 }
 
-// ============================================================
-// Internal
-// ============================================================
 function runningAvg(current, newVal, weight) {
   if (current === null) return newVal;
   return Math.round(current * (1 - weight) + newVal * weight);
 }
 
-// Debug
 export function getAdaptiveState(id) {
   const s = state.get(id);
   return s ? { ...s, blockedParams: s.blockedParams ? [...s.blockedParams] : null } : null;
 }
 
-// 清除已不存在的渠道之學習資料（避免記憶體堆積）
 export function cleanupState(validIds) {
   for (const id of state.keys()) {
     if (!validIds.has(id)) state.delete(id);

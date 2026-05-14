@@ -1,8 +1,5 @@
-// Google Gemini Provider
-
 import { SKIP, DONE } from "./index.js";
 
-// ---- Internal Helpers ---- //
 let googleChunkId = 0;
 let googleToolCallId = 0;
 
@@ -40,7 +37,6 @@ function finishReasonMap(reason) {
   return map[reason] || null;
 }
 
-// ---- Convert OpenAI content parts to Google parts ---- //
 function openaiToGoogleParts(content) {
   if (typeof content === "string") {
     return [{ text: content }];
@@ -54,7 +50,6 @@ function openaiToGoogleParts(content) {
         const dataUrl = c.image_url?.url || "";
 
         if (dataUrl.startsWith("data:")) {
-          // Data URI → inlineData (base64)
           const commaIdx = dataUrl.indexOf(",");
           if (commaIdx === -1) { continue; }
           const header = dataUrl.slice(0, commaIdx);
@@ -63,13 +58,11 @@ function openaiToGoogleParts(content) {
             .replace("data:", "").replace(";base64", "").replace(";utf8", "").trim() || "image/png";
           parts.push({ inlineData: { mimeType, data: base64Data } });
         } else if (dataUrl.startsWith("http://") || dataUrl.startsWith("https://")) {
-          // HTTP URL — Gemini fileData format (requires publicly accessible URL)
           const ext = dataUrl.split(".").pop()?.split("?")[0]?.toLowerCase() || "";
           const mimeMap = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp" };
           const mimeType = mimeMap[ext] || "image/jpeg";
           parts.push({ fileData: { mimeType, fileUri: dataUrl } });
         }
-        // else: unsupported URI scheme — skip silently
       }
     }
     return parts;
@@ -77,7 +70,6 @@ function openaiToGoogleParts(content) {
   return [{ text: String(content || "") }];
 }
 
-// ---- Tool Call Parts (with streaming partial JSON tolerance) ---- //
 function buildFunctionCallParts(toolCalls) {
   if (!toolCalls || !Array.isArray(toolCalls)) return [];
   return toolCalls.map((tc) => {
@@ -85,7 +77,6 @@ function buildFunctionCallParts(toolCalls) {
     let args = {};
     if (fn.arguments) {
       try { args = JSON.parse(fn.arguments); } catch {
-        // Partial JSON during streaming — try to fix or use as-is
         try { args = JSON.parse(fn.arguments + (fn.arguments.endsWith('"') ? "" : '"')); } catch {}
       }
     }
@@ -93,29 +84,20 @@ function buildFunctionCallParts(toolCalls) {
   });
 }
 
-// ============================================================
-// Provider Interface
-// ============================================================
-
 const provider = {
   name: "google",
 
-  // ---- URL: /{base}/models/{model}:streamGenerateContent ---- //
   buildUrl(baseUrl, model) {
     let base = (baseUrl || "").trim().replace(/\/+$/, "");
     if (!base) return null;
-    // If baseUrl already has the full endpoint path, use it
     if (base.includes(":streamGenerateContent")) return base;
-    // URL-encode model name to handle special chars (e.g., "gemini-2.0-flash-001")
     const modelName = encodeURIComponent(model || "gemini-2.0-flash");
     return `${base}/models/${modelName}:streamGenerateContent`;
   },
 
-  // ---- Convert OpenAI request → Google format ---- //
   prepareRequest(body) {
     const { messages, tools, stream, ...rest } = body;
 
-    // Separate system instruction from messages
     let systemInstruction = undefined;
     const contents = [];
 
@@ -129,17 +111,14 @@ const provider = {
       const googleRole = m.role === "assistant" ? "model" : "user";
       const parts = [];
 
-      // Content parts
       if (m.content) {
         parts.push(...openaiToGoogleParts(m.content));
       }
 
-      // Tool calls in assistant messages
       if (m.tool_calls) {
         parts.push(...buildFunctionCallParts(m.tool_calls));
       }
 
-      // Tool responses
       if (m.role === "tool" || m.role === "function") {
         parts.push({
           functionResponse: {
@@ -149,13 +128,11 @@ const provider = {
         });
       }
 
-      // Skip empty messages
       if (parts.length > 0) {
         contents.push({ role: googleRole, parts });
       }
     }
 
-    // ---- response_format mapping (OpenAI JSON mode → Gemini) ---- //
     const responseFormat = rest.response_format;
     let responseMimeType;
     if (responseFormat?.type === "json_object") {
@@ -164,7 +141,6 @@ const provider = {
       responseMimeType = "application/json";
     }
 
-    // ---- tool_choice mapping (OpenAI → Gemini tool_config) ---- //
     let toolConfig;
     if (rest.tool_choice) {
       if (rest.tool_choice === "none") {
@@ -179,7 +155,6 @@ const provider = {
           },
         };
       }
-      // "auto" is the Gemini default; no config needed
     }
 
     const googleBody = {
@@ -200,14 +175,12 @@ const provider = {
       ...(toolConfig ? { toolConfig } : {}),
     };
 
-    // System instruction
     if (systemInstruction) {
       googleBody.systemInstruction = {
         parts: [{ text: systemInstruction.trim() }],
       };
     }
 
-    // Tools → functionDeclarations
     if (tools && Array.isArray(tools)) {
       googleBody.tools = [
         {
@@ -223,11 +196,9 @@ const provider = {
     return { body: googleBody, headers: {} };
   },
 
-  // ---- Parse Google response → canonical OpenAI format ---- //
   parseResponse(text) {
     const raw = JSON.parse(text);
 
-    // Error from Google
     if (raw.error) return raw;
 
     const candidate = raw.candidates?.[0];
@@ -263,7 +234,6 @@ const provider = {
     };
   },
 
-  // ---- Process Google SSE stream line ---- //
   processStreamLine(rawLine) {
     const trimmed = rawLine.trim();
     if (!trimmed.startsWith("data:")) return SKIP;
@@ -277,7 +247,6 @@ const provider = {
     try {
       const parsed = JSON.parse(dataStr);
 
-      // Error
       if (parsed.error) {
         return {
           _error: true,
@@ -286,7 +255,6 @@ const provider = {
       }
 
       const candidate = parsed.candidates?.[0];
-      // Safety-only events or empty candidates → skip
       if (!candidate || !candidate.content) return SKIP;
 
       const parts = candidate.content?.parts || [];

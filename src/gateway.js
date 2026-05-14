@@ -1,4 +1,3 @@
-// API Gateway — 轉發核心
 import { getProvider, detectProvider, SKIP, DONE } from "./lib/providers/index.js";
 import {
   parseRetryAfter, record429, record503, recordError, recordSuccess, computeCooldown,
@@ -17,14 +16,12 @@ import {
   STREAM_MAX_DURATION_MS, HEALTH_PERSIST_INTERVAL_MS,
 } from "./lib/constants.js";
 
-// ---- Cache State ----
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
 
-// ---- Dirty state (deferred D1 writes) ---- //
-let dirtyChannels = new Set(); // channel IDs with un-persisted rate counters
+let dirtyChannels = new Set();
 let lastDirtyFlush = 0;
-let healthDirtyChannels = new Set(); // channel IDs with un-persisted health state
+let healthDirtyChannels = new Set();
 let lastHealthFlush = 0;
 
 function markDirty(chId) {
@@ -45,12 +42,10 @@ function shouldPersistCounter(ch, nowSec) {
   return false;
 }
 
-// 定期寫入 rate counters
 async function flushDirtyRateCounters(env) {
   if (dirtyChannels.size === 0 || !cache.data?.channels) return;
   const nowSec = Math.floor(Date.now() / 1000);
 
-  // Filter: only persist counters that need it
   const toPersist = [];
   for (const ch of cache.data.channels) {
     if (dirtyChannels.has(ch.id) && shouldPersistCounter(ch, nowSec)) {
@@ -78,7 +73,6 @@ async function flushDirtyRateCounters(env) {
   lastDirtyFlush = Date.now();
 }
 
-// Persist dirty health state to D1 (throttled: at most once per interval)
 async function flushDirtyHealth(env) {
   if (healthDirtyChannels.size === 0 || !cache.data?.channels) return;
   const now = Date.now();
@@ -106,15 +100,12 @@ async function flushDirtyHealth(env) {
   );
 }
 
-// D1 batch safety: chunk into max 100 statements
 async function safeBatch(db, statements) {
   if (statements.length === 0) return;
   for (let i = 0; i < statements.length; i += D1_BATCH_MAX) {
     await db.batch(statements.slice(i, i + D1_BATCH_MAX));
   }
 }
-
-// ---- Helpers ----
 
 function sanitizeToolName(n) {
   return (n || "").replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, TOOL_NAME_MAX_LENGTH) || "unknown_tool";
@@ -157,7 +148,6 @@ function normalizeOpenAIMessages(messages) {
   return result;
 }
 
-// ---- RollingFilter ----
 class RollingFilter {
   constructor(filters) {
     this.filters = filters.filter(
@@ -204,8 +194,6 @@ class RollingFilter {
     return out;
   }
 }
-
-// ---- Channel Selection ----
 
 function exponentialCooldown(consecutiveErrors) {
   if (consecutiveErrors <= COOLDOWN_ERROR_THRESHOLD) return 0;
@@ -259,7 +247,6 @@ function updateRateCounters(cachedCh, nowSec) {
   markDirty(cachedCh.id);
 }
 
-// ---- Stream Transform ----
 let chunkIdCounter = 0;
 const mkChunk = (delta, finish_reason = null, model = undefined) =>
   JSON.stringify({
@@ -618,7 +605,6 @@ export function clearCache() {
 }
 
 export default function registerGateway(app) {
-  app.get("/health", (c) => c.json({ status: "ok" }));
   app.get("/v1/models", (c) => c.json({ object: "list", data: [] }));
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
 }

@@ -1,5 +1,3 @@
-// JsonDB — 記憶體資料庫 + 自動存檔
-// 介面相容 D1: prepare().bind().all() / first() / run()
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -22,11 +20,9 @@ export class JsonDB {
     this._load(seed);
   }
 
-  // ---- Load from file or seed ---- //
   _load(seed) {
     let loaded = null;
 
-    // Try file first
     if (this._filePath && existsSync(this._filePath)) {
       try {
         const content = readFileSync(this._filePath, "utf-8");
@@ -50,7 +46,6 @@ export class JsonDB {
     this._startAutoSave();
   }
 
-  // ---- Debounced save to disk (preserves rpm/rpd across restarts) ---- //
   _markDirty() {
     if (!this._filePath) return;
     this._dirty = true;
@@ -66,7 +61,6 @@ export class JsonDB {
     try {
       const dir = dirname(this._filePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      // Atomic write: write to tmp then rename (prevents corruption on crash)
       const tmpPath = this._filePath + ".tmp";
       writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), "utf-8");
       renameSync(tmpPath, this._filePath);
@@ -75,16 +69,12 @@ export class JsonDB {
     }
   }
 
-  // ---- Public: force save (for graceful shutdown) ---- //
   save() { this._dirty = true; this._flush(); }
 
-  // ---- Periodic forced save every 60s (safety net) ---- //
   _startAutoSave() {
     if (!this._filePath) return;
     setInterval(() => { if (this._dirty) this._flush(); }, 60000);
   }
-
-  // ---- D1-compatible interface ---- //
 
   prepare(sql) {
     return new Statement(sql.trim(), this);
@@ -98,8 +88,6 @@ export class JsonDB {
     return Promise.resolve(results);
   }
 
-  // ---- Export ---- //
-
   toJSON() {
     return {
       channels: this.data.channels.map((c) => ({ ...c })),
@@ -107,8 +95,6 @@ export class JsonDB {
       config: { ...this.data.config },
     };
   }
-
-  // ---- Internal ---- //
 
   _tryParse(s) {
     try {
@@ -124,22 +110,16 @@ export class JsonDB {
     const upper = sql.toUpperCase().trim();
 
     try {
-      // ---- CHANNELS ---- //
-
-      // SELECT ... FROM channels [WHERE ...] [ORDER BY ...]
       if (upper.includes("FROM CHANNELS") && !upper.includes("INSERT") && !upper.includes("DELETE")) {
         let rows = this.data.channels;
 
-        // WHERE id IN (...)
         if (upper.includes("WHERE ID IN")) {
           rows = rows.filter((r) => params.includes(r.id));
         }
-        // WHERE is_enabled=1
         else if (upper.includes("IS_ENABLED=1") || upper.includes("IS_ENABLED = 1")) {
           rows = rows.filter((r) => r.is_enabled === 1);
         }
 
-        // ORDER BY id
         if (upper.includes("ORDER BY ID")) {
           rows = [...rows].sort((a, b) => (a.id || 0) - (b.id || 0));
         }
@@ -147,26 +127,20 @@ export class JsonDB {
         return { results: rows };
       }
 
-      // DELETE FROM channels
       if (upper.startsWith("DELETE FROM CHANNELS")) {
         this.data.channels = [];
         this._markDirty();
         return { success: true, meta: { changes: 1 } };
       }
 
-      // UPDATE channels SET ... WHERE id=?
       if (upper.startsWith("UPDATE CHANNELS")) {
         return this._updateChannels(sql, params);
       }
 
-      // INSERT INTO channels (...)
       if (upper.startsWith("INSERT INTO CHANNELS") || upper.includes("INTO CHANNELS")) {
         return this._insertChannels(sql, params);
       }
 
-      // ---- FILTERS ---- //
-
-      // SELECT ... FROM filters
       if (upper.includes("FROM FILTERS") && !upper.includes("INSERT") && !upper.includes("DELETE")) {
         let rows = this.data.filters;
         if (upper.includes("IS_ENABLED=1")) {
@@ -178,21 +152,16 @@ export class JsonDB {
         return { results: rows };
       }
 
-      // DELETE FROM filters
       if (upper.startsWith("DELETE FROM FILTERS")) {
         this.data.filters = [];
         this._markDirty();
         return { success: true, meta: { changes: 1 } };
       }
 
-      // INSERT INTO filters (...)
       if (upper.startsWith("INSERT INTO FILTERS") || upper.includes("INTO FILTERS")) {
         return this._insertFilters(sql, params);
       }
 
-      // ---- CONFIG ---- //
-
-      // SELECT ... FROM config WHERE id=1
       if (upper.includes("FROM CONFIG")) {
         if (this.data.config && this.data.config.id) {
           return { results: [this.data.config], ...this.data.config };
@@ -200,12 +169,10 @@ export class JsonDB {
         return { results: [], ...DEFAULT_CONFIG };
       }
 
-      // INSERT OR REPLACE INTO config (...)
       if ((upper.startsWith("INSERT") || upper.includes("REPLACE")) && upper.includes("CONFIG")) {
         return this._upsertConfig(sql, params);
       }
 
-      // UPDATE config SET ...
       if (upper.startsWith("UPDATE CONFIG")) {
         return this._updateConfig(sql, params);
       }
@@ -217,44 +184,35 @@ export class JsonDB {
     }
   }
 
-  // ---- Channel Operations ---- //
-
   _updateChannels(sql, params) {
     const lower = sql.toLowerCase();
     let idx = 0;
     const row = this.data.channels.find((c) => {
-      // WHERE id=? is always the LAST param
       const whereIdx = Math.max(
         sql.toUpperCase().lastIndexOf("WHERE ID="),
         sql.toUpperCase().lastIndexOf("WHERE ID =")
       );
-      // The last param is the ID
       const idIdx = params.length - 1;
       return c.id === params[idIdx];
     });
     if (!row) return { success: true, meta: { changes: 0 } };
 
-    // Map SET clauses by their content
     if (lower.includes("rpm_count=")) {
-      // RPM/RPD update: rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?
       row.rpm_count = params[0];
       row.rpm_reset_at = params[1];
       row.rpd_count = params[2];
       row.rpd_reset_at = params[3];
     } else if (lower.includes("consecutive_errors=")) {
-      // Health update: consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=? WHERE id=?
       row.consecutive_errors = params[0];
       row.last_error_msg = params[1] || "";
       row.last_error_at = params[2] || 0;
       row.response_time = params[3] || 0;
     } else if (lower.includes("last_429=0")) {
-      // Reset health
       row.last_429 = 0;
       row.consecutive_errors = 0;
       row.last_error_msg = "";
       row.last_error_at = 0;
     } else if (lower.includes("response_time=")) {
-      // Simple health reset (from success path, old code): consecutive_errors=0, response_time=? WHERE id=?
       row.consecutive_errors = 0;
       row.response_time = params[0];
     }
@@ -288,7 +246,6 @@ export class JsonDB {
       created_at: Math.floor(Date.now() / 1000),
       updated_at: Math.floor(Date.now() / 1000),
     };
-    // Replace if exists
     const existing = this.data.channels.findIndex((c) => c.id === id);
     if (existing >= 0) {
       this.data.channels[existing] = ch;
@@ -300,10 +257,7 @@ export class JsonDB {
     return { success: true, meta: { last_row_id: id, changes: 1 } };
   }
 
-  // ---- Filter Operations ---- //
-
   _insertFilters(sql, params) {
-    // INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)
     const id = this._nextId.filter++;
     this.data.filters.push({
       id,
@@ -317,12 +271,7 @@ export class JsonDB {
     return { success: true, meta: { last_row_id: id, changes: 1 } };
   }
 
-  // ---- Config Operations ---- //
-
   _upsertConfig(sql, params) {
-    // INSERT OR REPLACE INTO config (id, client_token, admin_password, recovery_period) VALUES (1, ?, ?, ?)
-    // Also: INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)
-    // Also: INSERT INTO config (id, admin_password) VALUES (1, ?)
     const cfg = this.data.config;
     cfg.id = 1;
     cfg.updated_at = Math.floor(Date.now() / 1000);
@@ -330,7 +279,6 @@ export class JsonDB {
     if (params.length >= 1 && params[0] !== undefined && params[0] !== null) {
       const sqlLower = sql.toLowerCase();
       if (sqlLower.includes("admin_password")) {
-        // INSERT OR REPLACE INTO config (id, client_token, admin_password, recovery_period) VALUES (1, ?, ?, ?)
         if (params.length === 1) {
           cfg.admin_password = params[0];
         } else if (params.length === 3) {
@@ -367,8 +315,6 @@ export class JsonDB {
   }
 }
 
-// ---- Statement: mimics D1's prepared statement ---- //
-
 class Statement {
   constructor(sql, db) {
     this.sql = sql;
@@ -383,17 +329,14 @@ class Statement {
 
   all() {
     const result = this.db._execute(this);
-    // D1 .all() returns { results: [...] }
     return Promise.resolve(result.results ? result : { results: [] });
   }
 
   first() {
     const result = this.db._execute(this);
-    // D1 .first() returns a single row or null
     if (result.results && Array.isArray(result.results)) {
       return Promise.resolve(result.results[0] || null);
     }
-    // For config queries, result might be the row directly (with id field)
     if (result.id !== undefined) {
       return Promise.resolve(result);
     }
