@@ -300,25 +300,27 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
       reader.cancel("Stream idle timeout").catch(() => {});
     }
   }, 5000);
-  const send = async (data) => {
-    if (typeof data === "object") data = JSON.stringify(data);
-    await writer.write(encoder.encode(`data: ${data}\n\n`));
+  let doneSent = false;
+  const sendDone = async () => {
+    if (doneSent) return;
+    doneSent = true;
+    await send("[DONE]");
   };
   try {
     await send(mkChunk({ content: "" }, null, responseModel));
     while (true) {
       if (Date.now() - streamStart > STREAM_MAX_DURATION_MS) {
         await send(mkChunk({ content: "\n\n[Stream duration limit exceeded]" }, "stop", responseModel));
-        await send("[DONE]");
+        await sendDone();
         break;
       }
       let result;
       try {
         result = await reader.read();
-        if (result.done) { await send("[DONE]"); break; }
+        if (result.done) { await sendDone(); break; }
       } catch (e) {
         await send(mkChunk({ content: "\n\n[Upstream Connection Lost]" }, "stop", responseModel));
-        await send("[DONE]");
+        await sendDone();
         break;
       }
       lastActivity = Date.now();
@@ -332,12 +334,12 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
         if (event === DONE) {
           const tail = filter.flush();
           if (tail) await send(mkChunk({ content: tail }, null, responseModel));
-          await send("[DONE]");
-          continue;
+          await sendDone();
+          break;
         }
         if (event._error) {
           await send(mkChunk({ content: `\n\n[Upstream Error: ${event.message || "Unknown"}]` }, "stop", responseModel));
-          await send("[DONE]");
+          await sendDone();
           continue;
         }
         if (responseModel) event.model = responseModel;

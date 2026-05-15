@@ -31,6 +31,9 @@
       .input-group-text { font-size: 0.7rem; }
     }
     #loading-overlay .spinner-border { display: inline-block; width: 2rem; height: 2rem; border: 0.25em solid #fff; border-right-color: transparent; border-radius: 50%; animation: spinner-border 0.75s linear infinite; }
+    .tab-content-equal { display: grid; }
+    .tab-content-equal > .tab-pane { grid-area: 1/1/1/1; visibility: hidden; opacity: 0; transition: opacity 0.15s; }
+    .tab-content-equal > .tab-pane.active { visibility: visible; opacity: 1; position: static; }
   </style>
 </head>
 <body>
@@ -179,7 +182,8 @@
           <table class="table table-hover mb-0 text-center small">
             <thead class="table-light">
               <tr>
-                <th style="width: 80px" class="align-middle">
+                <th style="width: 60px" class="align-middle">ID</th>
+                <th style="width: 100px" class="align-middle">
                   <div class="d-flex align-items-center justify-content-center gap-1">
                     <input type="checkbox" class="form-check-input" onchange="toggleAllFilters(this.checked)" title="全選/全取消">
                     <span class="small">ON/OFF</span>
@@ -225,7 +229,7 @@
           <button class="nav-link fw-bold small px-3" id="advanced-tab-btn" data-bs-toggle="tab" data-bs-target="#advanced-tab" type="button" role="tab">Option</button>
         </li>
       </ul>
-      <div class="tab-content border border-top-0 rounded-bottom p-3" style="min-height:340px">
+      <div class="tab-content tab-content-equal border border-top-0 rounded-bottom p-3">
       <div class="tab-pane fade show active" id="basic-tab" role="tabpanel">
       <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
       <div class="mb-2">
@@ -275,7 +279,7 @@
         </div>
       </div>
       </div>
-      <div class="tab-pane fade" id="advanced-tab" role="tabpanel" style="min-height:280px">
+      <div class="tab-pane fade" id="advanced-tab" role="tabpanel">
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Provider Override <span class="text-muted fw-normal" style="font-size:0.6rem">留空=自動偵測</span></label>
         <select id="ch-provider" class="form-select form-select-sm">
@@ -715,13 +719,14 @@
     const renderFilters = () => {
       document.getElementById('filter-list').innerHTML = filters.map((f, i) => {
         let row = '<tr>';
-        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
+        row += '<td class="text-muted small align-middle">' + (f.id || '-') + '</td>';
+        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
         row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>';
         row += '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
         row += '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
         row += '</tr>';
         return row;
-      }).join('') || '<tr><td colspan="4" class="py-4 text-muted">No filters.</td></tr>';
+      }).join('') || '<tr><td colspan="5" class="py-4 text-muted">No filters.</td></tr>';
       initTooltips();
     };
 
@@ -1182,6 +1187,9 @@
           debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
           modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
           modelsModal._element.addEventListener('hidden.bs.modal', () => { if (chModal) chModal.show(); });
+          document.querySelectorAll('.modal').forEach(el => {
+            el.addEventListener('hide.bs.modal', () => { if (document.activeElement?.closest('.modal')) document.activeElement?.blur(); });
+          });
         } catch (e) { console.warn('[modal]', e); }
         const goTopBtn = document.getElementById('go-top-btn');
         if (goTopBtn) {
