@@ -497,111 +497,145 @@ async function handleChatRequest(c) {
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
     pool.sort((a, b) => ((b.model === originalModel || b.fallback_model === originalModel) ? 1 : 0) - ((a.model === originalModel || a.fallback_model === originalModel) ? 1 : 0));
+    const requestDeadline = Date.now() + REQUEST_TIMEOUT_SECONDS * 3000;
+    if (isStream) {
+      const { readable: out, writable } = new TransformStream();
+      const w = writable.getWriter();
+      const enc = new TextEncoder();
+      const keepalive = setInterval(() => { try { w.write(enc.encode("data: [KEEPALIVE]\n\n")); } catch { clearInterval(keepalive); } }, 8000);
+      setImmediate(async () => {
+        try {
+          let ok = false;
+          while (pool.length > 0 && !ok && Date.now() <= requestDeadline) {
+            const ch = selectChannel(pool);
+            if (!ch) break;
+            const providerName = ch.provider || detectProvider(ch.base_url);
+            const provider = getProvider(providerName);
+            const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
+            const url = provider.buildUrl(ch.base_url, effectiveModel, true);
+            if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
+            let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
+            const blocked = getBlockedParams(ch.id);
+            if (blocked && blocked.size > 0) { for (const param of blocked) { delete reqBody[param]; } }
+            let channelHeaders = {};
+            if (ch.headers && typeof ch.headers === "object") channelHeaders = { ...ch.headers };
+            else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch {}
+            if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
+            else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch {}
+            const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
+            try {
+              const startTime = Date.now();
+              const requestHeaders = {
+                "Content-Type": "application/json", "User-Agent": "api-gateway/1.0", "Accept": "application/json",
+                Authorization: "Bearer " + ch.api_key, ...pHeaders, ...channelHeaders,
+              };
+              if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
+              if (requestHeaders["x-api-key"] === "") delete requestHeaders["x-api-key"];
+              const res = await fetch(url, { method: "POST", headers: requestHeaders, body: JSON.stringify(pBody), signal: controller.signal });
+              const responseTime = Date.now() - startTime;
+              clearTimeout(timeoutId);
+              if (!res.ok) {
+                const errBody = await res.text().catch(() => "");
+                const errText = errBody || ("HTTP " + res.status);
+                pool = pool.filter(p => p.id !== ch.id);
+                if (res.status === 429) {
+                  record429(ch.id, parseRetryAfter(res));
+                  ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300); markDirty(ch.id); healthDirtyChannels.add(ch.id);
+                } else {
+                  recordError(ch.id);
+                  const errPattern = parseErrorForLearning(errText, res.status);
+                  if (errPattern) learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
+                  ch.consecutive_errors = (ch.consecutive_errors || 0) + 1; ch.last_error_at = Math.floor(Date.now() / 1000);
+                  ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url, request: pBody, response: truncateErrorBody(errBody) });
+                  ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
+                }
+                continue;
+              }
+              ok = true;
+              clearInterval(keepalive);
+              updateRateCounters(ch, Math.floor(Date.now() / 1000)); recordSuccess(ch.id);
+              ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
+              await tier2FullFilter(res.body, data.filters || [], originalModel, enc, w, provider);
+            } catch (e) {
+              clearTimeout(timeoutId);
+              recordError(ch.id); ch.consecutive_errors = (ch.consecutive_errors || 0) + 1; ch.last_error_at = Math.floor(Date.now() / 1000);
+              ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout"), url, request: pBody, response: "" });
+              ch.response_time = responseTime || 0; healthDirtyChannels.add(ch.id); pool = pool.filter(p => p.id !== ch.id);
+            }
+          }
+          if (!ok) {
+            const bye = { id: "chatcmpl-" + (++chunkIdCounter), object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: originalModel || "unknown", choices: [{ index: 0, delta: { content: "\n\nService temporarily unavailable, please try again later." }, finish_reason: "stop" }] };
+            try { await w.write(enc.encode("data: " + JSON.stringify(bye) + "\n\ndata: [DONE]\n\n")); } catch {}
+          }
+        } catch (e) { console.error("[stream] retry error:", e.message); }
+        clearInterval(keepalive);
+        try { await w.close(); } catch {}
+      });
+      return new Response(out, { headers: SSE_CHUNK_HEADERS });
+    }
     while (pool.length > 0) {
+      if (Date.now() > requestDeadline) return errResponse(c, "Request deadline exceeded", "server_error", 504);
       const ch = selectChannel(pool);
       if (!ch) return errResponse(c, "Rate limited or cooldown", "rate_limit_error", 429);
       const providerName = ch.provider || detectProvider(ch.base_url);
       const provider = getProvider(providerName);
       const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
-      const url = provider.buildUrl(ch.base_url, effectiveModel, isStream);
+      const url = provider.buildUrl(ch.base_url, effectiveModel, false);
       if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
       let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
       const blocked = getBlockedParams(ch.id);
-      if (blocked && blocked.size > 0) {
-        for (const param of blocked) { delete reqBody[param]; }
-      }
+      if (blocked && blocked.size > 0) { for (const param of blocked) { delete reqBody[param]; } }
       let channelHeaders = {};
-      if (ch.headers && typeof ch.headers === "object") {
-        channelHeaders = { ...ch.headers };
-      } else if (ch.headers && typeof ch.headers === "string") {
-        try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
-      }
-      if (ch.provider_options && typeof ch.provider_options === "object") {
-        Object.assign(reqBody, ch.provider_options);
-      } else if (ch.provider_options && typeof ch.provider_options === "string") {
-        try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) {}
-      }
+      if (ch.headers && typeof ch.headers === "object") channelHeaders = { ...ch.headers };
+      else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch {}
+      if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
+      else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch {}
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
       let responseTime = 0;
       try {
         const startTime = Date.now();
-        const requestBody = JSON.stringify(pBody);
         const requestHeaders = {
-          "Content-Type": "application/json",
-          "User-Agent": "api-gateway/1.0",
-          "Accept": "application/json",
-          Authorization: "Bearer " + ch.api_key,
-          ...pHeaders,
-          ...channelHeaders,
+          "Content-Type": "application/json", "User-Agent": "api-gateway/1.0", "Accept": "application/json",
+          Authorization: "Bearer " + ch.api_key, ...pHeaders, ...channelHeaders,
         };
         if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
         if (requestHeaders["x-api-key"] === "") delete requestHeaders["x-api-key"];
-        const res = await fetch(url, {
-          method: "POST",
-          headers: requestHeaders,
-          body: requestBody,
-          signal: controller.signal,
-        });
+        const res = await fetch(url, { method: "POST", headers: requestHeaders, body: JSON.stringify(pBody), signal: controller.signal });
         responseTime = Date.now() - startTime;
         clearTimeout(timeoutId);
         if (!res.ok) {
           const errBody = await res.text().catch(() => "");
           const errText = errBody || ("HTTP " + res.status);
-          if (res.status !== 429 && errBody) {
-            const errPreview = errBody.replace(/\n/g, " ").slice(0, 200);
-            console.log("[diag]", res.status, url.replace(/\/\/[^@]+@/, "//***@"), errPreview);
-          }
+          if (res.status !== 429 && errBody) console.log("[diag]", res.status, url.replace(/\/\/[^@]+@/, "//***@"), errBody.replace(/\n/g," ").slice(0,200));
           if (res.status === 429) {
-            record429(ch.id, parseRetryAfter(res));
-            ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
-            markDirty(ch.id);
-            healthDirtyChannels.add(ch.id);
-            pool = pool.filter(p => p.id !== ch.id);
-            continue;
+            record429(ch.id, parseRetryAfter(res)); ch.last_429 = Math.floor(Date.now()/1000) + (data.config.recovery_period||300);
+            markDirty(ch.id); healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id); continue;
           }
           recordError(ch.id);
           const errPattern = parseErrorForLearning(errText, res.status);
-          if (errPattern) {
-            const blockedParam = errPattern === "unknownParam" ? extractBlockedParam(errText) : null;
-            learnFromError(ch.id, errPattern, blockedParam);
-          }
-          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-          ch.last_error_at = Math.floor(Date.now() / 1000);
-          ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url, request: pBody, response: truncateErrorBody(errBody) });
-          ch.response_time = responseTime;
-          healthDirtyChannels.add(ch.id);
-          pool = pool.filter(p => p.id !== ch.id);
-          continue;
+          if (errPattern) learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
+          ch.consecutive_errors = (ch.consecutive_errors||0)+1; ch.last_error_at = Math.floor(Date.now()/1000);
+          ch.last_error_msg = JSON.stringify({message:truncateErrorBody(errText),url,request:pBody,response:truncateErrorBody(errBody)});
+          ch.response_time = responseTime; healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id); continue;
         }
-        updateRateCounters(ch, Math.floor(Date.now() / 1000));
-        recordSuccess(ch.id);
-        ch.consecutive_errors = 0;
-        ch.last_error_msg = "";
-        ch.last_error_at = 0;
-        ch.response_time = responseTime;
-        healthDirtyChannels.add(ch.id);
-        if (isStream) {
-          return new Response(transformStream(res.body, data.filters, originalModel, provider), { headers: SSE_CHUNK_HEADERS });
-        }
+        updateRateCounters(ch, Math.floor(Date.now()/1000)); recordSuccess(ch.id);
+        ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
         const resText = await res.text();
         const json = provider.parseResponse(resText);
         if (originalModel) json.model = originalModel;
         return c.json(json);
       } catch (e) {
-        clearTimeout(timeoutId);
-        recordError(ch.id);
-        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-        ch.last_error_at = Math.floor(Date.now() / 1000);
-        ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout or network error"), url, request: pBody, response: "" });
-        ch.response_time = responseTime || 0;
-        healthDirtyChannels.add(ch.id);
-        pool = pool.filter(p => p.id !== ch.id);
-        continue;
+        clearTimeout(timeoutId); recordError(ch.id);
+        ch.consecutive_errors = (ch.consecutive_errors||0)+1; ch.last_error_at = Math.floor(Date.now()/1000);
+        ch.last_error_msg = JSON.stringify({message:truncateErrorBody(e.message||"Request timeout or network error"),url,request:pBody,response:""});
+        ch.response_time = responseTime||0; healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id);
       }
     }
-    return errResponse(c, "All exhausted", "server_error", 503);
+    return c.json({ id: "chatcmpl-fallback", object: "chat.completion", created: Math.floor(Date.now()/1000), model: originalModel || "unknown", choices: [{ index: 0, message: { role: "assistant", content: "Service temporarily unavailable, please try again later." }, finish_reason: "stop" }] });
   } catch (e) {
     console.error("[gateway] unhandled:", e.message);
     return errResponse(c, "Internal Error", "server_error", 500);
@@ -774,20 +808,27 @@ async function handleImageGeneration(c) {
 }
 
 export default function registerGateway(app) {
-  app.get("/v1/models", async (c) => {
+  const modelsHandler = async (c) => {
     try {
       const data = await loadCache(c.env);
-      const models = (data.channels || []).filter((ch) => ch.is_enabled).map((ch) => ({
+      const enabled = (data.channels || []).filter((ch) => ch.is_enabled);
+      if (enabled.length === 0) return c.json({ error: "no_available_channels", message: "No channels available" }, 503);
+      const models = enabled.map((ch) => ({
         id: ch.model || "unknown", object: "model", created: 1735689600, owned_by: ch.name || "api-gateway",
       }));
-      const fallbacks = (data.channels || []).filter((ch) => ch.is_enabled && ch.fallback_model)
+      const fallbacks = enabled.filter((ch) => ch.fallback_model)
         .map((ch) => ({ id: ch.fallback_model, object: "model", created: 1735689600, owned_by: ch.name || "api-gateway" }));
-      return c.json({ object: "list", data: [...models, ...fallbacks] });
+      return c.json({ object: "list", data: [{ id: "openai", object: "model", created: 1735689600, owned_by: "api-gateway" }, ...models, ...fallbacks] });
     } catch (e) {
-      return c.json({ object: "list", data: [{ id: "openai", object: "model", created: 1735689600, owned_by: "api-gateway" }] });
+      return c.json({ error: "server_error", message: "Failed to load models" }, 503);
     }
-  });
+  };
+  app.get("/models", modelsHandler);
+  app.get("/v1/models", modelsHandler);
+  app.post("/chat/completions", async (c) => handleChatRequest(c));
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
+  app.post("/embeddings", async (c) => handleEmbeddings(c));
   app.post("/v1/embeddings", async (c) => handleEmbeddings(c));
+  app.post("/images/generations", async (c) => handleImageGeneration(c));
   app.post("/v1/images/generations", async (c) => handleImageGeneration(c));
 }
