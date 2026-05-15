@@ -179,7 +179,11 @@
           <table class="table table-hover mb-0 text-center small">
             <thead class="table-light">
               <tr>
-                <th style="width: 80px" class="align-middle">ON/OFF</th>
+                <th style="width: 80px" class="align-middle">
+                  <div class="d-flex align-items-center justify-content-center gap-1">
+                    <input type="checkbox" class="form-check-input" onchange="toggleAllFilters(this.checked)" title="全選/全取消">
+                  </div>
+                </th>
                 <th class="align-middle">Keyword <i class="bi bi-info-circle" title="要過濾的關鍵字"></i></th>
                 <th style="width: 120px" class="d-none d-sm-table-cell align-middle">Mode <i class="bi bi-info-circle" title="Truncate: 切除關鍵字及其後內容；Delete: 僅刪除關鍵字"></i></th>
                 <th style="width: 60px" class="align-middle">Actions</th>
@@ -212,15 +216,15 @@
     <div class="modal-body p-3 p-md-4">
       <input type="hidden" id="ch-idx" />
       <input type="hidden" id="ch-id" />
-      <ul class="nav nav-tabs mb-3 border-0" role="tablist">
+      <ul class="nav nav-tabs mb-0 border-bottom" role="tablist">
         <li class="nav-item" role="presentation">
-          <button class="nav-link active fw-bold small px-3" id="basic-tab-btn" data-bs-toggle="tab" data-bs-target="#basic-tab" type="button" role="tab">基本</button>
+          <button class="nav-link active fw-bold small px-3" id="basic-tab-btn" data-bs-toggle="tab" data-bs-target="#basic-tab" type="button" role="tab">Basic</button>
         </li>
         <li class="nav-item" role="presentation">
-          <button class="nav-link fw-bold small px-3" id="advanced-tab-btn" data-bs-toggle="tab" data-bs-target="#advanced-tab" type="button" role="tab">進階</button>
+          <button class="nav-link fw-bold small px-3" id="advanced-tab-btn" data-bs-toggle="tab" data-bs-target="#advanced-tab" type="button" role="tab">Option</button>
         </li>
       </ul>
-      <div class="tab-content">
+      <div class="tab-content border border-top-0 rounded-bottom p-3" style="min-height:340px">
       <div class="tab-pane fade show active" id="basic-tab" role="tabpanel">
       <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
       <div class="mb-2">
@@ -244,7 +248,7 @@
         <div class="input-group input-group-sm">
           <input type="text" id="ch-fallback-model" class="form-control form-control-sm" />
           <button class="btn btn-outline-secondary" type="button" onclick="clearInput('ch-fallback-model')" title="Clear"><i class="bi bi-x-lg"></i></button>
-          <button class="btn btn-outline-secondary fw-bold" type="button" id="btn-fetch-models-fallback" onclick="fetchModels('fallback')" disabled>FETCH</button>
+          <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models-fallback" onclick="fetchModels('fallback')" disabled>FETCH</button>
         </div>
       </div>
       <div class="row g-2 mb-2">
@@ -270,7 +274,7 @@
         </div>
       </div>
       </div>
-      <div class="tab-pane fade" id="advanced-tab" role="tabpanel">
+      <div class="tab-pane fade" id="advanced-tab" role="tabpanel" style="min-height:280px">
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Provider Override <span class="text-muted fw-normal" style="font-size:0.6rem">留空=自動偵測</span></label>
         <select id="ch-provider" class="form-select form-select-sm">
@@ -282,11 +286,11 @@
       </div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Custom Headers <span class="text-muted fw-normal" style="font-size:0.6rem">JSON, e.g. {"HTTP-Referer":"..."}</span></label>
-        <textarea id="ch-headers" class="form-control form-control-sm" rows="2" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"https://example.com","X-Title":"My App"}'></textarea>
+        <textarea id="ch-headers" class="form-control form-control-sm" rows="4" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"https://example.com","X-Title":"My App"}'></textarea>
       </div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Provider Options <span class="text-muted fw-normal" style="font-size:0.6rem">JSON body overrides, e.g. {"provider":{"order":["OpenAI"]}}</span></label>
-        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="2" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
+        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="4" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
       </div>
       </div>
       </div>
@@ -645,8 +649,8 @@
         row += '<input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()">';
         row += '</div></td>';
         const providerLabel = c.provider || (c.base_url ? (c.base_url.includes('googleapis') || c.base_url.includes('generativelanguage') ? 'Google' : c.base_url.includes('anthropic') ? 'Claude' : 'OpenAI') : '');
-        const providerBadge = providerLabel ? ' <span class="badge bg-secondary-subtle text-secondary-emphasis" style="font-size:0.55rem;vertical-align:middle">' + esc(providerLabel) + '</span>' : '';
-        row += '<td class="fw-bold align-middle">' + esc(c.name) + providerBadge + '</td>';
+        const providerTitle = providerLabel ? ' title="Provider: ' + esc(providerLabel) + '"' : '';
+        row += '<td class="fw-bold align-middle" style="cursor:help"' + providerTitle + '>' + esc(c.name) + '</td>';
         row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + toolsIcon + '</td>';
         row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
         row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
@@ -1000,6 +1004,11 @@
       renderChannels();
       renderStats();
       toast(val ? '已開啟所有渠道' : '已關閉所有渠道', 'info');
+    };
+    const toggleAllFilters = (val) => {
+      filters.forEach(f => f.is_enabled = val);
+      renderFilters();
+      toast(val ? '已啟用所有過濾器' : '已停用所有過濾器', 'info');
     };
 
     const resetAllHealth = async () => {
