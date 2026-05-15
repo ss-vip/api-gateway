@@ -259,12 +259,13 @@ const SSE_CHUNK_HEADERS = {
 
 async function tier0Passthrough(readable, encoder, writer) {
   const initialChunk = `data: ${mkChunk({ content: "" })}\n\n`;
+  const doneChunk = encoder.encode("data: [DONE]\n\n");
   try {
     await writer.write(encoder.encode(initialChunk));
     const reader = readable.getReader();
     while (true) {
       const { done, value } = await reader.read();
-      if (done) break;
+      if (done) { try { await writer.write(doneChunk); } catch {} break; }
       await writer.write(value);
     }
   } catch (e) {
@@ -314,7 +315,7 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
       let result;
       try {
         result = await reader.read();
-        if (result.done) break;
+        if (result.done) { await send("[DONE]"); break; }
       } catch (e) {
         await send(mkChunk({ content: "\n\n[Upstream Connection Lost]" }, "stop", responseModel));
         await send("[DONE]");

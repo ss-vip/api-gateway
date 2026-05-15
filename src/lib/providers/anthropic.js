@@ -232,6 +232,9 @@ const provider = {
         if (delta.type === "text_delta") {
           return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { content: delta.text || "" }, finish_reason: null }] };
         }
+        if (delta.type === "thinking_delta") {
+          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { thought: delta.thinking || "" }, finish_reason: null }] };
+        }
         if (delta.type === "input_json_delta") {
           const toolCallId = s.toolCallIds?.[blockIndex] || `toolu_${blockIndex}`;
           const partial = delta.partial_json || "";
@@ -254,6 +257,12 @@ const provider = {
         }
         if (block.type === "text") {
           return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { content: block.text || "" }, finish_reason: null }] };
+        }
+        if (block.type === "thinking") {
+          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { thought: block.thinking || "" }, finish_reason: null }] };
+        }
+        if (block.type === "redacted_thinking") {
+          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { thought: "[Redacted thinking]" }, finish_reason: null }] };
         }
         return SKIP;
       }
