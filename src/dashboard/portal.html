@@ -200,7 +200,7 @@
     <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
   </div></div></div>
 
-  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg"><div class="modal-content">
     <div class="modal-header border-0 pb-0">
       <div class="d-flex align-items-center gap-2">
         <h5 class="fw-bold small mb-0">Channel Editor</h5>
@@ -208,15 +208,25 @@
       </div>
       <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button>
     </div>
-    <form id="ch-form" onsubmit="event.preventDefault(); applyChannel();">
+    <form id="ch-form" autocomplete="off" onsubmit="event.preventDefault(); applyChannel();">
     <div class="modal-body p-3 p-md-4">
       <input type="hidden" id="ch-idx" />
       <input type="hidden" id="ch-id" />
+      <ul class="nav nav-tabs mb-3 border-0" role="tablist">
+        <li class="nav-item" role="presentation">
+          <button class="nav-link active fw-bold small px-3" id="basic-tab-btn" data-bs-toggle="tab" data-bs-target="#basic-tab" type="button" role="tab">基本</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link fw-bold small px-3" id="advanced-tab-btn" data-bs-toggle="tab" data-bs-target="#advanced-tab" type="button" role="tab">進階</button>
+        </li>
+      </ul>
+      <div class="tab-content">
+      <div class="tab-pane fade show active" id="basic-tab" role="tabpanel">
       <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">API Key *</label>
         <div class="input-group input-group-sm">
-          <input type="password" id="ch-key" class="form-control form-control-sm" required />
+          <input type="password" id="ch-key" class="form-control form-control-sm" autocomplete="new-password" required />
           <button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button>
         </div>
       </div>
@@ -241,15 +251,6 @@
         <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" required /></div>
         <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" value="0" /></div>
       </div>
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Provider Override <span class="text-muted fw-normal" style="font-size:0.6rem">留空=自動偵測</span></label>
-        <select id="ch-provider" class="form-select form-select-sm">
-          <option value="">Auto Detect</option>
-          <option value="openai">OpenAI 相容</option>
-          <option value="google">Google Gemini (原生)</option>
-          <option value="anthropic">Anthropic Claude</option>
-        </select>
-      </div>
       <div class="row g-1 mb-2">
         <div class="col-6"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
         <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
@@ -268,13 +269,26 @@
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
         </div>
       </div>
-      <div class="mb-2 mt-2 pt-2 border-top">
+      </div>
+      <div class="tab-pane fade" id="advanced-tab" role="tabpanel">
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Provider Override <span class="text-muted fw-normal" style="font-size:0.6rem">留空=自動偵測</span></label>
+        <select id="ch-provider" class="form-select form-select-sm">
+          <option value="">Auto Detect</option>
+          <option value="openai">OpenAI 相容</option>
+          <option value="google">Google Gemini (原生)</option>
+          <option value="anthropic">Anthropic Claude</option>
+        </select>
+      </div>
+      <div class="mb-2">
         <label class="form-label mini-label fw-bold">Custom Headers <span class="text-muted fw-normal" style="font-size:0.6rem">JSON, e.g. {"HTTP-Referer":"..."}</span></label>
         <textarea id="ch-headers" class="form-control form-control-sm" rows="2" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"https://example.com","X-Title":"My App"}'></textarea>
       </div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Provider Options <span class="text-muted fw-normal" style="font-size:0.6rem">JSON body overrides, e.g. {"provider":{"order":["OpenAI"]}}</span></label>
         <textarea id="ch-provider-options" class="form-control form-control-sm" rows="2" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
+      </div>
+      </div>
       </div>
     </div>
     <div class="modal-footer border-0 pt-0"><button type="submit" class="btn btn-primary w-100 fw-bold">APPLY</button></div>
@@ -1151,6 +1165,9 @@
         document.getElementById('theme-icon').className = theme === 'dark' ? 'bi bi-moon-fill' : 'bi bi-sun';
         try {
           chModal = new bootstrap.Modal(document.getElementById('chModal'), { backdrop: 'static' });
+          document.getElementById('chModal').addEventListener('show.bs.modal', () => {
+            document.getElementById('basic-tab-btn')?.click();
+          });
           passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
           debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
           modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });

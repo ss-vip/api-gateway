@@ -193,7 +193,7 @@ const provider = {
   processStreamLine(rawLine, state) {
     const trimmed = rawLine.trim();
     if (!trimmed) return SKIP;
-    const s = state || this._fallbackState || (this._fallbackState = createAnthropicStreamState());
+    const s = state || createAnthropicStreamState();
 
     if (trimmed.startsWith("event:")) {
       s.lastEvent = trimmed.slice(6).trim();

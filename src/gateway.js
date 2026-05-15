@@ -276,60 +276,6 @@ async function tier0Passthrough(readable, encoder, writer) {
   }
 }
 
-function fastReplaceModel(line, newModel) {
-  if (!line.startsWith("data:")) return line;
-  const trimmed = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
-  if (trimmed === "[DONE]" || trimmed.startsWith("[DONE]")) return line;
-  return line.replace(/"model"\s*:\s*"[^"]*"/, `"model":"${newModel}"`);
-}
-
-async function tier1ModelReplace(readable, encoder, writer, responseModel) {
-  const reader = readable.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  let lastActivity = Date.now();
-  let errNotified = false;
-  const streamStart = Date.now();
-  const errChunk = encoder.encode(`data: ${JSON.stringify({ _error: true, message: "Upstream stream error" })}\n\n`);
-  const idleTimer = setInterval(() => {
-    if (Date.now() - lastActivity > STREAM_IDLE_TIMEOUT_MS) {
-      reader.cancel("Stream idle timeout").catch(() => {});
-    }
-  }, 5000);
-  try {
-    await writer.write(encoder.encode(`data: ${mkChunk({ content: "" }, null, responseModel)}\n\n`));
-    while (true) {
-      if (Date.now() - streamStart > STREAM_MAX_DURATION_MS) {
-        await writer.write(encoder.encode(`data: ${JSON.stringify({ _error: true, message: "Stream duration limit exceeded" })}\n\n`));
-        break;
-      }
-      let result;
-      try {
-        result = await reader.read();
-        if (result.done) break;
-      } catch (e) {
-        await writer.write(errChunk);
-        errNotified = true;
-        break;
-      }
-      lastActivity = Date.now();
-      buf += decoder.decode(result.value, { stream: true });
-      if (buf.length > STREAM_BUF_MAX_BYTES) buf = buf.slice(buf.length - STREAM_BUF_MAX_BYTES);
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const line of lines) {
-        if (line.length === 0) { await writer.write(encoder.encode("\n")); continue; }
-        await writer.write(encoder.encode(fastReplaceModel(line, responseModel) + "\n"));
-      }
-    }
-  } catch (e) {
-    if (!errNotified) { try { await writer.write(errChunk); } catch (e2) {} }
-  } finally {
-    clearInterval(idleTimer);
-    try { writer.close(); } catch (e) {}
-  }
-}
-
 const buildChunk = (delta, finishReason, json, usage) => ({
   id: json.id || "chatcmpl-" + (++chunkIdCounter),
   object: "chat.completion.chunk",
@@ -421,14 +367,13 @@ function transformStream(readable, filters, responseModel, provider) {
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
   const hasFilters = filters && filters.length > 0;
+  const needsConversion = provider && provider.name !== "openai";
   const closeWriter = () => { try { writer.close(); } catch (e) {} };
   try {
-    if (!hasFilters && !responseModel) {
+    if (!hasFilters && !responseModel && !needsConversion) {
       tier0Passthrough(readable, encoder, writer).catch((e) => { console.error("[stream] tier0:", e.message); closeWriter(); });
-    } else if (!hasFilters && responseModel) {
-      tier1ModelReplace(readable, encoder, writer, responseModel).catch((e) => { console.error("[stream] tier1:", e.message); closeWriter(); });
     } else {
-      tier2FullFilter(readable, filters, responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
+      tier2FullFilter(readable, filters || [], responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
     }
   } catch (e) {
     console.error("[stream] setup error:", e.message);
@@ -548,7 +493,7 @@ async function handleChatRequest(c) {
     pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && isToolsExcluded(ch.id)));
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
-    pool.sort((a, b) => (b.model === originalModel ? 1 : 0) - (a.model === originalModel ? 1 : 0));
+    pool.sort((a, b) => ((b.model === originalModel || b.fallback_model === originalModel) ? 1 : 0) - ((a.model === originalModel || a.fallback_model === originalModel) ? 1 : 0));
     while (pool.length > 0) {
       const ch = selectChannel(pool);
       if (!ch) return errResponse(c, "Rate limited or cooldown", "rate_limit_error", 429);
@@ -742,7 +687,7 @@ async function handleEmbeddings(c) {
       recordError(ch.id);
       ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
       ch.last_error_at = Math.floor(Date.now() / 1000);
-      ch.last_error_msg = JSON.stringify({ message: e.message || "Request timeout", url: base });
+      ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout"), url: base });
       healthDirtyChannels.add(ch.id);
       return errResponse(c, "Request failed: " + e.message, "upstream_error", 502);
     }
@@ -759,16 +704,87 @@ export function clearCache() {
   console.log("[gateway] cache cleared");
 }
 
+async function handleImageGeneration(c) {
+  try {
+    const data = await loadCache(c.env);
+    const token = (c.req.header("Authorization") || "").replace("Bearer ", "");
+    if (data.config.client_token && token !== data.config.client_token)
+      return errResponse(c, "Unauthorized", "auth_error", 401);
+    let body;
+    try { body = await c.req.json(); } catch (e) {
+      return errResponse(c, "Invalid JSON", "invalid_request_error", 400);
+    }
+    const pool = data.channels.filter((ch) => ch.is_enabled);
+    if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
+    const ch = selectChannel(pool);
+    if (!ch) return errResponse(c, "Rate limited", "rate_limit_error", 429);
+    const providerName = ch.provider || detectProvider(ch.base_url);
+    const provider = getProvider(providerName);
+    if (provider.name !== "openai")
+      return errResponse(c, "Provider does not support image generation: " + providerName, "invalid_request_error", 400);
+    let base = (ch.base_url || "").trim().replace(/\/+$/, "");
+    if (base.endsWith("/chat/completions")) base = base.replace("/chat/completions", "/images/generations");
+    else if (base.endsWith("/v1")) base = `${base}/images/generations`;
+    else base = `${base}/v1/images/generations`;
+    let channelHeaders = {};
+    if (ch.headers && typeof ch.headers === "object") channelHeaders = { ...ch.headers };
+    else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch {}
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
+    try {
+      const requestHeaders = {
+        "Content-Type": "application/json", "User-Agent": "api-gateway/1.0",
+        Authorization: "Bearer " + ch.api_key, ...channelHeaders,
+      };
+      if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
+      const res = await fetch(base, {
+        method: "POST", headers: requestHeaders, body: JSON.stringify(body), signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        recordError(ch.id);
+        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+        ch.last_error_at = Math.floor(Date.now() / 1000);
+        ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url: base });
+        healthDirtyChannels.add(ch.id);
+        return errResponse(c, "Upstream error: " + (errText || res.status), "upstream_error", res.status);
+      }
+      updateRateCounters(ch, Math.floor(Date.now() / 1000));
+      recordSuccess(ch.id);
+      ch.consecutive_errors = 0; ch.last_error_msg = "";
+      healthDirtyChannels.add(ch.id);
+      return c.json(await res.json());
+    } catch (e) {
+      clearTimeout(timeoutId);
+      recordError(ch.id);
+      ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+      ch.last_error_at = Math.floor(Date.now() / 1000);
+      ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout"), url: base });
+      healthDirtyChannels.add(ch.id);
+      return errResponse(c, "Request failed: " + e.message, "upstream_error", 502);
+    }
+  } catch (e) {
+    console.error("[image] unhandled:", e.message);
+    return errResponse(c, "Internal Error", "server_error", 500);
+  }
+}
+
 export default function registerGateway(app) {
-  app.get("/v1/models", (c) => c.json({
-    object: "list",
-    data: [{
-      id: "openai",
-      object: "model",
-      created: 1735689600,
-      owned_by: "api-gateway",
-    }],
-  }));
+  app.get("/v1/models", async (c) => {
+    try {
+      const data = await loadCache(c.env);
+      const models = (data.channels || []).filter((ch) => ch.is_enabled).map((ch) => ({
+        id: ch.model || "unknown", object: "model", created: 1735689600, owned_by: ch.name || "api-gateway",
+      }));
+      const fallbacks = (data.channels || []).filter((ch) => ch.is_enabled && ch.fallback_model)
+        .map((ch) => ({ id: ch.fallback_model, object: "model", created: 1735689600, owned_by: ch.name || "api-gateway" }));
+      return c.json({ object: "list", data: [...models, ...fallbacks] });
+    } catch (e) {
+      return c.json({ object: "list", data: [{ id: "openai", object: "model", created: 1735689600, owned_by: "api-gateway" }] });
+    }
+  });
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
   app.post("/v1/embeddings", async (c) => handleEmbeddings(c));
+  app.post("/v1/images/generations", async (c) => handleImageGeneration(c));
 }

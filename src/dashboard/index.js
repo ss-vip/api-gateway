@@ -4,7 +4,13 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import createResourcesApp, { getAdminPass, verifyPassword } from "./resources.js";
 
-const _uiShell = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "portal.html"), "utf-8");
+let _uiShell = "";
+try {
+  _uiShell = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "portal.html"), "utf-8");
+} catch (e) {
+  console.error("[dashboard] failed to load portal.html:", e.message);
+  _uiShell = "<!DOCTYPE html><html><body><h3>Dashboard unavailable</h3><p>portal.html not found</p></body></html>";
+}
 
 const LOGIN_MAX_FAILURES = 10;
 const BAN_MS = 15 * 60 * 1000;
