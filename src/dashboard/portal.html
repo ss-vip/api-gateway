@@ -48,7 +48,7 @@
       l.style.display='block';
       document.getElementById('login-pass')?.focus();
     }
-  },15000);
+  },60000);
   </script>
 
   <div id="login-view" class="container py-5 mt-5">
@@ -635,7 +635,7 @@
             h = '<span class="badge bg-secondary health-badge" title="觀察中" onclick="showDebug(' + realIdx + ')">觀察</span>';
           else
             h = '<span class="badge bg-danger health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">異常</span>';
-        } else if (now - (c.last_429 || 0) < delay_period) {
+        } else if ((c.last_429 || 0) > now) {
           h = '<span class="badge bg-info health-badge" title="Recovery active" onclick="showDebug(' + realIdx + ')">冷卻</span>';
         } else if (c.consecutive_errors > 0) {
           h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
@@ -917,7 +917,7 @@
     const parseJsonField = (id) => {
       const val = document.getElementById(id).value.trim();
       if (!val) return null;
-      try { return JSON.parse(val); } catch (e) { return val; }
+      try { return JSON.parse(val); } catch (e) { return null; }
     };
 
     let fetchedModels = [];

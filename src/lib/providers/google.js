@@ -216,7 +216,8 @@ const provider = {
     const trimmed = rawLine.trim();
     if (!trimmed.startsWith("data:")) return SKIP;
     const dataStr = trimmed.startsWith("data: ") ? trimmed.slice(6).trim() : trimmed.slice(5).trim();
-    if (!dataStr || dataStr === "[DONE]") return DONE;
+    if (dataStr === "[DONE]") return DONE;
+    if (!dataStr) return SKIP;
     try {
       const parsed = JSON.parse(dataStr);
       if (parsed.error) {

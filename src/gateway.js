@@ -301,6 +301,9 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
     }
   }, 5000);
   let doneSent = false;
+  const send = async (data) => {
+    try { await writer.write(encoder.encode("data: " + data + "\n\n")); } catch (e) {}
+  };
   const sendDone = async () => {
     if (doneSent) return;
     doneSent = true;
@@ -309,6 +312,7 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
   try {
     await send(mkChunk({ content: "" }, null, responseModel));
     while (true) {
+      if (doneSent) break;
       if (Date.now() - streamStart > STREAM_MAX_DURATION_MS) {
         await send(mkChunk({ content: "\n\n[Stream duration limit exceeded]" }, "stop", responseModel));
         await sendDone();
@@ -340,7 +344,7 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
         if (event._error) {
           await send(mkChunk({ content: `\n\n[Upstream Error: ${event.message || "Unknown"}]` }, "stop", responseModel));
           await sendDone();
-          continue;
+          break;
         }
         if (responseModel) event.model = responseModel;
         const choice = event.choices?.[0];
@@ -493,7 +497,7 @@ async function handleChatRequest(c) {
     const hasVisionContent = hasImage(body.messages);
     let pool = data.channels.filter((ch) => ch.is_enabled && (!hasVisionContent || ch.is_vision));
     if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
-    pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && isToolsExcluded(ch.id)));
+    pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && body.tools.length > 0 && (isToolsExcluded(ch.id) || ch.support_tools === 0)));
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
     pool.sort((a, b) => ((b.model === originalModel || b.fallback_model === originalModel) ? 1 : 0) - ((a.model === originalModel || a.fallback_model === originalModel) ? 1 : 0));
@@ -635,7 +639,7 @@ async function handleChatRequest(c) {
         ch.response_time = responseTime||0; healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id);
       }
     }
-    return c.json({ id: "chatcmpl-fallback", object: "chat.completion", created: Math.floor(Date.now()/1000), model: originalModel || "unknown", choices: [{ index: 0, message: { role: "assistant", content: "Service temporarily unavailable, please try again later." }, finish_reason: "stop" }] });
+    return errResponse(c, "All upstream channels exhausted or failed", "server_error", 503);
   } catch (e) {
     console.error("[gateway] unhandled:", e.message);
     return errResponse(c, "Internal Error", "server_error", 500);
@@ -656,15 +660,16 @@ async function handleEmbeddings(c) {
     if (!body.model || !body.input) {
       return errResponse(c, "model and input required", "invalid_request_error", 400);
     }
-    const pool = data.channels.filter((ch) => ch.is_enabled);
-    if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
+    const pool = data.channels.filter((ch) => {
+      if (!ch.is_enabled) return false;
+      const pn = ch.provider || detectProvider(ch.base_url);
+      return pn === "openai";
+    });
+    if (pool.length === 0) return errResponse(c, "No embeddings-capable channels", "server_error", 503);
     const ch = selectChannel(pool);
     if (!ch) return errResponse(c, "Rate limited", "rate_limit_error", 429);
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
-    if (provider.name !== "openai") {
-      return errResponse(c, "Provider does not support embeddings: " + providerName, "invalid_request_error", 400);
-    }
     let base = (ch.base_url || "").trim().replace(/\/+$/, "");
     if (!base.endsWith("/embeddings")) {
       const hasChat = base.includes("/chat/completions");
@@ -751,14 +756,16 @@ async function handleImageGeneration(c) {
     try { body = await c.req.json(); } catch (e) {
       return errResponse(c, "Invalid JSON", "invalid_request_error", 400);
     }
-    const pool = data.channels.filter((ch) => ch.is_enabled);
-    if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
+    const pool = data.channels.filter((ch) => {
+      if (!ch.is_enabled) return false;
+      const pn = ch.provider || detectProvider(ch.base_url);
+      return pn === "openai";
+    });
+    if (pool.length === 0) return errResponse(c, "No image-capable channels", "server_error", 503);
     const ch = selectChannel(pool);
     if (!ch) return errResponse(c, "Rate limited", "rate_limit_error", 429);
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
-    if (provider.name !== "openai")
-      return errResponse(c, "Provider does not support image generation: " + providerName, "invalid_request_error", 400);
     let base = (ch.base_url || "").trim().replace(/\/+$/, "");
     if (base.endsWith("/chat/completions")) base = base.replace("/chat/completions", "/images/generations");
     else if (base.endsWith("/v1")) base = `${base}/images/generations`;

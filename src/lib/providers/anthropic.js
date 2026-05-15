@@ -240,7 +240,7 @@ const provider = {
           const partial = delta.partial_json || "";
           if (!s.toolCallAccums) s.toolCallAccums = {};
           s.toolCallAccums[blockIndex] = (s.toolCallAccums[blockIndex] || "") + partial;
-          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: toolCallId, type: "function", function: { name: "", arguments: partial } }] }, finish_reason: null }] };
+          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { tool_calls: [{ index: blockIndex, id: toolCallId, type: "function", function: { name: "", arguments: partial } }] }, finish_reason: null }] };
         }
         return SKIP;
       }
@@ -253,7 +253,7 @@ const provider = {
           s.toolCallIds[blockIndex] = block.id || `toolu_${blockIndex}`;
           s.toolCallAccums = s.toolCallAccums || {};
           s.toolCallAccums[blockIndex] = "";
-          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: block.id || `toolu_${blockIndex}`, type: "function", function: { name: block.name || "", arguments: "" } }] }, finish_reason: null }] };
+          return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { tool_calls: [{ index: blockIndex, id: block.id || `toolu_${blockIndex}`, type: "function", function: { name: block.name || "", arguments: "" } }] }, finish_reason: null }] };
         }
         if (block.type === "text") {
           return { id: `chatcmpl-a-${nextChunkId()}`, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: { content: block.text || "" }, finish_reason: null }] };
