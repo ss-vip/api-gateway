@@ -697,7 +697,7 @@
       document.getElementById('filter-list').innerHTML = filters.map((f, i) => {
         let row = '<tr>';
         row += '<td class="align-middle"><div class="form-check form-switch d-inline-block"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
-        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>';
+        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>';
         row += '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
         row += '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
         row += '</tr>';

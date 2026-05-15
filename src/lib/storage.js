@@ -1,9 +1,15 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { randomBytes } from "node:crypto";
+
+function generateToken() {
+  const bytes = randomBytes(15);
+  return "sk-" + Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
 
 const DEFAULT_CONFIG = {
   id: 1,
-  client_token: "sk-test123456",
+  client_token: generateToken(),
   admin_password: "",
   recovery_period: 300,
   created_at: 0,
@@ -51,6 +57,7 @@ export class JsonDB {
     this._dirty = true;
     if (!this._saveTimer) {
       this._saveTimer = setTimeout(() => this._flush(), 2000);
+      if (this._saveTimer && typeof this._saveTimer.unref === "function") this._saveTimer.unref();
     }
   }
 
@@ -299,9 +306,7 @@ export class JsonDB {
           cfg.admin_password = params[1] || "";
           cfg.recovery_period = parseInt(params[2]) || 300;
         } else if (params.length === 4) {
-          cfg.client_token = params[0];
-          cfg.admin_password = params[1];
-          cfg.recovery_period = params[3];
+          cfg.admin_password = params[0];
         }
       } else if (sqlLower.includes("client_token")) {
         cfg.client_token = params[0];
@@ -320,7 +325,7 @@ export class JsonDB {
     if (lower.includes("admin_password")) {
       cfg.admin_password = params[0] || "";
     } else if (lower.includes("client_token")) {
-      cfg.client_token = params[0] || "sk-test123456";
+      cfg.client_token = params[0] || generateToken();
       cfg.recovery_period = parseInt(params[1]) || 300;
     }
     this._markDirty();

@@ -5,7 +5,7 @@ import {
   parseErrorForLearning, learnFromError, extractBlockedParam,
 } from "./lib/adaptive.js";
 import {
-  TOOL_NAME_MAX_LENGTH, FILTER_TEXT_MAX_LENGTH,
+  TOOL_NAME_MAX_LENGTH, FILTER_TEXT_MIN_LENGTH, FILTER_TEXT_MAX_LENGTH,
   BACKOFF_ERROR_THRESHOLD, BACKOFF_429_SECONDS, BACKOFF_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
   REQUEST_TIMEOUT_SECONDS,
@@ -141,7 +141,7 @@ function normalizeOpenAIMessages(messages) {
 class RollingFilter {
   constructor(filters) {
     this.filters = filters.filter(
-      (f) => f.is_enabled && f.text && f.text.length > 0 && f.text.length <= FILTER_TEXT_MAX_LENGTH
+      (f) => f.is_enabled && f.text && f.text.length >= FILTER_TEXT_MIN_LENGTH && f.text.length <= FILTER_TEXT_MAX_LENGTH
     );
     this.safeLen = this.filters.reduce((m, f) => Math.max(m, f.text.length - 1), 0);
     this.buffer = "";
@@ -172,7 +172,7 @@ class RollingFilter {
   static applyStatic(text, filters) {
     if (!text || !filters || filters.length === 0) return text;
     let out = text;
-    const enabled = filters.filter((f) => f.is_enabled && f.text);
+    const enabled = filters.filter((f) => f.is_enabled && f.text && f.text.length >= FILTER_TEXT_MIN_LENGTH);
     for (const f of enabled) {
       if (f.mode === 1) {
         const idx = out.indexOf(f.text);
@@ -232,6 +232,13 @@ function updateRateCounters(cachedCh, nowSec) {
     cachedCh.rpd_count = (cachedCh.rpd_count || 0) + 1;
   }
   markDirty(cachedCh.id);
+}
+
+const MAX_ERROR_BODY_BYTES = 8192;
+function truncateErrorBody(text) {
+  if (!text || typeof text !== "string") return text || "";
+  if (text.length <= MAX_ERROR_BODY_BYTES) return text;
+  return text.slice(0, MAX_ERROR_BODY_BYTES) + "... [truncated " + (text.length - MAX_ERROR_BODY_BYTES) + " bytes]";
 }
 
 let chunkIdCounter = 0;
@@ -477,8 +484,13 @@ async function loadCache(env) {
         const channels = ch.results || [];
         for (const c of channels) {
           const saved = rateLimitCache.data[c.id];
-          if (saved && nowSec - saved.rpm_reset_at < RPM_WINDOW_SECONDS) {
-            c.rpm_count = saved.rpm_count; c.rpm_reset_at = saved.rpm_reset_at;
+          if (saved) {
+            if (nowSec - saved.rpm_reset_at < RPM_WINDOW_SECONDS) {
+              c.rpm_count = saved.rpm_count; c.rpm_reset_at = saved.rpm_reset_at;
+            }
+            if (nowSec - saved.rpd_reset_at < RPD_WINDOW_SECONDS) {
+              c.rpd_count = saved.rpd_count; c.rpd_reset_at = saved.rpd_reset_at;
+            }
           }
         }
         cache = {
@@ -486,7 +498,7 @@ async function loadCache(env) {
             channels,
             filters: fl.results || [],
             config: {
-              client_token: cf?.client_token || "sk-test123456",
+              client_token: cf?.client_token || (() => "sk-" + Math.random().toString(36).slice(2, 14) + Math.random().toString(36).slice(2, 14))(),
               recovery_period: parseInt(cf?.recovery_period) || BACKOFF_429_SECONDS,
             },
           },
@@ -598,7 +610,8 @@ async function handleChatRequest(c) {
             ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
             markDirty(ch.id);
             healthDirtyChannels.add(ch.id);
-            return c.json({ error: { message: "Upstream rate limited" } }, 429);
+            pool = pool.filter(p => p.id !== ch.id);
+            continue;
           }
           recordError(ch.id);
           const errPattern = parseErrorForLearning(errText, res.status);
@@ -608,7 +621,7 @@ async function handleChatRequest(c) {
           }
           ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
           ch.last_error_at = Math.floor(Date.now() / 1000);
-          ch.last_error_msg = JSON.stringify({ message: errText, url, request: pBody, response: errBody });
+          ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url, request: pBody, response: truncateErrorBody(errBody) });
           ch.response_time = responseTime;
           healthDirtyChannels.add(ch.id);
           pool = pool.filter(p => p.id !== ch.id);
@@ -633,7 +646,7 @@ async function handleChatRequest(c) {
         recordError(ch.id);
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
-        ch.last_error_msg = JSON.stringify({ message: e.message || "Request timeout or network error", url, request: pBody, response: "" });
+        ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout or network error"), url, request: pBody, response: "" });
         ch.response_time = responseTime || 0;
         healthDirtyChannels.add(ch.id);
         pool = pool.filter(p => p.id !== ch.id);
@@ -667,9 +680,13 @@ async function handleEmbeddings(c) {
     if (!ch) return errResponse(c, "Rate limited", "rate_limit_error", 429);
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
+    if (provider.name !== "openai") {
+      return errResponse(c, "Provider does not support embeddings: " + providerName, "invalid_request_error", 400);
+    }
     let base = (ch.base_url || "").trim().replace(/\/+$/, "");
     if (!base.endsWith("/embeddings")) {
-      if (base.endsWith("/chat/completions")) base = base.replace("/chat/completions", "/embeddings");
+      const hasChat = base.includes("/chat/completions");
+      if (hasChat) base = base.replace("/chat/completions", "/embeddings");
       else if (/\/v\d+$/.test(base)) base = `${base}/embeddings`;
       else base = `${base}/v1/embeddings`;
     }
@@ -709,7 +726,7 @@ async function handleEmbeddings(c) {
         recordError(ch.id);
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
-        ch.last_error_msg = JSON.stringify({ message: errText, url: base });
+        ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url: base });
         healthDirtyChannels.add(ch.id);
         return errResponse(c, "Upstream error: " + (errText || res.status), "upstream_error", res.status);
       }

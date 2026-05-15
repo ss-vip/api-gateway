@@ -1,7 +1,9 @@
 node_modules
 dist
-.log
+*.log
 .DS_Store
 .dev.vars
 temp
+logs
+backups
 db.json

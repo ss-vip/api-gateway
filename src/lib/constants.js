@@ -1,4 +1,5 @@
 export const TOOL_NAME_MAX_LENGTH = 64;
+export const FILTER_TEXT_MIN_LENGTH = 1;
 export const FILTER_TEXT_MAX_LENGTH = 30;
 
 export const BACKOFF_ERROR_THRESHOLD = 5;

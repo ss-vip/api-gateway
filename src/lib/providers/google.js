@@ -117,7 +117,7 @@ const provider = {
       if (m.tool_calls) parts.push(...buildFunctionCallParts(m.tool_calls));
       if (m.role === "tool" || m.role === "function") {
         parts.push({
-          functionResponse: { name: m.name || "unknown", response: { response: m.content || "" } },
+          functionResponse: { name: m.name || "unknown", response: m.content || "" },
         });
       }
       if (parts.length > 0) contents.push({ role: googleRole, parts });

@@ -39,7 +39,10 @@ export default function (clearCache) {
   app.get("/", (c) => c.html(_uiShell));
 
   app.post("/login", async (c) => {
-    const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || "unknown";
+    const ip = c.req.header("CF-Connecting-IP")
+      || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim()
+      || c.req.raw?.socket?.remoteAddress
+      || "unknown";
     cleanupStaleLoginEntries();
 
     const state = loginState.get(ip) || { count: 0, banUntil: 0 };

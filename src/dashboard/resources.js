@@ -3,13 +3,15 @@ import { Hono } from "hono";
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+const PEPPER = "vg7p@2mK9#qR";
+
 async function hashPassword(password) {
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(PEPPER + password));
   return bytesToHex(new Uint8Array(hash));
 }
 async function verifyPassword(password, storedHash) {
   if (!storedHash || storedHash.length !== 64) return false;
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(password));
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(PEPPER + password));
   return bytesToHex(new Uint8Array(hash)) === storedHash;
 }
 async function getAdminPass(c) {
@@ -21,15 +23,13 @@ async function getAdminPass(c) {
 
 export { getAdminPass, verifyPassword, hashPassword };
 
-const DEFAULTS = { token: "sk-test123456", delay_period: 300 };
-
-function maskApiKey(key) {
-  if (!key || key.length < 8) return "****";
-  return key.slice(0, 4) + "****" + key.slice(-4);
+function generateFallbackToken() {
+  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let t = "sk-";
+  for (let i = 0; i < 15; i++) t += chars[Math.floor(Math.random() * chars.length)];
+  return t;
 }
-function isMaskedKey(key) {
-  return key && key.includes("****");
-}
+const DEFAULTS = { token: generateFallbackToken(), delay_period: 300 };
 
 export default function (clearCache) {
   const api = new Hono();
@@ -52,13 +52,13 @@ export default function (clearCache) {
 
   api.get("/", async (c) => {
     const { results } = await c.env.DB.prepare(
-      `SELECT id, name, base_url, api_key, model, weight,
-              is_enabled, is_vision, last_429, consecutive_errors,
-              last_error_msg, last_error_at,
-              rpm_limit, rpd_limit, rpm_count, rpm_reset_at,
-              rpd_count, rpd_reset_at, max_tokens, support_tools,
-              response_time, fallback_model, headers, provider_options, provider
-       FROM channels ORDER BY id`
+      "SELECT id, name, base_url, api_key, model, weight,\
+              is_enabled, is_vision, last_429, consecutive_errors,\
+              last_error_msg, last_error_at,\
+              rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
+              rpd_count, rpd_reset_at, max_tokens, support_tools,\
+              response_time, fallback_model, headers, provider_options, provider\
+       FROM channels ORDER BY id"
     ).all();
     return c.json(results || []);
   });
@@ -70,12 +70,12 @@ export default function (clearCache) {
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of channels) {
-      const apiKey = isMaskedKey(ch.api_key) ? (allKeys[ch.id] || "") : ch.api_key || "";
+      const apiKey = ch.api_key || (allKeys[ch.id] || "");
       const h = ch.headers ? (typeof ch.headers === "object" ? JSON.stringify(ch.headers) : ch.headers) : null;
       const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
       batch.push(
         c.env.DB.prepare(
-          `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
           ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
@@ -222,12 +222,12 @@ export default function (clearCache) {
       const allKeys = {};
       for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
       for (const ch of d.channels) {
-        const apiKey = isMaskedKey(ch.api_key) ? (allKeys[ch.id] || "") : ch.api_key || "";
+        const apiKey = ch.api_key || (allKeys[ch.id] || "");
         const h = ch.headers ? (typeof ch.headers === "object" ? JSON.stringify(ch.headers) : ch.headers) : null;
         const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
         batch.push(
           c.env.DB.prepare(
-            `INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
@@ -258,13 +258,14 @@ export default function (clearCache) {
   });
 
   api.post("/reset", async (c) => {
+    const freshToken = generateFallbackToken();
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
       c.env.DB.prepare("DELETE FROM filters"),
-      c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1").bind(DEFAULTS.token, DEFAULTS.delay_period),
+      c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1").bind(freshToken, DEFAULTS.delay_period),
     ]);
     clearCache();
-    return c.json({ ok: true });
+    return c.json({ ok: true, new_token: freshToken });
   });
 
   return api;

@@ -46,31 +46,11 @@ export function parseRetryAfter(res) {
   return null;
 }
 
-export function computeCooldown(chId, errorType) {
-  const s = get(chId);
-  if (errorType === "429") return calc(s.avg429Recovery, s.consecutive429s, 300, 60);
-  if (errorType === "503") return calc(s.avg503Recovery, s.consecutive503s, 60, 10);
-  return calc(s.avgErrorRecovery, s.consecutiveErrors, 300, 60);
-}
-
-function calc(avg, consecutive, base, minVal) {
-  const exp = Math.min(consecutive, 4);
-  const cd = avg ? avg * Math.pow(2, exp) : base * Math.pow(2, exp);
-  return Math.max(minVal, Math.min(Math.round(cd), BACKOFF_MAX_SECONDS));
-}
-
 export function record429(chId, retryAfter) {
   const s = get(chId);
   s.consecutive429s++; s.consecutiveErrors++;
   s.last429At = Date.now(); s.lastErrorAt = Date.now();
   if (retryAfter > 0) s.avg429Recovery = runningAvg(s.avg429Recovery, Math.min(retryAfter, BACKOFF_MAX_SECONDS), WEIGHT_RECENT);
-}
-
-export function record503(chId, retryAfter) {
-  const s = get(chId);
-  s.consecutive503s++; s.consecutiveErrors++;
-  s.last503At = Date.now(); s.lastErrorAt = Date.now();
-  if (retryAfter > 0) s.avg503Recovery = runningAvg(s.avg503Recovery, Math.min(retryAfter, BACKOFF_MAX_SECONDS), WEIGHT_RECENT);
 }
 
 export function recordError(chId) {
@@ -104,9 +84,6 @@ const ERROR_PATTERNS = [
 
 export function parseErrorForLearning(errText, status) {
   const lower = String(errText || "").toLowerCase();
-  if (status >= 500 && /missing request extension.*authorization.*bearer/i.test(lower)) {
-    return "authDefect";
-  }
   if (status !== 400) return null;
   for (const p of ERROR_PATTERNS) {
     if (p.re.test(lower)) return p.key;
@@ -168,11 +145,6 @@ export function isToolsExcluded(chId) {
   return false;
 }
 
-export function requiresMaxTokens(chId) {
-  const s = state.get(chId);
-  return s ? s.requiresMaxTokens === true : false;
-}
-
 export function getBlockedParams(chId) {
   const s = state.get(chId);
   return s?.blockedParams;
@@ -181,11 +153,6 @@ export function getBlockedParams(chId) {
 function runningAvg(current, newVal, weight) {
   if (current === null) return newVal;
   return Math.round(current * (1 - weight) + newVal * weight);
-}
-
-export function getAdaptiveState(id) {
-  const s = state.get(id);
-  return s ? { ...s, blockedParams: s.blockedParams ? new Set(s.blockedParams) : null } : null;
 }
 
 export function cleanupState(validIds) {
