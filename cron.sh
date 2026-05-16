@@ -13,7 +13,7 @@ do_restart() {
   # Find PID by port
   PID=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2)
   [ -z "$PID" ] && PID=$(lsof -ti :$PORT 2>/dev/null)
-  [ -z "$PID" ] && PID=$(netstat -ano 2>/dev/null | findstr ":$PORT " | findstr LISTEN | awk "{print \$NF}")
+  [ -z "$PID" ] && PID=$(netstat -ano 2>/dev/null | findstr ":$PORT " 2>/dev/null | findstr LISTEN 2>/dev/null | awk "{print \$NF}" 2>/dev/null)
   # Kill
   if [ -n "$PID" ]; then
     kill $PID 2>/dev/null; sleep 1; kill -9 $PID 2>/dev/null
