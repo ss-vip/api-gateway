@@ -1,11 +1,11 @@
 #!/bin/bash
-# add cron job: bash cron.sh
-# do restart: bash cron.sh restart
-# other host: HOST=your-host PORT=8080 bash cron.sh restart
-HOST="${HOST:-localhost}"
+# add cron job:  bash cron.sh
+# do restart:    bash cron.sh restart
+# custom url:    BASE_URL=https://api-gateway-host bash cron.sh restart
+# custom port:   PORT=8080 bash cron.sh
+BASE_URL="${BASE_URL:-http://${HOST:-localhost}:${PORT:-7860}}"
 PORT="${PORT:-7860}"
 LOG_DIR="system/logs"
-BASE_URL="http://$HOST:$PORT"
 
 do_restart() {
   echo "[cron] restarting on port $PORT..."

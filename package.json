@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node --expose-gc app.js",
     "dev": "node --expose-gc --watch app.js",
-    "restart": "bash cron.sh restart"
+    "restart": "node -e \"var c=require('child_process');try{c.execSync('bash cron.sh restart',{stdio:'inherit'})}catch(e){console.log('[restart] Windows fallback');var f=require('fs');var p=process.env.PORT||7860;f.mkdirSync('system/logs',{recursive:true});var P='';try{P=parseInt(c.execSync('netstat -ano 2>/dev/null|findstr :'+p+'|findstr LISTEN',{shell:true,encoding:'utf8',timeout:3e3}).trim().split(/\\\\s+/).pop())}catch(x){}if(P){process.kill(P,'SIGTERM');console.log('[restart] killed',P)}else{console.log('[restart] no process on port',p)}var s=c.spawn('node',['--expose-gc','app.js'],{detached:true,stdio:'ignore'});s.unref();console.log('[restart] started',s.pid)}\""
   },
   "dependencies": {
     "hono": "^4.12.18",
