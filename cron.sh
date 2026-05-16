@@ -1,19 +1,44 @@
 #!/bin/bash
-# Keep-alive cron: checks service health, keeps PID file updated
-APP_DIR="$(cd "$(dirname "$0")" && pwd)"
-PORT=7860
-PID_FILE="$APP_DIR/system/temp/app.pid"
-RESTART_LOG="$APP_DIR/system/logs/restart.log"
+# add cron job: bash cron.sh
+# do restart: bash cron.sh restart
+# other host: HOST=your-host PORT=8080 bash cron.sh restart
+HOST="${HOST:-localhost}"
+PORT="${PORT:-7860}"
+LOG_DIR="system/logs"
+BASE_URL="http://$HOST:$PORT"
 
-# Check if service is responding
-if curl -sf http://localhost:$PORT/health > /dev/null 2>&1; then
-  # Service is alive — update PID file via port (for npm run restart to use)
-  lsof -ti :$PORT 2>/dev/null > "$PID_FILE" || true
-  exit 0
+do_restart() {
+  echo "[cron] restarting on port $PORT..."
+  mkdir -p "$LOG_DIR" "system/temp"
+  # Find PID by port
+  PID=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2)
+  [ -z "$PID" ] && PID=$(lsof -ti :$PORT 2>/dev/null)
+  [ -z "$PID" ] && PID=$(netstat -ano 2>/dev/null | findstr ":$PORT " | findstr LISTEN | awk "{print \$NF}")
+  # Kill
+  if [ -n "$PID" ]; then
+    kill $PID 2>/dev/null; sleep 1; kill -9 $PID 2>/dev/null
+    echo "[cron] killed pid $PID"
+  fi
+  # Start
+  nohup node --expose-gc app.js >> "$LOG_DIR/startup.log" 2>&1 &
+  echo "[cron] started pid $!"
+  # Health check (wait up to 15s)
+  for i in $(seq 1 15); do
+    sleep 1
+    if curl -sf $BASE_URL/health > /dev/null 2>&1; then
+      echo "[cron] health OK"; return 0
+    fi
+  done
+  echo "[cron] health FAILED — check $LOG_DIR/startup.log"
+  return 1
+}
+
+# restart mode
+if [ "$1" = "restart" ]; then
+  do_restart
+  exit $?
 fi
 
-# Service is down — restart
-mkdir -p "$APP_DIR/system/logs" "$APP_DIR/system/temp" "$APP_DIR/system/backups"
-cd "$APP_DIR" && nohup node --expose-gc app.js >> "$APP_DIR/system/logs/startup.log" 2>&1 &
-echo "$!" > "$PID_FILE"
-echo "[$(date)] restarted (pid $!)" >> "$RESTART_LOG"
+# cron mode (default)
+ss -tlnp 2>/dev/null | grep -q ":$PORT " || lsof -i :$PORT 2>/dev/null | grep -q LISTEN || do_restart
+curl -sf $BASE_URL/health > /dev/null 2>&1
