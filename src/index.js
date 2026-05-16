@@ -148,8 +148,9 @@ export function shutdownDb() {
 }
 
 const PORT = Math.min(65535, Math.max(1024, parseInt(process.env.PORT, 10) || 7860));
-const server = serve({ fetch: app.fetch, port: PORT }, () => {
-  console.log("[gateway] running on :" + PORT + " (" + process.pid + ")");
+const HOST = process.env.HOST || "127.0.0.1";
+const server = serve({ fetch: app.fetch, port: PORT, host: HOST }, () => {
+  console.log("[gateway] running on " + HOST + ":" + PORT + " (" + process.pid + ")");
 });
 
 server.on("error", (e) => {

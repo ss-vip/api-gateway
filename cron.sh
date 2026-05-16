@@ -20,7 +20,7 @@ do_restart() {
     echo "[cron] killed pid $PID"
   fi
   # Start
-  nohup node --expose-gc app.js >> "$LOG_DIR/startup.log" 2>&1 &
+  nohup node --expose-gc app.js >> "$LOG_DIR/startup.log" 2>&1 & disown
   echo "[cron] started pid $!"
   # Health check (wait up to 15s)
   for i in $(seq 1 15); do
