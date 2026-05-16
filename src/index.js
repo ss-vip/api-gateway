@@ -9,6 +9,7 @@ import registerGateway, { clearCache } from "./gateway.js";
 import createDashboardApp from "./dashboard/index.js";
 import { JsonDB } from "./lib/storage.js";
 import { cleanupState } from "./lib/adaptive.js";
+import { MAX_CONCURRENT_REQUESTS, GC_MEMORY_THRESHOLD_MB, ENABLE_BACKUPS, LOG_TRUNCATE_LINES, LOG_KEEP_LINES } from "./lib/constants.js";
 
 const app = new Hono();
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -18,11 +19,11 @@ const _db = new JsonDB(null, DB_PATH);
 const TEMP_DIR = resolve(__dirname, "../temp");
 const LOG_DIR = process.env.LOG_DIR || resolve(__dirname, "../logs");
 const BACKUP_DIR = process.env.BACKUP_DIR || resolve(__dirname, "../backups");
-try { mkdirSync(TEMP_DIR, { recursive: true }); } catch {}
-try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
-try { mkdirSync(BACKUP_DIR, { recursive: true }); } catch {}
+try { mkdirSync(TEMP_DIR, { recursive: true }); } catch (e) { console.error("[init] mkdir TEMP_DIR:", e.message); }
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch (e) { console.error("[init] mkdir LOG_DIR:", e.message); }
+try { mkdirSync(BACKUP_DIR, { recursive: true }); } catch (e) { console.error("[init] mkdir BACKUP_DIR:", e.message); }
 
-try { writeFileSync(resolve(TEMP_DIR, "app.pid"), String(process.pid), "utf-8"); } catch {}
+try { writeFileSync(resolve(TEMP_DIR, "app.pid"), String(process.pid), "utf-8"); } catch (e) { console.error("[init] pid file:", e.message); }
 
 let lastBackupDate = "";
 function runMaintenance() {
@@ -32,7 +33,7 @@ function runMaintenance() {
 
   try { appendFileSync(resolve(LOG_DIR, "mem.log"), `[${ts}] rss=${rssKB}KB\n`, "utf-8"); } catch {}
 
-  if (now.getHours() === 0 && now.getDate() !== parseInt(lastBackupDate.slice(-2)) && existsSync(DB_PATH)) {
+  if (ENABLE_BACKUPS && now.getHours() === 0 && now.getDate() !== parseInt(lastBackupDate.slice(-2)) && existsSync(DB_PATH)) {
     lastBackupDate = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}`;
     try {
       const content = readFileSync(DB_PATH);
@@ -62,10 +63,12 @@ function runMaintenance() {
       const p = resolve(LOG_DIR, name);
       if (existsSync(p)) {
         const lines = readFileSync(p, "utf-8").split("\n");
-        if (lines.length > 2000) writeFileSync(p, lines.slice(-1000).join("\n"), "utf-8");
+        if (lines.length > LOG_TRUNCATE_LINES) writeFileSync(p, lines.slice(-LOG_KEEP_LINES).join("\n"), "utf-8");
       }
     } catch {}
   }
+
+  cleanupState(new Set((_db.data?.channels || []).map((ch) => ch.id)));
 }
 
 const maintTimer = setInterval(runMaintenance, 300_000);
@@ -78,27 +81,31 @@ for (const ev of ["exit", "SIGTERM", "SIGINT"]) {
 
 let activeRequests = 0;
 app.use("*", async (c, next) => {
-  if (activeRequests >= 30) return c.json({ error: "overload", type: "overload" }, 503);
+  if (activeRequests >= MAX_CONCURRENT_REQUESTS) return c.json({ error: "overload", type: "overload" }, 503);
   activeRequests++;
-  try { await next(); } finally { activeRequests--; }
+  await next();
+  activeRequests--;
+});
+app.use("*", async (c, next) => {
+  await next();
+  try {
+    c.res.headers.set("X-RateLimit-Limit", String(MAX_CONCURRENT_REQUESTS));
+    c.res.headers.set("X-RateLimit-Remaining", String(Math.max(0, MAX_CONCURRENT_REQUESTS - (activeRequests + 1))));
+  } catch (e) {}
 });
 
-let lastGc = 0, lastCleanup = 0, gcCount = 0;
+let lastGc = 0, gcCount = 0;
 function maybeGc() {
   const rss = Math.round(process.memoryUsage().rss / 1024 / 1024);
-  if (rss > 150) {
+  if (rss > GC_MEMORY_THRESHOLD_MB) {
     if (typeof global.gc === "function") { global.gc(); gcCount++; }
-    if (rss > 250) console.warn("[gc] high memory: " + rss + "MB (total GC: " + gcCount + ")");
+    if (rss > GC_MEMORY_THRESHOLD_MB * 1.6) console.warn("[gc] high memory: " + rss + "MB (threshold: " + GC_MEMORY_THRESHOLD_MB + "MB, total GC: " + gcCount + ")");
   }
 }
 
 app.use("*", async (c, next) => {
   try {
-    const now = Date.now();
-    if (now - lastGc > 300_000) { lastGc = now; maybeGc(); }
-    if (now - lastCleanup > 600_000) { lastCleanup = now;
-      cleanupState(new Set((_db.data?.channels || []).map((ch) => ch.id)));
-    }
+    if (Date.now() - lastGc > 300_000) { lastGc = Date.now(); maybeGc(); }
   } catch (e) {}
   await next();
 });

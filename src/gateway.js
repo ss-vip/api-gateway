@@ -265,12 +265,13 @@ async function tier0Passthrough(readable, encoder, writer) {
     const reader = readable.getReader();
     while (true) {
       const { done, value } = await reader.read();
-      if (done) { try { await writer.write(doneChunk); } catch {} break; }
+      if (done) { try { await writer.write(doneChunk); } catch (e) { console.warn("[tier0] done write:", e.message); } break; }
       await writer.write(value);
     }
   } catch (e) {
     try {
       await writer.write(encoder.encode(`data: ${JSON.stringify({ _error: true, message: "Upstream stream error" })}\n\n`));
+      await writer.write(doneChunk);
     } catch (e2) {}
   } finally {
     try { writer.close(); } catch (e) {}
@@ -302,7 +303,8 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
   }, 5000);
   let doneSent = false;
   const send = async (data) => {
-    try { await writer.write(encoder.encode("data: " + data + "\n\n")); } catch (e) {}
+    const payload = typeof data === "string" ? data : JSON.stringify(data);
+    try { await writer.write(encoder.encode("data: " + payload + "\n\n")); } catch (e) {}
   };
   const sendDone = async () => {
     if (doneSent) return;
@@ -348,7 +350,7 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
         }
         if (responseModel) event.model = responseModel;
         const choice = event.choices?.[0];
-        if (!choice) { if (event.usage) await send(buildChunk({}, "stop", event, event.usage)); continue; }
+        if (!choice) { if (event.usage) await send(JSON.stringify({ id: event.id || "chatcmpl-" + (++chunkIdCounter), object: "chat.completion.chunk", created: event.created || Math.floor(Date.now() / 1000), model: event.model, choices: [], usage: event.usage })); continue; }
         const delta = { ...(choice.delta || {}) };
         if (delta.content) {
           delta.content = filter.transform(delta.content);
@@ -417,37 +419,23 @@ function validateImages(messages) {
   return null;
 }
 
-let rateLimitCache = { data: {}, ts: 0 };
 async function loadCache(env) {
   const hasRL = cache.data?.channels?.some((ch) => ch.rpm_limit > 0 || ch.rpd_limit > 0);
   const ttl = hasRL ? CACHE_TTL_RATE_MS : CACHE_TTL_NORMAL_MS;
   if (cache.data && Date.now() - cache.ts < ttl) return cache.data;
   if (!cacheFlight) {
     cacheFlight = (async () => {
-      if (dirtyChannels.size > 0) await flushDirtyRateCounters(env).catch(() => {});
-      if (healthDirtyChannels.size > 0) await flushDirtyHealth(env).catch(() => {});
+      if (dirtyChannels.size > 0) await flushDirtyRateCounters(env).catch((e) => console.error("[cache] rate flush:", e.message));
+      if (healthDirtyChannels.size > 0) await flushDirtyHealth(env).catch((e) => console.error("[cache] health flush:", e.message));
       try {
         const [ch, fl, cf] = await Promise.all([
           env.DB.prepare("SELECT * FROM channels WHERE is_enabled=1").all(),
           env.DB.prepare("SELECT * FROM filters WHERE is_enabled=1").all(),
           env.DB.prepare("SELECT * FROM config WHERE id=1").first(),
         ]);
-        const nowSec = Math.floor(Date.now() / 1000);
-        const channels = ch.results || [];
-        for (const c of channels) {
-          const saved = rateLimitCache.data[c.id];
-          if (saved) {
-            if (nowSec - saved.rpm_reset_at < RPM_WINDOW_SECONDS) {
-              c.rpm_count = saved.rpm_count; c.rpm_reset_at = saved.rpm_reset_at;
-            }
-            if (nowSec - saved.rpd_reset_at < RPD_WINDOW_SECONDS) {
-              c.rpd_count = saved.rpd_count; c.rpd_reset_at = saved.rpd_reset_at;
-            }
-          }
-        }
         cache = {
           data: {
-            channels,
+            channels: ch.results || [],
             filters: fl.results || [],
             config: {
               client_token: cf?.client_token || (() => "sk-" + Math.random().toString(36).slice(2, 14) + Math.random().toString(36).slice(2, 14))(),
@@ -473,8 +461,16 @@ function validateChatBody(body) {
   return null;
 }
 
+const ERROR_CODE_MAP = {
+  auth_error: "invalid_api_key",
+  invalid_request_error: "invalid_request_error",
+  server_error: "api_error",
+  rate_limit_error: "rate_limit_exceeded",
+  upstream_error: "upstream_error",
+};
+
 function errResponse(c, message, type, status) {
-  return c.json({ error: { message, type } }, status);
+  return c.json({ error: { message, type, code: ERROR_CODE_MAP[type] || type } }, status);
 }
 
 async function handleChatRequest(c) {
@@ -523,9 +519,9 @@ async function handleChatRequest(c) {
             if (blocked && blocked.size > 0) { for (const param of blocked) { delete reqBody[param]; } }
             let channelHeaders = {};
             if (ch.headers && typeof ch.headers === "object") channelHeaders = { ...ch.headers };
-            else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch {}
+            else             if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) { console.warn("[gw] headers parse:", e.message); }
             if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
-            else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch {}
+            else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
             const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
@@ -593,9 +589,9 @@ async function handleChatRequest(c) {
       if (blocked && blocked.size > 0) { for (const param of blocked) { delete reqBody[param]; } }
       let channelHeaders = {};
       if (ch.headers && typeof ch.headers === "object") channelHeaders = { ...ch.headers };
-      else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch {}
+      else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) { console.warn("[gw] headers parse:", e.message); }
       if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
-      else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch {}
+      else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
@@ -631,6 +627,9 @@ async function handleChatRequest(c) {
         const resText = await res.text();
         const json = provider.parseResponse(resText);
         if (originalModel) json.model = originalModel;
+        if (json.choices?.[0]?.message?.content && data.filters?.length > 0) {
+          json.choices[0].message.content = RollingFilter.applyStatic(json.choices[0].message.content, data.filters);
+        }
         return c.json(json);
       } catch (e) {
         clearTimeout(timeoutId); recordError(ch.id);
@@ -742,7 +741,6 @@ async function handleEmbeddings(c) {
 export function clearCache() {
   cache.data = null;
   cache.ts = 0;
-  rateLimitCache = { data: {}, ts: 0 };
   console.log("[gateway] cache cleared");
 }
 
@@ -819,15 +817,21 @@ export default function registerGateway(app) {
     try {
       const data = await loadCache(c.env);
       const enabled = (data.channels || []).filter((ch) => ch.is_enabled);
-      if (enabled.length === 0) return c.json({ error: "no_available_channels", message: "No channels available" }, 503);
       const models = enabled.map((ch) => ({
         id: ch.model || "unknown", object: "model", created: 1735689600, owned_by: ch.name || "api-gateway",
+        capabilities: {
+          vision: !!ch.is_vision,
+          tools: ch.support_tools !== 0,
+          embeddings: (ch.provider || detectProvider(ch.base_url)) === "openai",
+        },
       }));
       const fallbacks = enabled.filter((ch) => ch.fallback_model)
-        .map((ch) => ({ id: ch.fallback_model, object: "model", created: 1735689600, owned_by: ch.name || "api-gateway" }));
-      return c.json({ object: "list", data: [{ id: "openai", object: "model", created: 1735689600, owned_by: "api-gateway" }, ...models, ...fallbacks] });
+        .map((ch) => ({ id: ch.fallback_model, object: "model", created: 1735689600, owned_by: ch.name || "api-gateway",
+          capabilities: { vision: false, tools: true, embeddings: false },
+        }));
+      return c.json({ object: "list", data: [...models, ...fallbacks] });
     } catch (e) {
-      return c.json({ error: "server_error", message: "Failed to load models" }, 503);
+      return c.json({ object: "list", data: [] });
     }
   };
   app.get("/models", modelsHandler);

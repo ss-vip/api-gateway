@@ -595,7 +595,7 @@
         display.sort((a, b) => {
           let vA, vB;
           if (sortKey === 'status') {
-            const rank = (c) => c.consecutive_errors >= 5 ? 2 : (now - (c.last_429 || 0) < delay_period ? 1 : 0);
+            const rank = (c) => c.consecutive_errors >= 5 ? 2 : ((c.last_429 || 0) > now ? 1 : 0);
             vA = rank(a); vB = rank(b);
           } else {
             vA = a[sortKey]; vB = b[sortKey];

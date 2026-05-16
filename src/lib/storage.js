@@ -64,13 +64,13 @@ export class JsonDB {
   _flush() {
     this._saveTimer = null;
     if (!this._dirty || !this._filePath) return;
-    this._dirty = false;
     try {
       const dir = dirname(this._filePath);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
       const tmpPath = this._filePath + ".tmp";
       writeFileSync(tmpPath, JSON.stringify(this.data, null, 2), "utf-8");
       renameSync(tmpPath, this._filePath);
+      this._dirty = false;
     } catch (e) {
       console.error("[JsonDB] save failed:", e.message);
     }
