@@ -295,7 +295,7 @@
       </div>
       <div class="tab-pane fade" id="advanced-tab" role="tabpanel">
       <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Provider Override <span class="text-muted fw-normal" style="font-size:0.6rem">留空=自動偵測</span></label>
+        <label class="form-label mini-label fw-bold">Provider Override</label>
         <select id="ch-provider" class="form-select form-select-sm">
           <option value="">Auto Detect</option>
           <option value="openai">OpenAI 相容</option>
@@ -303,40 +303,39 @@
           <option value="anthropic">Anthropic Claude</option>
         </select>
       </div>
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Custom Headers <span class="text-muted fw-normal" style="font-size:0.6rem">JSON, e.g. {"HTTP-Referer":"..."}</span></label>
-        <textarea id="ch-headers" class="form-control form-control-sm" rows="4" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"https://example.com","X-Title":"My App"}'></textarea>
-      </div>
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Provider Options <span class="text-muted fw-normal" style="font-size:0.6rem">JSON body overrides, e.g. {"provider":{"order":["OpenAI"]}}</span></label>
-        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="4" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
+      <div class="row g-2">
+        <div class="col-md-6">
+          <label class="form-label mini-label fw-bold">Custom Headers</label>
+          <textarea id="ch-headers" class="form-control form-control-sm" rows="6" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"..."}'></textarea>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label mini-label fw-bold">Provider Options</label>
+          <textarea id="ch-provider-options" class="form-control form-control-sm" rows="6" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
+        </div>
       </div>
       </div>
       <div class="tab-pane fade" id="log-tab" role="tabpanel">
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Last Call</label>
-        <div id="ch-log-time" class="text-muted small py-1"></div>
+      <div class="d-flex justify-content-between align-items-center mb-1">
+        <label class="form-label mini-label fw-bold mb-0">Health Status</label>
+        <div id="ch-log-time" class="text-muted small"></div>
       </div>
-      <div class="mb-2">
+      <div class="mb-1">
         <label class="form-label mini-label fw-bold">Error Message</label>
         <textarea id="ch-log-msg" class="form-control form-control-sm text-danger" rows="2" readonly style="font-size:0.7rem"></textarea>
       </div>
-      <div class="mb-2" id="ch-log-url-wrapper">
+      <div class="mb-1" id="ch-log-url-wrapper">
         <label class="form-label mini-label fw-bold">Target URL</label>
         <input type="text" id="ch-log-url" class="form-control form-control-sm" readonly style="font-size:0.7rem" />
       </div>
-      <div class="row g-2" id="ch-log-req-res-wrapper">
-        <div class="col-12 col-md-6 mb-2">
-          <label class="form-label mini-label fw-bold">Request Payload</label>
-          <textarea id="ch-log-req" class="form-control form-control-sm" rows="6" readonly style="font-size:0.65rem"></textarea>
+      <div class="row g-1" id="ch-log-req-res-wrapper" style="min-height:0">
+        <div class="col-md-6">
+          <label class="form-label mini-label fw-bold">Request</label>
+          <textarea id="ch-log-req" class="form-control form-control-sm" rows="5" readonly style="font-size:0.65rem"></textarea>
         </div>
-        <div class="col-12 col-md-6 mb-2">
-          <label class="form-label mini-label fw-bold">Response Data</label>
-          <textarea id="ch-log-res" class="form-control form-control-sm" rows="6" readonly style="font-size:0.65rem"></textarea>
+        <div class="col-md-6">
+          <label class="form-label mini-label fw-bold">Response</label>
+          <textarea id="ch-log-res" class="form-control form-control-sm" rows="5" readonly style="font-size:0.65rem"></textarea>
         </div>
-      </div>
-      <div class="small text-muted mt-1" style="font-size:0.6rem">
-        <i class="bi bi-info-circle"></i> 此頁顯示該渠道最近一次請求的記錄，無記錄時顯示空欄位。
       </div>
       </div>
       </div>
@@ -455,11 +454,11 @@
       document.getElementById('setup-view').style.display = 'block';
       loading(false);
     };
-    const showAdmin = () => {
+    const showAdmin = async () => {
       document.getElementById('login-view').style.display = 'none';
       document.getElementById('setup-view').style.display = 'none';
       document.getElementById('admin-view').style.display = 'block';
-      init();
+      await init();
       loading(false);
     };
     const logout = () => {
@@ -552,16 +551,15 @@
     };
 
     const init = async () => {
-      const cfg = await api('/admin/api/config', 'GET', null, false);
-      if (!cfg) return;
-      document.getElementById('cfg-token').value = cfg.token;
-      document.getElementById('cfg-recovery-period').value = cfg.recovery_period;
-
-      delay_period = cfg.recovery_period;
-
-      const initData = await api('/admin/api', 'GET', null, false);
-      if (initData) { channels = initData; lastChannelsStr = JSON.stringify(channels); }
-      filters = (await api('/admin/api/filters', 'GET', null, false)) || [];
+      // Single batch endpoint that returns everything at once
+      const batch = await api('/admin/api/init', 'GET', null, false);
+      if (!batch) return;
+      document.getElementById('cfg-token').value = batch.config?.token || '';
+      document.getElementById('cfg-recovery-period').value = batch.config?.recovery_period || 300;
+      delay_period = batch.config?.recovery_period || 300;
+      channels = batch.channels || [];
+      lastChannelsStr = JSON.stringify(channels);
+      filters = batch.filters || [];
       renderStats();
       renderChannels();
       renderFilters();
@@ -902,23 +900,45 @@
 
       document.getElementById('ch-log-time').textContent = statusIcon + ' ' + healthStates.join(' | ');
 
+      // Build descriptive status message
+      let statusMsg = '';
+      if (c.last_429 > now) {
+        const remain = c.last_429 - now;
+        statusMsg = '🧊 冷卻機制觸發 — 上游回傳 429 限速，自動進入冷卻 ' + remain + ' 秒\n';
+        statusMsg += '   冷卻期間此渠道不會被選中，到期後自動恢復。';
+      } else if (c.consecutive_errors >= 5) {
+        statusMsg = '🔴 渠道異常 — 連續錯誤 ' + c.consecutive_errors + ' 次，已暫時排除\n';
+        if (now - (c.last_error_at || 0) > 1800) {
+          statusMsg += '   觀察期 >30 分鐘，若恢復正常將自動重新啟用。';
+        } else {
+          statusMsg += '   錯誤發生不到 30 分鐘，持續觀察中。';
+        }
+      } else if (c.consecutive_errors > 0) {
+        statusMsg = '🟡 渠道不穩定 — 已發生 ' + c.consecutive_errors + ' 次錯誤\n';
+        statusMsg += '   尚未達排除門檻（5 次），會繼續嘗試使用此渠道。';
+      } else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) {
+        statusMsg = '⚫ 每日限額已耗盡 — RPD ' + (c.rpd_count || 0) + '/' + c.rpd_limit + '\n';
+        statusMsg += '   將於下次重置週期自動恢復（每日 RPD 窗口）。';
+      }
+
       if (c.last_error_msg) {
         let parsed = null;
         try { parsed = JSON.parse(c.last_error_msg); } catch (e) {}
         if (parsed && typeof parsed === 'object') {
-          document.getElementById('ch-log-msg').value = typeof parsed.message === 'object' ? JSON.stringify(parsed.message, null, 2) : (parsed.message || '');
+          const errMsg = typeof parsed.message === 'object' ? JSON.stringify(parsed.message, null, 2) : (parsed.message || '');
+          document.getElementById('ch-log-msg').value = statusMsg ? statusMsg + '\n\n📋 原始錯誤資訊：\n' + errMsg : errMsg;
           document.getElementById('ch-log-url').value = parsed.url || '';
           document.getElementById('ch-log-req').value = typeof parsed.request === 'object' ? JSON.stringify(parsed.request, null, 2) : (parsed.request || '');
           document.getElementById('ch-log-res').value = typeof parsed.response === 'object' ? JSON.stringify(parsed.response, null, 2) : (parsed.response || '');
           document.getElementById('ch-log-url-wrapper').style.display = '';
           document.getElementById('ch-log-req-res-wrapper').style.display = '';
         } else {
-          document.getElementById('ch-log-msg').value = c.last_error_msg;
+          document.getElementById('ch-log-msg').value = statusMsg ? statusMsg + '\n\n📋 原始錯誤：\n' + c.last_error_msg : c.last_error_msg;
           document.getElementById('ch-log-url-wrapper').style.display = 'none';
           document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
         }
       } else {
-        document.getElementById('ch-log-msg').value = '目前無錯誤記錄';
+        document.getElementById('ch-log-msg').value = statusMsg || '✅ 渠道運作正常，目前無異常或限速記錄。';
         document.getElementById('ch-log-url').value = '';
         document.getElementById('ch-log-req').value = '';
         document.getElementById('ch-log-res').value = '';
