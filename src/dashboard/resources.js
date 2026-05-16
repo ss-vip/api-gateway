@@ -57,7 +57,7 @@ export default function (clearCache) {
               last_error_msg, last_error_at,\
               rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
               rpd_count, rpd_reset_at, max_tokens, support_tools,\
-              response_time, fallback_model, headers, provider_options, provider\
+              response_time, fallback_model, headers, provider_options, provider, absolute_url\
        FROM channels ORDER BY id"
     ).all();
     return c.json(results || []);
@@ -75,14 +75,14 @@ export default function (clearCache) {
       const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
       batch.push(
         c.env.DB.prepare(
-          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider, absolute_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
           ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
           ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
           ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
           ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || "",
-          h, po, ch.provider || ""
+          h, po, ch.provider || "", ch.absolute_url ? 1 : 0
         )
       );
     }
@@ -227,14 +227,14 @@ export default function (clearCache) {
         const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
         batch.push(
           c.env.DB.prepare(
-            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider, absolute_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
             ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
             ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
             ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || "",
-            h, po, ch.provider || ""
+            h, po, ch.provider || "", ch.absolute_url ? 1 : 0
           )
         );
       }

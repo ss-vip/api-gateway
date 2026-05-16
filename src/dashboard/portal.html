@@ -228,18 +228,32 @@
         <li class="nav-item" role="presentation">
           <button class="nav-link fw-bold small px-3" id="advanced-tab-btn" data-bs-toggle="tab" data-bs-target="#advanced-tab" type="button" role="tab">Option</button>
         </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link fw-bold small px-3" id="log-tab-btn" data-bs-toggle="tab" data-bs-target="#log-tab" type="button" role="tab">Log</button>
+        </li>
       </ul>
       <div class="tab-content tab-content-equal border border-top-0 rounded-bottom p-3">
       <div class="tab-pane fade show active" id="basic-tab" role="tabpanel">
       <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
-      <div class="mb-2">
+      <div class="mb-2" style="position:relative">
         <label class="form-label mini-label fw-bold">API Key *</label>
+        <!-- Hidden dummy field to fool browser password managers -->
+        <input type="password" style="position:absolute;width:0;height:0;padding:0;border:0;opacity:0" tabindex="-1" aria-hidden="true" readonly />
         <div class="input-group input-group-sm">
-          <input type="password" id="ch-key" class="form-control form-control-sm" autocomplete="new-password" required />
+          <input type="text" id="ch-key" class="form-control form-control-sm" autocomplete="off" style="-webkit-text-security:disc" required />
           <button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button>
         </div>
       </div>
-      <div class="mb-2"><label class="form-label mini-label fw-bold">Base URL * <span class="text-muted fw-normal" style="font-size:0.6rem">建議結尾包含 /v1</span></label><input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required /></div>
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Base URL *</label>
+        <div class="input-group input-group-sm">
+          <input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required />
+          <div class="input-group-text bg-transparent px-2" style="font-size:0.7rem;gap:4px">
+            <input type="checkbox" id="ch-absolute-url" class="form-check-input mt-0" style="transform:scale(0.8)" />
+            <label for="ch-absolute-url" class="text-muted" style="cursor:pointer;white-space:nowrap">Absolute URL</label>
+          </div>
+        </div>
+      </div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Primary Model *</label>
         <div class="input-group input-group-sm">
@@ -296,6 +310,33 @@
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Provider Options <span class="text-muted fw-normal" style="font-size:0.6rem">JSON body overrides, e.g. {"provider":{"order":["OpenAI"]}}</span></label>
         <textarea id="ch-provider-options" class="form-control form-control-sm" rows="4" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
+      </div>
+      </div>
+      <div class="tab-pane fade" id="log-tab" role="tabpanel">
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Last Call</label>
+        <div id="ch-log-time" class="text-muted small py-1"></div>
+      </div>
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Error Message</label>
+        <textarea id="ch-log-msg" class="form-control form-control-sm text-danger" rows="2" readonly style="font-size:0.7rem"></textarea>
+      </div>
+      <div class="mb-2" id="ch-log-url-wrapper">
+        <label class="form-label mini-label fw-bold">Target URL</label>
+        <input type="text" id="ch-log-url" class="form-control form-control-sm" readonly style="font-size:0.7rem" />
+      </div>
+      <div class="row g-2" id="ch-log-req-res-wrapper">
+        <div class="col-12 col-md-6 mb-2">
+          <label class="form-label mini-label fw-bold">Request Payload</label>
+          <textarea id="ch-log-req" class="form-control form-control-sm" rows="6" readonly style="font-size:0.65rem"></textarea>
+        </div>
+        <div class="col-12 col-md-6 mb-2">
+          <label class="form-label mini-label fw-bold">Response Data</label>
+          <textarea id="ch-log-res" class="form-control form-control-sm" rows="6" readonly style="font-size:0.65rem"></textarea>
+        </div>
+      </div>
+      <div class="small text-muted mt-1" style="font-size:0.6rem">
+        <i class="bi bi-info-circle"></i> 此頁顯示該渠道最近一次請求的記錄，無記錄時顯示空欄位。
       </div>
       </div>
       </div>
@@ -788,6 +829,15 @@
       document.getElementById('ch-provider').value = '';
       document.getElementById('ch-headers').value = '';
       document.getElementById('ch-provider-options').value = '';
+      document.getElementById('ch-absolute-url').checked = false;
+      // Reset Log tab for new channel
+      document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
+      document.getElementById('ch-log-msg').value = '';
+      document.getElementById('ch-log-url').value = '';
+      document.getElementById('ch-log-req').value = '';
+      document.getElementById('ch-log-res').value = '';
+      document.getElementById('ch-log-url-wrapper').style.display = 'none';
+      document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
       checkFetchModelsBtn();
       chModal.show();
     };
@@ -814,6 +864,40 @@
       document.getElementById('ch-provider').value = c.provider || '';
       document.getElementById('ch-headers').value = c.headers ? (typeof c.headers === 'object' ? JSON.stringify(c.headers, null, 2) : c.headers) : '';
       document.getElementById('ch-provider-options').value = c.provider_options ? (typeof c.provider_options === 'object' ? JSON.stringify(c.provider_options, null, 2) : c.provider_options) : '';
+      document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
+      // Populate Log tab
+      const now = Math.floor(Date.now() / 1000);
+      if (c.last_error_at) {
+        document.getElementById('ch-log-time').textContent = '🕐 ' + new Date(c.last_error_at * 1000).toLocaleString();
+      } else if ((c.last_429 || 0) > now) {
+        const remain = (c.last_429 - now);
+        document.getElementById('ch-log-time').textContent = '🧊 冷卻中 — 剩 ' + remain + ' 秒 (' + new Date(c.last_429 * 1000).toLocaleString() + ' 解封)';
+      } else {
+        document.getElementById('ch-log-time').textContent = '📭 尚無記錄';
+      }
+      if (c.last_error_msg) {
+        let parsed = null;
+        try { parsed = JSON.parse(c.last_error_msg); } catch (e) {}
+        if (parsed && typeof parsed === 'object') {
+          document.getElementById('ch-log-msg').value = typeof parsed.message === 'object' ? JSON.stringify(parsed.message, null, 2) : (parsed.message || '');
+          document.getElementById('ch-log-url').value = parsed.url || '';
+          document.getElementById('ch-log-req').value = typeof parsed.request === 'object' ? JSON.stringify(parsed.request, null, 2) : (parsed.request || '');
+          document.getElementById('ch-log-res').value = typeof parsed.response === 'object' ? JSON.stringify(parsed.response, null, 2) : (parsed.response || '');
+          document.getElementById('ch-log-url-wrapper').style.display = '';
+          document.getElementById('ch-log-req-res-wrapper').style.display = '';
+        } else {
+          document.getElementById('ch-log-msg').value = c.last_error_msg;
+          document.getElementById('ch-log-url-wrapper').style.display = 'none';
+          document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
+        }
+      } else {
+        document.getElementById('ch-log-msg').value = '';
+        document.getElementById('ch-log-url').value = '';
+        document.getElementById('ch-log-req').value = '';
+        document.getElementById('ch-log-res').value = '';
+        document.getElementById('ch-log-url-wrapper').style.display = 'none';
+        document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
+      }
       checkFetchModelsBtn();
       chModal.show();
     };
@@ -877,6 +961,7 @@
         provider: document.getElementById('ch-provider').value,
         headers: parseJsonField('ch-headers'),
         provider_options: parseJsonField('ch-provider-options'),
+        absolute_url: document.getElementById('ch-absolute-url').checked ? 1 : 0,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -911,7 +996,11 @@
 
     const toggleKeyVis = () => {
       const i = document.getElementById('ch-key');
-      i.type = i.type === 'password' ? 'text' : 'password';
+      if (i.style.webkitTextSecurity === 'disc') {
+        i.style.webkitTextSecurity = 'none';
+      } else {
+        i.style.webkitTextSecurity = 'disc';
+      }
     };
 
     const parseJsonField = (id) => {
@@ -1092,6 +1181,7 @@
         provider: c.provider || "",
         headers: c.headers || null,
         provider_options: c.provider_options || null,
+        absolute_url: c.absolute_url ? 1 : 0,
       }));
       const cleanFilters = filters.map(f => ({ text: f.text, mode: f.mode || 1, is_enabled: f.is_enabled ? 1 : 0 }));
       const data = {

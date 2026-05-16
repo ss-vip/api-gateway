@@ -241,6 +241,7 @@ export class JsonDB {
       try { providerOptions = typeof params[19] === "string" ? JSON.parse(params[19]) : params[19]; } catch { providerOptions = {}; }
     }
     const providerOverride = params[20] !== undefined ? params[20] : "";
+    const absoluteUrl = params[21] !== undefined ? params[21] : 0;
     const ch = {
       id,
       name: params[1] || "",
@@ -263,6 +264,7 @@ export class JsonDB {
       headers,
       provider_options: providerOptions,
       provider: providerOverride,
+      absolute_url: absoluteUrl,
       created_at: Math.floor(Date.now() / 1000),
       updated_at: Math.floor(Date.now() / 1000),
     };

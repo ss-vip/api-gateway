@@ -15,6 +15,21 @@ import {
   STREAM_MAX_DURATION_MS, HEALTH_PERSIST_INTERVAL_MS,
 } from "./lib/constants.js";
 
+// OpenAI-only params that non-OpenAI providers (Google, Anthropic) reject
+const OPENAI_ONLY_PARAMS = new Set([
+  "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs",
+  "n", "logit_bias", "best_of", "echo", "suffix",
+]);
+
+function stripOpenAIOnlyParams(body, baseUrl) {
+  // Detect upstream API type from the actual URL, regardless of configured provider
+  const upstream = detectProvider(baseUrl);
+  if (upstream === "openai") return;
+  for (const param of OPENAI_ONLY_PARAMS) {
+    delete body[param];
+  }
+}
+
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
 
@@ -512,14 +527,15 @@ async function handleChatRequest(c) {
             const providerName = ch.provider || detectProvider(ch.base_url);
             const provider = getProvider(providerName);
             const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
-            const url = provider.buildUrl(ch.base_url, effectiveModel, true);
+            const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, effectiveModel, true);
             if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
             let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
+            stripOpenAIOnlyParams(reqBody, ch.base_url);
             const blocked = getBlockedParams(ch.id);
             if (blocked && blocked.size > 0) { for (const param of blocked) { delete reqBody[param]; } }
             let channelHeaders = {};
             if (ch.headers && typeof ch.headers === "object") channelHeaders = { ...ch.headers };
-            else             if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) { console.warn("[gw] headers parse:", e.message); }
+            else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) { console.warn("[gw] headers parse:", e.message); }
             if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
             else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
             const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
@@ -542,7 +558,10 @@ async function handleChatRequest(c) {
                 pool = pool.filter(p => p.id !== ch.id);
                 if (res.status === 429) {
                   record429(ch.id, parseRetryAfter(res));
-                  ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300); markDirty(ch.id); healthDirtyChannels.add(ch.id);
+                  ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
+                  ch.last_error_msg = JSON.stringify({ message: "Rate limited (429) — recovery period: " + (data.config.recovery_period || 300) + "s", url, request: pBody, response: errBody });
+                  ch.last_error_at = Math.floor(Date.now() / 1000);
+                  markDirty(ch.id); healthDirtyChannels.add(ch.id);
                 } else {
                   recordError(ch.id);
                   const errPattern = parseErrorForLearning(errText, res.status);
@@ -582,9 +601,10 @@ async function handleChatRequest(c) {
       const providerName = ch.provider || detectProvider(ch.base_url);
       const provider = getProvider(providerName);
       const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
-      const url = provider.buildUrl(ch.base_url, effectiveModel, false);
+      const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, effectiveModel, false);
       if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
       let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
+      stripOpenAIOnlyParams(reqBody, ch.base_url);
       const blocked = getBlockedParams(ch.id);
       if (blocked && blocked.size > 0) { for (const param of blocked) { delete reqBody[param]; } }
       let channelHeaders = {};
@@ -613,6 +633,8 @@ async function handleChatRequest(c) {
           if (res.status !== 429 && errBody) console.log("[diag]", res.status, url.replace(/\/\/[^@]+@/, "//***@"), errBody.replace(/\n/g," ").slice(0,200));
           if (res.status === 429) {
             record429(ch.id, parseRetryAfter(res)); ch.last_429 = Math.floor(Date.now()/1000) + (data.config.recovery_period||300);
+            ch.last_error_msg = JSON.stringify({ message: "Rate limited (429) — recovery period: " + (data.config.recovery_period || 300) + "s", url, request: pBody, response: errBody });
+            ch.last_error_at = Math.floor(Date.now()/1000);
             markDirty(ch.id); healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id); continue;
           }
           recordError(ch.id);
@@ -670,7 +692,9 @@ async function handleEmbeddings(c) {
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
     let base = (ch.base_url || "").trim().replace(/\/+$/, "");
-    if (!base.endsWith("/embeddings")) {
+    if (ch.absolute_url) {
+      base += "/";
+    } else if (!base.endsWith("/embeddings")) {
       const hasChat = base.includes("/chat/completions");
       if (hasChat) base = base.replace("/chat/completions", "/embeddings");
       else if (/\/v\d+$/.test(base)) base = `${base}/embeddings`;
@@ -765,7 +789,9 @@ async function handleImageGeneration(c) {
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
     let base = (ch.base_url || "").trim().replace(/\/+$/, "");
-    if (base.endsWith("/chat/completions")) base = base.replace("/chat/completions", "/images/generations");
+    if (ch.absolute_url) {
+      base += "/";
+    } else if (base.endsWith("/chat/completions")) base = base.replace("/chat/completions", "/images/generations");
     else if (base.endsWith("/v1")) base = `${base}/images/generations`;
     else base = `${base}/v1/images/generations`;
     let channelHeaders = {};

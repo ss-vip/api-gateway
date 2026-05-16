@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node --expose-gc app.js",
     "dev": "node --expose-gc --watch app.js",
-    "restart": "node -e \"try{var f=require('fs').readFileSync('./system/temp/app.pid','utf8');process.kill(parseInt(f),'SIGTERM');console.log('[restart] killed',parseInt(f))}catch(e){console.log('[restart] no running instance')}\" && sleep 1 && node --expose-gc app.js"
+    "restart": "node --input-type=module -e \"import{readFileSync}from'fs';import{spawn}from'child_process';try{var p=parseInt(readFileSync('./system/temp/app.pid','utf8'));process.kill(p,'SIGTERM');console.log('[restart] killed',p)}catch(e){console.log('[restart]',e.code==='ESRCH'?'process gone':e.code==='ENOENT'?'no pid file':'no pid')};setTimeout(()=>{spawn('node',['--expose-gc','app.js'],{stdio:'inherit',detached:true}).unref()},1000)\""
   },
   "dependencies": {
     "hono": "^4.12.18",
