@@ -209,7 +209,7 @@
     <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
   </div></div></div>
 
-  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg"><div class="modal-content">
+  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable" style="max-width:680px;min-height:500px"><div class="modal-content" style="min-height:500px">
     <div class="modal-header border-0 pb-0">
       <div class="d-flex align-items-center gap-2">
         <h5 class="fw-bold small mb-0">Channel Editor</h5>
@@ -670,7 +670,7 @@
         let hoverMsg = c.last_error_msg || 'Unknown';
         try { hoverMsg = JSON.parse(hoverMsg).message || hoverMsg; } catch (e) {}
 
-        let h = '<span class="badge bg-success health-badge">正常</span>';
+        let h = '<span class="badge bg-success health-badge" style="cursor:pointer" onclick="showDebug(' + realIdx + ')" title="點擊查看詳情">正常</span>';
         if (c.consecutive_errors >= 5) {
           if (now - (c.last_error_at || 0) > 1800)
             h = '<span class="badge bg-secondary health-badge" title="觀察中" onclick="showDebug(' + realIdx + ')">觀察</span>';
@@ -681,7 +681,7 @@
         } else if (c.consecutive_errors > 0) {
           h = '<span class="badge bg-warning text-dark health-badge" title="點擊查看詳細錯誤" onclick="showDebug(' + realIdx + ')">不穩</span>';
         } else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) {
-          h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '">限額</span>';
+          h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '" onclick="showDebug(' + realIdx + ')" style="cursor:pointer">限額</span>';
         }
 
         const visionIcon = c.is_vision ? " \u{1F441}\u{FE0F}" : "";
@@ -865,16 +865,38 @@
       document.getElementById('ch-headers').value = c.headers ? (typeof c.headers === 'object' ? JSON.stringify(c.headers, null, 2) : c.headers) : '';
       document.getElementById('ch-provider-options').value = c.provider_options ? (typeof c.provider_options === 'object' ? JSON.stringify(c.provider_options, null, 2) : c.provider_options) : '';
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
-      // Populate Log tab
+      // Populate Log tab — show ALL health states
       const now = Math.floor(Date.now() / 1000);
-      if (c.last_error_at) {
-        document.getElementById('ch-log-time').textContent = '🕐 ' + new Date(c.last_error_at * 1000).toLocaleString();
+      const healthStates = [];
+      let statusIcon = '✅';
+      if (c.consecutive_errors >= 5) {
+        if (now - (c.last_error_at || 0) > 1800) {
+          healthStates.push('觀察中（過去錯誤 >30min）');
+          statusIcon = '👀';
+        } else {
+          healthStates.push('異常（連續錯誤 ' + c.consecutive_errors + ' 次）');
+          statusIcon = '🔴';
+        }
       } else if ((c.last_429 || 0) > now) {
-        const remain = (c.last_429 - now);
-        document.getElementById('ch-log-time').textContent = '🧊 冷卻中 — 剩 ' + remain + ' 秒 (' + new Date(c.last_429 * 1000).toLocaleString() + ' 解封)';
+        const remain = c.last_429 - now;
+        healthStates.push('冷卻中（剩 ' + remain + ' 秒）');
+        statusIcon = '🧊';
+      } else if (c.consecutive_errors > 0) {
+        healthStates.push('不穩定（錯誤 ' + c.consecutive_errors + ' 次）');
+        statusIcon = '🟡';
+      } else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) {
+        healthStates.push('RPD 限額耗盡（' + c.rpd_count + '/' + c.rpd_limit + '）');
+        statusIcon = '⚫';
       } else {
-        document.getElementById('ch-log-time').textContent = '📭 尚無記錄';
+        healthStates.push('正常');
+        statusIcon = '✅';
       }
+      if (c.response_time) healthStates.push('延遲: ' + c.response_time + 'ms');
+      if (c.rpm_limit > 0) healthStates.push('RPM: ' + (c.rpm_count || 0) + '/' + c.rpm_limit);
+      if (c.rpd_limit > 0) healthStates.push('RPD: ' + (c.rpd_count || 0) + '/' + c.rpd_limit);
+
+      document.getElementById('ch-log-time').textContent = statusIcon + ' ' + healthStates.join(' | ');
+
       if (c.last_error_msg) {
         let parsed = null;
         try { parsed = JSON.parse(c.last_error_msg); } catch (e) {}
@@ -891,7 +913,7 @@
           document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
         }
       } else {
-        document.getElementById('ch-log-msg').value = '';
+        document.getElementById('ch-log-msg').value = '目前無錯誤記錄';
         document.getElementById('ch-log-url').value = '';
         document.getElementById('ch-log-req').value = '';
         document.getElementById('ch-log-res').value = '';

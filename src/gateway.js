@@ -222,14 +222,21 @@ function selectChannel(channels) {
     return true;
   });
   if (available.length === 0) return null;
+  // Weight by configured weight and response_time (faster = higher chance)
   let totalW = 0;
-  for (const c of available) totalW += Math.max(1, c.weight || 1);
+  const weights = available.map((c) => {
+    const base = Math.max(1, c.weight || 1);
+    const speedFactor = 1 / (1 + (c.response_time || 0) / 10000);
+    const w = Math.round(base * speedFactor * 10) + 1;
+    totalW += w;
+    return w;
+  });
   let r = Math.random() * totalW;
-  for (const c of available) {
-    r -= Math.max(1, c.weight || 1);
-    if (r <= 0) return c;
+  for (let i = 0; i < available.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return available[i];
   }
-  return available[0];
+  return available[available.length - 1];
 }
 
 function updateRateCounters(cachedCh, nowSec) {
@@ -273,10 +280,8 @@ const SSE_CHUNK_HEADERS = {
 };
 
 async function tier0Passthrough(readable, encoder, writer) {
-  const initialChunk = `data: ${mkChunk({ content: "" })}\n\n`;
   const doneChunk = encoder.encode("data: [DONE]\n\n");
   try {
-    await writer.write(encoder.encode(initialChunk));
     const reader = readable.getReader();
     while (true) {
       const { done, value } = await reader.read();
@@ -327,7 +332,6 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
     await send("[DONE]");
   };
   try {
-    await send(mkChunk({ content: "" }, null, responseModel));
     while (true) {
       if (doneSent) break;
       if (Date.now() - streamStart > STREAM_MAX_DURATION_MS) {
@@ -511,12 +515,22 @@ async function handleChatRequest(c) {
     pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && body.tools.length > 0 && (isToolsExcluded(ch.id) || ch.support_tools === 0)));
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
-    pool.sort((a, b) => ((b.model === originalModel || b.fallback_model === originalModel) ? 1 : 0) - ((a.model === originalModel || a.fallback_model === originalModel) ? 1 : 0));
+    pool.sort((a, b) => {
+      // Primary: model name match (matched channels first)
+      const ma = (a.model === originalModel || a.fallback_model === originalModel) ? 1 : 0;
+      const mb = (b.model === originalModel || b.fallback_model === originalModel) ? 1 : 0;
+      if (ma !== mb) return mb - ma;
+      // Secondary: response_time (faster channels first)
+      return (a.response_time || 999999) - (b.response_time || 999999);
+    });
     const requestDeadline = Date.now() + REQUEST_TIMEOUT_SECONDS * 3000;
     if (isStream) {
       const { readable: out, writable } = new TransformStream();
       const w = writable.getWriter();
       const enc = new TextEncoder();
+      // Send initial chunk IMMEDIATELY so client knows response started (role = assistant)
+      w.write(enc.encode("data: " + mkChunk({ role: "assistant", content: "" }) + "\n\n")).catch(() => {});
+      // Keepalive prevents proxy timeout during long upstream TTFB (up to 60s)
       const keepalive = setInterval(() => { try { w.write(enc.encode("data: [KEEPALIVE]\n\n")); } catch { clearInterval(keepalive); } }, 8000);
       setImmediate(async () => {
         try {
@@ -539,8 +553,12 @@ async function handleChatRequest(c) {
             if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
             else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
             const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
+            // Adaptive timeout: faster fail for slow channels
+            const chTimeout = ch.response_time > 0
+              ? Math.max(5000, Math.min(REQUEST_TIMEOUT_SECONDS * 1000, ch.response_time * 3))
+              : REQUEST_TIMEOUT_SECONDS * 1000;
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
+            const timeoutId = setTimeout(() => controller.abort(), chTimeout);
             try {
               const startTime = Date.now();
               const requestHeaders = {
@@ -573,7 +591,6 @@ async function handleChatRequest(c) {
                 continue;
               }
               ok = true;
-              clearInterval(keepalive);
               updateRateCounters(ch, Math.floor(Date.now() / 1000)); recordSuccess(ch.id);
               ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
               await tier2FullFilter(res.body, data.filters || [], originalModel, enc, w, provider);
@@ -589,7 +606,6 @@ async function handleChatRequest(c) {
             try { await w.write(enc.encode("data: " + JSON.stringify(bye) + "\n\ndata: [DONE]\n\n")); } catch {}
           }
         } catch (e) { console.error("[stream] retry error:", e.message); }
-        clearInterval(keepalive);
         try { await w.close(); } catch {}
       });
       return new Response(out, { headers: SSE_CHUNK_HEADERS });
@@ -613,8 +629,11 @@ async function handleChatRequest(c) {
       if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
       else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
+      const chTimeout = ch.response_time > 0
+        ? Math.max(5000, Math.min(REQUEST_TIMEOUT_SECONDS * 1000, ch.response_time * 3))
+        : REQUEST_TIMEOUT_SECONDS * 1000;
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_SECONDS * 1000);
+      const timeoutId = setTimeout(() => controller.abort(), chTimeout);
       let responseTime = 0;
       try {
         const startTime = Date.now();

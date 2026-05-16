@@ -1,5 +1,5 @@
 #!/bin/bash
-# Serv00 keep-alive cron: checks service health, keeps PID file updated
+# Keep-alive cron: checks service health, keeps PID file updated
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=7860
 PID_FILE="$APP_DIR/system/temp/app.pid"
