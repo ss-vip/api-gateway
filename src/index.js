@@ -16,9 +16,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = resolve(__dirname, "db.json");
 const _db = new JsonDB(null, DB_PATH);
 
-const TEMP_DIR = resolve(__dirname, "../temp");
-const LOG_DIR = process.env.LOG_DIR || resolve(__dirname, "../logs");
-const BACKUP_DIR = process.env.BACKUP_DIR || resolve(__dirname, "../backups");
+const SYSTEM_DIR = resolve(__dirname, "../system");
+const TEMP_DIR = process.env.TEMP_DIR || resolve(SYSTEM_DIR, "temp");
+const LOG_DIR = process.env.LOG_DIR || resolve(SYSTEM_DIR, "logs");
+const BACKUP_DIR = process.env.BACKUP_DIR || resolve(SYSTEM_DIR, "backups");
 try { mkdirSync(TEMP_DIR, { recursive: true }); } catch (e) { console.error("[init] mkdir TEMP_DIR:", e.message); }
 try { mkdirSync(LOG_DIR, { recursive: true }); } catch (e) { console.error("[init] mkdir LOG_DIR:", e.message); }
 try { mkdirSync(BACKUP_DIR, { recursive: true }); } catch (e) { console.error("[init] mkdir BACKUP_DIR:", e.message); }
