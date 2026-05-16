@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node --expose-gc app.js",
     "dev": "node --expose-gc --watch app.js",
-    "restart": "node --input-type=module -e \"import{readFileSync,mkdirSync}from'fs';mkdirSync('system/logs',{recursive:true});try{var p=parseInt(readFileSync('./system/temp/app.pid','utf8'));process.kill(p,'SIGTERM');console.log('[restart] killed',p)}catch(e){console.log('[restart]','no running instance')}\" 2>/dev/null;sleep 1;nohup node --expose-gc app.js >> system/logs/startup.log 2>&1 &"
+    "restart": "node --input-type=module -e \"import{readFileSync,mkdirSync}from'fs';mkdirSync('system/logs',{recursive:true});try{var p=parseInt(readFileSync('./system/temp/app.pid','utf8'));process.kill(p,'SIGTERM');console.log('[restart] killed',p)}catch(e){console.log('[restart] no process')}\" 2>/dev/null;sleep 1;nohup node --expose-gc app.js >> system/logs/startup.log 2>&1 &"
   },
   "dependencies": {
     "hono": "^4.12.18",
