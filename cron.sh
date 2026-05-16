@@ -1,5 +1,5 @@
 #!/bin/bash
-APP_DIR=~/domains/your-domain/public_nodejs
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=7860
 PID_FILE="$APP_DIR/system/temp/app.pid"
 RESTART_LOG="$APP_DIR/system/logs/restart.log"

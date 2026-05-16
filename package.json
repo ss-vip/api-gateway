@@ -5,7 +5,7 @@
   "scripts": {
     "start": "node --expose-gc app.js",
     "dev": "node --expose-gc --watch app.js",
-    "restart": "node --input-type=module -e \"import{readFileSync}from'fs';import{spawn}from'child_process';try{var p=parseInt(readFileSync('./system/temp/app.pid','utf8'));process.kill(p,'SIGTERM');console.log('[restart] killed',p)}catch(e){console.log('[restart]',e.code==='ESRCH'?'process gone':e.code==='ENOENT'?'no pid file':'no pid')};setTimeout(()=>{spawn('node',['--expose-gc','app.js'],{stdio:'inherit',detached:true}).unref()},1000)\""
+    "restart": "node --input-type=module -e \"import{readFileSync,openSync,mkdirSync}from'fs';import{spawn}from'child_process';var log='system/logs/gateway.log';mkdirSync('system/logs',{recursive:true});try{var p=parseInt(readFileSync('./system/temp/app.pid','utf8'));process.kill(p,'SIGTERM');console.log('[restart] killed',p)}catch(e){console.log('[restart]',e.code==='ESRCH'?'already stopped':'starting fresh')};setTimeout(()=>{spawn('node',['--expose-gc','app.js'],{stdio:['ignore',openSync(log,'a'),openSync(log,'a')],detached:true,cwd:'.'}).unref();console.log('[restart] spawned, tail -f system/logs/gateway.log')},1000)\""
   },
   "dependencies": {
     "hono": "^4.12.18",
