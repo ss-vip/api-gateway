@@ -3,13 +3,5 @@ dist
 *.log
 .DS_Store
 .dev.vars
-temp
-logs
-backups
 db.json
-test
 system
-system/test
-system/backups
-system/logs
-system/temp

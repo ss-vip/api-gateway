@@ -29,10 +29,13 @@ export const KNOWN_OPENAI_COMPAT = [
 ];
 
 const HOST_RULES = [
+  // ── 非 OpenAI 相容（需專用 provider 轉換）──
   { pattern: "googleapis.com", provider: "google" },
   { pattern: "generativelanguage", provider: "google" },
   { pattern: "api.anthropic.com", provider: "anthropic" },
   { pattern: "api.claude.ai", provider: "anthropic" },
+
+  // ── OpenAI 相容 ──
   { pattern: "openai.azure.com", provider: "openai" },
   { pattern: "azure.com/openai", provider: "openai" },
   { pattern: "openrouter.ai", provider: "openai" },
@@ -52,6 +55,8 @@ const HOST_RULES = [
   { pattern: "api.nvidia.com", provider: "openai" },
   { pattern: "ollama", provider: "openai" },
   { pattern: "models.inference.ai.azure.com", provider: "openai" },
+  { pattern: "api.siliconflow.cn", provider: "openai" },
+  { pattern: "api.cloudflare.com", provider: "openai" },
 ];
 
 export function detectProvider(baseUrl) {

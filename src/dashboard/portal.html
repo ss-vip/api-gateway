@@ -862,6 +862,11 @@
       document.getElementById('ch-tools').checked = c.support_tools !== 0;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
       document.getElementById('ch-provider').value = c.provider || '';
+      // Auto-detect provider if empty
+      if (!c.provider) {
+        const detected = detectProviderByUrl(c.base_url);
+        if (detected) document.getElementById('ch-provider').value = detected;
+      }
       document.getElementById('ch-headers').value = c.headers ? (typeof c.headers === 'object' ? JSON.stringify(c.headers, null, 2) : c.headers) : '';
       document.getElementById('ch-provider-options').value = c.provider_options ? (typeof c.provider_options === 'object' ? JSON.stringify(c.provider_options, null, 2) : c.provider_options) : '';
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
@@ -1034,11 +1039,26 @@
     let fetchedModels = [];
     let currentModelTarget = 'primary';
 
+    // Mirror backend detectProvider — auto-select provider from URL
+    const detectProviderByUrl = (url) => {
+      if (!url) return '';
+      const lower = url.toLowerCase();
+      if (lower.includes('googleapis') || lower.includes('generativelanguage')) return 'google';
+      if (lower.includes('anthropic') || lower.includes('claude.ai')) return 'anthropic';
+      return ''; // 空 = Auto Detect（預設為 OpenAI 相容）
+    };
+
     const checkFetchModelsBtn = () => {
       const url = document.getElementById('ch-url').value.trim();
       const disabled = url.length === 0;
       document.getElementById('btn-fetch-models-primary').disabled = disabled;
       document.getElementById('btn-fetch-models-fallback').disabled = disabled;
+      // Auto-select provider when URL changes AND provider is empty
+      const providerSel = document.getElementById('ch-provider');
+      if (!providerSel.value) {
+        const detected = detectProviderByUrl(url);
+        if (detected) providerSel.value = detected;
+      }
     };
 
     const fetchModels = async (target) => {
