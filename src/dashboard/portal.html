@@ -209,7 +209,7 @@
     <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
   </div></div></div>
 
-  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable" style="max-width:680px;min-height:500px"><div class="modal-content" style="min-height:500px">
+  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable" style="max-width:680px;height:520px"><div class="modal-content" style="height:100%">
     <div class="modal-header border-0 pb-0">
       <div class="d-flex align-items-center gap-2">
         <h5 class="fw-bold small mb-0">Channel Editor</h5>
@@ -931,23 +931,14 @@
 
     const showDebug = (idx) => {
       const c = channels[idx];
-      if (!c || !c.last_error_msg) return toast('無錯誤資訊', 'warning');
-      document.getElementById('debug-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
-      let parsed = null;
-      try { parsed = JSON.parse(c.last_error_msg); } catch (e) {}
-      if (parsed && typeof parsed === 'object') {
-        document.getElementById('debug-msg').value = typeof parsed.message === 'object' ? JSON.stringify(parsed.message, null, 2) : (parsed.message || '');
-        document.getElementById('debug-url').value = parsed.url || '';
-        document.getElementById('debug-req').value = typeof parsed.request === 'object' ? JSON.stringify(parsed.request, null, 2) : (parsed.request || '');
-        document.getElementById('debug-res').value = typeof parsed.response === 'object' ? JSON.stringify(parsed.response, null, 2) : (parsed.response || '');
-        document.getElementById('debug-url-wrapper').style.display = 'block';
-        document.getElementById('debug-req-res-wrapper').style.display = 'flex';
-      } else {
-        document.getElementById('debug-msg').value = c.last_error_msg;
-        document.getElementById('debug-url-wrapper').style.display = 'none';
-        document.getElementById('debug-req-res-wrapper').style.display = 'none';
-      }
-      debugModal.show();
+      if (!c) return toast('無渠道資訊', 'warning');
+      // Open channel editor on Log tab (reuses editChannel to populate all tabs)
+      editChannel(idx);
+      // After modal opens, switch to Log tab
+      chModal._element.addEventListener('shown.bs.modal', function switchTab() {
+        document.getElementById('log-tab-btn')?.click();
+        chModal._element.removeEventListener('shown.bs.modal', switchTab);
+      }, { once: true });
     };
 
     const applyChannel = () => {

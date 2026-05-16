@@ -8,7 +8,8 @@ PORT="${PORT:-7860}"
 LOG_DIR="system/logs"
 
 do_restart() {
-  echo "[cron] restarting on port $PORT..."
+  TS="[$(date '+%Y-%m-%d %H:%M:%S')]"
+  echo "$TS [cron] restarting on port $PORT..."
   mkdir -p "$LOG_DIR" "system/temp"
   # Find PID by port
   PID=$(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -o 'pid=[0-9]*' | cut -d= -f2)
@@ -17,19 +18,19 @@ do_restart() {
   # Kill
   if [ -n "$PID" ]; then
     kill $PID 2>/dev/null; sleep 1; kill -9 $PID 2>/dev/null
-    echo "[cron] killed pid $PID"
+    echo "$TS [cron] killed pid $PID"
   fi
   # Start
   nohup node --expose-gc app.js >> "$LOG_DIR/startup.log" 2>&1 & disown
-  echo "[cron] started pid $!"
+  echo "$TS [cron] started pid $!"
   # Health check (wait up to 15s)
   for i in $(seq 1 15); do
     sleep 1
     if curl -sf $BASE_URL/health > /dev/null 2>&1; then
-      echo "[cron] health OK"; return 0
+      echo "$TS [cron] health OK"; return 0
     fi
   done
-  echo "[cron] health FAILED — check $LOG_DIR/startup.log"
+  echo "$TS [cron] health FAILED — check $LOG_DIR/startup.log"
   return 1
 }
 
@@ -40,5 +41,6 @@ if [ "$1" = "restart" ]; then
 fi
 
 # cron mode (default)
+TS="[$(date '+%Y-%m-%d %H:%M:%S')]"
 ss -tlnp 2>/dev/null | grep -q ":$PORT " || lsof -i :$PORT 2>/dev/null | grep -q LISTEN || do_restart
 curl -sf $BASE_URL/health > /dev/null 2>&1

@@ -11,6 +11,12 @@ import { JsonDB } from "./lib/storage.js";
 import { cleanupState } from "./lib/adaptive.js";
 import { MAX_CONCURRENT_REQUESTS, GC_MEMORY_THRESHOLD_MB, ENABLE_BACKUPS, LOG_TRUNCATE_LINES, LOG_KEEP_LINES } from "./lib/constants.js";
 
+// Prepend timestamps to all console output (for log files clarity)
+const _log = console.log, _error = console.error, _warn = console.warn;
+console.log = function() { _log.apply(console, ["[" + new Date().toISOString().replace("T"," ").slice(0,19) + "]", ...arguments]); };
+console.error = function() { _error.apply(console, ["[" + new Date().toISOString().replace("T"," ").slice(0,19) + "]", ...arguments]); };
+console.warn = function() { _warn.apply(console, ["[" + new Date().toISOString().replace("T"," ").slice(0,19) + "]", ...arguments]); };
+
 const app = new Hono();
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DB_PATH = resolve(__dirname, "db.json");
@@ -59,7 +65,7 @@ function runMaintenance() {
     } catch (e) { console.error("[maint] backup:", e.message); }
   }
 
-  for (const name of ["mem.log", "backup.log", "restart.log"]) {
+  for (const name of ["mem.log", "backup.log", "restart.log", "startup.log"]) {
     try {
       const p = resolve(LOG_DIR, name);
       if (existsSync(p)) {
