@@ -1,7 +1,7 @@
 import { getProvider, detectProvider, SKIP, DONE } from "./lib/providers/index.js";
 import {
   parseRetryAfter, record429, recordError, recordSuccess,
-  isVisionExcluded, isToolsExcluded, getBlockedParams,
+  isVisionExcluded, isToolsExcluded, isContextExceeded, requiresMaxTokens, getBlockedParams,
   parseErrorForLearning, learnFromError, extractBlockedParam,
 } from "./lib/adaptive.js";
 import {
@@ -14,12 +14,64 @@ import {
   D1_BATCH_MAX, STREAM_BUF_MAX_BYTES, MAX_IMAGE_BASE64_BYTES,
   STREAM_MAX_DURATION_MS, HEALTH_PERSIST_INTERVAL_MS,
 } from "./lib/constants.js";
+import { createHash } from "node:crypto";
 
 // OpenAI-only params that non-OpenAI providers (Google, Anthropic) reject
 const OPENAI_ONLY_PARAMS = new Set([
   "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs",
   "n", "logit_bias", "best_of", "echo", "suffix",
 ]);
+
+// ── Response Cache (LRU) ────────────────────────────────────────────
+const RESP_CACHE = new Map();
+const CACHE_MAX = 200;
+const CACHE_TTL_MS = 45_000;
+function cacheKey(body) {
+  return createHash("sha256").update(JSON.stringify([
+    body.model, body.messages, body.stream, body.temperature, body.top_p,
+    body.max_tokens, body.tools, body.tool_choice,
+  ])).digest("hex").slice(0, 16);
+}
+function cacheGet(key) {
+  const e = RESP_CACHE.get(key);
+  if (!e) return null;
+  if (Date.now() - e.ts > CACHE_TTL_MS) { RESP_CACHE.delete(key); return null; }
+  RESP_CACHE.delete(key); RESP_CACHE.set(key, e); // LRU: move to end
+  return e.data;
+}
+function cacheSet(key, data) {
+  if (RESP_CACHE.size >= CACHE_MAX) { const k = RESP_CACHE.keys().next().value; if (k) RESP_CACHE.delete(k); }
+  RESP_CACHE.set(key, { data, ts: Date.now() });
+}
+
+// ── Usage Stats ─────────────────────────────────────────────────────
+const DAILY_STATS = { date: "", requests: 0, tokens: 0, channels: {} };
+function recordUsage(model, ch, tokens) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (DAILY_STATS.date !== today) { DAILY_STATS.date = today; DAILY_STATS.requests = 0; DAILY_STATS.tokens = 0; DAILY_STATS.channels = {}; }
+  DAILY_STATS.requests++;
+  DAILY_STATS.tokens += tokens || 0;
+  const k = (ch || "?") + "@" + (model || "?");
+  if (!DAILY_STATS.channels[k]) DAILY_STATS.channels[k] = { requests: 0, tokens: 0 };
+  DAILY_STATS.channels[k].requests++;
+  DAILY_STATS.channels[k].tokens += tokens || 0;
+}
+function getStats() { return { ...DAILY_STATS, channels: { ...DAILY_STATS.channels } }; }
+
+// ── Response Time History (last 20) ─────────────────────────────────
+const RT_HISTORY = new Map();
+function recordRt(chId, ms) {
+  let a = RT_HISTORY.get(chId);
+  if (!a) { a = []; RT_HISTORY.set(chId, a); }
+  a.push(ms);
+  if (a.length > 20) a.shift();
+}
+function getRt(chId) { return RT_HISTORY.get(chId) || []; }
+function getAvgRt(chId) {
+  const a = RT_HISTORY.get(chId);
+  if (!a || a.length === 0) return 0;
+  return Math.round(a.reduce((s, v) => s + v, 0) / a.length);
+}
 
 function stripOpenAIOnlyParams(body, baseUrl) {
   // Detect upstream API type from the actual URL, regardless of configured provider
@@ -512,8 +564,10 @@ async function handleChatRequest(c) {
     const hasVisionContent = hasImage(body.messages);
     let pool = data.channels.filter((ch) => ch.is_enabled && (!hasVisionContent || ch.is_vision));
     if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
-    pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !(body.tools && body.tools.length > 0 && (isToolsExcluded(ch.id) || ch.support_tools === 0)));
+    pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !isContextExceeded(ch.id) && !(body.tools && body.tools.length > 0 && (isToolsExcluded(ch.id) || ch.support_tools === 0)));
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
+    // Adaptive: exclude channels that require max_tokens when client didn't send it
+    if (!body.max_tokens) pool = pool.filter((ch) => !requiresMaxTokens(ch.id));
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
     pool.sort((a, b) => {
       // Primary: model name match (matched channels first)
@@ -583,7 +637,12 @@ async function handleChatRequest(c) {
                 } else {
                   recordError(ch.id);
                   const errPattern = parseErrorForLearning(errText, res.status);
-                  if (errPattern) learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
+                  if (errPattern) {
+                    learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
+                    // Persist learned limitations to channel config
+                    if (errPattern === "noVision" && ch.is_vision) { ch.is_vision = 0; markDirty(ch.id); }
+                    if (errPattern === "noTools" && ch.support_tools !== 0) { ch.support_tools = 0; markDirty(ch.id); }
+                  }
                   ch.consecutive_errors = (ch.consecutive_errors || 0) + 1; ch.last_error_at = Math.floor(Date.now() / 1000);
                   ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url, request: pBody, response: truncateErrorBody(errBody) });
                   ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
@@ -629,6 +688,14 @@ async function handleChatRequest(c) {
       if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
       else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
+      // Check response cache for non-streaming
+      if (!isStream) {
+        const ck = cacheKey(body);
+        const cached = cacheGet(ck);
+        if (cached) {
+          try { return c.json(JSON.parse(cached)); } catch (e) {}
+        }
+      }
       const chTimeout = ch.response_time > 0
         ? Math.max(5000, Math.min(REQUEST_TIMEOUT_SECONDS * 1000, ch.response_time * 3))
         : REQUEST_TIMEOUT_SECONDS * 1000;
@@ -658,7 +725,11 @@ async function handleChatRequest(c) {
           }
           recordError(ch.id);
           const errPattern = parseErrorForLearning(errText, res.status);
-          if (errPattern) learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
+          if (errPattern) {
+            learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
+            if (errPattern === "noVision" && ch.is_vision) { ch.is_vision = 0; markDirty(ch.id); }
+            if (errPattern === "noTools" && ch.support_tools !== 0) { ch.support_tools = 0; markDirty(ch.id); }
+          }
           ch.consecutive_errors = (ch.consecutive_errors||0)+1; ch.last_error_at = Math.floor(Date.now()/1000);
           ch.last_error_msg = JSON.stringify({message:truncateErrorBody(errText),url,request:pBody,response:truncateErrorBody(errBody)});
           ch.response_time = responseTime; healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id); continue;
@@ -671,6 +742,10 @@ async function handleChatRequest(c) {
         if (json.choices?.[0]?.message?.content && data.filters?.length > 0) {
           json.choices[0].message.content = RollingFilter.applyStatic(json.choices[0].message.content, data.filters);
         }
+        // Cache non-streaming responses
+        if (!isStream) cacheSet(cacheKey(body), resText);
+        recordUsage(originalModel || ch.model, ch.name, json.usage?.total_tokens || 0);
+        recordRt(ch.id, responseTime);
         return c.json(json);
       } catch (e) {
         clearTimeout(timeoutId); recordError(ch.id);
@@ -786,6 +861,7 @@ export function clearCache() {
   cache.ts = 0;
   console.log("[gateway] cache cleared");
 }
+export { getStats, getRt, getAvgRt };
 
 async function handleImageGeneration(c) {
   try {

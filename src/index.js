@@ -82,6 +82,42 @@ const maintTimer = setInterval(runMaintenance, 300_000);
 maintTimer.unref();
 runMaintenance();
 
+// ── Health Probe (opt-in: ENABLE_PROBE=true) ────────────
+const ENABLE_PROBE = process.env.ENABLE_PROBE === "true" || process.env.ENABLE_PROBE === "1";
+async function probeChannels() {
+  try {
+    const enabled = (_db.data?.channels || []).filter(c => c.is_enabled);
+    for (const ch of enabled) {
+      try {
+        const { getProvider, detectProvider } = await import("./lib/providers/index.js");
+        const pn = ch.provider || detectProvider(ch.base_url);
+        const p = getProvider(pn);
+        const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : p.buildUrl(ch.base_url, ch.model || "test", false);
+        if (!url) continue;
+        const testBody = { model: ch.model, messages: [{ role: "user", content: "OK" }], max_tokens: 1 };
+        const { body, headers: pH } = p.prepareRequest(testBody, ch);
+        const hdrs = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key, ...pH };
+        if (hdrs.Authorization === "") delete hdrs.Authorization;
+        const pStart = Date.now();
+        const res = await fetch(url, { method: "POST", headers: hdrs, body: JSON.stringify(body), signal: AbortSignal.timeout(10000) });
+        ch.response_time = Date.now() - pStart;
+        if (!res.ok) {
+          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+          if (res.status === 429) ch.last_429 = Math.floor(Date.now() / 1000) + 300;
+        } else {
+          ch.consecutive_errors = 0;
+        }
+      } catch (e) { ch.consecutive_errors = (ch.consecutive_errors || 0) + 1; }
+    }
+  } catch (e) { console.warn("[probe]", e.message); }
+}
+if (ENABLE_PROBE) {
+  probeChannels();
+  const probeTimer = setInterval(probeChannels, 300_000);
+  probeTimer.unref();
+  console.log("[init] health probe enabled (every 5min)");
+}
+
 for (const ev of ["exit", "SIGTERM", "SIGINT"]) {
   process.on(ev, () => { try { unlinkSync(resolve(TEMP_DIR, "app.pid")); } catch {} });
 }

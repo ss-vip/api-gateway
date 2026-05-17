@@ -221,6 +221,43 @@ export default function (clearCache) {
     return c.json({ ok: true });
   });
 
+  api.get("/stats", async (c) => {
+    const { getStats, getRt, getAvgRt } = await import("../../gateway.js");
+    const channels = (await c.env.DB.prepare("SELECT id, name, model FROM channels").all()).results || [];
+    const stats = getStats();
+    const channelRts = {};
+    for (const ch of channels) {
+      const avg = getAvgRt(ch.id);
+      if (avg > 0) channelRts[ch.name || ch.id] = { avg, history: getRt(ch.id) };
+    }
+    return c.json({ stats, rts: channelRts });
+  });
+
+  api.post("/channels/:id/test", async (c) => {
+    const chId = parseInt(c.req.param("id"), 10);
+    const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || [];
+    const ch = rows[0];
+    if (!ch) return c.json({ error: "Channel not found" }, 404);
+    const { getProvider, detectProvider } = await import("../../lib/providers/index.js");
+    const providerName = ch.provider || detectProvider(ch.base_url);
+    const provider = getProvider(providerName);
+    const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, ch.model || "test", false);
+    if (!url) return c.json({ error: "Invalid URL" }, 400);
+    const testReq = { model: ch.model || "test", messages: [{ role: "user", content: "Say OK" }], max_tokens: 10 };
+    const { body: pBody, headers: pHeaders } = provider.prepareRequest(testReq, ch);
+    const start = Date.now();
+    try {
+      const headers = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key, ...pHeaders };
+      if (headers.Authorization === "") delete headers.Authorization;
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(pBody), signal: AbortSignal.timeout(15000) });
+      const ms = Date.now() - start;
+      const text = await res.text();
+      return c.json({ status: res.status, ms, body: text.slice(0, 500) });
+    } catch (e) {
+      return c.json({ error: e.message, ms: Date.now() - start }, 502);
+    }
+  });
+
   api.get("/export", async (c) => {
     const [channels, filters] = await Promise.all([
       c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),

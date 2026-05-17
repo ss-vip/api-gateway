@@ -303,39 +303,39 @@
           <option value="anthropic">Anthropic Claude</option>
         </select>
       </div>
-      <div class="row g-2">
-        <div class="col-md-6">
-          <label class="form-label mini-label fw-bold">Custom Headers</label>
-          <textarea id="ch-headers" class="form-control form-control-sm" rows="6" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"..."}'></textarea>
-        </div>
-        <div class="col-md-6">
-          <label class="form-label mini-label fw-bold">Provider Options</label>
-          <textarea id="ch-provider-options" class="form-control form-control-sm" rows="6" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
-        </div>
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Custom Headers</label>
+        <textarea id="ch-headers" class="form-control form-control-sm" rows="5" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"..."}'></textarea>
+      </div>
+      <div class="mb-2">
+        <label class="form-label mini-label fw-bold">Provider Options</label>
+        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="5" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
       </div>
       </div>
       <div class="tab-pane fade" id="log-tab" role="tabpanel">
       <div class="d-flex justify-content-between align-items-center mb-1">
-        <label class="form-label mini-label fw-bold mb-0">Health Status</label>
-        <div id="ch-log-time" class="text-muted small"></div>
+        <label class="form-label mini-label fw-bold mb-0">&#x1F4C5; Last Call</label>
+        <span id="ch-log-time" class="text-muted small"></span>
+      </div>
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <label class="form-label mini-label fw-bold mb-0">&#x1F3AF; Health Status</label>
+        <span id="ch-log-status" class="small"></span>
       </div>
       <div class="mb-1">
-        <label class="form-label mini-label fw-bold">Error Message</label>
-        <textarea id="ch-log-msg" class="form-control form-control-sm text-danger" rows="2" readonly style="font-size:0.7rem"></textarea>
+        <label class="form-label mini-label fw-bold">&#x1F4AC; Detail</label>
+        <textarea id="ch-log-msg" class="form-control form-control-sm" rows="3" readonly style="font-size:0.7rem"></textarea>
       </div>
       <div class="mb-1" id="ch-log-url-wrapper">
-        <label class="form-label mini-label fw-bold">Target URL</label>
+        <label class="form-label mini-label fw-bold">&#x1F517; Target URL</label>
         <input type="text" id="ch-log-url" class="form-control form-control-sm" readonly style="font-size:0.7rem" />
       </div>
-      <div class="row g-1" id="ch-log-req-res-wrapper" style="min-height:0">
-        <div class="col-md-6">
-          <label class="form-label mini-label fw-bold">Request</label>
-          <textarea id="ch-log-req" class="form-control form-control-sm" rows="5" readonly style="font-size:0.65rem"></textarea>
-        </div>
-        <div class="col-md-6">
-          <label class="form-label mini-label fw-bold">Response</label>
-          <textarea id="ch-log-res" class="form-control form-control-sm" rows="5" readonly style="font-size:0.65rem"></textarea>
-        </div>
+      <div class="mb-1" id="ch-log-req-wrapper">
+        <label class="form-label mini-label fw-bold">&#x1F4E8; Request</label>
+        <textarea id="ch-log-req" class="form-control form-control-sm" rows="4" readonly style="font-size:0.65rem"></textarea>
+      </div>
+      <div class="mb-1" id="ch-log-res-wrapper">
+        <label class="form-label mini-label fw-bold">&#x1F4E9; Response</label>
+        <textarea id="ch-log-res" class="form-control form-control-sm" rows="4" readonly style="font-size:0.65rem"></textarea>
       </div>
       </div>
       </div>
@@ -560,6 +560,8 @@
       channels = batch.channels || [];
       lastChannelsStr = JSON.stringify(channels);
       filters = batch.filters || [];
+      // Load stats in background
+      api('/admin/api/stats', 'GET', null, false).then(r => { if (r) window._lastStats = r; renderStats(); });
       renderStats();
       renderChannels();
       renderFilters();
@@ -579,6 +581,17 @@
       const rpdUsed = rpdChannels.reduce((s, c) => s + ((now - (c.rpd_reset_at || 0)) < 86400 ? (c.rpd_count || 0) : 0), 0);
       const rpdPct = rpdTotal > 0 ? Math.round(rpdUsed / rpdTotal * 100) : -1;
       const rpdColor = rpdPct < 0 ? 'secondary' : rpdPct >= 90 ? 'danger' : rpdPct >= 70 ? 'warning' : 'success';
+
+      // Daily usage stats (from server)
+      const statsData = window._lastStats?.stats;
+      const dailyStatsHtml = statsData && statsData.requests > 0
+        ? '<div class="col-12"><div class="card border-0 shadow-sm"><div class="card-body p-3">' +
+          '<div class="small text-muted text-uppercase fw-bold mb-1">📊 本日用量 (' + statsData.date + ')</div>' +
+          '<div class="d-flex gap-4 flex-wrap">' +
+          '<span>請求: <strong>' + statsData.requests + '</strong></span>' +
+          '<span>Token: <strong>' + (statsData.tokens || 0).toLocaleString() + '</strong></span>' +
+          '</div></div></div></div>'
+        : '';
 
       const stats = [
         { label: 'Total', val: total, cls: 'text-body-secondary' },
@@ -615,6 +628,7 @@
         rpdContent = '<div class="text-muted small py-1"><i class="bi bi-info-circle me-1"></i> No RPD limits configured.</div>';
       }
 
+      html += dailyStatsHtml;
       html +=
         '<div class="col-12">' +
           '<div class="card border-0 shadow-sm">' +
@@ -703,6 +717,7 @@
         row += '  <div class="d-none d-md-flex justify-content-center gap-1">';
         row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
+        row += '    <button onclick="testChannel(' + c.id + ')" class="btn btn-sm btn-outline-info py-1 px-2" title="Test Channel"><i class="bi bi-play-fill"></i></button>';
         row += '    <button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-1 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>';
         row += '    <button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>';
         row += '  </div>';
@@ -710,6 +725,7 @@
         row += '    <button class="btn btn-sm btn-light py-1 px-2" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>';
         row += '    <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
         row += '      <li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small">Edit</button></li>';
+        row += '      <li><button onclick="testChannel(' + c.id + ')" class="dropdown-item small">Test</button></li>';
         row += '      <li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>';
         row += '      <li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small">Copy</button></li>';
         row += '      <li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small text-danger">Delete</button></li>';
@@ -736,6 +752,16 @@
     };
 
     const clearInput = (id) => { document.getElementById(id).value = ''; };
+
+    const testChannel = async (id) => {
+      if (!id) return toast('請先儲存渠道', 'warning');
+      toast('測試中...', 'info');
+      const r = await api('/admin/api/channels/' + id + '/test', 'POST');
+      if (r) {
+        toast('回應: HTTP ' + r.status + ' (' + r.ms + 'ms)', r.status < 400 ? 'success' : 'danger');
+        if (r.body) console.log('[test]', r.body.slice(0, 200));
+      }
+    };
 
     const resetHealth = async (id) => {
       if (!id) return toast('請先儲存渠道', 'warning');
@@ -868,83 +894,99 @@
       document.getElementById('ch-headers').value = c.headers ? (typeof c.headers === 'object' ? JSON.stringify(c.headers, null, 2) : c.headers) : '';
       document.getElementById('ch-provider-options').value = c.provider_options ? (typeof c.provider_options === 'object' ? JSON.stringify(c.provider_options, null, 2) : c.provider_options) : '';
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
-      // Populate Log tab — show ALL health states
+      // Populate Log tab — show ALL health states with <li> format
       const now = Math.floor(Date.now() / 1000);
-      const healthStates = [];
-      let statusIcon = '✅';
+      let healthLabel = '', healthColor = '';
+      let isError = false;
       if (c.consecutive_errors >= 5) {
         if (now - (c.last_error_at || 0) > 1800) {
-          healthStates.push('觀察中（過去錯誤 >30min）');
-          statusIcon = '👀';
+          healthLabel = '觀察中（過去錯誤 >30min）'; healthColor = '#6c757d'; isError = true;
         } else {
-          healthStates.push('異常（連續錯誤 ' + c.consecutive_errors + ' 次）');
-          statusIcon = '🔴';
+          healthLabel = '異常（連續錯誤 ' + c.consecutive_errors + ' 次）'; healthColor = '#dc3545'; isError = true;
         }
       } else if ((c.last_429 || 0) > now) {
-        const remain = c.last_429 - now;
-        healthStates.push('冷卻中（剩 ' + remain + ' 秒）');
-        statusIcon = '🧊';
+        const r = c.last_429 - now;
+        healthLabel = '冷卻中（剩 ' + r + ' 秒）'; healthColor = '#0dcaf0';
       } else if (c.consecutive_errors > 0) {
-        healthStates.push('不穩定（錯誤 ' + c.consecutive_errors + ' 次）');
-        statusIcon = '🟡';
+        healthLabel = '不穩定（錯誤 ' + c.consecutive_errors + ' 次）'; healthColor = '#ffc107';
       } else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) {
-        healthStates.push('RPD 限額耗盡（' + c.rpd_count + '/' + c.rpd_limit + '）');
-        statusIcon = '⚫';
+        healthLabel = 'RPD 限額耗盡（' + c.rpd_count + '/' + c.rpd_limit + '）'; healthColor = '#212529';
       } else {
-        healthStates.push('正常');
-        statusIcon = '✅';
+        healthLabel = '正常'; healthColor = '#198754';
       }
-      if (c.response_time) healthStates.push('延遲: ' + c.response_time + 'ms');
-      if (c.rpm_limit > 0) healthStates.push('RPM: ' + (c.rpm_count || 0) + '/' + c.rpm_limit);
-      if (c.rpd_limit > 0) healthStates.push('RPD: ' + (c.rpd_count || 0) + '/' + c.rpd_limit);
+      document.getElementById('ch-log-status').textContent = healthLabel;
+      document.getElementById('ch-log-status').style.color = healthColor;
 
-      document.getElementById('ch-log-time').textContent = statusIcon + ' ' + healthStates.join(' | ');
+      // Last call time
+      if (c.last_error_at) {
+        document.getElementById('ch-log-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
+      } else {
+        document.getElementById('ch-log-time').textContent = '尚無調用記錄';
+      }
 
-      // Build descriptive status message
-      let statusMsg = '';
+      // Build detail message using <li> lines (no emojis in textarea)
+      const lines = [];
       if (c.last_429 > now) {
-        const remain = c.last_429 - now;
-        statusMsg = '🧊 冷卻機制觸發 — 上游回傳 429 限速，自動進入冷卻 ' + remain + ' 秒\n';
-        statusMsg += '   冷卻期間此渠道不會被選中，到期後自動恢復。';
+        const r = c.last_429 - now;
+        lines.push('• 冷卻機制觸發：上游回傳 429 限速，自動進入冷卻 ' + r + ' 秒');
+        lines.push('  冷卻期間此渠道不會被選中，到期後自動恢復。');
       } else if (c.consecutive_errors >= 5) {
-        statusMsg = '🔴 渠道異常 — 連續錯誤 ' + c.consecutive_errors + ' 次，已暫時排除\n';
+        lines.push('• 渠道異常：連續錯誤 ' + c.consecutive_errors + ' 次，已暫時排除');
         if (now - (c.last_error_at || 0) > 1800) {
-          statusMsg += '   觀察期 >30 分鐘，若恢復正常將自動重新啟用。';
+          lines.push('  觀察期已超過 30 分鐘，若恢復正常將自動重新啟用。');
         } else {
-          statusMsg += '   錯誤發生不到 30 分鐘，持續觀察中。';
+          lines.push('  錯誤發生不到 30 分鐘，持續觀察中。');
         }
       } else if (c.consecutive_errors > 0) {
-        statusMsg = '🟡 渠道不穩定 — 已發生 ' + c.consecutive_errors + ' 次錯誤\n';
-        statusMsg += '   尚未達排除門檻（5 次），會繼續嘗試使用此渠道。';
+        lines.push('• 渠道不穩定：已發生 ' + c.consecutive_errors + ' 次錯誤');
+        lines.push('  尚未達排除門檻（5 次），會繼續嘗試使用此渠道。');
       } else if (c.rpd_limit > 0 && (now - (c.rpd_reset_at || 0)) < 86400 && (c.rpd_count || 0) >= c.rpd_limit) {
-        statusMsg = '⚫ 每日限額已耗盡 — RPD ' + (c.rpd_count || 0) + '/' + c.rpd_limit + '\n';
-        statusMsg += '   將於下次重置週期自動恢復（每日 RPD 窗口）。';
+        lines.push('• 每日限額已耗盡：RPD ' + (c.rpd_count || 0) + '/' + c.rpd_limit);
+        lines.push('  將於下次重置週期自動恢復（每日 RPD 窗口）。');
+      } else {
+        lines.push('• 渠道運作正常，目前無異常或限速記錄。');
       }
+      if (c.response_time) lines.push('• 最後延遲：' + c.response_time + 'ms');
+      if (c.rpm_limit > 0) lines.push('• RPM：' + (c.rpm_count || 0) + '/' + c.rpm_limit);
+      if (c.rpd_limit > 0) lines.push('• RPD：' + (c.rpd_count || 0) + '/' + c.rpd_limit);
+      // Response time history (from server-side stats)
+      if (c._rtHistory && c._rtHistory.length > 0) {
+        const avg = Math.round(c._rtHistory.reduce((s, v) => s + v, 0) / c._rtHistory.length);
+        const max = Math.max(...c._rtHistory);
+        lines.push('• 回應時間趨勢（最近 ' + c._rtHistory.length + ' 次）：平均 ' + avg + 'ms / 最慢 ' + max + 'ms');
+      }
+
+      let detail = lines.join('\n');
 
       if (c.last_error_msg) {
         let parsed = null;
         try { parsed = JSON.parse(c.last_error_msg); } catch (e) {}
         if (parsed && typeof parsed === 'object') {
           const errMsg = typeof parsed.message === 'object' ? JSON.stringify(parsed.message, null, 2) : (parsed.message || '');
-          document.getElementById('ch-log-msg').value = statusMsg ? statusMsg + '\n\n📋 原始錯誤資訊：\n' + errMsg : errMsg;
+          if (errMsg) detail += '\n\n--- 原始錯誤訊息 ---\n' + errMsg;
           document.getElementById('ch-log-url').value = parsed.url || '';
           document.getElementById('ch-log-req').value = typeof parsed.request === 'object' ? JSON.stringify(parsed.request, null, 2) : (parsed.request || '');
           document.getElementById('ch-log-res').value = typeof parsed.response === 'object' ? JSON.stringify(parsed.response, null, 2) : (parsed.response || '');
           document.getElementById('ch-log-url-wrapper').style.display = '';
-          document.getElementById('ch-log-req-res-wrapper').style.display = '';
+          document.getElementById('ch-log-req-wrapper').style.display = '';
+          document.getElementById('ch-log-res-wrapper').style.display = '';
         } else {
-          document.getElementById('ch-log-msg').value = statusMsg ? statusMsg + '\n\n📋 原始錯誤：\n' + c.last_error_msg : c.last_error_msg;
+          if (c.last_error_msg) detail += '\n\n--- 原始錯誤 ---\n' + c.last_error_msg;
           document.getElementById('ch-log-url-wrapper').style.display = 'none';
-          document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
+          document.getElementById('ch-log-req-wrapper').style.display = 'none';
+          document.getElementById('ch-log-res-wrapper').style.display = 'none';
         }
       } else {
-        document.getElementById('ch-log-msg').value = statusMsg || '✅ 渠道運作正常，目前無異常或限速記錄。';
         document.getElementById('ch-log-url').value = '';
         document.getElementById('ch-log-req').value = '';
         document.getElementById('ch-log-res').value = '';
         document.getElementById('ch-log-url-wrapper').style.display = 'none';
-        document.getElementById('ch-log-req-res-wrapper').style.display = 'none';
+        document.getElementById('ch-log-req-wrapper').style.display = 'none';
+        document.getElementById('ch-log-res-wrapper').style.display = 'none';
       }
+      document.getElementById('ch-log-msg').value = detail;
+      // No red text for normal state
+      document.getElementById('ch-log-msg').style.color = isError ? '#dc3545' : '#212529';
       checkFetchModelsBtn();
       chModal.show();
     };

@@ -126,6 +126,10 @@ export function learnFromError(chId, patternKey, paramName) {
       if (!s.blockedParams) s.blockedParams = new Set();
       s.blockedParams.add("response_format");
       break;
+    case "contextExceeded":
+      s.contextExceededCount = (s.contextExceededCount || 0) + 1;
+      s.excludeContextUntil = now + FEATURE_EXCLUDE_MS;
+      break;
   }
 }
 
@@ -143,6 +147,18 @@ export function isToolsExcluded(chId) {
   if (s.tools === false) return true;
   if (Date.now() < s.excludeToolsUntil) return true;
   return false;
+}
+
+export function isContextExceeded(chId) {
+  const s = state.get(chId);
+  if (!s) return false;
+  if (s.contextExceededCount > 0 && Date.now() < (s.excludeContextUntil || 0)) return true;
+  return false;
+}
+
+export function requiresMaxTokens(chId) {
+  const s = state.get(chId);
+  return s?.requiresMaxTokens === true && (s?.requiresMaxTokensConfidence || 0) >= 2;
 }
 
 export function getBlockedParams(chId) {

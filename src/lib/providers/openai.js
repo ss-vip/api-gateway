@@ -7,6 +7,9 @@ const provider = {
     let base = (baseUrl || "").trim().replace(/\/+$/, "");
     if (!base) return null;
     if (base.endsWith("/chat/completions")) return base;
+    // URL already has an API version path (e.g. /v1/, /v1beta/, /v2/...)
+    // Append /chat/completions directly without adding another /v1/
+    if (/\/v[\w]+\//.test(base + "/")) return `${base}/chat/completions`;
     if (/\/v\d+$/.test(base)) return `${base}/chat/completions`;
     return `${base}/v1/chat/completions`;
   },
