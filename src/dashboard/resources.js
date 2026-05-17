@@ -222,7 +222,7 @@ export default function (clearCache) {
   });
 
   api.get("/stats", async (c) => {
-    const { getStats, getRt, getAvgRt } = await import("../../gateway.js");
+    const { getStats, getRt, getAvgRt } = await import("../gateway.js");
     const channels = (await c.env.DB.prepare("SELECT id, name, model FROM channels").all()).results || [];
     const stats = getStats();
     const channelRts = {};
@@ -238,7 +238,7 @@ export default function (clearCache) {
     const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || [];
     const ch = rows[0];
     if (!ch) return c.json({ error: "Channel not found" }, 404);
-    const { getProvider, detectProvider } = await import("../../lib/providers/index.js");
+    const { getProvider, detectProvider } = await import("../lib/providers/index.js");
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
     const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, ch.model || "test", false);

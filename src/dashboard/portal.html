@@ -458,6 +458,7 @@
       document.getElementById('login-view').style.display = 'none';
       document.getElementById('setup-view').style.display = 'none';
       document.getElementById('admin-view').style.display = 'block';
+      loading(true);
       await init();
       loading(false);
     };
@@ -552,7 +553,7 @@
 
     const init = async () => {
       // Single batch endpoint that returns everything at once
-      const batch = await api('/admin/api/init', 'GET', null, false);
+      const batch = await api('/admin/api/init', 'GET', null, true);
       if (!batch) return;
       document.getElementById('cfg-token').value = batch.config?.token || '';
       document.getElementById('cfg-recovery-period').value = batch.config?.recovery_period || 300;
@@ -1356,7 +1357,7 @@
       if (el) el.classList.add('hide');
       document.body.classList.remove('loading');
     };
-    setTimeout(forceShow, 20000);
+    setTimeout(forceShow, 60000);
 
     window.onload = () => {
       try {
