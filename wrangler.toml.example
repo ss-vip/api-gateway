@@ -1,0 +1,18 @@
+name = "api-gateway"
+main = "src/worker.js"
+compatibility_date = "2026-05-18"
+compatibility_flags = ["nodejs_compat"]
+
+[placement]
+mode = "smart"
+
+# .html 匯入規則 (dashboard/portal.html)
+rules = [
+  { type = "Text", globs = ["**/*.html"] }
+]
+
+# 在 CF Dashboard 建立 D1: npx wrangler d1 create api-gateway-db 取得資料填入
+[[d1_databases]]
+binding = "DB"
+database_name = "api-gateway-db"
+database_id = "api-gateway-db-uuid"

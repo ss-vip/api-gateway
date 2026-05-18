@@ -305,11 +305,11 @@
       </div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Custom Headers</label>
-        <textarea id="ch-headers" class="form-control form-control-sm" rows="5" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"..."}'></textarea>
+        <textarea id="ch-headers" class="form-control form-control-sm" rows="8" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"..."}'></textarea>
       </div>
       <div class="mb-2">
         <label class="form-label mini-label fw-bold">Provider Options</label>
-        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="5" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
+        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="8" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
       </div>
       </div>
       <div class="tab-pane fade" id="log-tab" role="tabpanel">
@@ -323,7 +323,7 @@
       </div>
       <div class="mb-1">
         <label class="form-label mini-label fw-bold">&#x1F4AC; Detail</label>
-        <textarea id="ch-log-msg" class="form-control form-control-sm" rows="3" readonly style="font-size:0.7rem"></textarea>
+        <textarea id="ch-log-msg" class="form-control form-control-sm" rows="8" readonly style="font-size:0.7rem"></textarea>
       </div>
       <div class="mb-1" id="ch-log-url-wrapper">
         <label class="form-label mini-label fw-bold">&#x1F517; Target URL</label>
@@ -331,11 +331,11 @@
       </div>
       <div class="mb-1" id="ch-log-req-wrapper">
         <label class="form-label mini-label fw-bold">&#x1F4E8; Request</label>
-        <textarea id="ch-log-req" class="form-control form-control-sm" rows="4" readonly style="font-size:0.65rem"></textarea>
+        <textarea id="ch-log-req" class="form-control form-control-sm" rows="8" readonly style="font-size:0.65rem"></textarea>
       </div>
       <div class="mb-1" id="ch-log-res-wrapper">
         <label class="form-label mini-label fw-bold">&#x1F4E9; Response</label>
-        <textarea id="ch-log-res" class="form-control form-control-sm" rows="4" readonly style="font-size:0.65rem"></textarea>
+        <textarea id="ch-log-res" class="form-control form-control-sm" rows="8" readonly style="font-size:0.65rem"></textarea>
       </div>
       </div>
       </div>
@@ -918,11 +918,13 @@
       document.getElementById('ch-log-status').textContent = healthLabel;
       document.getElementById('ch-log-status').style.color = healthColor;
 
-      // Last call time
+      // Last call time (use response_time as evidence of successful call)
       if (c.last_error_at) {
-        document.getElementById('ch-log-time').textContent = new Date(c.last_error_at * 1000).toLocaleString();
+        document.getElementById('ch-log-time').textContent = new Date(c.last_error_at * 1000).toLocaleString() + ' (錯誤)';
+      } else if (c.response_time) {
+        document.getElementById('ch-log-time').textContent = '有成功調用記錄，最後延遲 ' + c.response_time + 'ms';
       } else {
-        document.getElementById('ch-log-time').textContent = '尚無調用記錄';
+        document.getElementById('ch-log-time').textContent = '尚無錯誤記錄';
       }
 
       // Build detail message using <li> lines (no emojis in textarea)

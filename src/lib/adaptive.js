@@ -84,7 +84,7 @@ const ERROR_PATTERNS = [
 
 export function parseErrorForLearning(errText, status) {
   const lower = String(errText || "").toLowerCase();
-  if (status !== 400) return null;
+  if (status < 400 || status >= 500) return null;
   for (const p of ERROR_PATTERNS) {
     if (p.re.test(lower)) return p.key;
   }

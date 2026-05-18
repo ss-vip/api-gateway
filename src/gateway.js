@@ -10,33 +10,70 @@ import {
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
   REQUEST_TIMEOUT_SECONDS,
   CACHE_TTL_RATE_MS, CACHE_TTL_NORMAL_MS,
-  RATE_PERSIST_THRESHOLD, STREAM_IDLE_TIMEOUT_MS,
-  D1_BATCH_MAX, STREAM_BUF_MAX_BYTES, MAX_IMAGE_BASE64_BYTES,
-  STREAM_MAX_DURATION_MS, HEALTH_PERSIST_INTERVAL_MS,
+  STREAM_BUF_MAX_BYTES, MAX_IMAGE_BASE64_BYTES,
+  STREAM_MAX_DURATION_MS,
+  MAX_SUBREQUESTS, GLOBAL_TIMEOUT_MS,
 } from "./lib/constants.js";
-import { createHash } from "node:crypto";
+import { quickHash } from "./lib/db.js";
+import { bufferRate, getBufferedRate } from "./routes/maintenance.js";
 
-// OpenAI-only params that non-OpenAI providers (Google, Anthropic) reject
+function parseModelList(s) {
+  if (!s) return null;
+  const parts = s.split(",").map(x => x.trim()).filter(Boolean);
+  return parts.length > 0 ? new Set(parts) : null;
+}
+function modelMatches(ch, reqModel) {
+  if (ch.model === reqModel || ch.fallback_model === reqModel) return true;
+  const a = ch._modelSet || (ch._modelSet = parseModelList(ch.model));
+  const b = ch._fallbackSet || (ch._fallbackSet = parseModelList(ch.fallback_model));
+  return (a && a.has(reqModel)) || (b && b.has(reqModel));
+}
+
+function createSubrequestLimiter() {
+  let count = 0;
+  return {
+    countSubrequest() {
+      count++;
+      if (count >= MAX_SUBREQUESTS) throw new Error("Subrequest limit: " + count);
+    },
+    async safeFetch(url, options) { this.countSubrequest(); return fetch(url, options); },
+  };
+}
+
+async function persistHealth(db, ch) {
+  if (!ch || !ch.id) return;
+  if (!ch.response_time && !ch.consecutive_errors && !ch.last_429 && !ch.cooldown_until) return;
+  try {
+    await db.prepare(
+      "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=?, is_vision=? WHERE id=?"
+    ).bind(
+      ch.response_time || 0, ch.consecutive_errors || 0,
+      ch.last_error_msg || '', ch.last_error_at || 0,
+      ch.last_429 || 0, ch.cooldown_until || 0,
+      ch.is_vision ? 1 : 0, ch.id
+    ).run();
+  } catch (e) { console.error("[persist] health:", ch.id, e.message); }
+}
+
 const OPENAI_ONLY_PARAMS = new Set([
   "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs",
   "n", "logit_bias", "best_of", "echo", "suffix",
 ]);
 
-// ── Response Cache (LRU) ────────────────────────────────────────────
 const RESP_CACHE = new Map();
 const CACHE_MAX = 200;
 const CACHE_TTL_MS = 45_000;
-function cacheKey(body) {
-  return createHash("sha256").update(JSON.stringify([
+async function cacheKey(body) {
+  return quickHash([
     body.model, body.messages, body.stream, body.temperature, body.top_p,
     body.max_tokens, body.tools, body.tool_choice,
-  ])).digest("hex").slice(0, 16);
+  ]);
 }
 function cacheGet(key) {
   const e = RESP_CACHE.get(key);
   if (!e) return null;
   if (Date.now() - e.ts > CACHE_TTL_MS) { RESP_CACHE.delete(key); return null; }
-  RESP_CACHE.delete(key); RESP_CACHE.set(key, e); // LRU: move to end
+  RESP_CACHE.delete(key); RESP_CACHE.set(key, e);
   return e.data;
 }
 function cacheSet(key, data) {
@@ -44,7 +81,6 @@ function cacheSet(key, data) {
   RESP_CACHE.set(key, { data, ts: Date.now() });
 }
 
-// ── Usage Stats ─────────────────────────────────────────────────────
 const DAILY_STATS = { date: "", requests: 0, tokens: 0, channels: {} };
 function recordUsage(model, ch, tokens) {
   const today = new Date().toISOString().slice(0, 10);
@@ -58,7 +94,6 @@ function recordUsage(model, ch, tokens) {
 }
 function getStats() { return { ...DAILY_STATS, channels: { ...DAILY_STATS.channels } }; }
 
-// ── Response Time History (last 20) ─────────────────────────────────
 const RT_HISTORY = new Map();
 function recordRt(chId, ms) {
   let a = RT_HISTORY.get(chId);
@@ -74,7 +109,6 @@ function getAvgRt(chId) {
 }
 
 function stripOpenAIOnlyParams(body, baseUrl) {
-  // Detect upstream API type from the actual URL, regardless of configured provider
   const upstream = detectProvider(baseUrl);
   if (upstream === "openai") return;
   for (const param of OPENAI_ONLY_PARAMS) {
@@ -85,82 +119,27 @@ function stripOpenAIOnlyParams(body, baseUrl) {
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
 
-let dirtyChannels = new Set();
-let lastDirtyFlush = 0;
-let healthDirtyChannels = new Set();
-let lastHealthFlush = 0;
-
-function markDirty(chId) {
-  if (chId != null) dirtyChannels.add(chId);
-}
-
-function shouldPersistCounter(ch, nowSec) {
-  if (ch.rpm_limit > 0) {
-    const ratio = (ch.rpm_count || 0) / ch.rpm_limit;
-    const windowEnd = (ch.rpm_reset_at || 0) + RPM_WINDOW_SECONDS;
-    if (ratio >= RATE_PERSIST_THRESHOLD || windowEnd - nowSec < 10) return true;
-  }
-  if (ch.rpd_limit > 0) {
-    const ratio = (ch.rpd_count || 0) / ch.rpd_limit;
-    const windowEnd = (ch.rpd_reset_at || 0) + RPD_WINDOW_SECONDS;
-    if (ratio >= RATE_PERSIST_THRESHOLD || windowEnd - nowSec < 60) return true;
-  }
-  return false;
-}
-
-async function flushDirtyRateCounters(env) {
-  if (dirtyChannels.size === 0 || !cache.data?.channels) return;
-  const nowSec = Math.floor(Date.now() / 1000);
-  const toPersist = [];
-  for (const ch of cache.data.channels) {
-    if (dirtyChannels.has(ch.id) && shouldPersistCounter(ch, nowSec)) {
-      toPersist.push(ch);
+function safeParseResponse(text, provider) {
+  try {
+    const json = provider.parseResponse(text);
+    if (json && json.error) return json;
+    if (!json.choices || !Array.isArray(json.choices)) {
+      json.choices = [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }];
     }
+    for (const c of json.choices) {
+      if (c.message && typeof c.message.content !== "string" && c.message.content !== null) {
+        c.message.content = String(c.message.content || "");
+      }
+    }
+    return json;
+  } catch (e) {
+    return { error: { message: "Response parse failed: " + e.message, type: "server_error" } };
   }
-  dirtyChannels.clear();
-  if (toPersist.length === 0) return;
-  const updates = toPersist.map((ch) =>
-    env.DB.prepare(
-      "UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?"
-    ).bind(
-      ch.rpm_count || 0, ch.rpm_reset_at || nowSec,
-      ch.rpd_count || 0, ch.rpd_reset_at || nowSec, ch.id
-    )
-  );
-  await safeBatch(env.DB, updates).catch((e) =>
-    console.error("[rate] flush failed:", e.message, "count:", updates.length)
-  );
-  lastDirtyFlush = Date.now();
 }
 
-async function flushDirtyHealth(env) {
-  if (healthDirtyChannels.size === 0 || !cache.data?.channels) return;
-  const now = Date.now();
-  if (now - lastHealthFlush < HEALTH_PERSIST_INTERVAL_MS) return;
-  const toPersist = [];
-  for (const ch of cache.data.channels) {
-    if (healthDirtyChannels.has(ch.id)) toPersist.push(ch);
-  }
-  healthDirtyChannels.clear();
-  lastHealthFlush = now;
-  if (toPersist.length === 0) return;
-  const updates = toPersist.map((ch) =>
-    env.DB.prepare(
-      "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=?, last_429=? WHERE id=?"
-    ).bind(
-      ch.consecutive_errors || 0, ch.last_error_msg || "",
-      ch.last_error_at || 0, ch.response_time || 0, ch.last_429 || 0, ch.id
-    )
-  );
-  await safeBatch(env.DB, updates).catch((e) =>
-    console.error("[health] flush failed:", e.message, "count:", updates.length)
-  );
-}
-
-async function safeBatch(db, statements) {
-  if (statements.length === 0) return;
-  for (let i = 0; i < statements.length; i += D1_BATCH_MAX) {
-    await db.batch(statements.slice(i, i + D1_BATCH_MAX));
+function bufferRateCounters(ch) {
+  if (ch && ch.id) {
+    bufferRate(ch.id, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0);
   }
 }
 
@@ -264,31 +243,44 @@ function selectChannel(channels) {
     if (!c.is_enabled) return false;
     if (c.consecutive_errors >= BACKOFF_ERROR_THRESHOLD &&
         now - (c.last_error_at || 0) <= exponentialCooldown(c.consecutive_errors)) return false;
-    if (c.last_429 > now) return false;
+    if (c.cooldown_until > now) return false;
+    if (c.last_429 > 0 && c.last_429 > now) return false;
+    const buf = getBufferedRate(c.id);
+    const rpmCount = buf ? buf.rpmCount : (c.rpm_count || 0);
+    const rpmResetAt = buf ? buf.rpmResetAt : (c.rpm_reset_at || 0);
+    const rpdCount = buf ? buf.rpdCount : (c.rpd_count || 0);
+    const rpdResetAt = buf ? buf.rpdResetAt : (c.rpd_reset_at || 0);
     if (c.rpm_limit > 0 &&
-        now - (c.rpm_reset_at || 0) < RPM_WINDOW_SECONDS &&
-        (c.rpm_count || 0) >= c.rpm_limit) return false;
+        now - rpmResetAt < RPM_WINDOW_SECONDS &&
+        rpmCount >= c.rpm_limit) return false;
     if (c.rpd_limit > 0 &&
-        now - (c.rpd_reset_at || 0) < RPD_WINDOW_SECONDS &&
-        (c.rpd_count || 0) >= c.rpd_limit) return false;
+        now - rpdResetAt < RPD_WINDOW_SECONDS &&
+        rpdCount >= c.rpd_limit) return false;
     return true;
   });
   if (available.length === 0) return null;
-  // Weight by configured weight and response_time (faster = higher chance)
-  let totalW = 0;
-  const weights = available.map((c) => {
-    const base = Math.max(1, c.weight || 1);
-    const speedFactor = 1 / (1 + (c.response_time || 0) / 10000);
-    const w = Math.round(base * speedFactor * 10) + 1;
-    totalW += w;
-    return w;
-  });
-  let r = Math.random() * totalW;
-  for (let i = 0; i < available.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return available[i];
+
+  const withRt = available.filter(c => c.response_time > 0);
+
+  if (withRt.length > 0) {
+    let totalW = 0;
+    const weights = withRt.map((c) => {
+      const base = Math.max(1, c.weight || 1);
+      const speedFactor = 1 / (1 + c.response_time / 10000);
+      const w = Math.round(base * speedFactor * 10) + 1;
+      totalW += w;
+      return w;
+    });
+    let r = Math.random() * totalW;
+    for (let i = 0; i < withRt.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return withRt[i];
+    }
+    return withRt[withRt.length - 1];
   }
-  return available[available.length - 1];
+
+  const pickFrom = available.slice(0, Math.min(3, available.length));
+  return pickFrom[Math.floor(Math.random() * pickFrom.length)];
 }
 
 function updateRateCounters(cachedCh, nowSec) {
@@ -305,7 +297,7 @@ function updateRateCounters(cachedCh, nowSec) {
   } else {
     cachedCh.rpd_count = (cachedCh.rpd_count || 0) + 1;
   }
-  markDirty(cachedCh.id);
+  bufferRateCounters(cachedCh);
 }
 
 const MAX_ERROR_BODY_BYTES = 8192;
@@ -331,25 +323,6 @@ const SSE_CHUNK_HEADERS = {
   "X-Accel-Buffering": "no",
 };
 
-async function tier0Passthrough(readable, encoder, writer) {
-  const doneChunk = encoder.encode("data: [DONE]\n\n");
-  try {
-    const reader = readable.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) { try { await writer.write(doneChunk); } catch (e) { console.warn("[tier0] done write:", e.message); } break; }
-      await writer.write(value);
-    }
-  } catch (e) {
-    try {
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ _error: true, message: "Upstream stream error" })}\n\n`));
-      await writer.write(doneChunk);
-    } catch (e2) {}
-  } finally {
-    try { writer.close(); } catch (e) {}
-  }
-}
-
 const buildChunk = (delta, finishReason, json, usage) => ({
   id: json.id || "chatcmpl-" + (++chunkIdCounter),
   object: "chat.completion.chunk",
@@ -368,11 +341,6 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
   let lastActivity = Date.now();
   const streamStart = Date.now();
   const streamState = provider.createStreamState ? provider.createStreamState() : null;
-  const idleTimer = setInterval(() => {
-    if (Date.now() - lastActivity > STREAM_IDLE_TIMEOUT_MS) {
-      reader.cancel("Stream idle timeout").catch(() => {});
-    }
-  }, 5000);
   let doneSent = false;
   const send = async (data) => {
     const payload = typeof data === "string" ? data : JSON.stringify(data);
@@ -397,6 +365,11 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
         if (result.done) { await sendDone(); break; }
       } catch (e) {
         await send(mkChunk({ content: "\n\n[Upstream Connection Lost]" }, "stop", responseModel));
+        await sendDone();
+        break;
+      }
+      if (Date.now() - lastActivity > 60_000) {
+        await send(mkChunk({ content: "\n\n[Stream idle timeout]" }, "stop", responseModel));
         await sendDone();
         break;
       }
@@ -437,29 +410,8 @@ async function tier2FullFilter(readable, filters, responseModel, encoder, writer
       }
     }
   } finally {
-    clearInterval(idleTimer);
     try { writer.close(); } catch (e) {}
   }
-}
-
-function transformStream(readable, filters, responseModel, provider) {
-  const { readable: out, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const encoder = new TextEncoder();
-  const hasFilters = filters && filters.length > 0;
-  const needsConversion = provider && provider.name !== "openai";
-  const closeWriter = () => { try { writer.close(); } catch (e) {} };
-  try {
-    if (!hasFilters && !responseModel && !needsConversion) {
-      tier0Passthrough(readable, encoder, writer).catch((e) => { console.error("[stream] tier0:", e.message); closeWriter(); });
-    } else {
-      tier2FullFilter(readable, filters || [], responseModel, encoder, writer, provider).catch((e) => { console.error("[stream] tier2:", e.message); closeWriter(); });
-    }
-  } catch (e) {
-    console.error("[stream] setup error:", e.message);
-    closeWriter();
-  }
-  return out;
 }
 
 function hasImage(messages) {
@@ -496,8 +448,6 @@ async function loadCache(env) {
   if (cache.data && Date.now() - cache.ts < ttl) return cache.data;
   if (!cacheFlight) {
     cacheFlight = (async () => {
-      if (dirtyChannels.size > 0) await flushDirtyRateCounters(env).catch((e) => console.error("[cache] rate flush:", e.message));
-      if (healthDirtyChannels.size > 0) await flushDirtyHealth(env).catch((e) => console.error("[cache] health flush:", e.message));
       try {
         const [ch, fl, cf] = await Promise.all([
           env.DB.prepare("SELECT * FROM channels WHERE is_enabled=1").all(),
@@ -509,7 +459,14 @@ async function loadCache(env) {
             channels: ch.results || [],
             filters: fl.results || [],
             config: {
-              client_token: cf?.client_token || (() => "sk-" + Math.random().toString(36).slice(2, 14) + Math.random().toString(36).slice(2, 14))(),
+              client_token: cf?.client_token || (() => {
+                const bytes = new Uint8Array(22);
+                crypto.getRandomValues(bytes);
+                const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+                let t = "sk-";
+                for (let i = 0; i < 30; i++) t += chars[bytes[i] % chars.length];
+                return t;
+              })(),
               recovery_period: parseInt(cf?.recovery_period) || BACKOFF_429_SECONDS,
             },
           },
@@ -545,13 +502,14 @@ function errResponse(c, message, type, status) {
 }
 
 async function handleChatRequest(c) {
+  const limiter = createSubrequestLimiter();
   try {
     let data;
     try { data = await loadCache(c.env); } catch (e) {
       if (!cache.data) return errResponse(c, "DB Error", "server_error", 500);
       data = cache.data;
     }
-    const token = (c.req.header("Authorization") || "").replace("Bearer ", "");
+    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) return errResponse(c, "Unauthorized", "auth_error", 401);
     let body;
     try { body = await c.req.json(); } catch (e) { return errResponse(c, "Invalid JSON", "invalid_request_error", 400); }
@@ -566,27 +524,22 @@ async function handleChatRequest(c) {
     if (pool.length === 0) return errResponse(c, "No channels", "server_error", 503);
     pool = pool.filter((ch) => !isVisionExcluded(ch.id) && !isContextExceeded(ch.id) && !(body.tools && body.tools.length > 0 && (isToolsExcluded(ch.id) || ch.support_tools === 0)));
     if (body.max_tokens) pool = pool.filter((ch) => ch.max_tokens <= 0 || body.max_tokens <= ch.max_tokens);
-    // Adaptive: exclude channels that require max_tokens when client didn't send it
     if (!body.max_tokens) pool = pool.filter((ch) => !requiresMaxTokens(ch.id));
     if (pool.length === 0) return errResponse(c, "No filtered channels", "server_error", 503);
     pool.sort((a, b) => {
-      // Primary: model name match (matched channels first)
-      const ma = (a.model === originalModel || a.fallback_model === originalModel) ? 1 : 0;
-      const mb = (b.model === originalModel || b.fallback_model === originalModel) ? 1 : 0;
+      const ma = modelMatches(a, originalModel) ? 1 : 0;
+      const mb = modelMatches(b, originalModel) ? 1 : 0;
       if (ma !== mb) return mb - ma;
-      // Secondary: response_time (faster channels first)
       return (a.response_time || 999999) - (b.response_time || 999999);
     });
-    const requestDeadline = Date.now() + REQUEST_TIMEOUT_SECONDS * 3000;
+    const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
     if (isStream) {
       const { readable: out, writable } = new TransformStream();
       const w = writable.getWriter();
       const enc = new TextEncoder();
-      // Send initial chunk IMMEDIATELY so client knows response started (role = assistant)
       w.write(enc.encode("data: " + mkChunk({ role: "assistant", content: "" }) + "\n\n")).catch(() => {});
-      // Keepalive prevents proxy timeout during long upstream TTFB (up to 60s)
-      const keepalive = setInterval(() => { try { w.write(enc.encode("data: [KEEPALIVE]\n\n")); } catch { clearInterval(keepalive); } }, 8000);
-      setImmediate(async () => {
+      const keepalive = setInterval(() => { try { w.write(enc.encode(": keepalive\n\n")); } catch { clearInterval(keepalive); } }, 8000);
+      c.executionCtx.waitUntil((async () => {
         try {
           let ok = false;
           while (pool.length > 0 && !ok && Date.now() <= requestDeadline) {
@@ -594,7 +547,7 @@ async function handleChatRequest(c) {
             if (!ch) break;
             const providerName = ch.provider || detectProvider(ch.base_url);
             const provider = getProvider(providerName);
-            const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
+            const effectiveModel = ch._fallbackModel || (modelMatches(ch, originalModel) ? originalModel : ch.model);
             const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, effectiveModel, true);
             if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
             let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
@@ -607,10 +560,13 @@ async function handleChatRequest(c) {
             if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
             else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
             const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
-            // Adaptive timeout: faster fail for slow channels
-            const chTimeout = ch.response_time > 0
-              ? Math.max(5000, Math.min(REQUEST_TIMEOUT_SECONDS * 1000, ch.response_time * 3))
-              : REQUEST_TIMEOUT_SECONDS * 1000;
+            const remainingMs = requestDeadline - Date.now();
+            const historicalTimeout = ch.response_time > 0
+              ? Math.max(5000, Math.min(20000, ch.response_time * 3))
+              : 15000;
+            const chTimeout = remainingMs < 15000
+              ? Math.max(3000, Math.min(historicalTimeout, Math.floor(remainingMs * 0.6)))
+              : historicalTimeout;
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), chTimeout);
             try {
@@ -621,7 +577,7 @@ async function handleChatRequest(c) {
               };
               if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
               if (requestHeaders["x-api-key"] === "") delete requestHeaders["x-api-key"];
-              const res = await fetch(url, { method: "POST", headers: requestHeaders, body: JSON.stringify(pBody), signal: controller.signal });
+              const res = await limiter.safeFetch(url, { method: "POST", headers: requestHeaders, body: JSON.stringify(pBody), signal: controller.signal });
               const responseTime = Date.now() - startTime;
               clearTimeout(timeoutId);
               if (!res.ok) {
@@ -633,31 +589,47 @@ async function handleChatRequest(c) {
                   ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
                   ch.last_error_msg = JSON.stringify({ message: "Rate limited (429) — recovery period: " + (data.config.recovery_period || 300) + "s", url, request: pBody, response: errBody });
                   ch.last_error_at = Math.floor(Date.now() / 1000);
-                  markDirty(ch.id); healthDirtyChannels.add(ch.id);
+                  bufferRateCounters(ch);
                 } else {
                   recordError(ch.id);
                   const errPattern = parseErrorForLearning(errText, res.status);
                   if (errPattern) {
                     learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
-                    // Persist learned limitations to channel config
-                    if (errPattern === "noVision" && ch.is_vision) { ch.is_vision = 0; markDirty(ch.id); }
-                    if (errPattern === "noTools" && ch.support_tools !== 0) { ch.support_tools = 0; markDirty(ch.id); }
+                    if (errPattern === "noVision" && ch.is_vision) { ch.is_vision = 0; bufferRateCounters(ch); }
+                    if (errPattern === "noTools" && ch.support_tools !== 0) { ch.support_tools = 0; bufferRateCounters(ch); }
                   }
                   ch.consecutive_errors = (ch.consecutive_errors || 0) + 1; ch.last_error_at = Math.floor(Date.now() / 1000);
                   ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url, request: pBody, response: truncateErrorBody(errBody) });
-                  ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
+                  ch.response_time = responseTime;
+                  if (!ch._fallbackModel && ch.model !== effectiveModel) {
+                    ch._fallbackModel = ch.model;
+                    continue;
+                  }
                 }
                 continue;
               }
               ok = true;
               updateRateCounters(ch, Math.floor(Date.now() / 1000)); recordSuccess(ch.id);
-              ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
+              ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime;
+              recordRt(ch.id, responseTime);
+              c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+              clearInterval(keepalive);
               await tier2FullFilter(res.body, data.filters || [], originalModel, enc, w, provider);
+              recordUsage(originalModel || ch.model, ch.name, 0);
             } catch (e) {
               clearTimeout(timeoutId);
               recordError(ch.id); ch.consecutive_errors = (ch.consecutive_errors || 0) + 1; ch.last_error_at = Math.floor(Date.now() / 1000);
               ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout"), url, request: pBody, response: "" });
-              ch.response_time = responseTime || 0; healthDirtyChannels.add(ch.id); pool = pool.filter(p => p.id !== ch.id);
+              ch.response_time = responseTime || 0;
+              if (e.name === 'AbortError') {
+                ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(60 * Math.pow(2, ch.consecutive_errors), 600);
+                c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+              }
+              if (!ch._fallbackModel && ch.model !== effectiveModel) {
+                ch._fallbackModel = ch.model;
+              } else {
+                pool = pool.filter(p => p.id !== ch.id);
+              }
             }
           }
           if (!ok) {
@@ -665,9 +637,17 @@ async function handleChatRequest(c) {
             try { await w.write(enc.encode("data: " + JSON.stringify(bye) + "\n\ndata: [DONE]\n\n")); } catch {}
           }
         } catch (e) { console.error("[stream] retry error:", e.message); }
+        clearInterval(keepalive);
         try { await w.close(); } catch {}
-      });
+      })());
       return new Response(out, { headers: SSE_CHUNK_HEADERS });
+    }
+    if (!isStream) {
+      const ck = await cacheKey(body);
+      const cached = cacheGet(ck);
+      if (cached) {
+        try { return c.json(JSON.parse(cached)); } catch (e) {}
+      }
     }
     while (pool.length > 0) {
       if (Date.now() > requestDeadline) return errResponse(c, "Request deadline exceeded", "server_error", 504);
@@ -675,7 +655,7 @@ async function handleChatRequest(c) {
       if (!ch) return errResponse(c, "Rate limited or cooldown", "rate_limit_error", 429);
       const providerName = ch.provider || detectProvider(ch.base_url);
       const provider = getProvider(providerName);
-      const effectiveModel = (ch.model === originalModel || ch.fallback_model === originalModel) ? originalModel : ch.model;
+      const effectiveModel = modelMatches(ch, originalModel) ? originalModel : ch.model;
       const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, effectiveModel, false);
       if (!url) { pool = pool.filter(p => p.id !== ch.id); continue; }
       let reqBody = { ...body, model: effectiveModel, messages: normalizeOpenAIMessages(body.messages) };
@@ -688,17 +668,13 @@ async function handleChatRequest(c) {
       if (ch.provider_options && typeof ch.provider_options === "object") Object.assign(reqBody, ch.provider_options);
       else if (ch.provider_options && typeof ch.provider_options === "string") try { Object.assign(reqBody, JSON.parse(ch.provider_options)); } catch (e) { console.warn("[gw] provider_options parse:", e.message); }
       const { body: pBody, headers: pHeaders } = provider.prepareRequest(reqBody, ch);
-      // Check response cache for non-streaming
-      if (!isStream) {
-        const ck = cacheKey(body);
-        const cached = cacheGet(ck);
-        if (cached) {
-          try { return c.json(JSON.parse(cached)); } catch (e) {}
-        }
-      }
-      const chTimeout = ch.response_time > 0
-        ? Math.max(5000, Math.min(REQUEST_TIMEOUT_SECONDS * 1000, ch.response_time * 3))
-        : REQUEST_TIMEOUT_SECONDS * 1000;
+      const remainingMs = requestDeadline - Date.now();
+      const historicalTimeout = ch.response_time > 0
+        ? Math.max(5000, Math.min(20000, ch.response_time * 3))
+        : 15000;
+      const chTimeout = remainingMs < 15000
+        ? Math.max(3000, Math.min(historicalTimeout, Math.floor(remainingMs * 0.6)))
+        : historicalTimeout;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), chTimeout);
       let responseTime = 0;
@@ -710,40 +686,44 @@ async function handleChatRequest(c) {
         };
         if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
         if (requestHeaders["x-api-key"] === "") delete requestHeaders["x-api-key"];
-        const res = await fetch(url, { method: "POST", headers: requestHeaders, body: JSON.stringify(pBody), signal: controller.signal });
+        const res = await limiter.safeFetch(url, { method: "POST", headers: requestHeaders, body: JSON.stringify(pBody), signal: controller.signal });
         responseTime = Date.now() - startTime;
         clearTimeout(timeoutId);
         if (!res.ok) {
           const errBody = await res.text().catch(() => "");
           const errText = errBody || ("HTTP " + res.status);
-          if (res.status !== 429 && errBody) console.log("[diag]", res.status, url.replace(/\/\/[^@]+@/, "//***@"), errBody.replace(/\n/g," ").slice(0,200));
           if (res.status === 429) {
             record429(ch.id, parseRetryAfter(res)); ch.last_429 = Math.floor(Date.now()/1000) + (data.config.recovery_period||300);
             ch.last_error_msg = JSON.stringify({ message: "Rate limited (429) — recovery period: " + (data.config.recovery_period || 300) + "s", url, request: pBody, response: errBody });
             ch.last_error_at = Math.floor(Date.now()/1000);
-            markDirty(ch.id); healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id); continue;
+            bufferRateCounters(ch); pool = pool.filter(p=>p.id!==ch.id); continue;
           }
           recordError(ch.id);
           const errPattern = parseErrorForLearning(errText, res.status);
           if (errPattern) {
             learnFromError(ch.id, errPattern, errPattern === "unknownParam" ? extractBlockedParam(errText) : null);
-            if (errPattern === "noVision" && ch.is_vision) { ch.is_vision = 0; markDirty(ch.id); }
-            if (errPattern === "noTools" && ch.support_tools !== 0) { ch.support_tools = 0; markDirty(ch.id); }
+            if (errPattern === "noVision" && ch.is_vision) { ch.is_vision = 0; bufferRateCounters(ch); }
+            if (errPattern === "noTools" && ch.support_tools !== 0) { ch.support_tools = 0; bufferRateCounters(ch); }
           }
           ch.consecutive_errors = (ch.consecutive_errors||0)+1; ch.last_error_at = Math.floor(Date.now()/1000);
           ch.last_error_msg = JSON.stringify({message:truncateErrorBody(errText),url,request:pBody,response:truncateErrorBody(errBody)});
-          ch.response_time = responseTime; healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id); continue;
+          ch.response_time = responseTime; pool = pool.filter(p=>p.id!==ch.id); continue;
         }
         updateRateCounters(ch, Math.floor(Date.now()/1000)); recordSuccess(ch.id);
-        ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime; healthDirtyChannels.add(ch.id);
+        ch.consecutive_errors = 0; ch.last_error_msg = ""; ch.last_error_at = 0; ch.response_time = responseTime;
+        c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
         const resText = await res.text();
-        const json = provider.parseResponse(resText);
+        const MAX_RESP_BYTES = 4 * 1024 * 1024;
+        if (resText.length > MAX_RESP_BYTES) {
+          return errResponse(c, "Upstream response too large (" + resText.length + " bytes)", "server_error", 502);
+        }
+        const json = safeParseResponse(resText, provider);
+        if (json.error) return errResponse(c, json.error.message, "upstream_error", 502);
         if (originalModel) json.model = originalModel;
         if (json.choices?.[0]?.message?.content && data.filters?.length > 0) {
           json.choices[0].message.content = RollingFilter.applyStatic(json.choices[0].message.content, data.filters);
         }
-        // Cache non-streaming responses
-        if (!isStream) cacheSet(cacheKey(body), resText);
+        cacheSet(await cacheKey(body), resText);
         recordUsage(originalModel || ch.model, ch.name, json.usage?.total_tokens || 0);
         recordRt(ch.id, responseTime);
         return c.json(json);
@@ -751,7 +731,15 @@ async function handleChatRequest(c) {
         clearTimeout(timeoutId); recordError(ch.id);
         ch.consecutive_errors = (ch.consecutive_errors||0)+1; ch.last_error_at = Math.floor(Date.now()/1000);
         ch.last_error_msg = JSON.stringify({message:truncateErrorBody(e.message||"Request timeout or network error"),url,request:pBody,response:""});
-        ch.response_time = responseTime||0; healthDirtyChannels.add(ch.id); pool = pool.filter(p=>p.id!==ch.id);
+        ch.response_time = responseTime||0;
+        if (e.name === 'AbortError') {
+          ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(60 * Math.pow(2, ch.consecutive_errors), 600);
+        }
+        if (!ch._fallbackModel && ch.model !== effectiveModel) {
+          ch._fallbackModel = ch.model;
+        } else {
+          pool = pool.filter(p=>p.id!==ch.id);
+        }
       }
     }
     return errResponse(c, "All upstream channels exhausted or failed", "server_error", 503);
@@ -762,9 +750,10 @@ async function handleChatRequest(c) {
 }
 
 async function handleEmbeddings(c) {
+  const limiter = createSubrequestLimiter();
   try {
     const data = await loadCache(c.env);
-    const token = (c.req.header("Authorization") || "").replace("Bearer ", "");
+    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
       return errResponse(c, "Unauthorized", "auth_error", 401);
     }
@@ -818,7 +807,7 @@ async function handleEmbeddings(c) {
         ...channelHeaders,
       };
       if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
-      const res = await fetch(base, {
+      const res = await limiter.safeFetch(base, {
         method: "POST",
         headers: requestHeaders,
         body: JSON.stringify(reqBody),
@@ -831,14 +820,12 @@ async function handleEmbeddings(c) {
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
         ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url: base });
-        healthDirtyChannels.add(ch.id);
         return errResponse(c, "Upstream error: " + (errText || res.status), "upstream_error", res.status);
       }
       updateRateCounters(ch, Math.floor(Date.now() / 1000));
       recordSuccess(ch.id);
       ch.consecutive_errors = 0;
       ch.last_error_msg = "";
-      healthDirtyChannels.add(ch.id);
       const resText = await res.text();
       return c.json(JSON.parse(resText));
     } catch (e) {
@@ -847,7 +834,6 @@ async function handleEmbeddings(c) {
       ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
       ch.last_error_at = Math.floor(Date.now() / 1000);
       ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout"), url: base });
-      healthDirtyChannels.add(ch.id);
       return errResponse(c, "Request failed: " + e.message, "upstream_error", 502);
     }
   } catch (e) {
@@ -864,9 +850,10 @@ export function clearCache() {
 export { getStats, getRt, getAvgRt };
 
 async function handleImageGeneration(c) {
+  const limiter = createSubrequestLimiter();
   try {
     const data = await loadCache(c.env);
-    const token = (c.req.header("Authorization") || "").replace("Bearer ", "");
+    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token)
       return errResponse(c, "Unauthorized", "auth_error", 401);
     let body;
@@ -900,7 +887,7 @@ async function handleImageGeneration(c) {
         Authorization: "Bearer " + ch.api_key, ...channelHeaders,
       };
       if (requestHeaders.Authorization === "") delete requestHeaders.Authorization;
-      const res = await fetch(base, {
+      const res = await limiter.safeFetch(base, {
         method: "POST", headers: requestHeaders, body: JSON.stringify(body), signal: controller.signal,
       });
       clearTimeout(timeoutId);
@@ -910,13 +897,11 @@ async function handleImageGeneration(c) {
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
         ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(errText), url: base });
-        healthDirtyChannels.add(ch.id);
         return errResponse(c, "Upstream error: " + (errText || res.status), "upstream_error", res.status);
       }
       updateRateCounters(ch, Math.floor(Date.now() / 1000));
       recordSuccess(ch.id);
       ch.consecutive_errors = 0; ch.last_error_msg = "";
-      healthDirtyChannels.add(ch.id);
       return c.json(await res.json());
     } catch (e) {
       clearTimeout(timeoutId);
@@ -924,7 +909,6 @@ async function handleImageGeneration(c) {
       ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
       ch.last_error_at = Math.floor(Date.now() / 1000);
       ch.last_error_msg = JSON.stringify({ message: truncateErrorBody(e.message || "Request timeout"), url: base });
-      healthDirtyChannels.add(ch.id);
       return errResponse(c, "Request failed: " + e.message, "upstream_error", 502);
     }
   } catch (e) {

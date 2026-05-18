@@ -21,15 +21,30 @@ async function getAdminPass(c) {
   } catch { return null; }
 }
 
-export { getAdminPass, verifyPassword, hashPassword };
+export { getAdminPass, verifyPassword };
 
 function generateFallbackToken() {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
   let t = "sk-";
-  for (let i = 0; i < 15; i++) t += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 30; i++) t += chars[Math.floor(Math.random() * chars.length)];
   return t;
 }
 const DEFAULTS = { token: generateFallbackToken(), delay_period: 300 };
+
+const setupRateLimit = new Map();
+const SETUP_MAX_ATTEMPTS = 5;
+const SETUP_BAN_MS = 10 * 60 * 1000; // 10 minutes
+
+function checkSetupRateLimit(ip) {
+  const state = setupRateLimit.get(ip) || { count: 0, banUntil: 0 };
+  if (Date.now() < state.banUntil) return { blocked: true, remaining: 0 };
+  if (state.count >= SETUP_MAX_ATTEMPTS) {
+    setupRateLimit.set(ip, { count: 0, banUntil: Date.now() + SETUP_BAN_MS });
+    return { blocked: true, remaining: 0 };
+  }
+  setupRateLimit.set(ip, { count: state.count + 1, banUntil: 0 });
+  return { blocked: false, remaining: SETUP_MAX_ATTEMPTS - state.count - 1 };
+}
 
 export default function (clearCache) {
   const api = new Hono();
@@ -207,6 +222,12 @@ export default function (clearCache) {
   });
 
   api.post("/admin-pass", async (c) => {
+    const ip = c.req.header("CF-Connecting-IP")
+      || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim()
+      || "unknown";
+    const rl = checkSetupRateLimit(ip);
+    if (rl.blocked) return c.json({ error: "嘗試過多，請 10 分鐘後再试" }, 429);
+
     const { pass } = await c.req.json();
     if (!pass || pass.length < 6 || pass.length > 20)
       return c.json({ error: "密碼需 6-20 個字元" }, 400);
