@@ -1,4 +1,6 @@
 import { cleanupState } from "../lib/adaptive.js";
+import { pruneSetupRateLimit } from "../dashboard/resources.js";
+import { pruneLoginState } from "../dashboard/index.js";
 
 const rateBuffer = new Map();
 const RATE_BUF_MAX = 200;
@@ -49,6 +51,11 @@ export function registerMaintenance(app) {
     const DB = c.env.DB;
     const actions = {};
     const nowUnix = Math.floor(now / 1000);
+
+    // Prune in-memory rate limit state for setup endpoint
+    pruneSetupRateLimit();
+    pruneLoginState();
+    actions.state_pruned = true;
 
     const { results: recovered } = await DB.prepare(
       `SELECT id FROM channels 

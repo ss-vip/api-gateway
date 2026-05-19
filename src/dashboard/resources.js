@@ -46,6 +46,14 @@ function checkSetupRateLimit(ip) {
   return { blocked: false, remaining: SETUP_MAX_ATTEMPTS - state.count - 1 };
 }
 
+// Periodic cleanup: remove expired bans
+export function pruneSetupRateLimit() {
+  const now = Date.now();
+  for (const [ip, state] of setupRateLimit) {
+    if (state.banUntil > 0 && now >= state.banUntil) setupRateLimit.delete(ip);
+  }
+}
+
 export default function (clearCache) {
   const api = new Hono();
 
@@ -242,41 +250,120 @@ export default function (clearCache) {
     return c.json({ ok: true });
   });
 
-  api.get("/stats", async (c) => {
-    const { getStats, getRt, getAvgRt } = await import("../gateway.js");
-    const channels = (await c.env.DB.prepare("SELECT id, name, model FROM channels").all()).results || [];
-    const stats = getStats();
-    const channelRts = {};
-    for (const ch of channels) {
-      const avg = getAvgRt(ch.id);
-      if (avg > 0) channelRts[ch.name || ch.id] = { avg, history: getRt(ch.id) };
-    }
-    return c.json({ stats, rts: channelRts });
-  });
-
   api.post("/channels/:id/test", async (c) => {
     const chId = parseInt(c.req.param("id"), 10);
     const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || [];
     const ch = rows[0];
-    if (!ch) return c.json({ error: "Channel not found" }, 404);
+    if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
     const { getProvider, detectProvider } = await import("../lib/providers/index.js");
     const providerName = ch.provider || detectProvider(ch.base_url);
     const provider = getProvider(providerName);
     const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : provider.buildUrl(ch.base_url, ch.model || "test", false);
-    if (!url) return c.json({ error: "Invalid URL" }, 400);
-    const testReq = { model: ch.model || "test", messages: [{ role: "user", content: "Say OK" }], max_tokens: 10 };
-    const { body: pBody, headers: pHeaders } = provider.prepareRequest(testReq, ch);
-    const start = Date.now();
-    try {
-      const headers = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key, ...pHeaders };
-      if (headers.Authorization === "") delete headers.Authorization;
-      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(pBody), signal: AbortSignal.timeout(15000) });
-      const ms = Date.now() - start;
-      const text = await res.text();
-      return c.json({ status: res.status, ms, body: text.slice(0, 500) });
-    } catch (e) {
-      return c.json({ error: e.message, ms: Date.now() - start }, 502);
+    if (!url) return c.json({ ok: false, error: "Invalid URL", diagnosis: "渠道 URL 格式錯誤" }, 400);
+
+    // Helper: send a test request and return diagnosis
+    // feature: 'basic' | 'vision' | 'tools' — changes success criteria
+    async function testRequest(reqBody, timeoutMs = 10000, feature = 'basic') {
+      const start = Date.now();
+      try {
+        const headers = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key };
+        if (!headers.Authorization) delete headers.Authorization;
+        const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(timeoutMs) });
+        const text = await res.text();
+        const ms = Date.now() - start;
+        if (res.status === 200) {
+          try {
+            const json = JSON.parse(text);
+            const content = json?.choices?.[0]?.message?.content || json?.choices?.[0]?.delta?.content;
+            const toolCalls = json?.choices?.[0]?.message?.tool_calls || json?.choices?.[0]?.delta?.tool_calls;
+            const finishReason = json?.choices?.[0]?.finish_reason;
+
+            // Tools test: must return actual tool_calls to be considered supported
+            if (feature === 'tools') {
+              const hasToolCalls = (toolCalls && toolCalls.length > 0) || finishReason === "tool_calls";
+              if (hasToolCalls) return { ok: true, ms, detail: "tool_calls received" };
+              return { ok: false, ms, detail: "tools not supported (text-only response)" };
+            }
+
+            if (content && content.trim().length > 0) return { ok: true, ms, detail: content.slice(0, 100) };
+            if (toolCalls && toolCalls.length > 0) return { ok: true, ms, detail: "tool_calls received" };
+            if (finishReason === "tool_calls") return { ok: true, ms, detail: "tool_calls (finish_reason)" };
+            return { ok: false, ms, detail: "empty response" };
+          } catch (e) {
+            if (text && text.length > 0) return { ok: true, ms, detail: "non-JSON response" };
+            return { ok: false, ms, detail: "empty body" };
+          }
+        }
+        if (res.status === 400) return { ok: false, ms, detail: "不支援（HTTP 400）" };
+        if (res.status === 401 || res.status === 403) return { ok: false, ms, detail: "API Key 無效（" + res.status + "）" };
+        return { ok: false, ms, detail: "HTTP " + res.status };
+      } catch (e) {
+        const ms = Date.now() - start;
+        if (e.name === 'TimeoutError') return { ok: false, ms, detail: "超時" };
+        return { ok: false, ms, detail: e.message?.slice(0, 80) || "error" };
+      }
     }
+
+    // Helper: update channel health and force cache refresh
+    async function updateHealth(isHealthy, diagnosis) {
+      const now = Math.floor(Date.now() / 1000);
+      const newErrors = isHealthy ? 0 : (ch.consecutive_errors || 0) + 1;
+      await c.env.DB.prepare(
+        "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=? WHERE id=?"
+      ).bind(newErrors, isHealthy ? "" : diagnosis, now, 0, chId).run();
+      clearCache(); // Force gateway to reload channel state
+    }
+
+    // 1. Basic connectivity test (explicit non-streaming to get clean JSON)
+    const baseReq = { model: ch.model || "test", messages: [{ role: "user", content: "OK" }], stream: false };
+    const baseResult = await testRequest(baseReq, 15000);
+    if (!baseResult.ok) {
+      let diagnosis = "連線失敗";
+      let httpStatus = 0;
+      if (baseResult.detail.includes("無效")) { diagnosis = "API Key 無效或已失效"; httpStatus = 401; }
+      else if (baseResult.detail.includes("400")) { diagnosis = "請求被拒絕，模型可能不支援"; httpStatus = 400; }
+      else if (baseResult.detail.includes("超時")) { diagnosis = "連線超時（15s），渠道可能無回應"; httpStatus = 0; }
+      else if (baseResult.detail.includes("empty")) { diagnosis = "回應內容為空，渠道未正確回應"; httpStatus = 200; }
+      await updateHealth(false, diagnosis);
+      return c.json({ ok: false, status: httpStatus, ms: baseResult.ms, diagnosis,
+        health_updated: true, message: "渠道已標記為異常，將暫時不被選用" });
+    }
+
+    // Basic test passed - reset health
+    await updateHealth(true, "");
+    const baseMs = baseResult.ms;
+
+    // 2. Test capabilities (vision, tools) in parallel
+    const [visionRes, toolsRes] = await Promise.all([
+      testRequest({
+        model: ch.model || "test",
+        messages: [{ role: "user", content: [{ type: "text", text: "desc" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }],
+        stream: false,
+      }, 8000).catch(() => ({ ok: false, ms: 0, detail: "test error" })),
+      testRequest({
+        model: ch.model || "test",
+        messages: [{ role: "user", content: "test" }],
+        tools: [{ type: "function", function: { name: "test_func", description: "test", parameters: { type: "object", properties: {} } } }],
+        tool_choice: "required",
+        stream: false,
+      }, 8000, 'tools').catch(() => ({ ok: false, ms: 0, detail: "test error" })),
+    ]);
+
+    const capabilities = {
+      vision: { ok: visionRes.ok, detail: visionRes.ok ? "✅ 支援" : "❌ " + visionRes.detail },
+      tools: { ok: toolsRes.ok, detail: toolsRes.ok ? "✅ 支援" : "❌ " + toolsRes.detail },
+      web_search: { ok: false, detail: "OpenAI search preview 專用，不在此測試範圍" },
+    };
+
+    return c.json({
+      ok: true,
+      status: 200,
+      ms: baseMs,
+      diagnosis: "連線正常",
+      health_updated: true,
+      message: "渠道健康狀態已重置",
+      capabilities,
+    });
   });
 
   api.get("/export", async (c) => {

@@ -15,6 +15,8 @@ function pruneLoginState() {
   }
 }
 
+export { pruneLoginState };
+
 export default function (clearCache) {
   const app = new Hono();
   app.route("/api", createResourcesApp(clearCache));

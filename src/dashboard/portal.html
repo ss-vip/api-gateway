@@ -226,9 +226,6 @@
           <button class="nav-link active fw-bold small px-3" id="basic-tab-btn" data-bs-toggle="tab" data-bs-target="#basic-tab" type="button" role="tab">Basic</button>
         </li>
         <li class="nav-item" role="presentation">
-          <button class="nav-link fw-bold small px-3" id="advanced-tab-btn" data-bs-toggle="tab" data-bs-target="#advanced-tab" type="button" role="tab">Option</button>
-        </li>
-        <li class="nav-item" role="presentation">
           <button class="nav-link fw-bold small px-3" id="log-tab-btn" data-bs-toggle="tab" data-bs-target="#log-tab" type="button" role="tab">Log</button>
         </li>
       </ul>
@@ -291,25 +288,6 @@
           <label class="form-check-label small fw-bold mb-1" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
         </div>
-      </div>
-      </div>
-      <div class="tab-pane fade" id="advanced-tab" role="tabpanel">
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Provider Override</label>
-        <select id="ch-provider" class="form-select form-select-sm">
-          <option value="">Auto Detect</option>
-          <option value="openai">OpenAI 相容</option>
-          <option value="google">Google Gemini (原生)</option>
-          <option value="anthropic">Anthropic Claude</option>
-        </select>
-      </div>
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Custom Headers</label>
-        <textarea id="ch-headers" class="form-control form-control-sm" rows="8" style="font-size:0.7rem" placeholder='{"HTTP-Referer":"..."}'></textarea>
-      </div>
-      <div class="mb-2">
-        <label class="form-label mini-label fw-bold">Provider Options</label>
-        <textarea id="ch-provider-options" class="form-control form-control-sm" rows="8" style="font-size:0.7rem" placeholder='{"provider":{"order":["OpenAI"]}}'></textarea>
       </div>
       </div>
       <div class="tab-pane fade" id="log-tab" role="tabpanel">
@@ -404,7 +382,10 @@
       if (show) {
         pendingRequests++;
         el.classList.remove('hide');
-        setTimeout(() => { if (pendingRequests > 0) { pendingRequests = 0; el.classList.add('hide'); } }, 10000);
+        // Safety timeout: 60s max (covers test button: 15s basic + 8s capabilities)
+        setTimeout(() => {
+          if (pendingRequests > 0) { pendingRequests = 0; el.classList.add('hide'); }
+        }, 60000);
       } else {
         pendingRequests = Math.max(0, pendingRequests - 1);
         if (pendingRequests === 0) el.classList.add('hide');
@@ -561,8 +542,6 @@
       channels = batch.channels || [];
       lastChannelsStr = JSON.stringify(channels);
       filters = batch.filters || [];
-      // Load stats in background
-      api('/admin/api/stats', 'GET', null, false).then(r => { if (r) window._lastStats = r; renderStats(); });
       renderStats();
       renderChannels();
       renderFilters();
@@ -759,8 +738,22 @@
       toast('測試中...', 'info');
       const r = await api('/admin/api/channels/' + id + '/test', 'POST');
       if (r) {
-        toast('回應: HTTP ' + r.status + ' (' + r.ms + 'ms)', r.status < 400 ? 'success' : 'danger');
-        if (r.body) console.log('[test]', r.body.slice(0, 200));
+        // Auto-update capabilities in local state
+        if (r.capabilities) {
+          const idx = channels.findIndex(c => c.id === id);
+          if (idx !== -1) {
+            const ch = channels[idx];
+            if (!r.capabilities.vision.ok && ch.is_vision) ch.is_vision = 0;
+            if (!r.capabilities.tools.ok && ch.support_tools !== 0) ch.support_tools = 0;
+          }
+          renderChannels();
+        }
+        // Simple toast
+        if (r.ok) {
+          toast('✅ 測試回應成功 ' + (r.status || 200), 'success');
+        } else {
+          toast('❌ 測試回應失敗 ' + (r.status || '連線'), 'danger');
+        }
       }
     };
 
@@ -851,9 +844,6 @@
       document.getElementById('ch-enabled').checked = true;
       document.getElementById('ch-vision').checked = false;
       document.getElementById('ch-tools').checked = true;
-      document.getElementById('ch-provider').value = '';
-      document.getElementById('ch-headers').value = '';
-      document.getElementById('ch-provider-options').value = '';
       document.getElementById('ch-absolute-url').checked = false;
       // Reset Log tab for new channel
       document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
@@ -886,14 +876,6 @@
       document.getElementById('ch-vision').checked = c.is_vision == 1;
       document.getElementById('ch-tools').checked = c.support_tools !== 0;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
-      document.getElementById('ch-provider').value = c.provider || '';
-      // Auto-detect provider if empty
-      if (!c.provider) {
-        const detected = detectProviderByUrl(c.base_url);
-        if (detected) document.getElementById('ch-provider').value = detected;
-      }
-      document.getElementById('ch-headers').value = c.headers ? (typeof c.headers === 'object' ? JSON.stringify(c.headers, null, 2) : c.headers) : '';
-      document.getElementById('ch-provider-options').value = c.provider_options ? (typeof c.provider_options === 'object' ? JSON.stringify(c.provider_options, null, 2) : c.provider_options) : '';
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
       // Populate Log tab — show ALL health states with <li> format
       const now = Math.floor(Date.now() / 1000);
@@ -1041,9 +1023,6 @@
         rpm_reset_at: prev ? prev.rpm_reset_at||0 : 0,
         rpd_count: prev ? prev.rpd_count||0 : 0,
         rpd_reset_at: prev ? prev.rpd_reset_at||0 : 0,
-        provider: document.getElementById('ch-provider').value,
-        headers: parseJsonField('ch-headers'),
-        provider_options: parseJsonField('ch-provider-options'),
         absolute_url: document.getElementById('ch-absolute-url').checked ? 1 : 0,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
@@ -1096,25 +1075,11 @@
     let currentModelTarget = 'primary';
 
     // Mirror backend detectProvider — auto-select provider from URL
-    const detectProviderByUrl = (url) => {
-      if (!url) return '';
-      const lower = url.toLowerCase();
-      if (lower.includes('googleapis') || lower.includes('generativelanguage')) return 'google';
-      if (lower.includes('anthropic') || lower.includes('claude.ai')) return 'anthropic';
-      return ''; // 空 = Auto Detect（預設為 OpenAI 相容）
-    };
-
     const checkFetchModelsBtn = () => {
       const url = document.getElementById('ch-url').value.trim();
       const disabled = url.length === 0;
       document.getElementById('btn-fetch-models-primary').disabled = disabled;
       document.getElementById('btn-fetch-models-fallback').disabled = disabled;
-      // Auto-select provider when URL changes AND provider is empty
-      const providerSel = document.getElementById('ch-provider');
-      if (!providerSel.value) {
-        const detected = detectProviderByUrl(url);
-        if (detected) providerSel.value = detected;
-      }
     };
 
     const fetchModels = async (target) => {
