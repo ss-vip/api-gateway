@@ -128,8 +128,12 @@ function selectChannel(channels, originalModel) {
     else if (err === 2) w *= 0.6;
     else if (err === 1) w *= 0.8;
 
-    if (ch.rpm_limit > 0 && (ch.rpm_count || 0) / ch.rpm_limit > 0.8) w *= 0.5;
-    if (ch.rpd_limit > 0 && (ch.rpd_count || 0) / ch.rpd_limit > 0.8) w *= 0.5;
+    // 使用與硬限制檢查一致的 buffered rate 值
+    const buf = getBufferedRate(ch.id);
+    const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
+    const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
+    if (ch.rpm_limit > 0 && rpmCount / ch.rpm_limit > 0.8) w *= 0.5;
+    if (ch.rpd_limit > 0 && rpdCount / ch.rpd_limit > 0.8) w *= 0.5;
 
     const rt = ch.response_time || 0;
     if (rt > 0 && avgRt > 0) {
@@ -888,7 +892,7 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
         }
 
         settle({ ch, json, responseTime: rt });
-        resolve({ ch, json, rt });
+        resolve({ ch, json, responseTime: rt });
       } catch (e) {
         clearTimeout(cfg.timeoutId);
         if (settled) { resolve(null); return; }
@@ -977,9 +981,6 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
         markChannelError(ch, res.status, errText, rt, data);
-        if (res.status === 429) {
-          ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
-        }
         deferPersist(c, ch);
         removePoolItem(pool, ch);
         continue;
