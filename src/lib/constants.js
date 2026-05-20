@@ -5,5 +5,5 @@ export const BACKOFF_MAX_SECONDS = 3600;
 export const RPM_WINDOW_SECONDS = 60;
 export const RPD_WINDOW_SECONDS = 86400;
 
-export const REQUEST_TIMEOUT_SECONDS = 25;
-export const GLOBAL_TIMEOUT_MS = 29_500;
+export const REQUEST_TIMEOUT_SECONDS = 120;
+export const GLOBAL_TIMEOUT_MS = 300_000;

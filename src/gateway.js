@@ -7,6 +7,10 @@ import {
 } from "./lib/constants.js";
 import { bufferRate, getBufferedRate } from "./routes/maintenance.js";
 
+const MAX_RETRY = 3;
+const RACE_TIMEOUT_MS = 15000;
+const RACE_MAX_CONCURRENT = 3;
+
 const SSE_CHUNK_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
@@ -21,9 +25,13 @@ const ERROR_CODE_MAP = {
   upstream_error: "upstream_error",
 };
 
+// ─── 回應工具 ───────────────────────────────────────────────────────
+
 function errResponse(c, message, type, status) {
   return c.json({ error: { message, type, code: ERROR_CODE_MAP[type] || type } }, status);
 }
+
+// ─── 快取 ──────────────────────────────────────────────────────────
 
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
@@ -41,7 +49,7 @@ async function loadCache(env) {
           env.DB.prepare("SELECT * FROM filters WHERE is_enabled=1").all(),
           env.DB.prepare("SELECT * FROM config WHERE id=1").first(),
         ]);
-        if (cacheGen !== gen) return; // stale, discarded
+        if (cacheGen !== gen) return;
         cache = {
           data: {
             channels: ch.results || [],
@@ -64,18 +72,26 @@ async function loadCache(env) {
   return cacheFlight;
 }
 
+export function clearCache() {
+  cacheGen++;
+  cache.data = null;
+  cache.ts = 0;
+}
+
+// ─── 退避計算 ─────────────────────────────────────────────────────
+
 function exponentialCooldown(consecutiveErrors) {
   if (consecutiveErrors <= BACKOFF_ERROR_THRESHOLD) return 0;
   const exponent = Math.min(consecutiveErrors - BACKOFF_ERROR_THRESHOLD, 4);
   return Math.min(BACKOFF_429_SECONDS * Math.pow(2, exponent), BACKOFF_MAX_SECONDS);
 }
 
-// Weighted random channel selection with dynamic weight reduction
+// ─── 渠道選擇 ──────────────────────────────────────────────────────
+
 function selectChannel(channels, originalModel) {
   const now = Math.floor(Date.now() / 1000);
   const model = (originalModel || '').trim();
 
-  // Phase 1: Hard health checks (exclude unhealthy channels entirely)
   const healthy = channels.filter(ch => {
     if (!ch.is_enabled) return false;
     if (ch.consecutive_errors >= BACKOFF_ERROR_THRESHOLD &&
@@ -92,7 +108,6 @@ function selectChannel(channels, originalModel) {
   });
   if (healthy.length === 0) return null;
 
-  // Phase 2: Dynamic effective weight calculation
   const rtValues = healthy.map(ch => ch.response_time || 0).filter(v => v > 0);
   const avgRt = rtValues.length > 0 ? rtValues.reduce((s, v) => s + v, 0) / rtValues.length : 0;
 
@@ -101,25 +116,21 @@ function selectChannel(channels, originalModel) {
   for (const ch of healthy) {
     let w = ch.weight || 50;
 
-    // Model match factor
     const models = (ch.model || '').split(',').map(s => s.trim()).filter(Boolean);
     const fallbacks = (ch.fallback_model || '').split(',').map(s => s.trim()).filter(Boolean);
     if (models.includes(model)) w *= 10;
     else if (fallbacks.includes(model)) w *= 5;
     else w *= 0.1;
 
-    // Error factor: gradual reduction before hard cooldown
     const err = ch.consecutive_errors || 0;
     if (err >= 4) w *= 0.2;
     else if (err === 3) w *= 0.4;
     else if (err === 2) w *= 0.6;
     else if (err === 1) w *= 0.8;
 
-    // Rate limit proximity factor
     if (ch.rpm_limit > 0 && (ch.rpm_count || 0) / ch.rpm_limit > 0.8) w *= 0.5;
     if (ch.rpd_limit > 0 && (ch.rpd_count || 0) / ch.rpd_limit > 0.8) w *= 0.5;
 
-    // Latency factor (relative to pool average)
     const rt = ch.response_time || 0;
     if (rt > 0 && avgRt > 0) {
       if (rt > avgRt * 2) w *= 0.3;
@@ -132,7 +143,6 @@ function selectChannel(channels, originalModel) {
     totalW += w;
   }
 
-  // Phase 3: Weighted random selection
   let r = Math.random() * totalW;
   for (let i = 0; i < healthy.length; i++) {
     r -= weights[i];
@@ -141,26 +151,29 @@ function selectChannel(channels, originalModel) {
   return healthy[healthy.length - 1];
 }
 
-function updateRateCounters(cachedCh, nowSec) {
-  if (!cachedCh) return;
-  if (nowSec - (cachedCh.rpm_reset_at || 0) >= RPM_WINDOW_SECONDS) {
-    cachedCh.rpm_count = 1;
-    cachedCh.rpm_reset_at = nowSec;
+// ─── Rate 計數 ─────────────────────────────────────────────────────
+
+function updateRateCounters(ch, nowSec) {
+  if (!ch) return;
+  if (nowSec - (ch.rpm_reset_at || 0) >= RPM_WINDOW_SECONDS) {
+    ch.rpm_count = 1;
+    ch.rpm_reset_at = nowSec;
   } else {
-    cachedCh.rpm_count = (cachedCh.rpm_count || 0) + 1;
+    ch.rpm_count = (ch.rpm_count || 0) + 1;
   }
-  if (nowSec - (cachedCh.rpd_reset_at || 0) >= RPD_WINDOW_SECONDS) {
-    cachedCh.rpd_count = 1;
-    cachedCh.rpd_reset_at = nowSec;
+  if (nowSec - (ch.rpd_reset_at || 0) >= RPD_WINDOW_SECONDS) {
+    ch.rpd_count = 1;
+    ch.rpd_reset_at = nowSec;
   } else {
-    cachedCh.rpd_count = (cachedCh.rpd_count || 0) + 1;
+    ch.rpd_count = (ch.rpd_count || 0) + 1;
   }
-  bufferRate(cachedCh.id, cachedCh.rpm_count || 0, cachedCh.rpm_reset_at || 0, cachedCh.rpd_count || 0, cachedCh.rpd_reset_at || 0);
+  bufferRate(ch.id, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0);
 }
+
+// ─── Health 持久化 ────────────────────────────────────────────────
 
 async function persistHealth(db, ch) {
   if (!ch || !ch.id) return;
-  if (!ch.response_time && !ch.consecutive_errors && !ch.last_429 && !ch.cooldown_until) return;
   try {
     await db.prepare(
       "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=? WHERE id=?"
@@ -173,6 +186,12 @@ async function persistHealth(db, ch) {
   } catch (e) { console.error("[persist] health:", ch.id, e.message); }
 }
 
+function deferPersist(c, ch) {
+  if (ch) c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+}
+
+// ─── 工具函式 ──────────────────────────────────────────────────────
+
 function removePoolItem(pool, ch) {
   const idx = pool.indexOf(ch);
   if (idx !== -1) pool.splice(idx, 1);
@@ -184,7 +203,12 @@ function truncateErrorBody(text) {
   return text.slice(0, 8192) + "... [truncated]";
 }
 
-// Rolling filter for streaming content keyword filtering
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// ─── 內容過濾器 ────────────────────────────────────────────────────
+
 class RollingFilter {
   constructor(filters) {
     this.filters = (filters || []).filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
@@ -226,6 +250,774 @@ class RollingFilter {
   }
 }
 
+// ─── Tool Simulation ──────────────────────────────────────────────
+
+function hasTools(body) {
+  return body.tools && Array.isArray(body.tools) && body.tools.length > 0;
+}
+
+function shouldSimulateTools(body) {
+  // tool_choice === "none" 時 client 明確不需要工具
+  return hasTools(body) && body.tool_choice !== "none";
+}
+
+// 安全的 tool_call ID
+let idCounter = 0;
+function nextToolCallId() {
+  const ts = Date.now().toString(36);
+  const counter = (++idCounter % 1e6).toString(36).padStart(4, "0");
+  const rand = Math.random().toString(36).slice(2, 6);
+  return "call_" + ts + counter + rand;
+}
+
+function formatToolSchema(tool) {
+  const fn = tool.function || {};
+  let desc = `- ${fn.name}: ${fn.description || 'No description'}`;
+  if (fn.parameters) {
+    try {
+      const params = typeof fn.parameters === "string" ? JSON.parse(fn.parameters) : fn.parameters;
+      const props = params.properties || {};
+      const required = params.required || [];
+      const propLines = Object.entries(props).map(([k, v]) => {
+        const req = required.includes(k) ? " (required)" : "";
+        const typeDesc = (v.type === "object" && v.properties)
+          ? "object (" + Object.keys(v.properties).join(", ") + ")"
+          : v.description || v.type || "any";
+        return `    ${k}${req}: ${typeDesc}`;
+      });
+      desc += "\n  Parameters:\n" + propLines.join("\n");
+    } catch (e) { /* skip if unparseable */ }
+  }
+  return desc;
+}
+
+// 從模型回覆的文字中嘗試擷取 JSON（容錯處理 code fence / 前後文字）
+function extractJsonFromContent(content) {
+  if (!content) return null;
+  const trimmed = content.trim();
+
+  // Fast path: 純 JSON
+  try { return JSON.parse(trimmed); } catch (e) {}
+
+  // Markdown code fence
+  const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (fenceMatch) {
+    try { return JSON.parse(fenceMatch[1].trim()); } catch (e) {}
+  }
+
+  // 找到第一個 { 或 [，追蹤括號深度直到匹配
+  const firstBrace = trimmed.indexOf('{');
+  const firstBracket = trimmed.indexOf('[');
+  const start = (firstBrace === -1 && firstBracket === -1) ? -1
+    : (firstBrace === -1) ? firstBracket
+    : (firstBracket === -1) ? firstBrace
+    : Math.min(firstBrace, firstBracket);
+  if (start === -1) return null;
+
+  const endChar = trimmed[start] === '{' ? '}' : ']';
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+
+  for (let i = start; i < trimmed.length; i++) {
+    const c = trimmed[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\' && inStr) { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{' || c === '[') depth++;
+    if (c === '}' || c === ']') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(trimmed.slice(start, i + 1)); } catch (e) { return null; }
+      }
+    }
+  }
+  return null;
+}
+
+function prepareRequestBody(body, ch, originalModel) {
+  const reqBody = { ...body, model: ch.model || originalModel };
+
+  if (shouldSimulateTools(body) && !ch.support_tools) {
+    delete reqBody.tools;
+    const toolDesc = (body.tools || []).map(formatToolSchema).join('\n');
+    const toolInstruction =
+      `You have access to these tools:\n${toolDesc}\n\n` +
+      `When you need to call a tool, respond ONLY with JSON: {"tool":"name","arguments":{...}} or ` +
+      `an array [{"tool":"name","arguments":{...}}] for multiple tools. ` +
+      `"name" is the tool name and "arguments" is an object with the required parameters. ` +
+      `Otherwise respond normally.`;
+
+    const msgs = body.messages || [];
+    if (msgs.length > 0 && msgs[0].role === "system") {
+      reqBody.messages = [
+        { role: "system", content: msgs[0].content + "\n\n" + toolInstruction },
+        ...msgs.slice(1),
+      ];
+    } else {
+      reqBody.messages = [
+        { role: "system", content: toolInstruction },
+        ...msgs,
+      ];
+    }
+  }
+
+  if (ch.max_tokens > 0) {
+    reqBody.max_tokens = ch.max_tokens;
+  }
+
+  return reqBody;
+}
+
+function wrapToolResponse(json, ch, body) {
+  if (!hasTools(body) || ch.support_tools) return json;
+  const msg = json?.choices?.[0]?.message;
+  if (!msg?.content) return json;
+
+  const parsed = extractJsonFromContent(msg.content);
+  if (!parsed) return json;
+
+  const toolCalls = [];
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+
+  for (const item of items) {
+    if (item && typeof item === 'object' && item.tool && item.arguments) {
+      toolCalls.push({
+        id: nextToolCallId(),
+        type: "function",
+        function: { name: item.tool, arguments: JSON.stringify(item.arguments) },
+      });
+    }
+  }
+
+  if (toolCalls.length > 0) {
+    json.choices[0].message = {
+      role: "assistant",
+      content: null,
+      tool_calls: toolCalls,
+    };
+    json.choices[0].finish_reason = "tool_calls";
+    const origContent = msg.content || "";
+    if (json.usage) {
+      json.usage.completion_tokens = (json.usage.completion_tokens || 0) + origContent.length;
+    }
+  }
+
+  return json;
+}
+
+// ─── 渠道請求組裝 ──────────────────────────────────────────────────
+
+function buildChannelConfig(ch, body, originalModel, deadline, stream) {
+  const effectiveModel = ch.model || originalModel || "gpt-4o";
+  const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, stream);
+  if (!url) return null;
+
+  const reqBody = prepareRequestBody(body, ch, originalModel);
+
+  let channelHeaders = {};
+  if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
+  else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
+
+  const requestHeaders = {
+    "Content-Type": "application/json",
+    Authorization: "Bearer " + ch.api_key,
+    ...channelHeaders,
+  };
+  if (!requestHeaders.Authorization) delete requestHeaders.Authorization;
+
+  const remainingMs = Math.max(2000, deadline - Date.now());
+  const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), chTimeout);
+
+  return { effectiveModel, url, reqBody, requestHeaders, controller, timeoutId };
+}
+
+function markChannelError(ch, status, errMsg, responseTime, data) {
+  ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+  ch.last_error_at = Math.floor(Date.now() / 1000);
+  ch.last_error_msg = truncateErrorBody(errMsg || ("HTTP " + status));
+  ch.response_time = responseTime || 0;
+  if (status === 429) {
+    ch.last_429 = Math.floor(Date.now() / 1000) + (data?.config?.recovery_period || 300);
+  }
+}
+
+// ─── Pool 管理 ─────────────────────────────────────────────────────
+
+function pickChannels(pool, originalModel, maxCount) {
+  const picked = [];
+  for (let i = 0; i < maxCount && pool.length > 0; i++) {
+    const ch = selectChannel(pool, originalModel);
+    if (!ch) break;
+    removePoolItem(pool, ch);
+    picked.push(ch);
+  }
+  return picked;
+}
+
+// ─── SSE 寫入工具 ─────────────────────────────────────────────────
+
+function sseEvent(w, enc, data) {
+  return w.write(enc.encode("data: " + JSON.stringify(data) + "\n\n"));
+}
+
+function buildErrorChunk(msg) {
+  return {
+    id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    choices: [{ index: 0, delta: { content: "\n\n" + msg }, finish_reason: "stop" }],
+  };
+}
+
+async function writeStreamError(w, enc, msg) {
+  try {
+    await sseEvent(w, enc, buildErrorChunk(msg));
+  } catch (e) {}
+  try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
+}
+
+// ─── 競速共用基礎 ─────────────────────────────────────────────────
+
+function abortAll(infos) {
+  for (const info of infos) {
+    clearTimeout(info.timeoutId);
+    info.controller.abort();
+  }
+}
+
+// ─── 將完整 JSON 回應模擬為 SSE chunk 寫出 ────────────────────────
+
+async function writeSimulatedStream(w, enc, json) {
+  try {
+    const msg = json?.choices?.[0]?.message;
+    const finishReason = json?.choices?.[0]?.finish_reason || "stop";
+    const id = json.id || ("chatcmpl-" + Date.now());
+    const created = json.created || Math.floor(Date.now() / 1000);
+    const model = json.model || "";
+
+    if (msg?.tool_calls && msg.tool_calls.length > 0) {
+      await sseEvent(w, enc, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{
+          index: 0,
+          delta: { tool_calls: msg.tool_calls.map(tc => ({
+            index: 0, id: tc.id, type: tc.type,
+            function: tc.function,
+          }))},
+          finish_reason: "tool_calls",
+        }],
+      });
+    } else if (msg?.content) {
+      await sseEvent(w, enc, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta: { content: msg.content }, finish_reason }],
+      });
+    }
+
+    if (json.usage) {
+      await sseEvent(w, enc, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [],
+        usage: json.usage,
+      });
+    }
+
+    await w.write(enc.encode("data: [DONE]\n\n"));
+  } catch (e) {
+    try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
+  }
+}
+
+// ─── 串流競速 ─────────────────────────────────────────────────────
+
+async function raceStream(c, pool, body, originalModel, data, w, enc, requestDeadline) {
+  const picked = pickChannels(pool, originalModel, RACE_MAX_CONCURRENT);
+  if (picked.length === 0) {
+    await writeStreamError(w, enc, "No available channels");
+    return;
+  }
+
+  let resolveWinner;
+  const winnerOrFail = new Promise((resolve) => { resolveWinner = resolve; });
+
+  const allInfos = [];
+  let settled = false;
+
+  function settle(winner) {
+    if (settled) return;
+    settled = true;
+    abortAll(allInfos);
+    resolveWinner(winner);
+  }
+
+  // 是否需要此渠道的工具模擬
+  const needToolSim = shouldSimulateTools(body);
+
+  function startChannel(ch, delay) {
+    return new Promise(async (resolve) => {
+      if (delay > 0) await sleep(delay);
+      if (settled) { resolve(null); return; }
+
+      const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
+      if (!cfg) { removePoolItem(pool, ch); resolve(null); return; }
+      allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
+
+      // 工具模擬：強制上游回傳完整 JSON 而非 SSE
+      const needSim = needToolSim && !ch.support_tools;
+      if (needSim) {
+        cfg.reqBody.stream = false;
+      }
+
+      const startTime = Date.now();
+      try {
+        const res = await fetch(cfg.url, {
+          method: "POST",
+          headers: cfg.requestHeaders,
+          body: JSON.stringify(cfg.reqBody),
+          signal: cfg.controller.signal,
+        });
+        clearTimeout(cfg.timeoutId);
+        const rt = Date.now() - startTime;
+
+        if (settled) { resolve(null); return; }
+
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          markChannelError(ch, res.status, errBody, rt, data);
+          deferPersist(c, ch);
+          resolve(null);
+          return;
+        }
+
+        // ── 工具模擬路徑：全量讀取 → 包裝 → 模擬串流 ──
+        if (needSim) {
+          const resText = await res.text();
+          if (resText.length > 4 * 1024 * 1024) { resolve(null); return; }
+          let json;
+          try { json = JSON.parse(resText); } catch (e) { resolve(null); return; }
+          json = wrapToolResponse(json, ch, body);
+          settle({ ch, simulatedJson: json, responseTime: rt, isSimulated: true });
+          resolve({ isSimulated: true, json });
+          return;
+        }
+
+        // ── 正常串流路徑 ──
+        settle({ ch, res, cfg, responseTime: rt, isSimulated: false });
+        resolve({ isSimulated: false, res, cfg });
+      } catch (e) {
+        clearTimeout(cfg.timeoutId);
+        if (settled) { resolve(null); return; }
+        markChannelError(ch, null, e.message, Date.now() - startTime, data);
+        if (e.name === 'AbortError') {
+          ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
+        }
+        deferPersist(c, ch);
+        resolve(null);
+      }
+    });
+  }
+
+  // Phase 1: 主渠道立即開始
+  const primaryPromise = startChannel(picked[0], 0);
+
+  // Phase 2: RACE_TIMEOUT 後啟動次要
+  let backupStarted = false;
+  const raceTimer = sleep(RACE_TIMEOUT_MS).then(() => {
+    if (settled) return;
+    backupStarted = true;
+    const backups = [];
+    for (let i = 1; i < picked.length; i++) {
+      backups.push(startChannel(picked[i], 0));
+    }
+    return Promise.all(backups);
+  });
+
+  const primaryResult = await primaryPromise;
+
+  if (primaryResult) {
+    if (primaryResult.isSimulated) {
+      await writeSimulatedStream(w, enc, primaryResult.json);
+      return;
+    }
+    const winner = await winnerOrFail;
+    await streamChannelResponse(c, winner, data, w, enc);
+    return;
+  }
+
+  if (!backupStarted) await raceTimer;
+
+  const winner = await Promise.race([
+    winnerOrFail,
+    new Promise(r => setTimeout(r, 30000)).then(() => null),
+  ]);
+
+  if (winner) {
+    if (winner.isSimulated) {
+      await writeSimulatedStream(w, enc, winner.simulatedJson);
+      return;
+    }
+    await streamChannelResponse(c, winner, data, w, enc);
+    return;
+  }
+
+  await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline);
+}
+
+async function streamChannelResponse(c, winner, data, w, enc) {
+  const { ch, res, cfg, responseTime } = winner;
+
+  updateRateCounters(ch, Math.floor(Date.now() / 1000));
+  ch.consecutive_errors = 0;
+  ch.last_error_msg = "";
+  ch.last_error_at = 0;
+  ch.response_time = responseTime;
+  c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let sseBuf = "";
+  let streamHadContent = false;
+  const contentFilter = new RollingFilter(data.filters || []);
+
+  try {
+    let lastLine = "";
+    let streamDone = false;
+    while (!streamDone) {
+      const { done, value } = await reader.read();
+      if (done) { streamDone = true; break; }
+      sseBuf += decoder.decode(value, { stream: true });
+      const lines = sseBuf.split("\n");
+      sseBuf = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        lastLine = line;
+
+        if (line.includes("[DONE]")) {
+          const tail = contentFilter.flush();
+          if (tail) {
+            await sseEvent(w, enc, {
+              id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              choices: [{ index: 0, delta: { content: tail }, finish_reason: "stop" }],
+            });
+          }
+          try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
+          streamDone = true; break;
+        }
+
+        try {
+          const colonIdx = line.indexOf(":");
+          const jsonStr = line.slice(colonIdx + 1).trim();
+          const chunk = JSON.parse(jsonStr);
+          const delta = chunk?.choices?.[0]?.delta;
+          if (delta?.content || delta?.tool_calls) streamHadContent = true;
+
+          if (delta?.content) {
+            const filtered = contentFilter.transform(delta.content);
+            if (filtered) {
+              delta.content = filtered;
+              await sseEvent(w, enc, chunk);
+            }
+            if (contentFilter.truncated) {
+              try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
+              streamDone = true; break;
+            }
+          } else {
+            try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
+          }
+        } catch (e) {
+          try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
+        }
+      }
+    }
+
+    if (!streamHadContent) {
+      ch.last_error_msg = "Empty response (no content)";
+      ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+      ch.last_error_at = Math.floor(Date.now() / 1000);
+      deferPersist(c, ch);
+      await writeStreamError(w, enc, "Empty response from upstream");
+      return;
+    }
+
+    if (!lastLine.includes("[DONE]") && !streamDone) {
+      try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
+    }
+  } catch (e) {
+    console.error("[stream] read error:", ch.id, e.message);
+    try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
+  }
+}
+
+// ─── 串流 Fallback 順序重試 ───────────────────────────────────────
+
+async function fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline) {
+  let retries = 0;
+  let lastError = "";
+  const needToolSim = shouldSimulateTools(body);
+
+  while (pool.length > 0 && Date.now() < requestDeadline && retries < MAX_RETRY) {
+    retries++;
+    const ch = selectChannel(pool, originalModel);
+    if (!ch) { lastError = "all channels in cooldown or rate-limited"; break; }
+    removePoolItem(pool, ch);
+
+    const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
+    if (!cfg) continue;
+
+    // 工具模擬同前
+    const needSim = needToolSim && !ch.support_tools;
+    if (needSim) {
+      cfg.reqBody.stream = false;
+    }
+
+    const fetchStart = Date.now();
+    try {
+      const res = await fetch(cfg.url, {
+        method: "POST", headers: cfg.requestHeaders,
+        body: JSON.stringify(cfg.reqBody), signal: cfg.controller.signal,
+      });
+      clearTimeout(cfg.timeoutId);
+      const rt = Date.now() - fetchStart;
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => "");
+        markChannelError(ch, res.status, errBody, rt, data);
+        deferPersist(c, ch);
+        continue;
+      }
+
+      if (needSim) {
+        const resText = await res.text();
+        if (resText.length > 4 * 1024 * 1024) continue;
+        let json;
+        try { json = JSON.parse(resText); } catch (e) { continue; }
+        json = wrapToolResponse(json, ch, body);
+        updateRateCounters(ch, Math.floor(Date.now() / 1000));
+        ch.consecutive_errors = 0;
+        ch.response_time = rt;
+        deferPersist(c, ch);
+        await writeSimulatedStream(w, enc, json);
+        return;
+      }
+
+      const winner = { ch, res, cfg, responseTime: rt };
+      await streamChannelResponse(c, winner, data, w, enc);
+      return;
+    } catch (e) {
+      clearTimeout(cfg.timeoutId);
+      const rt = Date.now() - fetchStart;
+      markChannelError(ch, null, e.message, rt, data);
+      if (e.name === 'AbortError') {
+        ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
+      }
+      deferPersist(c, ch);
+      lastError = (e.message || "Request failed").slice(0, 200);
+    }
+  }
+
+  await writeStreamError(w, enc, "All upstream channels failed" + (lastError ? ": " + lastError : ""));
+}
+
+// ─── 非串流競速 ─────────────────────────────────────────────────────
+
+async function raceNonStream(c, pool, body, originalModel, data, requestDeadline) {
+  const picked = pickChannels(pool, originalModel, RACE_MAX_CONCURRENT);
+  if (picked.length === 0) {
+    return errResponse(c, "No available channels", "server_error", 503);
+  }
+
+  let resolveWinner;
+  const winnerOrFail = new Promise((resolve) => { resolveWinner = resolve; });
+
+  const allInfos = [];
+  let settled = false;
+
+  function settle(winner) {
+    if (settled) return;
+    settled = true;
+    abortAll(allInfos);
+    resolveWinner(winner);
+  }
+
+  function tryChannel(ch, delay) {
+    return new Promise(async (resolve) => {
+      if (delay > 0) await sleep(delay);
+      if (settled) { resolve(null); return; }
+
+      const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, false);
+      if (!cfg) { resolve(null); return; }
+      allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
+
+      const startTime = Date.now();
+      try {
+        const res = await fetch(cfg.url, {
+          method: "POST", headers: cfg.requestHeaders,
+          body: JSON.stringify(cfg.reqBody), signal: cfg.controller.signal,
+        });
+        clearTimeout(cfg.timeoutId);
+        const rt = Date.now() - startTime;
+
+        if (settled) { resolve(null); return; }
+
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          markChannelError(ch, res.status, errBody, rt, data);
+          deferPersist(c, ch);
+          resolve(null);
+          return;
+        }
+
+        const resText = await res.text();
+        if (resText.length > 4 * 1024 * 1024) { resolve(null); return; }
+
+        let json = JSON.parse(resText);
+        json = wrapToolResponse(json, ch, body);
+
+        const choice = json?.choices?.[0];
+        if (choice && !choice.message?.content && !choice.message?.tool_calls && choice.finish_reason === "stop") {
+          ch.last_error_msg = "Empty response (no content)";
+          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+          ch.last_error_at = Math.floor(Date.now() / 1000);
+          deferPersist(c, ch);
+          resolve(null);
+          return;
+        }
+
+        settle({ ch, json, responseTime: rt });
+        resolve({ ch, json, rt });
+      } catch (e) {
+        clearTimeout(cfg.timeoutId);
+        if (settled) { resolve(null); return; }
+        markChannelError(ch, null, e.message, Date.now() - startTime, data);
+        if (e.name === 'AbortError') {
+          ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
+        }
+        deferPersist(c, ch);
+        resolve(null);
+      }
+    });
+  }
+
+  // Phase 1: 主渠道立即
+  const primaryPromise = tryChannel(picked[0], 0);
+
+  // Phase 2: RACE_TIMEOUT 後啟動次要
+  let backupStarted = false;
+  const raceTimer = sleep(RACE_TIMEOUT_MS).then(() => {
+    if (settled) return;
+    backupStarted = true;
+    const backups = [];
+    for (let i = 1; i < picked.length; i++) {
+      backups.push(tryChannel(picked[i], 0));
+    }
+    return Promise.all(backups);
+  });
+
+  const primaryResult = await primaryPromise;
+  if (primaryResult) {
+    return finalizeNonStream(c, primaryResult, data);
+  }
+
+  if (!backupStarted) await raceTimer;
+
+  const winner = await Promise.race([
+    winnerOrFail,
+    new Promise(r => setTimeout(r, 30000)).then(() => null),
+  ]);
+
+  if (winner) {
+    return finalizeNonStream(c, winner, data);
+  }
+
+  return fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline);
+}
+
+function finalizeNonStream(c, winner, data) {
+  const { ch, json, responseTime } = winner;
+  updateRateCounters(ch, Math.floor(Date.now() / 1000));
+  ch.consecutive_errors = 0;
+  ch.last_error_msg = "";
+  ch.last_error_at = 0;
+  ch.response_time = responseTime;
+  c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+
+  if (json?.choices?.[0]?.message?.content && data.filters?.length > 0) {
+    json.choices[0].message.content = RollingFilter.applyStatic(
+      json.choices[0].message.content, data.filters
+    );
+  }
+  return c.json(json);
+}
+
+// ─── 非串流 Fallback 順序重試 ─────────────────────────────────────
+
+async function fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline) {
+  let retries = 0;
+  while (pool.length > 0 && Date.now() < requestDeadline && retries < MAX_RETRY) {
+    retries++;
+    const ch = selectChannel(pool, originalModel);
+    if (!ch) return errResponse(c, "Rate limited or all channels unavailable", "rate_limit_error", 429);
+
+    const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, false);
+    if (!cfg) { removePoolItem(pool, ch); continue; }
+
+    const startTime = Date.now();
+    try {
+      const res = await fetch(cfg.url, {
+        method: "POST", headers: cfg.requestHeaders,
+        body: JSON.stringify(cfg.reqBody), signal: cfg.controller.signal,
+      });
+      clearTimeout(cfg.timeoutId);
+      const rt = Date.now() - startTime;
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        markChannelError(ch, res.status, errText, rt, data);
+        if (res.status === 429) {
+          ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
+        }
+        deferPersist(c, ch);
+        removePoolItem(pool, ch);
+        continue;
+      }
+
+      const resText = await res.text();
+      if (resText.length > 4 * 1024 * 1024) {
+        return errResponse(c, "Response too large", "server_error", 502);
+      }
+      let json = JSON.parse(resText);
+      json = wrapToolResponse(json, ch, body);
+
+      const choice = json?.choices?.[0];
+      if (choice && !choice.message?.content && !choice.message?.tool_calls && choice.finish_reason === "stop") {
+        ch.last_error_msg = "Empty response (no content)";
+        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+        ch.last_error_at = Math.floor(Date.now() / 1000);
+        deferPersist(c, ch);
+        removePoolItem(pool, ch);
+        continue;
+      }
+
+      return finalizeNonStream(c, { ch, json, responseTime: rt }, data);
+    } catch (e) {
+      clearTimeout(cfg.timeoutId);
+      markChannelError(ch, null, e.message, Date.now() - startTime, data);
+      if (e.name === 'AbortError') {
+        ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
+      }
+      deferPersist(c, ch);
+      removePoolItem(pool, ch);
+    }
+  }
+  return errResponse(c, "All channels failed or request timed out", "server_error", 504);
+}
+
+// ─── 主要請求處理 ───────────────────────────────────────────────────
+
 async function handleChatRequest(c) {
   try {
     let data;
@@ -255,7 +1047,8 @@ async function handleChatRequest(c) {
     const originalModel = body.model;
     const isStream = body.stream !== false;
 
-    let pool = data.channels.filter((ch) => ch.is_enabled);
+    // 淺拷貝 pool 隔離各 request 的 channel mutation，避免併發汙染快取
+    let pool = data.channels.filter((ch) => ch.is_enabled).map(ch => ({ ...ch }));
     if (pool.length === 0) return errResponse(c, "No available channels", "server_error", 503);
 
     const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
@@ -265,7 +1058,7 @@ async function handleChatRequest(c) {
       const w = writable.getWriter();
       const enc = new TextEncoder();
 
-      // Send initial chunk immediately so client knows response started
+      // 立即送出初始 chunk，表示連線存活
       const initChunk = {
         id: "chatcmpl-" + Date.now(),
         object: "chat.completion.chunk",
@@ -276,291 +1069,19 @@ async function handleChatRequest(c) {
       w.write(enc.encode("data: " + JSON.stringify(initChunk) + "\n\n")).catch(() => {});
 
       c.executionCtx.waitUntil((async () => {
-        let ok = false;
-        let lastError = "";
-
-        while (pool.length > 0 && !ok && Date.now() < requestDeadline) {
-          const ch = selectChannel(pool, originalModel);
-          if (!ch) { lastError = "all channels in cooldown or rate-limited"; break; }
-
-          const effectiveModel = ch.model || originalModel || "gpt-4o";
-          const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, true);
-          if (!url) { removePoolItem(pool, ch); continue; }
-
-          // Forward the request AS-IS with minimal modification
-          const reqBody = { ...body, model: effectiveModel, stream: true };
-
-          let channelHeaders = {};
-          if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
-          else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
-
-          const remainingMs = Math.max(2000, requestDeadline - Date.now());
-          const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), chTimeout);
-
-          let responseTime = 0;
-          try {
-            const requestHeaders = {
-              "Content-Type": "application/json",
-              Authorization: "Bearer " + ch.api_key,
-              ...channelHeaders,
-            };
-            if (!requestHeaders.Authorization) delete requestHeaders.Authorization;
-
-            const startTime = Date.now();
-            const res = await fetch(url, {
-              method: "POST",
-              headers: requestHeaders,
-              body: JSON.stringify(reqBody),
-              signal: controller.signal,
-            });
-            responseTime = Date.now() - startTime;
-            clearTimeout(timeoutId);
-
-            if (!res.ok) {
-              const errBody = await res.text().catch(() => "");
-              const errText = errBody || ("HTTP " + res.status);
-              lastError = errText.slice(0, 200);
-              ch.response_time = responseTime;
-
-              if (res.status === 429) {
-                ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
-                ch.last_error_at = Math.floor(Date.now() / 1000);
-                ch.last_error_msg = errText;
-                ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-              } else {
-                ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-                ch.last_error_at = Math.floor(Date.now() / 1000);
-                ch.last_error_msg = errText;
-              }
-              removePoolItem(pool, ch);
-              continue;
-            }
-
-            // Success: update health and start streaming
-            updateRateCounters(ch, Math.floor(Date.now() / 1000));
-            ch.consecutive_errors = 0;
-            ch.last_error_msg = "";
-            ch.last_error_at = 0;
-            ch.response_time = responseTime;
-            c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
-            ok = true;
-
-            // Stream the upstream response directly to the client
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let sseBuf = "";
-            let streamHadContent = false;
-            const contentFilter = new RollingFilter(data.filters || []);
-
-            try {
-              let lastLine = "";
-              let streamDone = false;
-              while (!streamDone) {
-                const { done, value } = await reader.read();
-                if (done) { streamDone = true; break; }
-                sseBuf += decoder.decode(value, { stream: true });
-                const lines = sseBuf.split("\n");
-                sseBuf = lines.pop() || "";
-                for (const line of lines) {
-                  if (!line.startsWith("data:")) continue;
-                  lastLine = line;
-
-                  if (line.includes("[DONE]")) {
-                    const tail = contentFilter.flush();
-                    if (tail) {
-                      try { await w.write(enc.encode("data: " + JSON.stringify({
-                        id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk",
-                        created: Math.floor(Date.now() / 1000),
-                        choices: [{ index: 0, delta: { content: tail }, finish_reason: "stop" }]
-                      }) + "\n\n")); } catch (e) {}
-                    }
-                    try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
-                    streamDone = true; break;
-                  }
-
-                  try {
-                    const jsonStr = line.replace(/^data:?\s?/, "");
-                    const chunk = JSON.parse(jsonStr);
-                    const delta = chunk?.choices?.[0]?.delta;
-                    if (delta?.content || delta?.tool_calls) streamHadContent = true;
-
-                    if (delta?.content) {
-                      const filtered = contentFilter.transform(delta.content);
-                      if (filtered) {
-                        delta.content = filtered;
-                        try { await w.write(enc.encode("data: " + JSON.stringify(chunk) + "\n\n")); } catch (e) {}
-                      }
-                      if (contentFilter.truncated) {
-                        try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
-                        streamDone = true; break;
-                      }
-                    } else {
-                      try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
-                    }
-                  } catch (e) {
-                    try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
-                  }
-                }
-              }
-              // Check if stream was empty (no content or tool_calls)
-              if (!streamHadContent) {
-                ch.last_error_msg = "Empty response (no content)";
-                ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-                ch.last_error_at = Math.floor(Date.now() / 1000);
-                try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
-                removePoolItem(pool, ch);
-                continue;
-              }
-              // Send [DONE] only if upstream didn't already
-              if (!lastLine.includes("[DONE]") && !streamDone) {
-                try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
-              }
-            } catch (e) {
-              console.error("[stream] read error:", ch.id, e.message);
-              removePoolItem(pool, ch);
-              break;
-            }
-            return; // Successfully completed
-
-          } catch (e) {
-            clearTimeout(timeoutId);
-            console.error("[stream] fetch error:", ch.id, e.message);
-            ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-            ch.last_error_at = Math.floor(Date.now() / 1000);
-            ch.last_error_msg = truncateErrorBody(e.message || "");
-            ch.response_time = responseTime || 0;
-            if (e.name === 'AbortError') {
-              ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors), 60);
-            }
-            lastError = (e.message || "Request failed").slice(0, 200);
-            removePoolItem(pool, ch);
-          }
-        }
-
-        // All channels failed
-        if (!ok) {
-          const errMsg = "All upstream channels failed" + (lastError ? ": " + lastError : "");
-          const bye = {
-            id: "chatcmpl-" + Date.now(),
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: originalModel || "unknown",
-            choices: [{ index: 0, delta: { content: "\n\n" + errMsg }, finish_reason: "stop" }],
-          };
-          try { await w.write(enc.encode("data: " + JSON.stringify(bye) + "\n\ndata: [DONE]\n\n")); } catch (e) {}
-        }
-
+        await raceStream(c, pool, body, originalModel, data, w, enc, requestDeadline);
         try { await w.close(); } catch (e) {}
       })());
 
       return new Response(out, { headers: SSE_CHUNK_HEADERS });
     }
 
-    // Non-streaming: simple forward with cache bypass
-    while (Date.now() < requestDeadline) {
-      const ch = selectChannel(pool, originalModel);
-      if (!ch) return errResponse(c, "Rate limited or all channels unavailable", "rate_limit_error", 429);
-
-      const effectiveModel = ch.model || originalModel || "gpt-4o";
-      const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, false);
-      if (!url) { removePoolItem(pool, ch); continue; }
-
-      const reqBody = { ...body, model: effectiveModel };
-      let channelHeaders = {};
-      if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
-      else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
-
-      const chTimeout = Math.min(Math.max(2000, requestDeadline - Date.now()), REQUEST_TIMEOUT_SECONDS * 1000);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), chTimeout);
-
-      let responseTime = 0;
-      try {
-        const requestHeaders = {
-          "Content-Type": "application/json",
-          Authorization: "Bearer " + ch.api_key,
-          ...channelHeaders,
-        };
-        if (!requestHeaders.Authorization) delete requestHeaders.Authorization;
-
-        const startTime = Date.now();
-        const res = await fetch(url, {
-          method: "POST",
-          headers: requestHeaders,
-          body: JSON.stringify(reqBody),
-          signal: controller.signal,
-        });
-        responseTime = Date.now() - startTime;
-        clearTimeout(timeoutId);
-
-        if (!res.ok) {
-          const errText = await res.text().catch(() => "");
-          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-          ch.last_error_at = Math.floor(Date.now() / 1000);
-          ch.last_error_msg = truncateErrorBody(errText);
-          ch.response_time = responseTime;
-          if (res.status === 429) {
-            ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
-          }
-          removePoolItem(pool, ch);
-          continue;
-        }
-
-        updateRateCounters(ch, Math.floor(Date.now() / 1000));
-        ch.consecutive_errors = 0;
-        ch.last_error_msg = "";
-        ch.last_error_at = 0;
-        ch.response_time = responseTime;
-        c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
-
-        const resText = await res.text();
-        if (resText.length > 4 * 1024 * 1024) {
-          return errResponse(c, "Response too large", "server_error", 502);
-        }
-        const json = JSON.parse(resText);
-        // Detect empty 200 response and retry with next channel
-        const choice = json?.choices?.[0];
-        if (choice && !choice.message?.content && !choice.message?.tool_calls && choice.finish_reason === "stop") {
-          ch.last_error_msg = "Empty response (no content)";
-          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-          ch.last_error_at = Math.floor(Date.now() / 1000);
-          ch.response_time = responseTime;
-          removePoolItem(pool, ch);
-          continue;
-        }
-        // Apply content filters for non-streaming
-        if (json?.choices?.[0]?.message?.content && data.filters?.length > 0) {
-          json.choices[0].message.content = RollingFilter.applyStatic(json.choices[0].message.content, data.filters);
-        }
-        return c.json(json);
-
-      } catch (e) {
-        clearTimeout(timeoutId);
-        console.error("[chat] fetch error:", ch.id, e.message);
-        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-        ch.last_error_at = Math.floor(Date.now() / 1000);
-        ch.last_error_msg = truncateErrorBody(e.message || "");
-        ch.response_time = responseTime || 0;
-        if (e.name === 'AbortError') {
-          ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors), 60);
-        }
-        removePoolItem(pool, ch);
-      }
-    }
-    return errResponse(c, "All channels failed or request timed out", "server_error", 504);
+    return await raceNonStream(c, pool, body, originalModel, data, requestDeadline);
 
   } catch (e) {
     console.error("[gateway] unhandled:", e.message);
     return errResponse(c, "Internal Error", "server_error", 500);
   }
-}
-
-export function clearCache() {
-  cacheGen++;
-  cache.data = null;
-  cache.ts = 0;
 }
 
 export default function registerGateway(app) {

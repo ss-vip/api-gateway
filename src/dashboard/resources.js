@@ -31,7 +31,9 @@ function generateFallbackToken() {
   for (let i = 0; i < 30; i++) t += chars[bytes[i] % chars.length];
   return t;
 }
-const DEFAULTS = { token: generateFallbackToken(), recovery_period: 300 };
+function getDefaults() {
+  return { token: generateFallbackToken(), recovery_period: 300 };
+}
 
 const setupRateLimit = new Map();
 const SETUP_MAX_ATTEMPTS = 5;
@@ -172,11 +174,11 @@ export default function (clearCache) {
     try {
       const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
       return c.json({
-        token: cf?.client_token || DEFAULTS.token,
-        recovery_period: cf?.recovery_period || DEFAULTS.recovery_period,
+        token: cf?.client_token || getDefaults().token,
+        recovery_period: cf?.recovery_period || getDefaults().recovery_period,
       });
     } catch (e) {
-      return c.json({ token: DEFAULTS.token, recovery_period: DEFAULTS.recovery_period });
+      return c.json({ token: getDefaults().token, recovery_period: getDefaults().recovery_period });
     }
   });
 
@@ -203,10 +205,10 @@ export default function (clearCache) {
     try {
       if (ex) {
         await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
-          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.recovery_period).run();
+          .bind(b.token || getDefaults().token, parseInt(b.recovery_period) || getDefaults().recovery_period).run();
       } else {
         await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
-          .bind(b.token || DEFAULTS.token, parseInt(b.recovery_period) || DEFAULTS.recovery_period).run();
+          .bind(b.token || getDefaults().token, parseInt(b.recovery_period) || getDefaults().recovery_period).run();
       }
     } catch (e) {
       return c.json({ error: e.message }, 500);
@@ -429,7 +431,7 @@ export default function (clearCache) {
       const currentPass = await getAdminPass(c);
       batch.push(
         c.env.DB.prepare("INSERT OR REPLACE INTO config (id, client_token, admin_password, recovery_period) VALUES (1, ?, ?, ?)")
-          .bind(d.config.token || DEFAULTS.token, currentPass || "", parseInt(d.config.recovery_period) || DEFAULTS.recovery_period)
+          .bind(d.config.token || getDefaults().token, currentPass || "", parseInt(d.config.recovery_period) || getDefaults().recovery_period)
       );
     }
     if (batch.length > 0) await c.env.DB.batch(batch);
@@ -442,7 +444,7 @@ export default function (clearCache) {
     await c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
       c.env.DB.prepare("DELETE FROM filters"),
-      c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1").bind(freshToken, DEFAULTS.recovery_period),
+      c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1").bind(freshToken, getDefaults().recovery_period),
     ]);
     clearCache();
     return c.json({ ok: true, new_token: freshToken });
