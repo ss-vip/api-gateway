@@ -13,6 +13,10 @@ function pruneLoginState() {
   for (const [ip, state] of loginState) {
     if (state.banUntil > 0 && now >= state.banUntil) loginState.delete(ip);
   }
+  if (loginState.size > 1000) {
+    const entries = [...loginState.entries()].sort((a, b) => b[1].count - a[1].count);
+    for (let i = 500; i < entries.length; i++) loginState.delete(entries[i][0]);
+  }
 }
 
 export { pruneLoginState };

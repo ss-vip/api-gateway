@@ -1,4 +1,3 @@
-import { cleanupState } from "../lib/adaptive.js";
 import { pruneSetupRateLimit } from "../dashboard/resources.js";
 import { pruneLoginState } from "../dashboard/index.js";
 
@@ -52,10 +51,8 @@ export function registerMaintenance(app) {
     const actions = {};
     const nowUnix = Math.floor(now / 1000);
 
-    // Prune in-memory rate limit state for setup endpoint
     pruneSetupRateLimit();
     pruneLoginState();
-    actions.state_pruned = true;
 
     const { results: recovered } = await DB.prepare(
       `SELECT id FROM channels 
@@ -72,20 +69,15 @@ export function registerMaintenance(app) {
           ).bind(r.id)
         )
       );
-      cleanupState(new Set(recovered.map(r => r.id)));
     }
     actions.channels_recovered = (recovered || []).length;
-
-    const { results: validChs } = await DB.prepare("SELECT id FROM channels").all();
-    const validIds = new Set((validChs || []).map(r => r.id));
-    cleanupState(validIds);
-    actions.state_pruned = validIds.size;
 
     actions.rate_flushed = await flushRateBuffer(DB);
 
     const { results: allChs } = await DB.prepare(
       "SELECT id, name, model, is_enabled, consecutive_errors, cooldown_until, response_time, last_429 FROM channels ORDER BY id"
     ).all();
+    actions.channel_count = (allChs || []).length;
 
     const summary = {
       total: (allChs || []).length,

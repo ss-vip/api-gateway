@@ -1,4 +1,4 @@
-import { getProvider, detectProvider } from "./lib/providers/index.js";
+import { buildUrl } from "./lib/providers/openai.js";
 import {
   BACKOFF_ERROR_THRESHOLD, BACKOFF_429_SECONDS, BACKOFF_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
@@ -27,11 +27,13 @@ function errResponse(c, message, type, status) {
 
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
+let cacheGen = 0;
 
 async function loadCache(env) {
   const TTL = 60_000;
   if (cache.data && Date.now() - cache.ts < TTL) return cache.data;
   if (!cacheFlight) {
+    const gen = cacheGen;
     cacheFlight = (async () => {
       try {
         const [ch, fl, cf] = await Promise.all([
@@ -39,6 +41,7 @@ async function loadCache(env) {
           env.DB.prepare("SELECT * FROM filters WHERE is_enabled=1").all(),
           env.DB.prepare("SELECT * FROM config WHERE id=1").first(),
         ]);
+        if (cacheGen !== gen) return; // stale, discarded
         cache = {
           data: {
             channels: ch.results || [],
@@ -67,28 +70,75 @@ function exponentialCooldown(consecutiveErrors) {
   return Math.min(BACKOFF_429_SECONDS * Math.pow(2, exponent), BACKOFF_MAX_SECONDS);
 }
 
-// Pick the first (fastest) available channel that passes health checks
-function selectChannel(channels) {
+// Weighted random channel selection with dynamic weight reduction
+function selectChannel(channels, originalModel) {
   const now = Math.floor(Date.now() / 1000);
-  for (const ch of channels) {
-    if (!ch.is_enabled) continue;
+  const model = (originalModel || '').trim();
+
+  // Phase 1: Hard health checks (exclude unhealthy channels entirely)
+  const healthy = channels.filter(ch => {
+    if (!ch.is_enabled) return false;
     if (ch.consecutive_errors >= BACKOFF_ERROR_THRESHOLD &&
-        now - (ch.last_error_at || 0) <= exponentialCooldown(ch.consecutive_errors)) continue;
-    if (ch.last_429 > 0 && ch.last_429 > now) continue;
+        now - (ch.last_error_at || 0) <= exponentialCooldown(ch.consecutive_errors)) return false;
+    if (ch.last_429 > 0 && ch.last_429 > now) return false;
     const buf = getBufferedRate(ch.id);
     const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
     const rpmResetAt = buf ? buf.rpmResetAt : (ch.rpm_reset_at || 0);
     const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
     const rpdResetAt = buf ? buf.rpdResetAt : (ch.rpd_reset_at || 0);
-    if (ch.rpm_limit > 0 &&
-        now - rpmResetAt < RPM_WINDOW_SECONDS &&
-        rpmCount >= ch.rpm_limit) continue;
-    if (ch.rpd_limit > 0 &&
-        now - rpdResetAt < RPD_WINDOW_SECONDS &&
-        rpdCount >= ch.rpd_limit) continue;
-    return ch;
+    if (ch.rpm_limit > 0 && now - rpmResetAt < RPM_WINDOW_SECONDS && rpmCount >= ch.rpm_limit) return false;
+    if (ch.rpd_limit > 0 && now - rpdResetAt < RPD_WINDOW_SECONDS && rpdCount >= ch.rpd_limit) return false;
+    return true;
+  });
+  if (healthy.length === 0) return null;
+
+  // Phase 2: Dynamic effective weight calculation
+  const rtValues = healthy.map(ch => ch.response_time || 0).filter(v => v > 0);
+  const avgRt = rtValues.length > 0 ? rtValues.reduce((s, v) => s + v, 0) / rtValues.length : 0;
+
+  let totalW = 0;
+  const weights = [];
+  for (const ch of healthy) {
+    let w = ch.weight || 50;
+
+    // Model match factor
+    const models = (ch.model || '').split(',').map(s => s.trim()).filter(Boolean);
+    const fallbacks = (ch.fallback_model || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (models.includes(model)) w *= 10;
+    else if (fallbacks.includes(model)) w *= 5;
+    else w *= 0.1;
+
+    // Error factor: gradual reduction before hard cooldown
+    const err = ch.consecutive_errors || 0;
+    if (err >= 4) w *= 0.2;
+    else if (err === 3) w *= 0.4;
+    else if (err === 2) w *= 0.6;
+    else if (err === 1) w *= 0.8;
+
+    // Rate limit proximity factor
+    if (ch.rpm_limit > 0 && (ch.rpm_count || 0) / ch.rpm_limit > 0.8) w *= 0.5;
+    if (ch.rpd_limit > 0 && (ch.rpd_count || 0) / ch.rpd_limit > 0.8) w *= 0.5;
+
+    // Latency factor (relative to pool average)
+    const rt = ch.response_time || 0;
+    if (rt > 0 && avgRt > 0) {
+      if (rt > avgRt * 2) w *= 0.3;
+      else if (rt > avgRt * 1.5) w *= 0.5;
+      else if (rt > avgRt * 1.2) w *= 0.75;
+    }
+
+    w = Math.max(1, Math.round(w));
+    weights.push(w);
+    totalW += w;
   }
-  return null;
+
+  // Phase 3: Weighted random selection
+  let r = Math.random() * totalW;
+  for (let i = 0; i < healthy.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return healthy[i];
+  }
+  return healthy[healthy.length - 1];
 }
 
 function updateRateCounters(cachedCh, nowSec) {
@@ -121,6 +171,11 @@ async function persistHealth(db, ch) {
       ch.id
     ).run();
   } catch (e) { console.error("[persist] health:", ch.id, e.message); }
+}
+
+function removePoolItem(pool, ch) {
+  const idx = pool.indexOf(ch);
+  if (idx !== -1) pool.splice(idx, 1);
 }
 
 function truncateErrorBody(text) {
@@ -161,7 +216,7 @@ class RollingFilter {
   }
   static applyStatic(text, filters) {
     if (!text || !filters || filters.length === 0) return text;
-    const enabled = filters.filter(f => f.is_enabled && f.text && f.text.length >= 1);
+    const enabled = filters.filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
     let out = text;
     for (const f of enabled) {
       if (f.mode === 1) { const idx = out.indexOf(f.text); if (idx !== -1) out = out.substring(0, idx); }
@@ -177,6 +232,10 @@ async function handleChatRequest(c) {
     try { data = await loadCache(c.env); } catch (e) {
       if (!cache.data) return errResponse(c, "DB Error", "server_error", 500);
       data = cache.data;
+    }
+    if (!data) {
+      data = await loadCache(c.env).catch(() => null);
+      if (!data) return errResponse(c, "Cache unavailable", "server_error", 500);
     }
 
     const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
@@ -196,28 +255,8 @@ async function handleChatRequest(c) {
     const originalModel = body.model;
     const isStream = body.stream !== false;
 
-    // Only use OpenAI-compatible channels (the only provider we support)
-    let pool = data.channels.filter((ch) => {
-      if (!ch.is_enabled) return false;
-      const pn = ch.provider || detectProvider(ch.base_url);
-      return pn === "openai";
-    });
+    let pool = data.channels.filter((ch) => ch.is_enabled);
     if (pool.length === 0) return errResponse(c, "No available channels", "server_error", 503);
-
-    // Sort: model match first, then response_time
-    function modelMatches(ch) {
-      if (!originalModel) return false;
-      if (ch.model === originalModel || ch.fallback_model === originalModel) return true;
-      const models = (ch.model || "").split(",").map(x => x.trim()).filter(Boolean);
-      const fallbacks = (ch.fallback_model || "").split(",").map(x => x.trim()).filter(Boolean);
-      return models.includes(originalModel) || fallbacks.includes(originalModel);
-    }
-    pool.sort((a, b) => {
-      const ma = modelMatches(a) ? 1 : 0;
-      const mb = modelMatches(b) ? 1 : 0;
-      if (ma !== mb) return mb - ma;
-      return (a.response_time || 999999) - (b.response_time || 999999);
-    });
 
     const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
 
@@ -241,15 +280,12 @@ async function handleChatRequest(c) {
         let lastError = "";
 
         while (pool.length > 0 && !ok && Date.now() < requestDeadline) {
-          const ch = selectChannel(pool);
+          const ch = selectChannel(pool, originalModel);
           if (!ch) { lastError = "all channels in cooldown or rate-limited"; break; }
 
-          const providerName = ch.provider || detectProvider(ch.base_url);
-          if (providerName !== "openai") { pool.splice(pool.indexOf(ch), 1); continue; }
-          const p = getProvider(providerName);
           const effectiveModel = ch.model || originalModel || "gpt-4o";
-          const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : p.buildUrl(ch.base_url, effectiveModel, true);
-          if (!url) continue;
+          const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, true);
+          if (!url) { removePoolItem(pool, ch); continue; }
 
           // Forward the request AS-IS with minimal modification
           const reqBody = { ...body, model: effectiveModel, stream: true };
@@ -259,7 +295,7 @@ async function handleChatRequest(c) {
           else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
 
           const remainingMs = Math.max(2000, requestDeadline - Date.now());
-          const chTimeout = Math.min(remainingMs, 25000);
+          const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), chTimeout);
 
@@ -298,6 +334,7 @@ async function handleChatRequest(c) {
                 ch.last_error_at = Math.floor(Date.now() / 1000);
                 ch.last_error_msg = errText;
               }
+              removePoolItem(pool, ch);
               continue;
             }
 
@@ -373,8 +410,7 @@ async function handleChatRequest(c) {
                 ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
                 ch.last_error_at = Math.floor(Date.now() / 1000);
                 try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
-                await w.close();
-                pool.splice(pool.indexOf(ch), 1);
+                removePoolItem(pool, ch);
                 continue;
               }
               // Send [DONE] only if upstream didn't already
@@ -382,14 +418,15 @@ async function handleChatRequest(c) {
                 try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
               }
             } catch (e) {
-              // Stream reading error - channel failed mid-stream
-              pool.splice(pool.indexOf(ch), 1);
-              continue;
+              console.error("[stream] read error:", ch.id, e.message);
+              removePoolItem(pool, ch);
+              break;
             }
             return; // Successfully completed
 
           } catch (e) {
             clearTimeout(timeoutId);
+            console.error("[stream] fetch error:", ch.id, e.message);
             ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
             ch.last_error_at = Math.floor(Date.now() / 1000);
             ch.last_error_msg = truncateErrorBody(e.message || "");
@@ -398,7 +435,7 @@ async function handleChatRequest(c) {
               ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors), 60);
             }
             lastError = (e.message || "Request failed").slice(0, 200);
-            pool.splice(pool.indexOf(ch), 1);
+            removePoolItem(pool, ch);
           }
         }
 
@@ -423,20 +460,19 @@ async function handleChatRequest(c) {
 
     // Non-streaming: simple forward with cache bypass
     while (Date.now() < requestDeadline) {
-      const ch = selectChannel(pool);
+      const ch = selectChannel(pool, originalModel);
       if (!ch) return errResponse(c, "Rate limited or all channels unavailable", "rate_limit_error", 429);
 
-      const p = getProvider("openai");
       const effectiveModel = ch.model || originalModel || "gpt-4o";
-      const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : p.buildUrl(ch.base_url, effectiveModel, false);
-      if (!url) { pool.splice(pool.indexOf(ch), 1); continue; }
+      const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, false);
+      if (!url) { removePoolItem(pool, ch); continue; }
 
       const reqBody = { ...body, model: effectiveModel };
       let channelHeaders = {};
       if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
       else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
 
-      const chTimeout = Math.min(Math.max(2000, requestDeadline - Date.now()), 25000);
+      const chTimeout = Math.min(Math.max(2000, requestDeadline - Date.now()), REQUEST_TIMEOUT_SECONDS * 1000);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), chTimeout);
 
@@ -468,7 +504,7 @@ async function handleChatRequest(c) {
           if (res.status === 429) {
             ch.last_429 = Math.floor(Date.now() / 1000) + (data.config.recovery_period || 300);
           }
-          pool.splice(pool.indexOf(ch), 1);
+          removePoolItem(pool, ch);
           continue;
         }
 
@@ -491,7 +527,7 @@ async function handleChatRequest(c) {
           ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
           ch.last_error_at = Math.floor(Date.now() / 1000);
           ch.response_time = responseTime;
-          pool.splice(pool.indexOf(ch), 1);
+          removePoolItem(pool, ch);
           continue;
         }
         // Apply content filters for non-streaming
@@ -502,6 +538,7 @@ async function handleChatRequest(c) {
 
       } catch (e) {
         clearTimeout(timeoutId);
+        console.error("[chat] fetch error:", ch.id, e.message);
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
         ch.last_error_msg = truncateErrorBody(e.message || "");
@@ -509,7 +546,7 @@ async function handleChatRequest(c) {
         if (e.name === 'AbortError') {
           ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors), 60);
         }
-        pool.splice(pool.indexOf(ch), 1);
+        removePoolItem(pool, ch);
       }
     }
     return errResponse(c, "All channels failed or request timed out", "server_error", 504);
@@ -521,6 +558,7 @@ async function handleChatRequest(c) {
 }
 
 export function clearCache() {
+  cacheGen++;
   cache.data = null;
   cache.ts = 0;
 }

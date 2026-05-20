@@ -28,10 +28,15 @@ app.use("*", cors({
 }));
 
 let inited = false;
+let initLock = null;
 app.use("*", async (c, next) => {
   if (!inited) {
-    try { await initConfig(c.env); } catch (e) { console.error("[init]", e.message); }
-    inited = true;
+    if (!initLock) initLock = (async () => {
+      try { await initConfig(c.env); } catch (e) { console.error("[init]", e.message); }
+      inited = true;
+      initLock = null;
+    })();
+    await initLock;
   }
   await next();
 });

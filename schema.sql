@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS channels (
   base_url      TEXT    NOT NULL DEFAULT '',
   api_key       TEXT    NOT NULL DEFAULT '',
   model         TEXT    NOT NULL DEFAULT '',
-  weight        INTEGER NOT NULL DEFAULT 1,
+  weight        INTEGER NOT NULL DEFAULT 50,
   is_enabled    INTEGER NOT NULL DEFAULT 1,
   is_vision     INTEGER NOT NULL DEFAULT 0,
   last_429      INTEGER NOT NULL DEFAULT 0,

@@ -6,4 +6,4 @@ export const RPM_WINDOW_SECONDS = 60;
 export const RPD_WINDOW_SECONDS = 86400;
 
 export const REQUEST_TIMEOUT_SECONDS = 25;
-export const GLOBAL_TIMEOUT_MS = 28_000;
+export const GLOBAL_TIMEOUT_MS = 29_500;
