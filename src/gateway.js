@@ -1,4 +1,4 @@
-import { buildUrl } from "./lib/providers/openai.js";
+import { buildUrl, buildEndpointUrl } from "./lib/providers/openai.js";
 import {
   BACKOFF_ERROR_THRESHOLD, BACKOFF_429_SECONDS, BACKOFF_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
@@ -23,6 +23,13 @@ const ERROR_CODE_MAP = {
   server_error: "api_error",
   rate_limit_error: "rate_limit_exceeded",
   upstream_error: "upstream_error",
+};
+
+const ENDPOINT_COLUMNS = {
+  image_gen: "support_image_gen",
+  image_edit: "support_image_edit",
+  audio_stt: "support_audio_stt",
+  audio_tts: "support_audio_tts",
 };
 
 // ─── 回應工具 ───────────────────────────────────────────────────────
@@ -183,7 +190,6 @@ function updateRateCounters(ch, nowSec) {
 // ─── Health 持久化 ────────────────────────────────────────────────
 
 function persistStateKey(ch) {
-  // 忽略 response_time（每次變動但非關鍵），只追蹤影響 routing 的狀態
   return [
     ch.consecutive_errors || 0,
     ch.last_error_msg || '',
@@ -193,6 +199,10 @@ function persistStateKey(ch) {
     ch.support_tools ? 1 : 0,
     ch.support_stream === 0 ? 0 : 1,
     ch.is_vision ? 1 : 0,
+    ch.support_image_gen ? 1 : 0,
+    ch.support_audio_tts ? 1 : 0,
+    ch.support_audio_stt ? 1 : 0,
+    ch.support_image_edit ? 1 : 0,
   ].join('|');
 }
 
@@ -202,7 +212,7 @@ async function persistHealth(db, ch) {
   if (lastPersistedState.get(ch.id) === key) return;
   try {
     await db.prepare(
-      "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=?, support_tools=?, support_stream=?, is_vision=? WHERE id=?"
+      "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=?, support_tools=?, support_stream=?, is_vision=?, support_image_gen=?, support_audio_tts=?, support_audio_stt=?, support_image_edit=? WHERE id=?"
     ).bind(
       ch.response_time || 0, ch.consecutive_errors || 0,
       ch.last_error_msg || '', ch.last_error_at || 0,
@@ -210,6 +220,10 @@ async function persistHealth(db, ch) {
       ch.support_tools ? 1 : 0,
       ch.support_stream === 0 ? 0 : 1,
       ch.is_vision ? 1 : 0,
+      ch.support_image_gen ? 1 : 0,
+      ch.support_audio_tts ? 1 : 0,
+      ch.support_audio_stt ? 1 : 0,
+      ch.support_image_edit ? 1 : 0,
       ch.id
     ).run();
     lastPersistedState.set(ch.id, key);
@@ -1149,7 +1163,116 @@ async function handleChatRequest(c) {
   }
 }
 
+// ─── 多模態端點代理 ────────────────────────────────────────────────
+
+async function proxyEndpoint(c, endpointType) {
+  try {
+    let data;
+    try { data = await loadCache(c.env); } catch (e) {
+      if (!cache.data) return errResponse(c, "The database query failed and no cached configuration is available", "server_error", 500);
+      data = cache.data;
+    }
+    if (!data) {
+      data = await loadCache(c.env).catch(() => null);
+      if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
+    }
+
+    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
+    if (data.config.client_token && token !== data.config.client_token) {
+      return errResponse(c, "Incorrect API key provided", "invalid_request_error", 401, "invalid_api_key");
+    }
+
+    let pool = data.channels.filter(ch => ch.is_enabled).map(ch => ({ ...ch }));
+    if (pool.length === 0) {
+      return errResponse(c, "No available channels — all upstream services are in cooldown, rate-limited, or disabled", "server_error", 503);
+    }
+
+    const col = ENDPOINT_COLUMNS[endpointType];
+    if (col) {
+      pool = pool.filter(ch => ch[col] === 1);
+    }
+    if (pool.length === 0) {
+      return errResponse(c, "No available channels support this endpoint type", "invalid_request_error", 400, "unsupported_endpoint");
+    }
+
+    const ch = selectChannel(pool, "", false);
+    if (!ch) {
+      return errResponse(c, "All channels are rate-limited or temporarily unavailable — please wait before retrying", "rate_limit_error", 429);
+    }
+
+    const url = buildEndpointUrl(ch.base_url, endpointType);
+    if (!url) return errResponse(c, "Invalid upstream URL configuration", "server_error", 500);
+
+    const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
+    const remainingMs = Math.max(2000, requestDeadline - Date.now());
+    const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), chTimeout);
+
+    let channelHeaders = {};
+    if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
+    else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
+    const reqHeaders = { Authorization: "Bearer " + ch.api_key, ...channelHeaders };
+    const ct = c.req.header("Content-Type");
+    if (ct) {
+      reqHeaders["Content-Type"] = ct;
+    } else if (endpointType === "image_gen" || endpointType === "audio_tts") {
+      reqHeaders["Content-Type"] = "application/json";
+    }
+
+    const startTime = Date.now();
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: reqHeaders,
+        body: c.req.raw.body,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      const rt = Date.now() - startTime;
+
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => "");
+        markChannelError(ch, res.status, errBody, rt, data);
+        deferPersist(c, ch);
+        try { return c.json(JSON.parse(errBody), res.status); } catch (e) {}
+        return errResponse(c, "Upstream error: HTTP " + res.status, "upstream_error", 502);
+      }
+
+      updateRateCounters(ch, Math.floor(Date.now() / 1000));
+      ch.consecutive_errors = 0;
+      ch.last_error_msg = "";
+      ch.last_error_at = 0;
+      ch.response_time = rt;
+      bufferResponseTime(ch.id, rt);
+      deferPersist(c, ch);
+
+      const responseHeaders = { "Content-Type": res.headers.get("Content-Type") || "application/json" };
+      for (const h of ["cache-control", "x-request-id", "openai-version", "openai-organization"]) {
+        const v = res.headers.get(h);
+        if (v) responseHeaders[h] = v;
+      }
+      return new Response(res.body, { status: 200, headers: responseHeaders });
+    } catch (e) {
+      clearTimeout(timeoutId);
+      markChannelError(ch, null, e.message, Date.now() - startTime, data);
+      if (e.name === 'AbortError') {
+        ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
+      }
+      deferPersist(c, ch);
+      return errResponse(c, "Request to upstream failed: " + e.message.slice(0, 200), "server_error", 502);
+    }
+  } catch (e) {
+    console.error("[proxy] unhandled:", e.message);
+    return errResponse(c, "The server had an error processing your request", "server_error", 500);
+  }
+}
+
 export default function registerGateway(app) {
   app.post("/chat/completions", async (c) => handleChatRequest(c));
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
+  for (const p of ["/images/generations", "/v1/images/generations"]) app.post(p, async (c) => proxyEndpoint(c, "image_gen"));
+  for (const p of ["/audio/speech", "/v1/audio/speech"]) app.post(p, async (c) => proxyEndpoint(c, "audio_tts"));
+  for (const p of ["/audio/transcriptions", "/v1/audio/transcriptions"]) app.post(p, async (c) => proxyEndpoint(c, "audio_stt"));
+  for (const p of ["/images/edits", "/v1/images/edits"]) app.post(p, async (c) => proxyEndpoint(c, "image_edit"));
 }

@@ -277,13 +277,25 @@
         <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
       </div>
       <div class="row g-2 mt-3 pt-2 border-top">
-        <div class="col-4 d-flex flex-column align-items-center">
+        <div class="col-4 d-flex flex-column align-items-center mb-1">
           <label class="form-check-label small fw-bold mb-1" for="ch-vision">&#x1F441;&#xFE0F; Vision</label>
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
         </div>
-        <div class="col-4 d-flex flex-column align-items-center">
-          <label class="form-check-label small fw-bold mb-1" for="ch-stream">&#x26A1; Stream</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-stream" checked></div>
+        <div class="col-4 d-flex flex-column align-items-center mb-1">
+          <label class="form-check-label small fw-bold mb-1" for="ch-image-gen">&#x1F5BC;&#xFE0F; Image</label>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-image-gen"></div>
+        </div>
+        <div class="col-4 d-flex flex-column align-items-center mb-1">
+          <label class="form-check-label small fw-bold mb-1" for="ch-image-edit">&#x270F;&#xFE0F; Edit</label>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-image-edit"></div>
+        </div>
+        <div class="col-4 d-flex flex-column align-items-center mb-1">
+          <label class="form-check-label small fw-bold mb-1" for="ch-audio-tts">&#x1F399;&#xFE0F; TTS</label>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-audio-tts"></div>
+        </div>
+        <div class="col-4 d-flex flex-column align-items-center mb-1">
+          <label class="form-check-label small fw-bold mb-1" for="ch-audio-stt">&#x1F3A4; STT</label>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-audio-stt"></div>
         </div>
         <div class="col-4 d-flex flex-column align-items-center">
           <label class="form-check-label small fw-bold mb-1" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
@@ -683,7 +695,10 @@
         }
 
         const visionIcon = c.is_vision ? " \u{1F441}\u{FE0F}" : "";
-        const streamIcon = (c.support_stream !== 0) ? " \u26A1" : "";
+        const imageGenIcon = c.support_image_gen ? " \u{1F5BC}\u{FE0F}" : "";
+        const audioTtsIcon = c.support_audio_tts ? " \u{1F399}\u{FE0F}" : "";
+        const audioSttIcon = c.support_audio_stt ? " \u{1F3A4}" : "";
+        const imageEditIcon = c.support_image_edit ? " \u{270F}\u{FE0F}" : "";
         const modelName = esc(c.model || "");
         const displayName = esc(c.model || "-");
 
@@ -695,7 +710,7 @@
         const providerLabel = c.provider || (c.base_url ? (c.base_url.includes('googleapis') || c.base_url.includes('generativelanguage') ? 'Google' : c.base_url.includes('anthropic') ? 'Claude' : 'OpenAI') : '');
         const providerTitle = providerLabel ? ' title="Provider: ' + esc(providerLabel) + '"' : '';
         row += '<td class="fw-bold align-middle" style="cursor:help"' + providerTitle + '>' + esc(c.name) + '</td>';
-        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + streamIcon + '</td>';
+        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + imageGenIcon + audioTtsIcon + audioSttIcon + imageEditIcon + '</td>';
         row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
         row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
         row += '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>';
@@ -862,7 +877,10 @@
       ['ch-rpm','ch-rpd','ch-tokens'].forEach(i => document.getElementById(i).value = 0);
       document.getElementById('ch-enabled').checked = true;
       document.getElementById('ch-vision').checked = false;
-      document.getElementById('ch-stream').checked = true;
+      document.getElementById('ch-image-gen').checked = false;
+      document.getElementById('ch-image-edit').checked = false;
+      document.getElementById('ch-audio-tts').checked = false;
+      document.getElementById('ch-audio-stt').checked = false;
       document.getElementById('ch-absolute-url').checked = false;
       // Reset Log tab for new channel
       document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
@@ -895,7 +913,10 @@
       document.getElementById('ch-rpm').value = c.rpm_limit || 0;
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
       document.getElementById('ch-vision').checked = c.is_vision == 1;
-      document.getElementById('ch-stream').checked = c.support_stream !== 0;
+      document.getElementById('ch-image-gen').checked = c.support_image_gen == 1;
+      document.getElementById('ch-image-edit').checked = c.support_image_edit == 1;
+      document.getElementById('ch-audio-tts').checked = c.support_audio_tts == 1;
+      document.getElementById('ch-audio-stt').checked = c.support_audio_stt == 1;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
       // Populate Log tab — show ALL health states with <li> format
@@ -1035,7 +1056,11 @@
         rpd_limit: parseInt(document.getElementById('ch-rpd').value) || 0,
         is_vision: document.getElementById('ch-vision').checked ? 1 : 0,
         support_tools: prev ? (prev.support_tools !== 0 ? 1 : 0) : 1,
-        support_stream: document.getElementById('ch-stream').checked ? 1 : 0,
+        support_stream: prev ? (prev.support_stream !== 0 ? 1 : 0) : 1,
+        support_image_gen: document.getElementById('ch-image-gen').checked ? 1 : 0,
+        support_audio_tts: document.getElementById('ch-audio-tts').checked ? 1 : 0,
+        support_audio_stt: document.getElementById('ch-audio-stt').checked ? 1 : 0,
+        support_image_edit: document.getElementById('ch-image-edit').checked ? 1 : 0,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
         last_429: prev ? prev.last_429||0 : 0,
         consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
@@ -1158,7 +1183,6 @@
         const visionKeywords = ['vision', 'claude-3', 'claude-3.5', 'claude-3.7', 'gpt-4o', 'gpt-4.1', 'gemini-1.5', 'gemini-2.0', 'gemini-2.5', 'gemini-exp'];
         const hasVision = visionKeywords.some(k => id.includes(k));
         document.getElementById('ch-vision').checked = hasVision;
-        document.getElementById('ch-stream').checked = true;
       } else {
         document.getElementById('ch-fallback-model').value = modelId;
       }
@@ -1212,6 +1236,13 @@
           oc.response_time = nc.response_time;
           oc.rpd_count = nc.rpd_count;
           oc.rpd_reset_at = nc.rpd_reset_at;
+          oc.is_vision = nc.is_vision;
+          oc.support_tools = nc.support_tools;
+          oc.support_stream = nc.support_stream;
+          oc.support_image_gen = nc.support_image_gen;
+          oc.support_audio_tts = nc.support_audio_tts;
+          oc.support_audio_stt = nc.support_audio_stt;
+          oc.support_image_edit = nc.support_image_edit;
 
           const healthEl = document.getElementById('ch-health-' + oc.id);
           if (healthEl) {
@@ -1261,6 +1292,10 @@
         max_tokens: c.max_tokens || 0,
         support_tools: c.support_tools !== 0 ? 1 : 0,
         support_stream: c.support_stream !== 0 ? 1 : 0,
+        support_image_gen: c.support_image_gen ? 1 : 0,
+        support_audio_tts: c.support_audio_tts ? 1 : 0,
+        support_audio_stt: c.support_audio_stt ? 1 : 0,
+        support_image_edit: c.support_image_edit ? 1 : 0,
         provider: c.provider || "",
         headers: c.headers || null,
         provider_options: c.provider_options || null,

@@ -19,8 +19,12 @@ CREATE TABLE IF NOT EXISTS channels (
   rpd_reset_at  INTEGER NOT NULL DEFAULT 0,
   max_tokens    INTEGER NOT NULL DEFAULT 0,
   support_tools INTEGER NOT NULL DEFAULT 1,
-  support_stream INTEGER NOT NULL DEFAULT 1,
-  response_time INTEGER NOT NULL DEFAULT 0,
+  support_stream    INTEGER NOT NULL DEFAULT 1,
+  support_image_gen INTEGER NOT NULL DEFAULT 0,
+  support_audio_tts INTEGER NOT NULL DEFAULT 0,
+  support_audio_stt INTEGER NOT NULL DEFAULT 0,
+  support_image_edit INTEGER NOT NULL DEFAULT 0,
+  response_time     INTEGER NOT NULL DEFAULT 0,
   fallback_model TEXT  NOT NULL DEFAULT '',
   headers       TEXT,
   provider_options TEXT,
@@ -52,5 +56,9 @@ CREATE TABLE IF NOT EXISTS config (
 INSERT OR IGNORE INTO config (id, client_token, admin_password, recovery_period)
 VALUES (1, '', '', 300);
 
--- Migration for existing databases (run via: wrangler d1 execute api-gateway-db --remote --command="ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1")
+-- Migration for existing databases:
 -- ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1;
+-- ALTER TABLE channels ADD COLUMN support_image_gen INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE channels ADD COLUMN support_audio_tts INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE channels ADD COLUMN support_audio_stt INTEGER NOT NULL DEFAULT 0;
+-- ALTER TABLE channels ADD COLUMN support_image_edit INTEGER NOT NULL DEFAULT 0;
