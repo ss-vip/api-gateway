@@ -172,19 +172,20 @@ function selectChannel(channels, originalModel, isStream) {
 
 function updateRateCounters(ch, nowSec) {
   if (!ch) return;
+  // Window 過期 → 重置計數器再 +1，否則直接 +1
   if (nowSec - (ch.rpm_reset_at || 0) >= RPM_WINDOW_SECONDS) {
-    ch.rpm_count = 1;
+    ch.rpm_count = 0;
     ch.rpm_reset_at = nowSec;
-  } else {
-    ch.rpm_count = (ch.rpm_count || 0) + 1;
   }
+  ch.rpm_count = (ch.rpm_count || 0) + 1;
+
   if (nowSec - (ch.rpd_reset_at || 0) >= RPD_WINDOW_SECONDS) {
-    ch.rpd_count = 1;
+    ch.rpd_count = 0;
     ch.rpd_reset_at = nowSec;
-  } else {
-    ch.rpd_count = (ch.rpd_count || 0) + 1;
   }
-  bufferRate(ch.id, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0);
+  ch.rpd_count = (ch.rpd_count || 0) + 1;
+
+  bufferRate(ch.id, ch.rpm_count, ch.rpm_reset_at, ch.rpd_count, ch.rpd_reset_at);
 }
 
 // ─── Health 持久化 ────────────────────────────────────────────────
@@ -212,9 +213,9 @@ async function persistHealth(db, ch) {
   if (lastPersistedState.get(ch.id) === key) return;
   try {
     await db.prepare(
-      "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=?, support_tools=?, support_stream=?, is_vision=?, support_image_gen=?, support_audio_tts=?, support_audio_stt=?, support_image_edit=? WHERE id=?"
+      "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=?, support_tools=?, support_stream=?, is_vision=?, support_image_gen=?, support_audio_tts=?, support_audio_stt=?, support_image_edit=? WHERE id=?"
     ).bind(
-      ch.response_time || 0, ch.consecutive_errors || 0,
+      ch.consecutive_errors || 0,
       ch.last_error_msg || '', ch.last_error_at || 0,
       ch.last_429 || 0, ch.cooldown_until || 0,
       ch.support_tools ? 1 : 0,
@@ -622,6 +623,7 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
       const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
       if (!cfg) { removePoolItem(pool, ch); resolve(null); return; }
       allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
+      if (settled) { resolve(null); return; }
 
       // 工具模擬：強制上游回傳完整 JSON 而非 SSE
       const needSim = needToolSim && !ch.support_tools;
@@ -733,7 +735,7 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
 }
 
 async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
-  const { ch, res, cfg, responseTime } = winner;
+  const { ch, res, responseTime } = winner;
 
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
 
@@ -741,6 +743,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
   const decoder = new TextDecoder();
   let sseBuf = "";
   let streamHadContent = false;
+  let streamError = null;
   const contentFilter = new RollingFilter(data.filters || []);
 
   try {
@@ -808,17 +811,16 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
       try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
     }
   } catch (e) {
+    streamError = e;
     console.error("[stream] read error:", ch.id, e.message);
-    if (!streamHadContent) {
-      ch.last_error_msg = "Stream error: " + e.message.slice(0, 120);
-      ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-      ch.last_error_at = Math.floor(Date.now() / 1000);
-      deferPersist(c, ch);
-    }
+    ch.last_error_msg = "Stream error: " + e.message.slice(0, 120);
+    ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+    ch.last_error_at = Math.floor(Date.now() / 1000);
+    deferPersist(c, ch);
     try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
   }
 
-  if (streamHadContent) {
+  if (streamHadContent && !streamError) {
     ch.consecutive_errors = 0;
     ch.last_error_msg = "";
     ch.last_error_at = 0;
@@ -931,6 +933,7 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
       const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, false);
       if (!cfg) { resolve(null); return; }
       allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
+      if (settled) { resolve(null); return; }
 
       const startTime = Date.now();
       try {
@@ -1025,7 +1028,7 @@ function finalizeNonStream(c, winner, data, hasVision) {
   ch.response_time = responseTime;
   bufferResponseTime(ch.id, responseTime);
   if (hasVision && !ch.is_vision) ch.is_vision = 1;
-  c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+  deferPersist(c, ch);
 
   if (json?.choices?.[0]?.message?.content && data.filters?.length > 0) {
     json.choices[0].message.content = RollingFilter.applyStatic(
@@ -1195,73 +1198,83 @@ async function proxyEndpoint(c, endpointType) {
       return errResponse(c, "No available channels support this endpoint type", "invalid_request_error", 400, "unsupported_endpoint");
     }
 
-    const ch = selectChannel(pool, "", false);
-    if (!ch) {
-      return errResponse(c, "All channels are rate-limited or temporarily unavailable — please wait before retrying", "rate_limit_error", 429);
-    }
-
-    const url = buildEndpointUrl(ch.base_url, endpointType);
-    if (!url) return errResponse(c, "Invalid upstream URL configuration", "server_error", 500);
-
     const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
-    const remainingMs = Math.max(2000, requestDeadline - Date.now());
-    const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), chTimeout);
+    let lastError = "";
 
-    let channelHeaders = {};
-    if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
-    else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
-    const reqHeaders = { Authorization: "Bearer " + ch.api_key, ...channelHeaders };
-    const ct = c.req.header("Content-Type");
-    if (ct) {
-      reqHeaders["Content-Type"] = ct;
-    } else if (endpointType === "image_gen" || endpointType === "audio_tts") {
-      reqHeaders["Content-Type"] = "application/json";
-    }
+    // 緩衝 body，避免 retry 時 stream 已被消費
+    const bodyBuffer = await c.req.arrayBuffer().catch(() => null);
 
-    const startTime = Date.now();
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: reqHeaders,
-        body: c.req.raw.body,
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-      const rt = Date.now() - startTime;
+    for (let attempt = 0; attempt < MAX_RETRY && pool.length > 0 && Date.now() < requestDeadline; attempt++) {
+      const ch = selectChannel(pool, "", false);
+      if (!ch) {
+        lastError = "all channels in cooldown or rate-limited";
+        break;
+      }
+      removePoolItem(pool, ch);
 
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => "");
-        markChannelError(ch, res.status, errBody, rt, data);
+      const url = buildEndpointUrl(ch.base_url, endpointType);
+      if (!url) continue;
+
+      const remainingMs = Math.max(2000, requestDeadline - Date.now());
+      const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), chTimeout);
+
+      let channelHeaders = {};
+      if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
+      else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
+      const reqHeaders = { Authorization: "Bearer " + ch.api_key, ...channelHeaders };
+      const ct = c.req.header("Content-Type");
+      if (ct) {
+        reqHeaders["Content-Type"] = ct;
+      } else if (endpointType === "image_gen" || endpointType === "audio_tts") {
+        reqHeaders["Content-Type"] = "application/json";
+      }
+
+      const startTime = Date.now();
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: reqHeaders,
+          body: bodyBuffer,
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        const rt = Date.now() - startTime;
+
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => "");
+          markChannelError(ch, res.status, errBody, rt, data);
+          deferPersist(c, ch);
+          lastError = "HTTP " + res.status;
+          continue;
+        }
+
+        updateRateCounters(ch, Math.floor(Date.now() / 1000));
+        ch.consecutive_errors = 0;
+        ch.last_error_msg = "";
+        ch.last_error_at = 0;
+        ch.response_time = rt;
+        bufferResponseTime(ch.id, rt);
         deferPersist(c, ch);
-        try { return c.json(JSON.parse(errBody), res.status); } catch (e) {}
-        return errResponse(c, "Upstream error: HTTP " + res.status, "upstream_error", 502);
-      }
 
-      updateRateCounters(ch, Math.floor(Date.now() / 1000));
-      ch.consecutive_errors = 0;
-      ch.last_error_msg = "";
-      ch.last_error_at = 0;
-      ch.response_time = rt;
-      bufferResponseTime(ch.id, rt);
-      deferPersist(c, ch);
-
-      const responseHeaders = { "Content-Type": res.headers.get("Content-Type") || "application/json" };
-      for (const h of ["cache-control", "x-request-id", "openai-version", "openai-organization"]) {
-        const v = res.headers.get(h);
-        if (v) responseHeaders[h] = v;
+        const responseHeaders = { "Content-Type": res.headers.get("Content-Type") || "application/json" };
+        for (const h of ["cache-control", "x-request-id", "openai-version", "openai-organization"]) {
+          const v = res.headers.get(h);
+          if (v) responseHeaders[h] = v;
+        }
+        return new Response(res.body, { status: 200, headers: responseHeaders });
+      } catch (e) {
+        clearTimeout(timeoutId);
+        markChannelError(ch, null, e.message, Date.now() - startTime, data);
+        if (e.name === 'AbortError') {
+          ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
+        }
+        deferPersist(c, ch);
+        lastError = e.message.slice(0, 200);
       }
-      return new Response(res.body, { status: 200, headers: responseHeaders });
-    } catch (e) {
-      clearTimeout(timeoutId);
-      markChannelError(ch, null, e.message, Date.now() - startTime, data);
-      if (e.name === 'AbortError') {
-        ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
-      }
-      deferPersist(c, ch);
-      return errResponse(c, "Request to upstream failed: " + e.message.slice(0, 200), "server_error", 502);
     }
+    return errResponse(c, "All upstream channels failed" + (lastError ? ": " + lastError : ""), "server_error", 502);
   } catch (e) {
     console.error("[proxy] unhandled:", e.message);
     return errResponse(c, "The server had an error processing your request", "server_error", 500);

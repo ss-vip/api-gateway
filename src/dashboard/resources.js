@@ -79,18 +79,7 @@ export default function (clearCache) {
 
   api.get("/init", async (c) => {
     const [ch, fl] = await Promise.all([
-      c.env.DB.prepare(
-        "SELECT id, name, base_url, api_key, model, weight,\
-                is_enabled, is_vision, last_429, consecutive_errors,\
-                last_error_msg, last_error_at,\
-                rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
-                rpd_count, rpd_reset_at, max_tokens, support_tools,\
-                support_stream, response_time, fallback_model, headers,\
-                provider_options, provider, absolute_url,\
-                cooldown_until,\
-                support_image_gen, support_audio_tts, support_audio_stt, support_image_edit\
-         FROM channels ORDER BY id"
-      ).all(),
+      c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
@@ -102,18 +91,7 @@ export default function (clearCache) {
   });
 
   const channelsListHandler = async (c) => {
-    const { results } = await c.env.DB.prepare(
-      "SELECT id, name, base_url, api_key, model, weight,\
-              is_enabled, is_vision, last_429, consecutive_errors,\
-              last_error_msg, last_error_at,\
-              rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
-              rpd_count, rpd_reset_at, max_tokens, support_tools,\
-              support_stream, response_time, fallback_model, headers,\
-              provider_options, provider, absolute_url,\
-              cooldown_until,\
-              support_image_gen, support_audio_tts, support_audio_stt, support_image_edit\
-       FROM channels ORDER BY id"
-    ).all();
+    const { results } = await c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all();
     return c.json(results || []);
   };
 

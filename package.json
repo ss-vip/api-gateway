@@ -5,9 +5,7 @@
   "description": "AI API Gateway — Cloudflare Workers Edition",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "db:migrate-local": "wrangler d1 execute api-gateway-db --local --file=./schema.sql",
-    "db:migrate-remote": "wrangler d1 execute api-gateway-db --remote --file=./schema.sql"
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
     "hono": "^4.12.21"

@@ -5,6 +5,7 @@ import registerGateway, { clearCache } from "./gateway.js";
 import createDashboardApp from "./dashboard/index.js";
 import { registerMaintenance } from "./routes/maintenance.js";
 import { generateToken } from "./lib/db.js";
+import { ensureSchema } from "./lib/schema.js";
 
 async function initConfig(env) {
   const cf = await env.DB.prepare("SELECT client_token FROM config WHERE id=1").first();
@@ -32,6 +33,7 @@ let initLock = null;
 app.use("*", async (c, next) => {
   if (!inited) {
     if (!initLock) initLock = (async () => {
+      try { await ensureSchema(c.env); } catch (e) { console.error("[schema]", e.message); }
       try { await initConfig(c.env); } catch (e) { console.error("[init]", e.message); }
       inited = true;
       initLock = null;
