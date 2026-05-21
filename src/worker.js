@@ -47,13 +47,12 @@ registerMaintenance(app);
 app.get("/", (c) => c.redirect("/admin"));
 
 app.notFound((c) => c.json({
-  error: "not_found", path: c.req.path, method: c.req.method,
-  message: "Route not found: " + c.req.method + " " + c.req.path,
+  error: { message: "Route not found: " + c.req.method + " " + c.req.path, type: "invalid_request_error", param: null, code: "not_found" },
 }, 404));
 
 app.onError((err, c) => {
   console.error("[error]", err.message);
-  return c.json({ error: "internal_error", message: err.message }, 500);
+  return c.json({ error: { message: "The server had an error processing your request", type: "server_error", param: null, code: "api_error" } }, 500);
 });
 
 export default {

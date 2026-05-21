@@ -282,8 +282,8 @@
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
         </div>
         <div class="col-4 d-flex flex-column align-items-center">
-          <label class="form-check-label small fw-bold mb-1" for="ch-tools">&#x1F527; Tools</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-tools" checked></div>
+          <label class="form-check-label small fw-bold mb-1" for="ch-stream">&#x26A1; Stream</label>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-stream" checked></div>
         </div>
         <div class="col-4 d-flex flex-column align-items-center">
           <label class="form-check-label small fw-bold mb-1" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
@@ -683,7 +683,7 @@
         }
 
         const visionIcon = c.is_vision ? " \u{1F441}\u{FE0F}" : "";
-        const toolsIcon = (c.support_tools !== 0) ? " \u{1F527}" : "";
+        const streamIcon = (c.support_stream !== 0) ? " \u26A1" : "";
         const modelName = esc(c.model || "");
         const displayName = esc(c.model || "-");
 
@@ -695,7 +695,7 @@
         const providerLabel = c.provider || (c.base_url ? (c.base_url.includes('googleapis') || c.base_url.includes('generativelanguage') ? 'Google' : c.base_url.includes('anthropic') ? 'Claude' : 'OpenAI') : '');
         const providerTitle = providerLabel ? ' title="Provider: ' + esc(providerLabel) + '"' : '';
         row += '<td class="fw-bold align-middle" style="cursor:help"' + providerTitle + '>' + esc(c.name) + '</td>';
-        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + toolsIcon + '</td>';
+        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + streamIcon + '</td>';
         row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
         row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
         row += '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>';
@@ -760,6 +760,7 @@
             const ch2 = channels[idx];
             if (!r.capabilities.vision.ok && ch2.is_vision) ch2.is_vision = 0;
             if (!r.capabilities.tools.ok && ch2.support_tools !== 0) ch2.support_tools = 0;
+            if (r.capabilities.stream && !r.capabilities.stream.ok && ch2.support_stream !== 0) ch2.support_stream = 0;
           }
           renderChannels();
         }
@@ -861,7 +862,7 @@
       ['ch-rpm','ch-rpd','ch-tokens'].forEach(i => document.getElementById(i).value = 0);
       document.getElementById('ch-enabled').checked = true;
       document.getElementById('ch-vision').checked = false;
-      document.getElementById('ch-tools').checked = true;
+      document.getElementById('ch-stream').checked = true;
       document.getElementById('ch-absolute-url').checked = false;
       // Reset Log tab for new channel
       document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
@@ -894,7 +895,7 @@
       document.getElementById('ch-rpm').value = c.rpm_limit || 0;
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
       document.getElementById('ch-vision').checked = c.is_vision == 1;
-      document.getElementById('ch-tools').checked = c.support_tools !== 0;
+      document.getElementById('ch-stream').checked = c.support_stream !== 0;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
       // Populate Log tab — show ALL health states with <li> format
@@ -1033,7 +1034,8 @@
         rpm_limit: parseInt(document.getElementById('ch-rpm').value) || 0,
         rpd_limit: parseInt(document.getElementById('ch-rpd').value) || 0,
         is_vision: document.getElementById('ch-vision').checked ? 1 : 0,
-        support_tools: document.getElementById('ch-tools').checked ? 1 : 0,
+        support_tools: prev ? (prev.support_tools !== 0 ? 1 : 0) : 1,
+        support_stream: document.getElementById('ch-stream').checked ? 1 : 0,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
         last_429: prev ? prev.last_429||0 : 0,
         consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
@@ -1153,10 +1155,10 @@
         if (maxTokens) document.getElementById('ch-tokens').value = maxTokens;
         if (rpm) document.getElementById('ch-rpm').value = rpm;
         if (rpd) document.getElementById('ch-rpd').value = rpd;
-        const visionKeywords = ['vision', 'claude-3', 'gpt-4o', 'gemini-1.5', 'gemini-exp', 'gpt-4-turbo'];
+        const visionKeywords = ['vision', 'claude-3', 'claude-3.5', 'claude-3.7', 'gpt-4o', 'gpt-4.1', 'gemini-1.5', 'gemini-2.0', 'gemini-2.5', 'gemini-exp'];
         const hasVision = visionKeywords.some(k => id.includes(k));
         document.getElementById('ch-vision').checked = hasVision;
-        document.getElementById('ch-tools').checked = true;
+        document.getElementById('ch-stream').checked = true;
       } else {
         document.getElementById('ch-fallback-model').value = modelId;
       }
@@ -1196,7 +1198,7 @@
     const refreshHealthOnly = async () => {
       if (document.body.classList.contains('modal-open')) return;
       try {
-        const res = await api('/admin/api', 'GET', null, false);
+        const res = await api('/admin/api/channels', 'GET', null, false);
         if (!res) return;
         const now = Math.floor(Date.now() / 1000);
         res.forEach(nc => {
@@ -1258,6 +1260,7 @@
         rpd_limit: c.rpd_limit || 0,
         max_tokens: c.max_tokens || 0,
         support_tools: c.support_tools !== 0 ? 1 : 0,
+        support_stream: c.support_stream !== 0 ? 1 : 0,
         provider: c.provider || "",
         headers: c.headers || null,
         provider_options: c.provider_options || null,

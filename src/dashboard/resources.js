@@ -85,7 +85,9 @@ export default function (clearCache) {
                 last_error_msg, last_error_at,\
                 rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
                 rpd_count, rpd_reset_at, max_tokens, support_tools,\
-                response_time, fallback_model, headers, provider_options, provider, absolute_url\
+                support_stream, response_time, fallback_model, headers,\
+                provider_options, provider, absolute_url,\
+                cooldown_until\
          FROM channels ORDER BY id"
       ).all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
@@ -98,18 +100,23 @@ export default function (clearCache) {
     });
   });
 
-  api.get("/", async (c) => {
+  const channelsListHandler = async (c) => {
     const { results } = await c.env.DB.prepare(
       "SELECT id, name, base_url, api_key, model, weight,\
               is_enabled, is_vision, last_429, consecutive_errors,\
               last_error_msg, last_error_at,\
               rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
               rpd_count, rpd_reset_at, max_tokens, support_tools,\
-              response_time, fallback_model, headers, provider_options, provider, absolute_url\
+              support_stream, response_time, fallback_model, headers,\
+              provider_options, provider, absolute_url,\
+              cooldown_until\
        FROM channels ORDER BY id"
     ).all();
     return c.json(results || []);
-  });
+  };
+
+  api.get("/", channelsListHandler);
+  api.get("/channels", channelsListHandler);
 
   api.post("/batch-channels", async (c) => {
     const body = await c.req.json();
@@ -125,13 +132,13 @@ export default function (clearCache) {
       const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
       batch.push(
         c.env.DB.prepare(
-          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider, absolute_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
-          ch.model || "", ch.weight || 1, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
+          ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
           ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
           ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
-          ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || "",
+          ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
           h, po, ch.provider || "", ch.absolute_url ? 1 : 0
         )
       );
@@ -201,14 +208,18 @@ export default function (clearCache) {
 
   api.post("/config", async (c) => {
     const b = await c.req.json();
-    const ex = await c.env.DB.prepare("SELECT id FROM config WHERE id=1").first();
+    const ex = await c.env.DB.prepare("SELECT client_token, recovery_period FROM config WHERE id=1").first();
+    const existingToken = ex?.client_token || "";
+    const existingPeriod = ex?.recovery_period ? parseInt(ex.recovery_period) : null;
     try {
+      const token = b.token || existingToken || getDefaults().token;
+      const period = parseInt(b.recovery_period) || existingPeriod || getDefaults().recovery_period;
       if (ex) {
         await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
-          .bind(b.token || getDefaults().token, parseInt(b.recovery_period) || getDefaults().recovery_period).run();
+          .bind(token, period).run();
       } else {
         await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
-          .bind(b.token || getDefaults().token, parseInt(b.recovery_period) || getDefaults().recovery_period).run();
+          .bind(token, period).run();
       }
     } catch (e) {
       return c.json({ error: e.message }, 500);
@@ -272,6 +283,36 @@ export default function (clearCache) {
     const { buildUrl } = await import("../lib/providers/openai.js");
     const url = ch.absolute_url ? ch.base_url.replace(/\/+$/, "") + "/" : buildUrl(ch.base_url, ch.model || "test", false);
     if (!url) return c.json({ ok: false, error: "Invalid URL", diagnosis: "渠道 URL 格式錯誤" }, 400);
+
+    // Helper: test streaming support
+    async function testStreamRequest(timeoutMs = 15000) {
+      const start = Date.now();
+      try {
+        const reqBody = { model: ch.model || "test", messages: [{ role: "user", content: "OK" }], stream: true };
+        const headers = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key };
+        const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(timeoutMs) });
+        const ms = Date.now() - start;
+        if (!res.ok) return { ok: false, ms, detail: "HTTP " + res.status };
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let hasContent = false;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          if (chunk.includes('"content":"') || chunk.includes('"content": "') || chunk.includes('"tool_calls"')) {
+            hasContent = true; break;
+          }
+        }
+        await reader.cancel();
+        if (hasContent) return { ok: true, ms, detail: "stream supported" };
+        return { ok: false, ms, detail: "empty stream (no SSE content)" };
+      } catch (e) {
+        const ms = Date.now() - start;
+        if (e.name === 'TimeoutError') return { ok: false, ms, detail: "超時" };
+        return { ok: false, ms, detail: e.message?.slice(0, 80) || "error" };
+      }
+    }
 
     // Helper: send a test request and return diagnosis
     // feature: 'basic' | 'vision' | 'tools' — changes success criteria
@@ -366,9 +407,22 @@ export default function (clearCache) {
       }, 8000, 'tools').catch(() => ({ ok: false, ms: 0, detail: "test error" })),
     ]);
 
+    // 3. Test streaming capability
+    const streamRes = await testStreamRequest(15000).catch(() => ({ ok: false, ms: 0, detail: "test error" }));
+
+    // Persist detected capabilities (only if not a test-from-body)
+    if (!fromBody) {
+      const now = Math.floor(Date.now() / 1000);
+      await c.env.DB.prepare(
+        "UPDATE channels SET support_stream=?, is_vision=?, support_tools=? WHERE id=?"
+      ).bind(streamRes.ok ? 1 : 0, visionRes.ok ? 1 : 0, toolsRes.ok ? 1 : 0, chId).run();
+      clearCache();
+    }
+
     const capabilities = {
       vision: { ok: visionRes.ok, detail: visionRes.ok ? "✅ 支援" : "❌ " + visionRes.detail },
       tools: { ok: toolsRes.ok, detail: toolsRes.ok ? "✅ 支援" : "❌ " + toolsRes.detail },
+      stream: { ok: streamRes.ok, detail: streamRes.ok ? "✅ 支援" : "❌ " + streamRes.detail },
     };
 
     return c.json({
@@ -409,13 +463,13 @@ export default function (clearCache) {
         const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
         batch.push(
           c.env.DB.prepare(
-            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, response_time, fallback_model, headers, provider_options, provider, absolute_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
             ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
             ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
-            ch.support_tools ? 1 : 0, ch.response_time || 0, ch.fallback_model || "",
+            ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
             h, po, ch.provider || "", ch.absolute_url ? 1 : 0
           )
         );

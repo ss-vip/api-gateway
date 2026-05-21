@@ -3,6 +3,7 @@ import { pruneLoginState } from "../dashboard/index.js";
 
 const rateBuffer = new Map();
 const RATE_BUF_MAX = 200;
+const responseTimeBuffer = new Map();
 
 export function bufferRate(chId, rpmCount, rpmResetAt, rpdCount, rpdResetAt) {
   if (rateBuffer.size >= RATE_BUF_MAX) {
@@ -15,6 +16,24 @@ export function bufferRate(chId, rpmCount, rpmResetAt, rpdCount, rpdResetAt) {
 
 export function getBufferedRate(chId) {
   return rateBuffer.get(chId) || null;
+}
+
+export function bufferResponseTime(chId, responseTime) {
+  responseTimeBuffer.set(chId, { responseTime, ts: Date.now() });
+}
+
+async function flushResponseTime(DB) {
+  if (responseTimeBuffer.size === 0) return 0;
+  const stmts = [];
+  for (const [id, data] of responseTimeBuffer) {
+    stmts.push(
+      DB.prepare("UPDATE channels SET response_time=? WHERE id=?").bind(data.responseTime, id)
+    );
+  }
+  if (stmts.length === 0) return 0;
+  await DB.batch(stmts);
+  responseTimeBuffer.clear();
+  return stmts.length;
 }
 
 async function flushRateBuffer(DB) {
@@ -30,9 +49,9 @@ async function flushRateBuffer(DB) {
       );
     }
   }
-  rateBuffer.clear();
   if (stmts.length === 0) return 0;
   await DB.batch(stmts);
+  rateBuffer.clear();
   return stmts.length;
 }
 
@@ -73,6 +92,7 @@ export function registerMaintenance(app) {
     actions.channels_recovered = (recovered || []).length;
 
     actions.rate_flushed = await flushRateBuffer(DB);
+    actions.rt_flushed = await flushResponseTime(DB);
 
     const { results: allChs } = await DB.prepare(
       "SELECT id, name, model, is_enabled, consecutive_errors, cooldown_until, response_time, last_429 FROM channels ORDER BY id"

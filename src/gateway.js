@@ -5,7 +5,7 @@ import {
   REQUEST_TIMEOUT_SECONDS,
   GLOBAL_TIMEOUT_MS,
 } from "./lib/constants.js";
-import { bufferRate, getBufferedRate } from "./routes/maintenance.js";
+import { bufferRate, getBufferedRate, bufferResponseTime } from "./routes/maintenance.js";
 
 const MAX_RETRY = 3;
 const RACE_TIMEOUT_MS = 15000;
@@ -27,8 +27,8 @@ const ERROR_CODE_MAP = {
 
 // ─── 回應工具 ───────────────────────────────────────────────────────
 
-function errResponse(c, message, type, status) {
-  return c.json({ error: { message, type, code: ERROR_CODE_MAP[type] || type } }, status);
+function errResponse(c, message, type, status, code) {
+  return c.json({ error: { message, type, param: null, code: code || ERROR_CODE_MAP[type] || type } }, status);
 }
 
 // ─── 快取 ──────────────────────────────────────────────────────────
@@ -36,6 +36,9 @@ function errResponse(c, message, type, status) {
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
 let cacheGen = 0;
+
+// 持久化去重：只在意義狀態變更時寫入 D1，跳過 routine 更新（如 response_time）
+const lastPersistedState = new Map();
 
 async function loadCache(env) {
   const TTL = 60_000;
@@ -76,6 +79,7 @@ export function clearCache() {
   cacheGen++;
   cache.data = null;
   cache.ts = 0;
+  lastPersistedState.clear();
 }
 
 // ─── 退避計算 ─────────────────────────────────────────────────────
@@ -88,15 +92,17 @@ function exponentialCooldown(consecutiveErrors) {
 
 // ─── 渠道選擇 ──────────────────────────────────────────────────────
 
-function selectChannel(channels, originalModel) {
+function selectChannel(channels, originalModel, isStream) {
   const now = Math.floor(Date.now() / 1000);
   const model = (originalModel || '').trim();
 
   const healthy = channels.filter(ch => {
     if (!ch.is_enabled) return false;
+    if (isStream && ch.support_stream === 0) return false;
     if (ch.consecutive_errors >= BACKOFF_ERROR_THRESHOLD &&
         now - (ch.last_error_at || 0) <= exponentialCooldown(ch.consecutive_errors)) return false;
     if (ch.last_429 > 0 && ch.last_429 > now) return false;
+    if (ch.cooldown_until > 0 && ch.cooldown_until > now) return false;
     const buf = getBufferedRate(ch.id);
     const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
     const rpmResetAt = buf ? buf.rpmResetAt : (ch.rpm_reset_at || 0);
@@ -176,17 +182,37 @@ function updateRateCounters(ch, nowSec) {
 
 // ─── Health 持久化 ────────────────────────────────────────────────
 
+function persistStateKey(ch) {
+  // 忽略 response_time（每次變動但非關鍵），只追蹤影響 routing 的狀態
+  return [
+    ch.consecutive_errors || 0,
+    ch.last_error_msg || '',
+    ch.last_error_at || 0,
+    ch.last_429 || 0,
+    ch.cooldown_until || 0,
+    ch.support_tools ? 1 : 0,
+    ch.support_stream === 0 ? 0 : 1,
+    ch.is_vision ? 1 : 0,
+  ].join('|');
+}
+
 async function persistHealth(db, ch) {
   if (!ch || !ch.id) return;
+  const key = persistStateKey(ch);
+  if (lastPersistedState.get(ch.id) === key) return;
   try {
     await db.prepare(
-      "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=? WHERE id=?"
+      "UPDATE channels SET response_time=?, consecutive_errors=?, last_error_msg=?, last_error_at=?, last_429=?, cooldown_until=?, support_tools=?, support_stream=?, is_vision=? WHERE id=?"
     ).bind(
       ch.response_time || 0, ch.consecutive_errors || 0,
       ch.last_error_msg || '', ch.last_error_at || 0,
       ch.last_429 || 0, ch.cooldown_until || 0,
+      ch.support_tools ? 1 : 0,
+      ch.support_stream === 0 ? 0 : 1,
+      ch.is_vision ? 1 : 0,
       ch.id
     ).run();
+    lastPersistedState.set(ch.id, key);
   } catch (e) { console.error("[persist] health:", ch.id, e.message); }
 }
 
@@ -205,6 +231,19 @@ function truncateErrorBody(text) {
   if (!text || typeof text !== "string") return text || "";
   if (text.length <= 8192) return text;
   return text.slice(0, 8192) + "... [truncated]";
+}
+
+function hasVisionContent(body) {
+  if (!body?.messages) return false;
+  for (const msg of body.messages) {
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part?.type === "image_url") return true;
+      }
+    }
+    if (msg?.content && typeof msg.content === "string" && msg.content.includes("data:image/")) return true;
+  }
+  return false;
 }
 
 function sleep(ms) {
@@ -451,10 +490,10 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
 
 // ─── Pool 管理 ─────────────────────────────────────────────────────
 
-function pickChannels(pool, originalModel, maxCount) {
+function pickChannels(pool, originalModel, maxCount, isStream) {
   const picked = [];
   for (let i = 0; i < maxCount && pool.length > 0; i++) {
-    const ch = selectChannel(pool, originalModel);
+    const ch = selectChannel(pool, originalModel, isStream);
     if (!ch) break;
     removePoolItem(pool, ch);
     picked.push(ch);
@@ -538,9 +577,10 @@ async function writeSimulatedStream(w, enc, json) {
 // ─── 串流競速 ─────────────────────────────────────────────────────
 
 async function raceStream(c, pool, body, originalModel, data, w, enc, requestDeadline) {
-  const picked = pickChannels(pool, originalModel, RACE_MAX_CONCURRENT);
+  const hasVision = hasVisionContent(body);
+  const picked = pickChannels(pool, originalModel, RACE_MAX_CONCURRENT, true);
   if (picked.length === 0) {
-    await writeStreamError(w, enc, "No available channels");
+    await writeStreamError(w, enc, "No available channels — all upstream services are in cooldown, rate-limited, or disabled");
     return;
   }
 
@@ -603,6 +643,14 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
           let json;
           try { json = JSON.parse(resText); } catch (e) { resolve(null); return; }
           json = wrapToolResponse(json, ch, body);
+          updateRateCounters(ch, Math.floor(Date.now() / 1000));
+          ch.consecutive_errors = 0;
+          ch.last_error_msg = "";
+          ch.last_error_at = 0;
+          ch.response_time = rt;
+          bufferResponseTime(ch.id, rt);
+          if (hasVision && !ch.is_vision) ch.is_vision = 1;
+          deferPersist(c, ch);
           settle({ ch, simulatedJson: json, responseTime: rt, isSimulated: true });
           resolve({ isSimulated: true, json });
           return;
@@ -647,7 +695,7 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
       return;
     }
     const winner = await winnerOrFail;
-    await streamChannelResponse(c, winner, data, w, enc);
+    await streamChannelResponse(c, winner, data, w, enc, hasVision);
     return;
   }
 
@@ -663,22 +711,17 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
       await writeSimulatedStream(w, enc, winner.simulatedJson);
       return;
     }
-    await streamChannelResponse(c, winner, data, w, enc);
+    await streamChannelResponse(c, winner, data, w, enc, hasVision);
     return;
   }
 
-  await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline);
+  await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
 }
 
-async function streamChannelResponse(c, winner, data, w, enc) {
+async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
   const { ch, res, cfg, responseTime } = winner;
 
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
-  ch.consecutive_errors = 0;
-  ch.last_error_msg = "";
-  ch.last_error_at = 0;
-  ch.response_time = responseTime;
-  c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -743,29 +786,45 @@ async function streamChannelResponse(c, winner, data, w, enc) {
       ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
       ch.last_error_at = Math.floor(Date.now() / 1000);
       deferPersist(c, ch);
-      await writeStreamError(w, enc, "Empty response from upstream");
+      await writeStreamError(w, enc, "The upstream service returned an empty response — no content was generated");
       return;
     }
 
-    if (!lastLine.includes("[DONE]") && !streamDone) {
+    if (!lastLine.includes("[DONE]")) {
       try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
     }
   } catch (e) {
     console.error("[stream] read error:", ch.id, e.message);
+    if (!streamHadContent) {
+      ch.last_error_msg = "Stream error: " + e.message.slice(0, 120);
+      ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+      ch.last_error_at = Math.floor(Date.now() / 1000);
+      deferPersist(c, ch);
+    }
     try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
+  }
+
+  if (streamHadContent) {
+    ch.consecutive_errors = 0;
+    ch.last_error_msg = "";
+    ch.last_error_at = 0;
+    ch.response_time = responseTime;
+    bufferResponseTime(ch.id, responseTime);
+    if (hasVision && !ch.is_vision) ch.is_vision = 1;
+    deferPersist(c, ch);
   }
 }
 
 // ─── 串流 Fallback 順序重試 ───────────────────────────────────────
 
-async function fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline) {
+async function fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision) {
   let retries = 0;
   let lastError = "";
   const needToolSim = shouldSimulateTools(body);
 
   while (pool.length > 0 && Date.now() < requestDeadline && retries < MAX_RETRY) {
     retries++;
-    const ch = selectChannel(pool, originalModel);
+    const ch = selectChannel(pool, originalModel, true);
     if (!ch) { lastError = "all channels in cooldown or rate-limited"; break; }
     removePoolItem(pool, ch);
 
@@ -803,13 +862,15 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
         ch.consecutive_errors = 0;
         ch.response_time = rt;
+        bufferResponseTime(ch.id, rt);
+        if (hasVision && !ch.is_vision) ch.is_vision = 1;
         deferPersist(c, ch);
         await writeSimulatedStream(w, enc, json);
         return;
       }
 
       const winner = { ch, res, cfg, responseTime: rt };
-      await streamChannelResponse(c, winner, data, w, enc);
+      await streamChannelResponse(c, winner, data, w, enc, hasVision);
       return;
     } catch (e) {
       clearTimeout(cfg.timeoutId);
@@ -829,9 +890,10 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
 // ─── 非串流競速 ─────────────────────────────────────────────────────
 
 async function raceNonStream(c, pool, body, originalModel, data, requestDeadline) {
-  const picked = pickChannels(pool, originalModel, RACE_MAX_CONCURRENT);
+  const hasVision = hasVisionContent(body);
+  const picked = pickChannels(pool, originalModel, RACE_MAX_CONCURRENT, false);
   if (picked.length === 0) {
-    return errResponse(c, "No available channels", "server_error", 503);
+    return errResponse(c, "No available channels — all upstream services are in cooldown, rate-limited, or disabled", "server_error", 503);
   }
 
   let resolveWinner;
@@ -923,7 +985,7 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
 
   const primaryResult = await primaryPromise;
   if (primaryResult) {
-    return finalizeNonStream(c, primaryResult, data);
+    return finalizeNonStream(c, primaryResult, data, hasVision);
   }
 
   if (!backupStarted) await raceTimer;
@@ -934,19 +996,21 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
   ]);
 
   if (winner) {
-    return finalizeNonStream(c, winner, data);
+    return finalizeNonStream(c, winner, data, hasVision);
   }
 
-  return fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline);
+  return fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision);
 }
 
-function finalizeNonStream(c, winner, data) {
+function finalizeNonStream(c, winner, data, hasVision) {
   const { ch, json, responseTime } = winner;
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
   ch.consecutive_errors = 0;
   ch.last_error_msg = "";
   ch.last_error_at = 0;
   ch.response_time = responseTime;
+  bufferResponseTime(ch.id, responseTime);
+  if (hasVision && !ch.is_vision) ch.is_vision = 1;
   c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
 
   if (json?.choices?.[0]?.message?.content && data.filters?.length > 0) {
@@ -959,12 +1023,12 @@ function finalizeNonStream(c, winner, data) {
 
 // ─── 非串流 Fallback 順序重試 ─────────────────────────────────────
 
-async function fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline) {
+async function fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision) {
   let retries = 0;
   while (pool.length > 0 && Date.now() < requestDeadline && retries < MAX_RETRY) {
     retries++;
-    const ch = selectChannel(pool, originalModel);
-    if (!ch) return errResponse(c, "Rate limited or all channels unavailable", "rate_limit_error", 429);
+    const ch = selectChannel(pool, originalModel, false);
+    if (!ch) return errResponse(c, "All channels are rate-limited or temporarily unavailable — please wait before retrying", "rate_limit_error", 429);
 
     const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, false);
     if (!cfg) { removePoolItem(pool, ch); continue; }
@@ -988,7 +1052,7 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
 
       const resText = await res.text();
       if (resText.length > 4 * 1024 * 1024) {
-        return errResponse(c, "Response too large", "server_error", 502);
+        return errResponse(c, "The response from the upstream server exceeded the maximum allowed size", "server_error", 502);
       }
       let json = JSON.parse(resText);
       json = wrapToolResponse(json, ch, body);
@@ -1003,7 +1067,7 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         continue;
       }
 
-      return finalizeNonStream(c, { ch, json, responseTime: rt }, data);
+      return finalizeNonStream(c, { ch, json, responseTime: rt }, data, hasVision);
     } catch (e) {
       clearTimeout(cfg.timeoutId);
       markChannelError(ch, null, e.message, Date.now() - startTime, data);
@@ -1014,7 +1078,7 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
       removePoolItem(pool, ch);
     }
   }
-  return errResponse(c, "All channels failed or request timed out", "server_error", 504);
+  return errResponse(c, "All upstream channels failed or the request timed out after " + (GLOBAL_TIMEOUT_MS / 1000) + "s", "server_error", 504);
 }
 
 // ─── 主要請求處理 ───────────────────────────────────────────────────
@@ -1023,26 +1087,26 @@ async function handleChatRequest(c) {
   try {
     let data;
     try { data = await loadCache(c.env); } catch (e) {
-      if (!cache.data) return errResponse(c, "DB Error", "server_error", 500);
+      if (!cache.data) return errResponse(c, "The database query failed and no cached configuration is available", "server_error", 500);
       data = cache.data;
     }
     if (!data) {
       data = await loadCache(c.env).catch(() => null);
-      if (!data) return errResponse(c, "Cache unavailable", "server_error", 500);
+      if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
     }
 
     const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
-      return errResponse(c, "Unauthorized", "auth_error", 401);
+      return errResponse(c, "Incorrect API key provided", "invalid_request_error", 401, "invalid_api_key");
     }
 
     let body;
     try { body = await c.req.json(); } catch (e) {
-      return errResponse(c, "Invalid JSON", "invalid_request_error", 400);
+      return errResponse(c, "We could not parse the JSON body of your request", "invalid_request_error", 400);
     }
 
     if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
-      return errResponse(c, "Invalid messages", "invalid_request_error", 400);
+      return errResponse(c, "'messages' is required and must contain at least one message", "invalid_request_error", 400);
     }
 
     const originalModel = body.model;
@@ -1050,7 +1114,7 @@ async function handleChatRequest(c) {
 
     // 淺拷貝 pool 隔離各 request 的 channel mutation，避免併發汙染快取
     let pool = data.channels.filter((ch) => ch.is_enabled).map(ch => ({ ...ch }));
-    if (pool.length === 0) return errResponse(c, "No available channels", "server_error", 503);
+    if (pool.length === 0) return errResponse(c, "No available channels — all upstream services are in cooldown, rate-limited, or disabled", "server_error", 503);
 
     const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
 
@@ -1081,7 +1145,7 @@ async function handleChatRequest(c) {
 
   } catch (e) {
     console.error("[gateway] unhandled:", e.message);
-    return errResponse(c, "Internal Error", "server_error", 500);
+    return errResponse(c, "The server had an error processing your request", "server_error", 500);
   }
 }
 
