@@ -7,8 +7,7 @@ import {
 } from "./lib/constants.js";
 import { bufferRate, getBufferedRate, bufferResponseTime } from "./routes/maintenance.js";
 
-const MAX_RETRY = 3;
-const RACE_TIMEOUT_MS = 15000;
+const RACE_TIMEOUT_MS = 5000;
 const RACE_MAX_CONCURRENT = 3;
 
 const SSE_CHUNK_HEADERS = {
@@ -32,19 +31,15 @@ const ENDPOINT_COLUMNS = {
   audio_tts: "support_audio_tts",
 };
 
-// ─── 回應工具 ───────────────────────────────────────────────────────
-
 function errResponse(c, message, type, status, code) {
   return c.json({ error: { message, type, param: null, code: code || ERROR_CODE_MAP[type] || type } }, status);
 }
-
-// ─── 快取 ──────────────────────────────────────────────────────────
 
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
 let cacheGen = 0;
 
-// 持久化去重：只在意義狀態變更時寫入 D1，跳過 routine 更新（如 response_time）
+// 僅在狀態變更時寫入 D1，跳過 routine 更新
 const lastPersistedState = new Map();
 
 async function loadCache(env) {
@@ -89,15 +84,12 @@ export function clearCache() {
   lastPersistedState.clear();
 }
 
-// ─── 退避計算 ─────────────────────────────────────────────────────
-
 function exponentialCooldown(consecutiveErrors) {
   if (consecutiveErrors <= BACKOFF_ERROR_THRESHOLD) return 0;
   const exponent = Math.min(consecutiveErrors - BACKOFF_ERROR_THRESHOLD, 4);
   return Math.min(BACKOFF_429_SECONDS * Math.pow(2, exponent), BACKOFF_MAX_SECONDS);
 }
 
-// ─── 渠道選擇 ──────────────────────────────────────────────────────
 
 function selectChannel(channels, originalModel, isStream) {
   const now = Math.floor(Date.now() / 1000);
@@ -141,7 +133,6 @@ function selectChannel(channels, originalModel, isStream) {
     else if (err === 2) w *= 0.6;
     else if (err === 1) w *= 0.8;
 
-    // 使用與硬限制檢查一致的 buffered rate 值
     const buf = getBufferedRate(ch.id);
     const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
     const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
@@ -168,11 +159,9 @@ function selectChannel(channels, originalModel, isStream) {
   return healthy[healthy.length - 1];
 }
 
-// ─── Rate 計數 ─────────────────────────────────────────────────────
 
 function updateRateCounters(ch, nowSec) {
   if (!ch) return;
-  // Window 過期 → 重置計數器再 +1，否則直接 +1
   if (nowSec - (ch.rpm_reset_at || 0) >= RPM_WINDOW_SECONDS) {
     ch.rpm_count = 0;
     ch.rpm_reset_at = nowSec;
@@ -188,7 +177,6 @@ function updateRateCounters(ch, nowSec) {
   bufferRate(ch.id, ch.rpm_count, ch.rpm_reset_at, ch.rpd_count, ch.rpd_reset_at);
 }
 
-// ─── Health 持久化 ────────────────────────────────────────────────
 
 function persistStateKey(ch) {
   return [
@@ -235,7 +223,6 @@ function deferPersist(c, ch) {
   if (ch) c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
 }
 
-// ─── 工具函式 ──────────────────────────────────────────────────────
 
 function removePoolItem(pool, ch) {
   const idx = pool.indexOf(ch);
@@ -265,7 +252,6 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ─── 內容過濾器 ────────────────────────────────────────────────────
 
 class RollingFilter {
   constructor(filters) {
@@ -308,18 +294,16 @@ class RollingFilter {
   }
 }
 
-// ─── Tool Simulation ──────────────────────────────────────────────
 
 function hasTools(body) {
   return body.tools && Array.isArray(body.tools) && body.tools.length > 0;
 }
 
 function shouldSimulateTools(body) {
-  // tool_choice === "none" 時 client 明確不需要工具
+  // tool_choice:"none" = client opts out
   return hasTools(body) && body.tool_choice !== "none";
 }
 
-// 安全的 tool_call ID
 let idCounter = 0;
 function nextToolCallId() {
   const ts = Date.now().toString(36);
@@ -349,12 +333,11 @@ function formatToolSchema(tool) {
   return desc;
 }
 
-// 從模型回覆的文字中嘗試擷取 JSON（容錯處理 code fence / 前後文字）
 function extractJsonFromContent(content) {
   if (!content) return null;
   const trimmed = content.trim();
 
-  // Fast path: 純 JSON
+  // Fast path: pure JSON
   try { return JSON.parse(trimmed); } catch (e) {}
 
   // Markdown code fence
@@ -363,7 +346,7 @@ function extractJsonFromContent(content) {
     try { return JSON.parse(fenceMatch[1].trim()); } catch (e) {}
   }
 
-  // 找到第一個 { 或 [，追蹤括號深度直到匹配
+  // Depth-match first { or [ across string-aware scan
   const firstBrace = trimmed.indexOf('{');
   const firstBracket = trimmed.indexOf('[');
   const start = (firstBrace === -1 && firstBracket === -1) ? -1
@@ -465,7 +448,6 @@ function wrapToolResponse(json, ch, body) {
   return json;
 }
 
-// ─── 渠道請求組裝 ──────────────────────────────────────────────────
 
 function buildChannelConfig(ch, body, originalModel, deadline, stream) {
   const effectiveModel = ch.model || originalModel || "gpt-4o";
@@ -503,7 +485,6 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
   }
 }
 
-// ─── Pool 管理 ─────────────────────────────────────────────────────
 
 function pickChannels(pool, originalModel, maxCount, isStream) {
   const picked = [];
@@ -516,7 +497,6 @@ function pickChannels(pool, originalModel, maxCount, isStream) {
   return picked;
 }
 
-// ─── SSE 寫入工具 ─────────────────────────────────────────────────
 
 function sseEvent(w, enc, data) {
   return w.write(enc.encode("data: " + JSON.stringify(data) + "\n\n"));
@@ -537,7 +517,6 @@ async function writeStreamError(w, enc, msg) {
   try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
 }
 
-// ─── 競速共用基礎 ─────────────────────────────────────────────────
 
 function abortAll(infos) {
   for (const info of infos) {
@@ -546,7 +525,6 @@ function abortAll(infos) {
   }
 }
 
-// ─── 將完整 JSON 回應模擬為 SSE chunk 寫出 ────────────────────────
 
 async function writeSimulatedStream(w, enc, json) {
   try {
@@ -589,7 +567,6 @@ async function writeSimulatedStream(w, enc, json) {
   }
 }
 
-// ─── 串流競速 ─────────────────────────────────────────────────────
 
 async function raceStream(c, pool, body, originalModel, data, w, enc, requestDeadline) {
   const hasVision = hasVisionContent(body);
@@ -612,7 +589,18 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
     resolveWinner(winner);
   }
 
-  // 是否需要此渠道的工具模擬
+  // Client disconnect → abort all in-flight
+  const clientSignal = c.req.raw.signal;
+  if (clientSignal.aborted) {
+    settled = true;
+    abortAll(allInfos);
+    resolveWinner(null);
+  } else {
+    clientSignal.addEventListener('abort', () => {
+      if (!settled) { settled = true; abortAll(allInfos); resolveWinner(null); }
+    }, { once: true });
+  }
+
   const needToolSim = shouldSimulateTools(body);
 
   function startChannel(ch, delay) {
@@ -625,7 +613,7 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
       allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
       if (settled) { resolve(null); return; }
 
-      // 工具模擬：強制上游回傳完整 JSON 而非 SSE
+      // Force non-stream for tool simulation
       const needSim = needToolSim && !ch.support_tools;
       if (needSim) {
         cfg.reqBody.stream = false;
@@ -672,7 +660,6 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
           return;
         }
 
-        // ── 正常串流路徑 ──
         settle({ ch, res, cfg, responseTime: rt, isSimulated: false });
         resolve({ isSimulated: false, res, cfg });
       } catch (e) {
@@ -745,11 +732,12 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
   let streamHadContent = false;
   let streamError = null;
   const contentFilter = new RollingFilter(data.filters || []);
+  const clientSignal = c.req.raw.signal;
 
   try {
     let lastLine = "";
     let streamDone = false;
-    while (!streamDone) {
+    while (!streamDone && !clientSignal.aborted) {
       const { done, value } = await reader.read();
       if (done) { streamDone = true; break; }
       sseBuf += decoder.decode(value, { stream: true });
@@ -831,15 +819,13 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
   }
 }
 
-// ─── 串流 Fallback 順序重試 ───────────────────────────────────────
 
 async function fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision) {
-  let retries = 0;
   let lastError = "";
+  const clientSignal = c.req.raw.signal;
   const needToolSim = shouldSimulateTools(body);
 
-  while (pool.length > 0 && Date.now() < requestDeadline && retries < MAX_RETRY) {
-    retries++;
+  while (pool.length > 0 && Date.now() < requestDeadline && !clientSignal.aborted) {
     const ch = selectChannel(pool, originalModel, true);
     if (!ch) { lastError = "all channels in cooldown or rate-limited"; break; }
     removePoolItem(pool, ch);
@@ -847,7 +833,7 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
     const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
     if (!cfg) continue;
 
-    // 工具模擬同前
+    // Force non-stream for tool simulation
     const needSim = needToolSim && !ch.support_tools;
     if (needSim) {
       cfg.reqBody.stream = false;
@@ -903,7 +889,6 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
   await writeStreamError(w, enc, "All upstream channels failed" + (lastError ? ": " + lastError : ""));
 }
 
-// ─── 非串流競速 ─────────────────────────────────────────────────────
 
 async function raceNonStream(c, pool, body, originalModel, data, requestDeadline) {
   const hasVision = hasVisionContent(body);
@@ -923,6 +908,18 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
     settled = true;
     abortAll(allInfos);
     resolveWinner(winner);
+  }
+
+  // Client disconnect → abort all in-flight
+  const clientSignal = c.req.raw.signal;
+  if (clientSignal.aborted) {
+    settled = true;
+    abortAll(allInfos);
+    resolveWinner(null);
+  } else {
+    clientSignal.addEventListener('abort', () => {
+      if (!settled) { settled = true; abortAll(allInfos); resolveWinner(null); }
+    }, { once: true });
   }
 
   function tryChannel(ch, delay) {
@@ -1038,17 +1035,16 @@ function finalizeNonStream(c, winner, data, hasVision) {
   return c.json(json);
 }
 
-// ─── 非串流 Fallback 順序重試 ─────────────────────────────────────
 
 async function fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision) {
-  let retries = 0;
-  while (pool.length > 0 && Date.now() < requestDeadline && retries < MAX_RETRY) {
-    retries++;
+  const clientSignal = c.req.raw.signal;
+  while (pool.length > 0 && Date.now() < requestDeadline && !clientSignal.aborted) {
     const ch = selectChannel(pool, originalModel, false);
     if (!ch) return errResponse(c, "All channels are rate-limited or temporarily unavailable — please wait before retrying", "rate_limit_error", 429);
+    removePoolItem(pool, ch);
 
     const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, false);
-    if (!cfg) { removePoolItem(pool, ch); continue; }
+    if (!cfg) continue;
 
     const startTime = Date.now();
     try {
@@ -1063,7 +1059,6 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         const errText = await res.text().catch(() => "");
         markChannelError(ch, res.status, errText, rt, data);
         deferPersist(c, ch);
-        removePoolItem(pool, ch);
         continue;
       }
 
@@ -1080,7 +1075,6 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
         ch.last_error_at = Math.floor(Date.now() / 1000);
         deferPersist(c, ch);
-        removePoolItem(pool, ch);
         continue;
       }
 
@@ -1092,25 +1086,16 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
       }
       deferPersist(c, ch);
-      removePoolItem(pool, ch);
     }
   }
   return errResponse(c, "All upstream channels failed or the request timed out after " + (GLOBAL_TIMEOUT_MS / 1000) + "s", "server_error", 504);
 }
 
-// ─── 主要請求處理 ───────────────────────────────────────────────────
 
 async function handleChatRequest(c) {
   try {
-    let data;
-    try { data = await loadCache(c.env); } catch (e) {
-      if (!cache.data) return errResponse(c, "The database query failed and no cached configuration is available", "server_error", 500);
-      data = cache.data;
-    }
-    if (!data) {
-      data = await loadCache(c.env).catch(() => null);
-      if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
-    }
+    const data = await loadCache(c.env).catch(() => null);
+    if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
 
     const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
@@ -1166,19 +1151,11 @@ async function handleChatRequest(c) {
   }
 }
 
-// ─── 多模態端點代理 ────────────────────────────────────────────────
 
 async function proxyEndpoint(c, endpointType) {
   try {
-    let data;
-    try { data = await loadCache(c.env); } catch (e) {
-      if (!cache.data) return errResponse(c, "The database query failed and no cached configuration is available", "server_error", 500);
-      data = cache.data;
-    }
-    if (!data) {
-      data = await loadCache(c.env).catch(() => null);
-      if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
-    }
+    const data = await loadCache(c.env).catch(() => null);
+    if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
 
     const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
@@ -1204,7 +1181,11 @@ async function proxyEndpoint(c, endpointType) {
     // 緩衝 body，避免 retry 時 stream 已被消費
     const bodyBuffer = await c.req.arrayBuffer().catch(() => null);
 
-    for (let attempt = 0; attempt < MAX_RETRY && pool.length > 0 && Date.now() < requestDeadline; attempt++) {
+    // Client disconnect → stop retrying
+    const clientSignal = c.req.raw.signal;
+    let clientGone = clientSignal.aborted;
+
+    while (pool.length > 0 && Date.now() < requestDeadline && !clientGone) {
       const ch = selectChannel(pool, "", false);
       if (!ch) {
         lastError = "all channels in cooldown or rate-limited";
@@ -1219,6 +1200,9 @@ async function proxyEndpoint(c, endpointType) {
       const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), chTimeout);
+      if (!clientSignal.aborted) {
+        clientSignal.addEventListener('abort', () => { controller.abort(); clientGone = true; }, { once: true });
+      }
 
       let channelHeaders = {};
       if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;

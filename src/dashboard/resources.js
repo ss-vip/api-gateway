@@ -1,5 +1,23 @@
 import { Hono } from "hono";
 
+const RES_CACHE_TTL = 30_000;
+let resCache = { data: null, ts: 0, gen: 0 };
+
+function withCache(fn) {
+  return async (c) => {
+    if (resCache.data && Date.now() - resCache.ts < RES_CACHE_TTL) return c.json(resCache.data);
+    const data = await fn(c);
+    resCache = { data, ts: Date.now(), gen: resCache.gen };
+    return c.json(data);
+  };
+}
+
+function clearResCache() {
+  resCache.gen++;
+  resCache.data = null;
+  resCache.ts = 0;
+}
+
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -24,11 +42,11 @@ async function getAdminPass(c) {
 export { getAdminPass, verifyPassword };
 
 function generateFallbackToken() {
-  const bytes = new Uint8Array(30);
-  crypto.getRandomValues(bytes);
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+  const rand = new Uint32Array(30);
+  crypto.getRandomValues(rand);
   let t = "sk-";
-  for (let i = 0; i < 30; i++) t += chars[bytes[i] % chars.length];
+  for (let i = 0; i < 30; i++) t += chars[rand[i] % chars.length];
   return t;
 }
 function getDefaults() {
@@ -58,8 +76,13 @@ export function pruneSetupRateLimit() {
   }
 }
 
-export default function (clearCache) {
+export default function (_clearCache) {
   const api = new Hono();
+
+  function clearCache() {
+    _clearCache();
+    clearResCache();
+  }
 
   const PUBLIC_SUFFIXES = ["/auth-status", "/verify-token"];
   api.use("*", async (c, next) => {
@@ -77,23 +100,23 @@ export default function (clearCache) {
     await next();
   });
 
-  api.get("/init", async (c) => {
+  api.get("/init", withCache(async (c) => {
     const [ch, fl] = await Promise.all([
       c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
-    return c.json({
+    return {
       channels: ch.results || [],
       filters: fl.results || [],
       config: { token: cf?.client_token || "", recovery_period: parseInt(cf?.recovery_period) || 300 },
-    });
-  });
+    };
+  }));
 
-  const channelsListHandler = async (c) => {
+  const channelsListHandler = withCache(async (c) => {
     const { results } = await c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all();
-    return c.json(results || []);
-  };
+    return results || [];
+  });
 
   api.get("/", channelsListHandler);
   api.get("/channels", channelsListHandler);
@@ -251,165 +274,270 @@ export default function (clearCache) {
 
   api.post("/channels/:id/test", async (c) => {
     const chId = parseInt(c.req.param("id"), 10);
-    const body = await c.req.json().catch(() => ({}));
-    const fromBody = !!body.base_url;
+    const reqBody = await c.req.json().catch(() => ({}));
+    const fromBody = !!reqBody.base_url;
     let ch;
     if (fromBody) {
-      ch = { id: chId, ...body };
+      ch = { id: chId, ...reqBody };
     } else {
       const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || [];
       ch = rows[0];
     }
     if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
     const { buildUrl, buildEndpointUrl } = await import("../lib/providers/openai.js");
-    const url = ch.absolute_url ? buildEndpointUrl(ch.base_url, "chat") : buildUrl(ch.base_url, ch.model || "test", false);
-    if (!url) return c.json({ ok: false, error: "Invalid URL", diagnosis: "渠道 URL 格式錯誤" }, 400);
 
-    // Helper: test streaming support
-    async function testStreamRequest(timeoutMs = 15000) {
+    // Determine channel type → test relevant endpoints
+    const modelLC = (ch.model || '').toLowerCase();
+    const isLikelyChat = !(
+      modelLC.includes('tts') || modelLC.includes('whisper') ||
+      (modelLC.includes('dall-e') && !modelLC.includes('gpt'))
+    );
+    const testsToRun = [];
+    if (isLikelyChat) testsToRun.push('chat');
+    if (ch.support_image_gen || modelLC.includes('dall-e') || modelLC.includes('image')) testsToRun.push('image_gen');
+    if (ch.support_audio_tts || modelLC.includes('tts') || modelLC.includes('speech') || modelLC.includes('audio')) testsToRun.push('audio_tts');
+    if (ch.support_audio_stt || modelLC.includes('whisper') || modelLC.includes('transcript')) testsToRun.push('audio_stt');
+    if (testsToRun.length === 0) testsToRun.push('chat');
+
+    // Shared fetch helper
+    async function testFetch(endpointType, fetchOpts, checkFn, timeoutMs = 15000) {
+      const url = endpointType === 'chat'
+        ? (ch.absolute_url ? buildEndpointUrl(ch.base_url, 'chat') : buildUrl(ch.base_url, ch.model || 'test', false))
+        : buildEndpointUrl(ch.base_url, endpointType);
+      if (!url) return { ok: false, ms: 0, detail: 'Invalid URL' };
       const start = Date.now();
       try {
-        const reqBody = { model: ch.model || "test", messages: [{ role: "user", content: "OK" }], stream: true };
-        const headers = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key };
-        const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(timeoutMs) });
+        const headers = { Authorization: 'Bearer ' + ch.api_key, ...fetchOpts.headers };
+        const res = await fetch(url, { ...fetchOpts, headers, signal: AbortSignal.timeout(timeoutMs) });
         const ms = Date.now() - start;
-        if (!res.ok) return { ok: false, ms, detail: "HTTP " + res.status };
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let hasContent = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const chunk = decoder.decode(value, { stream: true });
-          if (chunk.includes('"content":"') || chunk.includes('"content": "') || chunk.includes('"tool_calls"')) {
-            hasContent = true; break;
-          }
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          const detail = res.status === 400 ? '不支援（HTTP 400）'
+            : (res.status === 401 || res.status === 403) ? 'API Key 無效（' + res.status + '）'
+            : 'HTTP ' + res.status + (text ? ': ' + text.slice(0, 80) : '');
+          return { ok: false, ms, detail };
         }
-        await reader.cancel();
-        if (hasContent) return { ok: true, ms, detail: "stream supported" };
-        return { ok: false, ms, detail: "empty stream (no SSE content)" };
+        return await checkFn(res, ms);
       } catch (e) {
         const ms = Date.now() - start;
-        if (e.name === 'TimeoutError') return { ok: false, ms, detail: "超時" };
-        return { ok: false, ms, detail: e.message?.slice(0, 80) || "error" };
+        if (e.name === 'TimeoutError') return { ok: false, ms, detail: '超時' };
+        return { ok: false, ms, detail: e.message?.slice(0, 80) || 'error' };
       }
     }
 
-    // Helper: send a test request and return diagnosis
-    // feature: 'basic' | 'vision' | 'tools' — changes success criteria
-    async function testRequest(reqBody, timeoutMs = 10000, feature = 'basic') {
-      const start = Date.now();
-      try {
-        const headers = { "Content-Type": "application/json", Authorization: "Bearer " + ch.api_key };
-        if (!headers.Authorization) delete headers.Authorization;
-        const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(timeoutMs) });
-        const text = await res.text();
-        const ms = Date.now() - start;
-        if (res.status === 200) {
+    const capabilities = {};
+
+    // Chat: basic → vision / tools / stream
+    if (testsToRun.includes('chat')) {
+      const chatUrl = ch.absolute_url ? buildEndpointUrl(ch.base_url, 'chat') : buildUrl(ch.base_url, ch.model || 'test', false);
+      if (chatUrl) {
+        const basic = await testFetch('chat', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: ch.model || 'test', messages: [{ role: 'user', content: 'OK' }], stream: false }),
+        }, async (res, ms) => {
+          const text = await res.text();
           try {
-            const json = JSON.parse(text);
-            const content = json?.choices?.[0]?.message?.content || json?.choices?.[0]?.delta?.content;
-            const toolCalls = json?.choices?.[0]?.message?.tool_calls || json?.choices?.[0]?.delta?.tool_calls;
-            const finishReason = json?.choices?.[0]?.finish_reason;
-
-            // Tools test: must return actual tool_calls to be considered supported
-            if (feature === 'tools') {
-              const hasToolCalls = (toolCalls && toolCalls.length > 0) || finishReason === "tool_calls";
-              if (hasToolCalls) return { ok: true, ms, detail: "tool_calls received" };
-              return { ok: false, ms, detail: "tools not supported (text-only response)" };
-            }
-
-            // Vision: model must return content (image was sent inline)
-            if (feature === 'vision' && content && content.trim().length > 0) {
-              return { ok: true, ms, detail: content.slice(0, 100) };
-            }
-
-            if (content && content.trim().length > 0) return { ok: true, ms, detail: content.slice(0, 100) };
-            if (toolCalls && toolCalls.length > 0) return { ok: true, ms, detail: "tool_calls received" };
-            if (finishReason === "tool_calls") return { ok: true, ms, detail: "tool_calls (finish_reason)" };
-            return { ok: false, ms, detail: "empty response" };
+            const j = JSON.parse(text);
+            const c = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.delta?.content;
+            if (c && c.trim().length > 0) return { ok: true, ms, detail: c.slice(0, 100) };
+            if (j?.choices?.[0]?.message?.tool_calls) return { ok: true, ms, detail: 'tool_calls received' };
+            return { ok: false, ms, detail: 'empty response' };
           } catch (e) {
-            if (text && text.length > 0) return { ok: true, ms, detail: "non-JSON response" };
-            return { ok: false, ms, detail: "empty body" };
+            return text.length > 0 ? { ok: true, ms, detail: 'non-JSON response' } : { ok: false, ms, detail: 'empty body' };
           }
+        }, 15000);
+
+        if (basic.ok) {
+          capabilities.basic = basic;
+
+          const [visionRes, toolsRes] = await Promise.all([
+            testFetch('chat', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                model: ch.model || 'test',
+                messages: [{ role: 'user', content: [
+                  { type: 'text', text: 'desc' },
+                  { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==' } },
+                ] }],
+                stream: false,
+              }),
+            }, async (res, ms) => {
+              const j = await res.json();
+              const c = j?.choices?.[0]?.message?.content;
+              return c && c.trim().length > 0
+                ? { ok: true, ms, detail: c.slice(0, 100) }
+                : { ok: false, ms, detail: 'vision not supported' };
+            }, 10000).catch(() => ({ ok: false, ms: 0, detail: 'test error' })),
+
+            // Tools: try tool_choice:"required" first, fallback to "auto" on 400
+            (async () => {
+              const toolBody = {
+                model: ch.model || 'test',
+                messages: [{ role: 'user', content: 'test' }],
+                tools: [{ type: 'function', function: { name: 'test_func', description: 'test', parameters: { type: 'object', properties: {} } } }],
+                tool_choice: 'required',
+                stream: false,
+              };
+              const r1 = await testFetch('chat', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(toolBody),
+              }, async (res, ms) => {
+                const j = await res.json();
+                const tc = j?.choices?.[0]?.message?.tool_calls;
+                const fr = j?.choices?.[0]?.finish_reason;
+                if ((tc && tc.length > 0) || fr === 'tool_calls') return { ok: true, ms, detail: 'tool_calls received' };
+                return { ok: false, ms, detail: 'tools not supported (text-only)' };
+              }, 10000);
+              // 400 → retry with "auto"
+              if (!r1.ok && r1.detail.includes('400')) {
+                toolBody.tool_choice = 'auto';
+                delete toolBody.tool_choice;
+                return await testFetch('chat', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(toolBody),
+                }, async (res, ms) => {
+                  const j = await res.json();
+                  const tc = j?.choices?.[0]?.message?.tool_calls;
+                  const fr = j?.choices?.[0]?.finish_reason;
+                  if ((tc && tc.length > 0) || fr === 'tool_calls') return { ok: true, ms, detail: 'tool_calls received (auto)' };
+                  return { ok: true, ms, detail: 'chat ok (tools not forced)' };
+                }, 10000);
+              }
+              return r1;
+            })(),
+          ]);
+
+          capabilities.vision = visionRes;
+          capabilities.tools = toolsRes;
+
+          // Stream
+          const streamRes = await testFetch('chat', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: ch.model || 'test', messages: [{ role: 'user', content: 'OK' }], stream: true }),
+          }, async (res, ms) => {
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder();
+            let buf = '';
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += decoder.decode(value, { stream: true });
+              // Check for "[DONE]" marker OR valid SSE data line
+              if (buf.includes('[DONE]') || buf.includes('data: {')) break;
+            }
+            await reader.cancel();
+            const hasData = buf.includes('[DONE]') || buf.includes('data: {');
+            return hasData
+              ? { ok: true, ms, detail: 'stream supported' }
+              : { ok: false, ms, detail: 'empty stream' };
+          }, 15000).catch(() => ({ ok: false, ms: 0, detail: 'test error' }));
+          capabilities.stream = streamRes;
+        } else {
+          capabilities.basic = basic;
         }
-        if (res.status === 400) return { ok: false, ms, detail: "不支援（HTTP 400）" };
-        if (res.status === 401 || res.status === 403) return { ok: false, ms, detail: "API Key 無效（" + res.status + "）" };
-        return { ok: false, ms, detail: "HTTP " + res.status };
-      } catch (e) {
-        const ms = Date.now() - start;
-        if (e.name === 'TimeoutError') return { ok: false, ms, detail: "超時" };
-        return { ok: false, ms, detail: e.message?.slice(0, 80) || "error" };
       }
     }
 
-    // Helper: update channel health and force cache refresh
-    async function updateHealth(isHealthy, diagnosis) {
-      const now = Math.floor(Date.now() / 1000);
-      const newErrors = isHealthy ? 0 : (ch.consecutive_errors || 0) + 1;
-      await c.env.DB.prepare(
-        "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=? WHERE id=?"
-      ).bind(newErrors, isHealthy ? "" : diagnosis, now, 0, chId).run();
-      clearCache(); // Force gateway to reload channel state
+    if (testsToRun.includes('image_gen')) {
+      const imgRes = await testFetch('image_gen', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: ch.model || 'dall-e-3', prompt: 'a cat', n: 1, size: '1024x1024' }),
+      }, async (res, ms) => {
+        const j = await res.json();
+        const url = j?.data?.[0]?.url || j?.data?.[0]?.b64_json;
+        return url ? { ok: true, ms, detail: 'image generated' } : { ok: false, ms, detail: 'no image in response' };
+      }, 20000).catch(() => ({ ok: false, ms: 0, detail: 'test error' }));
+      capabilities.image_gen = imgRes;
     }
 
-    // 1. Basic connectivity test (explicit non-streaming to get clean JSON)
-    const baseReq = { model: ch.model || "test", messages: [{ role: "user", content: "OK" }], stream: false };
-    const baseResult = await testRequest(baseReq, 15000);
-    if (!baseResult.ok) {
-      let diagnosis = "連線失敗";
+    if (testsToRun.includes('audio_tts')) {
+      const ttsRes = await testFetch('audio_tts', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: ch.model || 'tts-1', input: 'hello', voice: 'alloy' }),
+      }, async (res, ms) => {
+        const ct = res.headers.get('content-type') || '';
+        const body = await res.arrayBuffer();
+        if (ct.startsWith('audio/') && body.byteLength > 100) return { ok: true, ms, detail: 'audio generated (' + ct + ')' };
+        return { ok: false, ms, detail: 'not audio content: ' + ct };
+      }, 20000).catch(() => ({ ok: false, ms: 0, detail: 'test error' }));
+      capabilities.audio_tts = ttsRes;
+    }
+
+    if (testsToRun.includes('audio_stt')) {
+      // STT needs multipart — minimally test endpoint reachability
+      const sttUrl = buildEndpointUrl(ch.base_url, 'audio_stt');
+      if (sttUrl) {
+        const start = Date.now();
+        try {
+          const headers = { Authorization: 'Bearer ' + ch.api_key };
+          const res = await fetch(sttUrl, { method: 'POST', headers, signal: AbortSignal.timeout(5000) });
+          const ms = Date.now() - start;
+          // 400 expected (no file), 404/501 = not supported
+          capabilities.audio_stt = res.status === 400 || res.status === 200
+            ? { ok: true, ms, detail: 'endpoint reachable (HTTP ' + res.status + ')' }
+            : { ok: false, ms, detail: 'HTTP ' + res.status };
+        } catch (e) {
+          capabilities.audio_stt = { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || 'error' };
+        }
+      } else {
+        capabilities.audio_stt = { ok: false, ms: 0, detail: 'Invalid URL' };
+      }
+    }
+
+    const chatOk = capabilities.basic?.ok;
+    const primaryTest = testsToRun.includes('chat') ? 'chat' : testsToRun[0];
+    const primaryOk = capabilities[primaryTest]?.ok || capabilities.basic?.ok;
+
+    if (!primaryOk) {
+      const result = capabilities.basic || capabilities.image_gen || capabilities.audio_tts || capabilities.audio_stt || { ms: 0, detail: 'unknown error' };
+      let diagnosis = '連線失敗';
       let httpStatus = 0;
-      if (baseResult.detail.includes("無效")) { diagnosis = "API Key 無效或已失效"; httpStatus = 401; }
-      else if (baseResult.detail.includes("400")) { diagnosis = "請求被拒絕，模型可能不支援"; httpStatus = 400; }
-      else if (baseResult.detail.includes("超時")) { diagnosis = "連線超時（15s），渠道可能無回應"; httpStatus = 0; }
-      else if (baseResult.detail.includes("empty")) { diagnosis = "回應內容為空，渠道未正確回應"; httpStatus = 200; }
-      if (!fromBody) await updateHealth(false, diagnosis);
-      return c.json({ ok: false, status: httpStatus, ms: baseResult.ms, diagnosis,
-        health_updated: !fromBody, message: fromBody ? "" : "渠道已標記為異常，將暫時不被選用" });
+      if (result.detail.includes('無效')) { diagnosis = 'API Key 無效或已失效'; httpStatus = 401; }
+      else if (result.detail.includes('400')) { diagnosis = '請求被拒絕，模型可能不支援'; httpStatus = 400; }
+      else if (result.detail.includes('超時')) { diagnosis = '連線超時，渠道可能無回應'; httpStatus = 0; }
+      else if (result.detail.includes('empty') || result.detail.includes('no image')) { diagnosis = '回應內容為空'; httpStatus = 200; }
+      if (!fromBody) {
+        const now = Math.floor(Date.now() / 1000);
+        await c.env.DB.prepare(
+          'UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=? WHERE id=?'
+        ).bind((ch.consecutive_errors || 0) + 1, diagnosis, now, 0, chId).run();
+        clearCache();
+      }
+      return c.json({ ok: false, status: httpStatus, ms: result.ms, diagnosis,
+        health_updated: !fromBody, message: fromBody ? '' : '渠道已標記為異常' });
     }
 
-    // Basic test passed - reset health
-    if (!fromBody) await updateHealth(true, "");
-    const baseMs = baseResult.ms;
-
-    // 2. Test capabilities (vision, tools) in parallel
-    const [visionRes, toolsRes] = await Promise.all([
-      testRequest({
-        model: ch.model || "test",
-        messages: [{ role: "user", content: [{ type: "text", text: "desc" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }],
-        stream: false,
-      }, 8000, 'vision').catch(() => ({ ok: false, ms: 0, detail: "test error" })),
-      testRequest({
-        model: ch.model || "test",
-        messages: [{ role: "user", content: "test" }],
-        tools: [{ type: "function", function: { name: "test_func", description: "test", parameters: { type: "object", properties: {} } } }],
-        tool_choice: "required",
-        stream: false,
-      }, 8000, 'tools').catch(() => ({ ok: false, ms: 0, detail: "test error" })),
-    ]);
-
-    // 3. Test streaming capability
-    const streamRes = await testStreamRequest(15000).catch(() => ({ ok: false, ms: 0, detail: "test error" }));
-
-    // Persist detected capabilities (only if not a test-from-body)
+    // Primary test passed — reset health
     if (!fromBody) {
       const now = Math.floor(Date.now() / 1000);
       await c.env.DB.prepare(
-        "UPDATE channels SET support_stream=?, is_vision=?, support_tools=? WHERE id=?"
-      ).bind(streamRes.ok ? 1 : 0, visionRes.ok ? 1 : 0, toolsRes.ok ? 1 : 0, chId).run();
-      clearCache();
+        'UPDATE channels SET consecutive_errors=0, last_error_msg="", last_error_at=0, response_time=? WHERE id=?'
+      ).bind(capabilities.basic?.ms || 0, chId).run();
     }
 
-    const capabilities = {
-      vision: { ok: visionRes.ok, detail: visionRes.ok ? "✅ 支援" : "❌ " + visionRes.detail },
-      tools: { ok: toolsRes.ok, detail: toolsRes.ok ? "✅ 支援" : "❌ " + toolsRes.detail },
-      stream: { ok: streamRes.ok, detail: streamRes.ok ? "✅ 支援" : "❌ " + streamRes.detail },
-    };
+    if (!fromBody) {
+      const now = Math.floor(Date.now() / 1000);
+      await c.env.DB.prepare(
+        `UPDATE channels SET
+          support_stream=?, is_vision=?, support_tools=?,
+          support_image_gen=?, support_audio_tts=?, support_audio_stt=?
+         WHERE id=?`
+      ).bind(
+        capabilities.stream?.ok ? 1 : 0,
+        capabilities.vision?.ok ? 1 : 0,
+        capabilities.tools?.ok ? 1 : 0,
+        capabilities.image_gen?.ok ? 1 : 0,
+        capabilities.audio_tts?.ok ? 1 : 0,
+        capabilities.audio_stt?.ok ? 1 : 0,
+        chId
+      ).run();
+      clearCache();
+    }
 
     return c.json({
       ok: true,
       status: 200,
-      ms: baseMs,
+      ms: capabilities.basic?.ms || 0,
       diagnosis: "連線正常",
       health_updated: !fromBody,
       message: fromBody ? "" : "渠道健康狀態已重置",

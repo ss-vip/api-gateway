@@ -73,12 +73,18 @@ export function registerMaintenance(app) {
     pruneSetupRateLimit();
     pruneLoginState();
 
+    // 恢復兩種渠道：
+    // 1. 有 cooldown_until 且已到期
+    // 2. 無 cooldown_until 但 last_error_at 超過 1h（backoff max = 3600s）
     const { results: recovered } = await DB.prepare(
       `SELECT id FROM channels 
        WHERE consecutive_errors > 0 
-       AND cooldown_until > 0 
-       AND cooldown_until < ?`
-    ).bind(nowUnix).all();
+       AND (
+         (cooldown_until > 0 AND cooldown_until < ?)
+         OR
+         (cooldown_until = 0 AND last_error_at > 0 AND ? - last_error_at > 3600)
+       )`
+    ).bind(nowUnix, nowUnix).all();
 
     if (recovered && recovered.length > 0) {
       await DB.batch(

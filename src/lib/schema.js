@@ -1,10 +1,5 @@
-// ─── 集中 Schema 管理 + 自動遷移 ─────────────────────────────────
-//
-// 設計原則:
-// 1. 所有 table/column 定義集中在這裡
-// 2. Worker startup 時自動偵測 DB 結構，補上遺漏欄位
-// 3. 避免 SELECT/UPDATE 因欄位不存在而噴錯
-// 4. 每個操作獨立 try-catch，單一失敗不中斷整體流程
+// 集中 Schema 管理 + 自動遷移
+// startup 時自動偵測 D1 結構，補上遺漏欄位
 
 const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,16 +56,19 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS config (
   updated_at      INTEGER NOT NULL DEFAULT (unixepoch())
 )`;
 
-// ─── Migration 定義 ─────────────────────────────────────────────
-//
-// 各 table 的「可能遺漏欄位」清單。
-// 當 DB 為舊 schema 時，逐欄執行 ALTER TABLE ADD COLUMN。
-// 若欄位已存在，PRAGMA 檢查會跳過。
-//
-// KEY  = table 名稱（也是 PRAGMA 的參數）
-// COLS = [ "col_name type constraints", ... ]
-//
-// 注意：ALIER TABLE 僅能 ADD COLUMN，無法修改或刪除現有欄位。
+const REQUEST_LOGS_DDL = `CREATE TABLE IF NOT EXISTS request_logs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id  INTEGER NOT NULL DEFAULT 0,
+  model       TEXT    NOT NULL DEFAULT '',
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  status      INTEGER NOT NULL DEFAULT 0,
+  error_msg   TEXT    NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+)`;
+
+// 注意：ALTER TABLE 僅能 ADD COLUMN，無法修改或刪除現有欄位。
 
 const TABLES = [
   {
@@ -96,47 +94,44 @@ const TABLES = [
     name: "filters",
     ddl: FILTERS_DDL,
     migrationCols: [],
-    // 未來若 filters 新增欄位，在此加入即可
   },
   {
     name: "config",
     ddl: CONFIG_DDL,
     migrationCols: [],
-    // 未來若 config 新增欄位，在此加入即可
+  },
+  {
+    name: "request_logs",
+    ddl: REQUEST_LOGS_DDL,
+    migrationCols: [],
   },
 ];
 
-/**
- * 啟動時執行 schema 檢查與自動遷移。
- * - 建立 table（若不存在）
- * - 逐一檢查各 table 並補上遺漏欄位
- * - 確保 config row 存在
- *
- * 回傳 { added: number } 本次新增的欄位總數。
- */
+const INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at)",
+];
+
+/** startup 自動建表 + 補欄位 + 建 index，回傳 { added, indexes } */
 export async function ensureSchema(env) {
   let totalAdded = 0;
+  let totalIndexes = 0;
 
   for (const table of TABLES) {
-    // 1. 建立 table（IF NOT EXISTS，已存在則跳過）
     try {
       await env.DB.prepare(table.ddl).run();
     } catch (e) {
       console.error(`[schema] failed to create table ${table.name}:`, e.message);
-      continue; // 無法建立 table → 跳過此 table 的所有 migration
+      continue;
     }
 
-    // 2. 查詢現有欄位 — 若失敗則設為 null 表示未知
     let existing = null;
     try {
       const { results } = await env.DB.prepare(`PRAGMA table_info('${table.name}')`).all();
       existing = new Set((results || []).map(r => r.name).filter(Boolean));
     } catch (e) {
-      console.error(`[schema] PRAGMA failed for ${table.name}, skip column migration:`, e.message);
-      // existing 維持 null，不會誤跑 ALTER
+      console.error(`[schema] PRAGMA failed for ${table.name}:`, e.message);
     }
 
-    // 3. 逐一補上遺漏欄位（僅當 PRAGMA 成功時）
     if (existing && table.migrationCols.length > 0) {
       for (const colDef of table.migrationCols) {
         const colName = colDef.split(" ")[0];
@@ -146,7 +141,6 @@ export async function ensureSchema(env) {
             totalAdded++;
             console.log(`[schema] migrated: ${table.name}.${colName}`);
           } catch (e) {
-            // 可能因併發 race condition 或其他原因失敗，記錄但不中斷
             console.error(`[schema] failed to add ${table.name}.${colName}:`, e.message);
           }
         }
@@ -154,16 +148,23 @@ export async function ensureSchema(env) {
     }
   }
 
-  // 4. 確保 config row 存在
+  for (const idxSql of INDEXES) {
+    try {
+      await env.DB.prepare(idxSql).run();
+      totalIndexes++;
+    } catch (e) {
+      console.error(`[schema] failed to create index:`, e.message);
+    }
+  }
+
   try {
     await env.DB.prepare(
       "INSERT OR IGNORE INTO config (id, client_token, admin_password, recovery_period) VALUES (1, '', '', 300)"
     ).run();
   } catch (e) {
     console.error("[schema] failed to ensure config row:", e.message);
-    // 不中斷 startup，config 可在首次使用時 lazy 初始化
   }
 
-  if (totalAdded > 0) console.log(`[schema] migration complete: ${totalAdded} column(s) added`);
-  return { added: totalAdded };
+  if (totalAdded > 0 || totalIndexes > 0) console.log(`[schema] migration complete: ${totalAdded} col(s), ${totalIndexes} index(es)`);
+  return { added: totalAdded, indexes: totalIndexes };
 }

@@ -6,3 +6,6 @@ dist
 .wrangler
 .env
 wrangler.toml
+test
+temp
+system
