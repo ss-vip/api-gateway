@@ -21,16 +21,33 @@ function clearResCache() {
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-const PEPPER = "vg7p@2mK9#qR";
-
 async function hashPassword(password) {
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(PEPPER + password));
-  return bytesToHex(new Uint8Array(hash));
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256
+  );
+  return bytesToHex(salt) + ":" + bytesToHex(new Uint8Array(bits));
 }
 async function verifyPassword(password, storedHash) {
-  if (!storedHash || storedHash.length !== 64) return false;
-  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(PEPPER + password));
-  return bytesToHex(new Uint8Array(hash)) === storedHash;
+  if (!storedHash) return false;
+  if (!storedHash.includes(":")) {
+    if (storedHash.length !== 64) return false;
+    const legacyHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("vg7p@2mK9#qR" + password));
+    return bytesToHex(new Uint8Array(legacyHash)) === storedHash;
+  }
+  const [saltHex, hashHex] = storedHash.split(":");
+  if (!saltHex || !hashHex) return false;
+  const salt = new Uint8Array(saltHex.match(/.{2}/g).map(b => parseInt(b, 16)));
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256
+  );
+  return bytesToHex(new Uint8Array(bits)) === hashHex;
 }
 async function getAdminPass(c) {
   try {
@@ -102,7 +119,18 @@ export default function (_clearCache) {
 
   api.get("/init", withCache(async (c) => {
     const [ch, fl] = await Promise.all([
-      c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
+      c.env.DB.prepare(
+        "SELECT id, name, base_url, api_key, model, weight,\
+                is_enabled, is_vision, last_429, consecutive_errors,\
+                last_error_msg, last_error_at,\
+                rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
+                rpd_count, rpd_reset_at, max_tokens, support_tools,\
+                support_stream, response_time, fallback_model, headers,\
+                provider_options, provider, absolute_url,\
+                cooldown_until,\
+                support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings\
+         FROM channels ORDER BY id"
+      ).all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
@@ -114,7 +142,18 @@ export default function (_clearCache) {
   }));
 
   const channelsListHandler = withCache(async (c) => {
-    const { results } = await c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all();
+    const { results } = await c.env.DB.prepare(
+      "SELECT id, name, base_url, api_key, model, weight,\
+              is_enabled, is_vision, last_429, consecutive_errors,\
+              last_error_msg, last_error_at,\
+              rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
+              rpd_count, rpd_reset_at, max_tokens, support_tools,\
+              support_stream, response_time, fallback_model, headers,\
+              provider_options, provider, absolute_url,\
+              cooldown_until,\
+              support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings\
+       FROM channels ORDER BY id"
+    ).all();
     return results || [];
   });
 
@@ -135,7 +174,7 @@ export default function (_clearCache) {
       const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
       batch.push(
         c.env.DB.prepare(
-          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
           ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
@@ -143,7 +182,7 @@ export default function (_clearCache) {
           ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
           ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
           h, po, ch.provider || "", ch.absolute_url ? 1 : 0,
-          ch.support_image_gen ? 1 : 0, ch.support_audio_tts ? 1 : 0, ch.support_audio_stt ? 1 : 0, ch.support_image_edit ? 1 : 0
+          ch.support_image_gen ? 1 : 0, ch.support_audio_tts ? 1 : 0, ch.support_audio_stt ? 1 : 0, ch.support_image_edit ? 1 : 0, ch.support_embeddings ? 1 : 0
         )
       );
     }
@@ -562,8 +601,8 @@ export default function (_clearCache) {
     const d = await c.req.json();
     const batch = [];
     if (d.channels) {
-      batch.push(c.env.DB.prepare("DELETE FROM channels"));
       const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
+      batch.push(c.env.DB.prepare("DELETE FROM channels"));
       const allKeys = {};
       for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
       for (const ch of d.channels) {
@@ -572,7 +611,7 @@ export default function (_clearCache) {
         const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
         batch.push(
           c.env.DB.prepare(
-            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
@@ -580,7 +619,7 @@ export default function (_clearCache) {
             ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
             ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
             h, po, ch.provider || "", ch.absolute_url ? 1 : 0,
-            ch.support_image_gen ? 1 : 0, ch.support_audio_tts ? 1 : 0, ch.support_audio_stt ? 1 : 0, ch.support_image_edit ? 1 : 0
+            ch.support_image_gen ? 1 : 0, ch.support_audio_tts ? 1 : 0, ch.support_audio_stt ? 1 : 0, ch.support_image_edit ? 1 : 0, ch.support_embeddings ? 1 : 0
           )
         );
       }

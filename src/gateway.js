@@ -9,6 +9,7 @@ import { bufferRate, getBufferedRate, bufferResponseTime } from "./routes/mainte
 
 const RACE_TIMEOUT_MS = 5000;
 const RACE_MAX_CONCURRENT = 3;
+let lastRRIdx = -1;
 
 const SSE_CHUNK_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -29,6 +30,7 @@ const ENDPOINT_COLUMNS = {
   image_edit: "support_image_edit",
   audio_stt: "support_audio_stt",
   audio_tts: "support_audio_tts",
+  embeddings: "support_embeddings",
 };
 
 function errResponse(c, message, type, status, code) {
@@ -91,6 +93,11 @@ function exponentialCooldown(consecutiveErrors) {
 }
 
 
+function getEffectiveRpm(ch) {
+  if (!ch.rpm_limit || ch.rpm_limit <= 0) return 0;
+  return Math.max(1, Math.round(ch.rpm_limit * (ch.weight || 50) / 50));
+}
+
 function selectChannel(channels, originalModel, isStream) {
   const now = Math.floor(Date.now() / 1000);
   const model = (originalModel || '').trim();
@@ -107,11 +114,38 @@ function selectChannel(channels, originalModel, isStream) {
     const rpmResetAt = buf ? buf.rpmResetAt : (ch.rpm_reset_at || 0);
     const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
     const rpdResetAt = buf ? buf.rpdResetAt : (ch.rpd_reset_at || 0);
-    if (ch.rpm_limit > 0 && now - rpmResetAt < RPM_WINDOW_SECONDS && rpmCount >= ch.rpm_limit) return false;
     if (ch.rpd_limit > 0 && now - rpdResetAt < RPD_WINDOW_SECONDS && rpdCount >= ch.rpd_limit) return false;
+    if (ch.rpm_limit > 0) {
+      const effectiveRpm = getEffectiveRpm(ch);
+      if (now - rpmResetAt < RPM_WINDOW_SECONDS && rpmCount >= effectiveRpm) return false;
+      const usage = rpmCount / effectiveRpm;
+      if (usage > 0.7 && Math.random() < (usage - 0.7) * 3) return false;
+    }
     return true;
   });
   if (healthy.length === 0) return null;
+
+  const allRpm1 = healthy.every(ch => ch.rpm_limit === 1);
+  if (allRpm1 && healthy.length > 1) {
+    healthy.sort((a, b) => (b.weight || 50) - (a.weight || 50));
+    lastRRIdx = (lastRRIdx + 1) % healthy.length;
+    return healthy[lastRRIdx];
+  }
+
+  const highLoad = healthy.every(ch => {
+    if (!ch.rpm_limit) return false;
+    const effectiveRpm = getEffectiveRpm(ch);
+    if (!effectiveRpm) return false;
+    const buf = getBufferedRate(ch.id);
+    const cnt = buf ? buf.rpmCount : (ch.rpm_count || 0);
+    return cnt / effectiveRpm > 0.5;
+  });
+  if (highLoad && healthy.length > 1) {
+    return healthy.reduce((best, ch) => {
+      const load = (getBufferedRate(ch.id)?.rpmCount || 0) / (ch.weight || 50);
+      return load < best.load ? { ch, load } : best;
+    }, { ch: null, load: Infinity }).ch;
+  }
 
   const rtValues = healthy.map(ch => ch.response_time || 0).filter(v => v > 0);
   const avgRt = rtValues.length > 0 ? rtValues.reduce((s, v) => s + v, 0) / rtValues.length : 0;
@@ -136,7 +170,8 @@ function selectChannel(channels, originalModel, isStream) {
     const buf = getBufferedRate(ch.id);
     const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
     const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
-    if (ch.rpm_limit > 0 && rpmCount / ch.rpm_limit > 0.8) w *= 0.5;
+    const effectiveRpm = getEffectiveRpm(ch);
+    if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpmCount / effectiveRpm > 0.8) w *= 0.5;
     if (ch.rpd_limit > 0 && rpdCount / ch.rpd_limit > 0.8) w *= 0.5;
 
     const rt = ch.response_time || 0;
@@ -220,7 +255,39 @@ async function persistHealth(db, ch) {
 }
 
 function deferPersist(c, ch) {
-  if (ch) c.executionCtx.waitUntil(persistHealth(c.env.DB, ch));
+  persistHealth(c.env, ch);
+}
+
+// ─── 模型列表端點 ───────────────────────────────────────────────────
+
+async function handleModels(c) {
+  try {
+    let data;
+    try { data = await loadCache(c.env); } catch (e) { data = cache.data; }
+    if (!data) data = await loadCache(c.env).catch(() => null);
+    if (!data) return errResponse(c, "Unable to load configuration", "server_error", 500);
+
+    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
+    if (data.config.client_token && token !== data.config.client_token) {
+      return errResponse(c, "Incorrect API key provided", "invalid_request_error", 401, "invalid_api_key");
+    }
+
+    const models = new Set();
+    data.channels.filter(ch => ch.is_enabled).forEach(ch => {
+      if (ch.model) ch.model.split(',').map(m => m.trim()).filter(Boolean).forEach(m => models.add(m));
+    });
+
+    const list = Array.from(models).map(m => ({
+      id: m,
+      object: "model",
+      created: 1686935002,
+      owned_by: "api-gateway"
+    }));
+
+    return c.json({ object: "list", data: list });
+  } catch (e) {
+    return errResponse(c, "Server error", "server_error", 500);
+  }
 }
 
 
@@ -604,12 +671,12 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
   const needToolSim = shouldSimulateTools(body);
 
   function startChannel(ch, delay) {
-    return new Promise(async (resolve) => {
+    return (async () => {
       if (delay > 0) await sleep(delay);
-      if (settled) { resolve(null); return; }
+      if (settled) return null;
 
       const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
-      if (!cfg) { removePoolItem(pool, ch); resolve(null); return; }
+      if (!cfg) { removePoolItem(pool, ch); return null; }
       allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
       if (settled) { resolve(null); return; }
 
@@ -630,22 +697,21 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
         clearTimeout(cfg.timeoutId);
         const rt = Date.now() - startTime;
 
-        if (settled) { resolve(null); return; }
+        if (settled) return null;
 
         if (!res.ok) {
           const errBody = await res.text().catch(() => "");
           markChannelError(ch, res.status, errBody, rt, data);
           deferPersist(c, ch);
-          resolve(null);
-          return;
+          return null;
         }
 
         // ── 工具模擬路徑：全量讀取 → 包裝 → 模擬串流 ──
         if (needSim) {
           const resText = await res.text();
-          if (resText.length > 4 * 1024 * 1024) { resolve(null); return; }
+          if (resText.length > 4 * 1024 * 1024) return null;
           let json;
-          try { json = JSON.parse(resText); } catch (e) { resolve(null); return; }
+          try { json = JSON.parse(resText); } catch (e) { return null; }
           json = wrapToolResponse(json, ch, body);
           updateRateCounters(ch, Math.floor(Date.now() / 1000));
           ch.consecutive_errors = 0;
@@ -656,23 +722,22 @@ async function raceStream(c, pool, body, originalModel, data, w, enc, requestDea
           if (hasVision && !ch.is_vision) ch.is_vision = 1;
           deferPersist(c, ch);
           settle({ ch, simulatedJson: json, responseTime: rt, isSimulated: true });
-          resolve({ isSimulated: true, json });
-          return;
+          return { isSimulated: true, json };
         }
 
         settle({ ch, res, cfg, responseTime: rt, isSimulated: false });
-        resolve({ isSimulated: false, res, cfg });
+        return { isSimulated: false, res, cfg };
       } catch (e) {
         clearTimeout(cfg.timeoutId);
-        if (settled) { resolve(null); return; }
+        if (settled) return null;
         markChannelError(ch, null, e.message, Date.now() - startTime, data);
         if (e.name === 'AbortError') {
           ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
         }
         deferPersist(c, ch);
-        resolve(null);
+        return null;
       }
-    });
+    })();
   }
 
   // Phase 1: 主渠道立即開始
@@ -923,12 +988,12 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
   }
 
   function tryChannel(ch, delay) {
-    return new Promise(async (resolve) => {
+    return (async () => {
       if (delay > 0) await sleep(delay);
-      if (settled) { resolve(null); return; }
+      if (settled) return null;
 
       const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, false);
-      if (!cfg) { resolve(null); return; }
+      if (!cfg) return null;
       allInfos.push({ controller: cfg.controller, timeoutId: cfg.timeoutId });
       if (settled) { resolve(null); return; }
 
@@ -941,18 +1006,17 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
         clearTimeout(cfg.timeoutId);
         const rt = Date.now() - startTime;
 
-        if (settled) { resolve(null); return; }
+        if (settled) return null;
 
         if (!res.ok) {
           const errBody = await res.text().catch(() => "");
           markChannelError(ch, res.status, errBody, rt, data);
           deferPersist(c, ch);
-          resolve(null);
-          return;
+          return null;
         }
 
         const resText = await res.text();
-        if (resText.length > 4 * 1024 * 1024) { resolve(null); return; }
+        if (resText.length > 4 * 1024 * 1024) return null;
 
         let json = JSON.parse(resText);
         json = wrapToolResponse(json, ch, body);
@@ -963,23 +1027,22 @@ async function raceNonStream(c, pool, body, originalModel, data, requestDeadline
           ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
           ch.last_error_at = Math.floor(Date.now() / 1000);
           deferPersist(c, ch);
-          resolve(null);
-          return;
+          return null;
         }
 
         settle({ ch, json, responseTime: rt });
-        resolve({ ch, json, responseTime: rt });
+        return { ch, json, responseTime: rt };
       } catch (e) {
         clearTimeout(cfg.timeoutId);
-        if (settled) { resolve(null); return; }
+        if (settled) return null;
         markChannelError(ch, null, e.message, Date.now() - startTime, data);
         if (e.name === 'AbortError') {
           ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
         }
         deferPersist(c, ch);
-        resolve(null);
+        return null;
       }
-    });
+    })();
   }
 
   // Phase 1: 主渠道立即
@@ -1176,33 +1239,26 @@ async function proxyEndpoint(c, endpointType) {
     }
 
     const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
+    
+    // Buffer body for retries
+    const reqBodyBuffer = await c.req.arrayBuffer();
+    
     let lastError = "";
-
-    // 緩衝 body，避免 retry 時 stream 已被消費
-    const bodyBuffer = await c.req.arrayBuffer().catch(() => null);
-
-    // Client disconnect → stop retrying
-    const clientSignal = c.req.raw.signal;
-    let clientGone = clientSignal.aborted;
-
-    while (pool.length > 0 && Date.now() < requestDeadline && !clientGone) {
+    
+    for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
       const ch = selectChannel(pool, "", false);
-      if (!ch) {
-        lastError = "all channels in cooldown or rate-limited";
-        break;
-      }
-      removePoolItem(pool, ch);
+      if (!ch) break;
 
       const url = buildEndpointUrl(ch.base_url, endpointType);
-      if (!url) continue;
+      if (!url) {
+        removePoolItem(pool, ch);
+        continue;
+      }
 
       const remainingMs = Math.max(2000, requestDeadline - Date.now());
       const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), chTimeout);
-      if (!clientSignal.aborted) {
-        clientSignal.addEventListener('abort', () => { controller.abort(); clientGone = true; }, { once: true });
-      }
 
       let channelHeaders = {};
       if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
@@ -1211,7 +1267,7 @@ async function proxyEndpoint(c, endpointType) {
       const ct = c.req.header("Content-Type");
       if (ct) {
         reqHeaders["Content-Type"] = ct;
-      } else if (endpointType === "image_gen" || endpointType === "audio_tts") {
+      } else if (endpointType === "image_gen" || endpointType === "audio_tts" || endpointType === "embeddings") {
         reqHeaders["Content-Type"] = "application/json";
       }
 
@@ -1220,7 +1276,7 @@ async function proxyEndpoint(c, endpointType) {
         const res = await fetch(url, {
           method: "POST",
           headers: reqHeaders,
-          body: bodyBuffer,
+          body: reqBodyBuffer,
           signal: controller.signal,
         });
         clearTimeout(timeoutId);
@@ -1230,7 +1286,8 @@ async function proxyEndpoint(c, endpointType) {
           const errBody = await res.text().catch(() => "");
           markChannelError(ch, res.status, errBody, rt, data);
           deferPersist(c, ch);
-          lastError = "HTTP " + res.status;
+          removePoolItem(pool, ch);
+          lastError = errBody.slice(0, 200);
           continue;
         }
 
@@ -1255,10 +1312,16 @@ async function proxyEndpoint(c, endpointType) {
           ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
         }
         deferPersist(c, ch);
-        lastError = e.message.slice(0, 200);
+        removePoolItem(pool, ch);
+        lastError = e.message;
+        continue;
       }
     }
-    return errResponse(c, "All upstream channels failed" + (lastError ? ": " + lastError : ""), "server_error", 502);
+
+    if (lastError) {
+      return errResponse(c, "All available channels failed: " + lastError, "server_error", 502);
+    }
+    return errResponse(c, "All channels are rate-limited or temporarily unavailable", "rate_limit_error", 429);
   } catch (e) {
     console.error("[proxy] unhandled:", e.message);
     return errResponse(c, "The server had an error processing your request", "server_error", 500);
@@ -1268,8 +1331,10 @@ async function proxyEndpoint(c, endpointType) {
 export default function registerGateway(app) {
   app.post("/chat/completions", async (c) => handleChatRequest(c));
   app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
+  for (const p of ["/models", "/v1/models"]) app.get(p, async (c) => handleModels(c));
   for (const p of ["/images/generations", "/v1/images/generations"]) app.post(p, async (c) => proxyEndpoint(c, "image_gen"));
   for (const p of ["/audio/speech", "/v1/audio/speech"]) app.post(p, async (c) => proxyEndpoint(c, "audio_tts"));
   for (const p of ["/audio/transcriptions", "/v1/audio/transcriptions"]) app.post(p, async (c) => proxyEndpoint(c, "audio_stt"));
   for (const p of ["/images/edits", "/v1/images/edits"]) app.post(p, async (c) => proxyEndpoint(c, "image_edit"));
+  for (const p of ["/embeddings", "/v1/embeddings"]) app.post(p, async (c) => proxyEndpoint(c, "embeddings"));
 }

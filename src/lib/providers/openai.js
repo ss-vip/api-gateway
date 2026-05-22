@@ -4,6 +4,7 @@ const ENDPOINT_PATHS = {
   image_edit: "/v1/images/edits",
   audio_stt: "/v1/audio/transcriptions",
   audio_tts: "/v1/audio/speech",
+  embeddings: "/v1/embeddings",
 };
 
 export function buildUrl(baseUrl, _model, _isStream) {
@@ -21,7 +22,7 @@ export function buildEndpointUrl(baseUrl, endpointType) {
   const suffix = ENDPOINT_PATHS[endpointType];
   if (!suffix) return null;
   if (base.endsWith(suffix)) return base;
-  const stripped = base.replace(/\/(?:v[\w]+\/)?(?:chat\/completions|images\/generations|images\/edits|audio\/speech|audio\/transcriptions)$/, "");
+  const stripped = base.replace(/\/(?:v[\w]+\/)?(?:chat\/completions|images\/generations|images\/edits|audio\/speech|audio\/transcriptions|embeddings)$/, "");
   if (stripped !== base) return stripped + suffix;
   const cleanSuffix = suffix.replace(/^\/v[\w]+/, "");
   if (/\/v[\w]+\//.test(base + "/")) return `${base}${cleanSuffix}`;

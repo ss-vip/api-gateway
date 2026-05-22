@@ -297,6 +297,10 @@
           <label class="form-check-label small fw-bold mb-1" for="ch-audio-stt">&#x1F3A4; STT</label>
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-audio-stt"></div>
         </div>
+        <div class="col-4 d-flex flex-column align-items-center mb-1">
+          <label class="form-check-label small fw-bold mb-1" for="ch-embeddings">&#x1F4DA; Embed</label>
+          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-embeddings"></div>
+        </div>
         <div class="col-4 d-flex flex-column align-items-center">
           <label class="form-check-label small fw-bold mb-1" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
           <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
@@ -699,6 +703,7 @@
         const audioTtsIcon = c.support_audio_tts ? " \u{1F399}\u{FE0F}" : "";
         const audioSttIcon = c.support_audio_stt ? " \u{1F3A4}" : "";
         const imageEditIcon = c.support_image_edit ? " \u{270F}\u{FE0F}" : "";
+        const embeddingsIcon = c.support_embeddings ? " \u{1F4DA}" : "";
         const modelName = esc(c.model || "");
         const displayName = esc(c.model || "-");
 
@@ -710,7 +715,7 @@
         const providerLabel = c.provider || (c.base_url ? (c.base_url.includes('googleapis') || c.base_url.includes('generativelanguage') ? 'Google' : c.base_url.includes('anthropic') ? 'Claude' : 'OpenAI') : '');
         const providerTitle = providerLabel ? ' title="Provider: ' + esc(providerLabel) + '"' : '';
         row += '<td class="fw-bold align-middle" style="cursor:help"' + providerTitle + '>' + esc(c.name) + '</td>';
-        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + imageGenIcon + audioTtsIcon + audioSttIcon + imageEditIcon + '</td>';
+        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + imageGenIcon + audioTtsIcon + audioSttIcon + imageEditIcon + embeddingsIcon + '</td>';
         row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
         row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
         row += '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>';
@@ -881,6 +886,7 @@
       document.getElementById('ch-image-edit').checked = false;
       document.getElementById('ch-audio-tts').checked = false;
       document.getElementById('ch-audio-stt').checked = false;
+      document.getElementById('ch-embeddings').checked = false;
       document.getElementById('ch-absolute-url').checked = false;
       // Reset Log tab for new channel
       document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
@@ -917,6 +923,7 @@
       document.getElementById('ch-image-edit').checked = c.support_image_edit == 1;
       document.getElementById('ch-audio-tts').checked = c.support_audio_tts == 1;
       document.getElementById('ch-audio-stt').checked = c.support_audio_stt == 1;
+      document.getElementById('ch-embeddings').checked = c.support_embeddings == 1;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
       // Populate Log tab — show ALL health states with <li> format
@@ -1061,6 +1068,7 @@
         support_audio_tts: document.getElementById('ch-audio-tts').checked ? 1 : 0,
         support_audio_stt: document.getElementById('ch-audio-stt').checked ? 1 : 0,
         support_image_edit: document.getElementById('ch-image-edit').checked ? 1 : 0,
+        support_embeddings: document.getElementById('ch-embeddings').checked ? 1 : 0,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
         last_429: prev ? prev.last_429||0 : 0,
         consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
@@ -1243,6 +1251,7 @@
           oc.support_audio_tts = nc.support_audio_tts;
           oc.support_audio_stt = nc.support_audio_stt;
           oc.support_image_edit = nc.support_image_edit;
+          oc.support_embeddings = nc.support_embeddings;
 
           const healthEl = document.getElementById('ch-health-' + oc.id);
           if (healthEl) {
@@ -1296,6 +1305,7 @@
         support_audio_tts: c.support_audio_tts ? 1 : 0,
         support_audio_stt: c.support_audio_stt ? 1 : 0,
         support_image_edit: c.support_image_edit ? 1 : 0,
+        support_embeddings: c.support_embeddings ? 1 : 0,
         provider: c.provider || "",
         headers: c.headers || null,
         provider_options: c.provider_options || null,
