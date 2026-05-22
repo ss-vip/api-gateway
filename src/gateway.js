@@ -604,6 +604,12 @@ async function writeSimulatedStream(w, enc, json) {
     const created = json.created || Math.floor(Date.now() / 1000);
     const model = json.model || "";
 
+    // Write initChunk first
+    await sseEvent(w, enc, {
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    });
+
     if (msg?.tool_calls && msg.tool_calls.length > 0) {
       await sseEvent(w, enc, {
         id, object: "chat.completion.chunk", created, model,
@@ -638,7 +644,7 @@ async function writeSimulatedStream(w, enc, json) {
 }
 
 
-async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
+async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel) {
   const { ch, res, responseTime } = winner;
 
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
@@ -647,6 +653,8 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
   const decoder = new TextDecoder();
   let sseBuf = "";
   let streamHadContent = false;
+  let bytesWritten = false;
+  let hasWrittenInit = false;
   let streamError = null;
   const contentFilter = new RollingFilter(data.filters || []);
   const clientSignal = c.req.raw.signal;
@@ -672,8 +680,9 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
               created: Math.floor(Date.now() / 1000),
               choices: [{ index: 0, delta: { content: tail }, finish_reason: "stop" }],
             });
+            bytesWritten = true;
           }
-          try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
+          try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
           streamDone = true; break;
         }
 
@@ -681,39 +690,86 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
           const colonIdx = line.indexOf(":");
           const jsonStr = line.slice(colonIdx + 1).trim();
           const chunk = JSON.parse(jsonStr);
-          const delta = chunk?.choices?.[0]?.delta;
+          const choice = chunk?.choices?.[0];
+          const delta = choice?.delta;
           if (delta?.content || delta?.tool_calls) streamHadContent = true;
 
-          if (delta?.content) {
+          if (!hasWrittenInit) {
+            await sseEvent(w, enc, {
+              id: chunk.id || ("chatcmpl-" + Date.now()),
+              object: "chat.completion.chunk",
+              created: chunk.created || Math.floor(Date.now() / 1000),
+              model: originalModel || chunk.model || "unknown",
+              choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+            });
+            bytesWritten = true;
+            hasWrittenInit = true;
+          }
+
+          if (delta && typeof delta.content === "string") {
             const filtered = contentFilter.transform(delta.content);
             if (filtered) {
               delta.content = filtered;
+              if (choice?.finish_reason) {
+                const tail = contentFilter.flush();
+                if (tail) {
+                  delta.content = filtered + tail;
+                }
+              }
               await sseEvent(w, enc, chunk);
+              bytesWritten = true;
+            } else if (choice?.finish_reason) {
+              const tail = contentFilter.flush();
+              if (tail) {
+                delta.content = tail;
+                await sseEvent(w, enc, chunk);
+                bytesWritten = true;
+              } else {
+                await sseEvent(w, enc, chunk);
+                bytesWritten = true;
+              }
             }
             if (contentFilter.truncated) {
-              try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
+              try { await w.write(enc.encode("data: [DONE]\n\n")); bytesWritten = true; } catch (e) {}
               streamDone = true; break;
             }
           } else {
-            try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
+            if (choice?.finish_reason) {
+              const tail = contentFilter.flush();
+              if (tail) {
+                choice.delta = choice.delta || {};
+                choice.delta.content = tail;
+                await sseEvent(w, enc, chunk);
+                bytesWritten = true;
+              } else {
+                try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
+              }
+            } else {
+              try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
+            }
           }
         } catch (e) {
-          try { await w.write(enc.encode(line + "\n\n")); } catch (e) {}
+          try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
         }
+
       }
     }
+
 
     if (!streamHadContent) {
       ch.last_error_msg = "Empty response (no content)";
       ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
       ch.last_error_at = Math.floor(Date.now() / 1000);
       deferPersist(c, ch);
+      if (!bytesWritten) {
+        return false;
+      }
       await writeStreamError(w, enc, "The upstream service returned an empty response — no content was generated");
-      return;
+      return true;
     }
 
     if (!lastLine.includes("[DONE]")) {
-      try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
+      try { await w.write(enc.encode("data: [DONE]\n\n")); bytesWritten = true; } catch (e) {}
     }
   } catch (e) {
     streamError = e;
@@ -722,6 +778,9 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
     ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
     ch.last_error_at = Math.floor(Date.now() / 1000);
     deferPersist(c, ch);
+    if (!bytesWritten) {
+      return false;
+    }
     try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
   }
 
@@ -734,6 +793,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision) {
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
     deferPersist(c, ch);
   }
+  return true;
 }
 
 
@@ -778,6 +838,18 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         let json;
         try { json = JSON.parse(resText); } catch (e) { continue; }
         json = wrapToolResponse(json, ch, body);
+
+        // 空回應視為 channel 錯誤，嘗試下一個渠道
+        const simChoice = json?.choices?.[0];
+        if (simChoice && !simChoice.message?.content && !simChoice.message?.tool_calls && simChoice.finish_reason === "stop") {
+          ch.last_error_msg = "Empty response (no content)";
+          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+          ch.last_error_at = Math.floor(Date.now() / 1000);
+          deferPersist(c, ch);
+          lastError = "Empty response (no content)";
+          continue;
+        }
+
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
         ch.consecutive_errors = Math.max(0, (ch.consecutive_errors || 0) - 1);
         ch.response_time = rt;
@@ -789,8 +861,12 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
       }
 
       const winner = { ch, res, cfg, responseTime: rt };
-      await streamChannelResponse(c, winner, data, w, enc, hasVision);
-      return true;
+      const ok = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel);
+      if (ok) {
+        return true;
+      }
+      lastError = ch.last_error_msg || "Stream failed early (no content)";
+      continue;
     } catch (e) {
       clearTimeout(cfg.timeoutId);
       const rt = Date.now() - fetchStart;
@@ -830,7 +906,7 @@ function finalizeNonStream(c, winner, data, hasVision) {
   c.executionCtx.waitUntil(logRequest(c.env.DB, ch.id, json.model || ch.model, tokensIn, tokensOut, responseTime, 200, ""));
 
   const nowSec = Math.floor(Date.now() / 1000);
-  c.header("X-RateLimit-Limit", ch.rpm_limit > 0 ? String(ch.rpm_limit) : "∞");
+  c.header("X-RateLimit-Limit", ch.rpm_limit > 0 ? String(ch.rpm_limit) : "inf");
   if (ch.rpm_limit > 0) {
     const remaining = Math.max(0, ch.rpm_limit - (ch.rpm_count || 0));
     c.header("X-RateLimit-Remaining", String(remaining));
@@ -895,6 +971,37 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
   return errResponse(c, "All upstream channels failed or the request timed out after " + (GLOBAL_TIMEOUT_MS / 1000) + "s", "server_error", 504);
 }
 
+// 修復 LobeChat 等客戶端發送畸形 JSON（缺少 "messages" key，裸陣列直接出現在物件中）
+function tryRepairChatJson(text) {
+  if (!text || text.length < 3) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let lastNonWS = '';
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; if (!inString) lastNonWS = '"'; continue; }
+    if (inString) continue;
+
+    if (ch === '{') { depth++; lastNonWS = '{'; continue; }
+    if (ch === '}') { depth--; lastNonWS = '}'; continue; }
+    if (ch === '[') {
+      // 在物件的第一層遇到裸 [ 且前面不是 ':'，代表缺少 key
+      if (depth === 1 && lastNonWS !== ':') {
+        const repaired = text.slice(0, i) + '"messages": ' + text.slice(i);
+        try { return JSON.parse(repaired); } catch (_) { return null; }
+      }
+      depth++; lastNonWS = '['; continue;
+    }
+    if (ch === ']') { depth--; lastNonWS = ']'; continue; }
+    if (ch.trim()) lastNonWS = ch;
+  }
+  return null;
+}
+
 async function handleChatRequest(c) {
   try {
     const data = await loadCache(c.env).catch(() => null);
@@ -906,8 +1013,20 @@ async function handleChatRequest(c) {
     }
 
     let body;
-    try { body = await c.req.json(); } catch (e) {
-      return errResponse(c, "We could not parse the JSON body of your request", "invalid_request_error", 400);
+    let bodyText = "";
+    try {
+      bodyText = await c.req.text();
+      body = JSON.parse(bodyText);
+    } catch (e) {
+      // 嘗試自動修復缺少 "messages" key 的畸形 JSON（LobeChat 已知問題）
+      const repaired = tryRepairChatJson(bodyText);
+      if (repaired) {
+        console.log("[gateway] Auto-repaired malformed JSON (missing 'messages' key), length:", bodyText?.length);
+        body = repaired;
+      } else {
+        console.error("[gateway] JSON parse error:", e.message, "Length:", bodyText?.length, "Raw body snippet:", bodyText?.slice(0, 500));
+        return errResponse(c, "We could not parse the JSON body of your request: " + e.message, "invalid_request_error", 400);
+      }
     }
 
     if (!body || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -928,19 +1047,10 @@ async function handleChatRequest(c) {
       const w = writable.getWriter();
       const enc = new TextEncoder();
 
-      const initChunk = {
-        id: "chatcmpl-" + Date.now(),
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: originalModel || "unknown",
-        choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-      };
-      w.write(enc.encode("data: " + JSON.stringify(initChunk) + "\n\n")).catch(() => {});
-
       c.executionCtx.waitUntil((async () => {
         const streamOk = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
         await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "");
-        await flushResponseTime(c.env);
+        await flushResponseTime(c.env.DB);
         await flushHealthWrites(c.env);
         try { await w.close(); } catch (e) {}
       })());
@@ -953,7 +1063,7 @@ async function handleChatRequest(c) {
       if (result.status !== 200) {
         await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, result?.status || 0, "");
       }
-      await flushResponseTime(c.env);
+      await flushResponseTime(c.env.DB);
       await flushHealthWrites(c.env);
     })());
     return result;
@@ -1050,7 +1160,7 @@ async function proxyEndpoint(c, endpointType) {
           if (v) responseHeaders[h] = v;
         }
         const nowSec = Math.floor(Date.now() / 1000);
-        responseHeaders["X-RateLimit-Limit"] = ch.rpm_limit > 0 ? String(ch.rpm_limit) : "∞";
+        responseHeaders["X-RateLimit-Limit"] = ch.rpm_limit > 0 ? String(ch.rpm_limit) : "inf";
         if (ch.rpm_limit > 0) {
           const remaining = Math.max(0, ch.rpm_limit - (ch.rpm_count || 0));
           responseHeaders["X-RateLimit-Remaining"] = String(remaining);
@@ -1058,7 +1168,7 @@ async function proxyEndpoint(c, endpointType) {
         }
         c.executionCtx.waitUntil((async () => {
           await logRequest(c.env.DB, ch.id, ch.model || "", 0, 0, rt, 200, "");
-          await flushResponseTime(c.env);
+          await flushResponseTime(c.env.DB);
           await flushHealthWrites(c.env);
         })());
         return new Response(res.body, { status: 200, headers: responseHeaders });
@@ -1074,7 +1184,7 @@ async function proxyEndpoint(c, endpointType) {
       }
     }
 
-    c.executionCtx.waitUntil((async () => { await flushResponseTime(c.env); await flushHealthWrites(c.env); })());
+    c.executionCtx.waitUntil((async () => { await flushResponseTime(c.env.DB); await flushHealthWrites(c.env); })());
 
     if (lastError) {
       return errResponse(c, "All available channels failed: " + lastError, "server_error", 502);
