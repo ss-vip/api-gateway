@@ -14,21 +14,22 @@ async function retry(fn, retries = 2) {
 }
 
 const RES_CACHE_TTL = 30_000;
-let resCache = { data: null, ts: 0, gen: 0 };
+let resCacheGen = 0;
 
 function withCache(fn) {
+  let localCache = { data: null, ts: 0, gen: -1 };
   return async (c) => {
-    if (resCache.data && Date.now() - resCache.ts < RES_CACHE_TTL) return c.json(resCache.data);
+    if (localCache.gen === resCacheGen && localCache.data && Date.now() - localCache.ts < RES_CACHE_TTL) {
+      return c.json(localCache.data);
+    }
     const data = await fn(c);
-    resCache = { data, ts: Date.now(), gen: resCache.gen };
+    localCache = { data, ts: Date.now(), gen: resCacheGen };
     return c.json(data);
   };
 }
 
 function clearResCache() {
-  resCache.gen++;
-  resCache.data = null;
-  resCache.ts = 0;
+  resCacheGen++;
 }
 
 function bytesToHex(bytes) {
@@ -367,7 +368,8 @@ export default function (_clearCache) {
   });
 
   api.get("/init", withCache(async (c) => {
-    const [ch, fl] = await Promise.all([
+    const today = new Date().toISOString().slice(0, 10);
+    const [ch, fl, stats] = await Promise.all([
       c.env.DB.prepare(
         "SELECT id, name, base_url, api_key, model, weight,\
                 is_enabled, is_vision, last_429, consecutive_errors,\
@@ -380,12 +382,16 @@ export default function (_clearCache) {
          FROM channels ORDER BY id"
       ).all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
+      c.env.DB.prepare(
+        "SELECT COALESCE(SUM(requests),0) AS requests, COALESCE(SUM(tokens_in + tokens_out),0) AS tokens FROM usage_stats WHERE day=?"
+      ).bind(today).first().catch(() => ({ requests: 0, tokens: 0 })),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
     return {
       channels: ch.results || [],
       filters: fl.results || [],
       config: { token: cf?.client_token || "", recovery_period: parseInt(cf?.recovery_period) || 300 },
+      stats: { date: today, requests: Number(stats?.requests || 0), tokens: Number(stats?.tokens || 0) },
     };
   }));
 

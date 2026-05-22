@@ -21,6 +21,8 @@ const ERROR_CODE_MAP = {
   upstream_error: "upstream_error",
 };
 
+const TOOL_SIMULATION_SCHEMA_CHAR_LIMIT = 12_000;
+
 function errResponse(c, message, type, status, code) {
   return c.json({ error: { message, type, param: null, code: code || ERROR_CODE_MAP[type] || type } }, status);
 }
@@ -97,6 +99,14 @@ function getEffectiveRpm(ch) {
   return Math.max(1, Math.round(ch.rpm_limit * (ch.weight || 50) / 50));
 }
 
+function normalizeRateWindow(count, resetAt, windowSeconds, now) {
+  const reset = Number(resetAt || 0);
+  const value = Number(count || 0);
+  if (!reset || reset > now + windowSeconds) return { count: 0, resetAt: now, active: false };
+  if (now - reset >= windowSeconds) return { count: 0, resetAt: now, active: false };
+  return { count: value, resetAt: reset, active: true };
+}
+
 function persistStateKey(ch) {
   return [
     ch.consecutive_errors || 0,
@@ -144,7 +154,7 @@ function selectChannel(channels, originalModel, isStream, body) {
   const now = Math.floor(Date.now() / 1000);
   const model = (originalModel || '').trim();
 
-  const inputTokens = body?.messages ? Math.ceil(JSON.stringify(body.messages).length / 4) : 0;
+  const inputTokens = estimateInputTokens(body);
 
   const healthy = channels.filter(ch => {
     if (!ch.is_enabled) return false;
@@ -155,16 +165,13 @@ function selectChannel(channels, originalModel, isStream, body) {
     if (ch.last_429 > 0 && ch.last_429 > now) return false;
     if (ch.cooldown_until > 0 && ch.cooldown_until > now) return false;
     const buf = getBufferedRate(ch.id);
-    const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
-    const rpmResetAt = buf ? buf.rpmResetAt : (ch.rpm_reset_at || 0);
-    const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
-    const rpdResetAt = buf ? buf.rpdResetAt : (ch.rpd_reset_at || 0);
-    if (ch.rpd_limit > 0 && now - rpdResetAt < RPD_WINDOW_SECONDS && rpdCount >= ch.rpd_limit) return false;
+    const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
+    const rpd = normalizeRateWindow(buf ? buf.rpdCount : ch.rpd_count, buf ? buf.rpdResetAt : ch.rpd_reset_at, RPD_WINDOW_SECONDS, now);
+    if (ch.rpd_limit > 0 && rpd.active && rpd.count >= ch.rpd_limit) return false;
     if (ch.rpm_limit > 0) {
       const effectiveRpm = getEffectiveRpm(ch);
-      const windowActive = now - rpmResetAt < RPM_WINDOW_SECONDS;
-      if (windowActive && rpmCount >= effectiveRpm) return false;
-      const usage = windowActive ? rpmCount / effectiveRpm : 0;
+      if (rpm.active && rpm.count >= effectiveRpm) return false;
+      const usage = rpm.active ? rpm.count / effectiveRpm : 0;
       if (usage > 0.7 && Math.random() < (usage - 0.7) * 3) return false;
     }
     return true;
@@ -183,10 +190,9 @@ function selectChannel(channels, originalModel, isStream, body) {
     const effectiveRpm = getEffectiveRpm(ch);
     if (!effectiveRpm) return false;
     const buf = getBufferedRate(ch.id);
-    const rpmResetAt = buf ? buf.rpmResetAt : (ch.rpm_reset_at || 0);
-    if (now - rpmResetAt >= RPM_WINDOW_SECONDS) return false;
-    const cnt = buf ? buf.rpmCount : (ch.rpm_count || 0);
-    return cnt / effectiveRpm > 0.5;
+    const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
+    if (!rpm.active) return false;
+    return rpm.count / effectiveRpm > 0.5;
   });
   if (highLoad && healthy.length > 1) {
     return healthy.reduce((best, ch) => {
@@ -216,11 +222,11 @@ function selectChannel(channels, originalModel, isStream, body) {
     else if (err === 1) w *= 0.8;
 
     const buf = getBufferedRate(ch.id);
-    const rpmCount = buf ? buf.rpmCount : (ch.rpm_count || 0);
-    const rpdCount = buf ? buf.rpdCount : (ch.rpd_count || 0);
+    const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
+    const rpd = normalizeRateWindow(buf ? buf.rpdCount : ch.rpd_count, buf ? buf.rpdResetAt : ch.rpd_reset_at, RPD_WINDOW_SECONDS, now);
     const effectiveRpm = getEffectiveRpm(ch);
-    if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpmCount / effectiveRpm > 0.8) w *= 0.5;
-    if (ch.rpd_limit > 0 && rpdCount / ch.rpd_limit > 0.8) w *= 0.5;
+    if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpm.active && rpm.count / effectiveRpm > 0.8) w *= 0.5;
+    if (ch.rpd_limit > 0 && rpd.active && rpd.count / ch.rpd_limit > 0.8) w *= 0.5;
 
     const rt = ch.response_time || 0;
     if (rt > 0 && avgRt > 0) {
@@ -322,6 +328,28 @@ function hasVisionContent(body) {
   return false;
 }
 
+function estimateInputTokens(body) {
+  if (!body?.messages) return 0;
+  let chars = 0;
+  for (const msg of body.messages) {
+    if (typeof msg?.content === "string") {
+      chars += msg.content.length;
+      continue;
+    }
+    if (Array.isArray(msg?.content)) {
+      for (const part of msg.content) {
+        if (typeof part?.text === "string") chars += part.text.length;
+        else if (part?.type === "image_url") chars += 1024;
+        else chars += JSON.stringify(part || {}).length;
+      }
+      continue;
+    }
+    chars += JSON.stringify(msg || {}).length;
+  }
+  if (Array.isArray(body.tools)) chars += Math.min(JSON.stringify(body.tools).length, 20_000);
+  return Math.ceil(chars / 4);
+}
+
 
 
 
@@ -373,6 +401,15 @@ function hasTools(body) {
 
 function shouldSimulateTools(body) {
   return hasTools(body) && body.tool_choice !== "none";
+}
+
+function toolSchemaText(body) {
+  return (body.tools || []).map(formatToolSchema).join('\n');
+}
+
+function canSimulateTools(body) {
+  if (!shouldSimulateTools(body)) return false;
+  return toolSchemaText(body).length <= TOOL_SIMULATION_SCHEMA_CHAR_LIMIT;
 }
 
 let idCounter = 0;
@@ -450,7 +487,13 @@ function prepareRequestBody(body, ch, originalModel) {
 
   if (shouldSimulateTools(body) && !ch.support_tools) {
     delete reqBody.tools;
-    const toolDesc = (body.tools || []).map(formatToolSchema).join('\n');
+    delete reqBody.tool_choice;
+
+    if (!canSimulateTools(body)) {
+      return reqBody;
+    }
+
+    const toolDesc = toolSchemaText(body);
     const toolInstruction =
       `You have access to these tools:\n${toolDesc}\n\n` +
       `When you need to call a tool, respond ONLY with JSON: {"tool":"name","arguments":{...}} or ` +
@@ -473,7 +516,7 @@ function prepareRequestBody(body, ch, originalModel) {
   }
 
   if (ch.max_tokens > 0) {
-    const inputTokens = body?.messages ? Math.ceil(JSON.stringify(body.messages).length / 4) : 0;
+    const inputTokens = estimateInputTokens(body);
     const remaining = Math.max(1, ch.max_tokens - inputTokens);
     reqBody.max_tokens = Math.min(reqBody.max_tokens || remaining, remaining, 1000000);
   }
@@ -572,6 +615,10 @@ function sseEvent(w, enc, data) {
   return w.write(enc.encode("data: " + JSON.stringify(data) + "\n\n"));
 }
 
+function sseComment(w, enc, comment) {
+  return w.write(enc.encode(": " + comment + "\n\n"));
+}
+
 function buildErrorChunk(msg) {
   return {
     id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk",
@@ -655,6 +702,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
   let streamHadContent = false;
   let bytesWritten = false;
   let hasWrittenInit = false;
+  let streamFinishedNormally = false;
   let streamError = null;
   const contentFilter = new RollingFilter(data.filters || []);
   const clientSignal = c.req.raw.signal;
@@ -673,6 +721,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
         lastLine = line;
 
         if (line.includes("[DONE]")) {
+          streamFinishedNormally = true;
           const tail = contentFilter.flush();
           if (tail) {
             await sseEvent(w, enc, {
@@ -693,6 +742,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           const choice = chunk?.choices?.[0];
           const delta = choice?.delta;
           if (delta?.content || delta?.tool_calls) streamHadContent = true;
+          if (choice?.finish_reason) streamFinishedNormally = true;
 
           if (!hasWrittenInit) {
             await sseEvent(w, enc, {
@@ -756,7 +806,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     }
 
 
-    if (!streamHadContent) {
+    if (!streamHadContent && !streamFinishedNormally) {
       ch.last_error_msg = "Empty response (no content)";
       ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
       ch.last_error_at = Math.floor(Date.now() / 1000);
@@ -811,7 +861,7 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
     const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
     if (!cfg) continue;
 
-    const needSim = needToolSim && !ch.support_tools;
+    const needSim = needToolSim && !ch.support_tools && canSimulateTools(body);
     if (needSim) {
       cfg.reqBody.stream = false;
     }
@@ -832,7 +882,8 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         continue;
       }
 
-      if (needSim) {
+      const contentType = res.headers.get("Content-Type") || "";
+      if (needSim || contentType.includes("application/json")) {
         const resText = await res.text();
         if (resText.length > 4 * 1024 * 1024) continue;
         let json;
@@ -840,16 +891,6 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         json = wrapToolResponse(json, ch, body);
 
         // 空回應視為 channel 錯誤，嘗試下一個渠道
-        const simChoice = json?.choices?.[0];
-        if (simChoice && !simChoice.message?.content && !simChoice.message?.tool_calls && simChoice.finish_reason === "stop") {
-          ch.last_error_msg = "Empty response (no content)";
-          ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-          ch.last_error_at = Math.floor(Date.now() / 1000);
-          deferPersist(c, ch);
-          lastError = "Empty response (no content)";
-          continue;
-        }
-
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
         ch.consecutive_errors = Math.max(0, (ch.consecutive_errors || 0) - 1);
         ch.response_time = rt;
@@ -918,6 +959,7 @@ function finalizeNonStream(c, winner, data, hasVision) {
 
 async function fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision) {
   const clientSignal = c.req.raw.signal;
+  let lastError = "";
   while (pool.length > 0 && Date.now() < requestDeadline && !clientSignal.aborted) {
     const ch = selectChannel(pool, originalModel, false, body);
     if (!ch) return errResponse(c, "All channels are rate-limited or temporarily unavailable — please wait before retrying", "rate_limit_error", 429);
@@ -939,6 +981,7 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         const errText = await res.text().catch(() => "");
         markChannelError(ch, res.status, errText, rt, data);
         deferPersist(c, ch);
+        lastError = "HTTP " + res.status + (errText ? ": " + errText.slice(0, 300) : "");
         continue;
       }
 
@@ -946,17 +989,16 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
       if (resText.length > 4 * 1024 * 1024) {
         return errResponse(c, "The response from the upstream server exceeded the maximum allowed size", "server_error", 502);
       }
-      let json = JSON.parse(resText);
-      json = wrapToolResponse(json, ch, body);
-
-      const choice = json?.choices?.[0];
-      if (choice && !choice.message?.content && !choice.message?.tool_calls && choice.finish_reason === "stop") {
-        ch.last_error_msg = "Empty response (no content)";
-        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-        ch.last_error_at = Math.floor(Date.now() / 1000);
+      let json;
+      try {
+        json = JSON.parse(resText);
+      } catch (e) {
+        markChannelError(ch, null, "Invalid JSON from upstream: " + e.message, rt, data);
         deferPersist(c, ch);
+        lastError = "Invalid JSON from upstream: " + e.message;
         continue;
       }
+      json = wrapToolResponse(json, ch, body);
 
       return finalizeNonStream(c, { ch, json, responseTime: rt }, data, hasVision);
     } catch (e) {
@@ -966,9 +1008,10 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
       }
       deferPersist(c, ch);
+      lastError = (e.name === 'AbortError' ? "Upstream request timed out" : (e.message || "Request failed")).slice(0, 300);
     }
   }
-  return errResponse(c, "All upstream channels failed or the request timed out after " + (GLOBAL_TIMEOUT_MS / 1000) + "s", "server_error", 504);
+  return errResponse(c, "All upstream channels failed or the request timed out after " + (GLOBAL_TIMEOUT_MS / 1000) + "s" + (lastError ? ": " + lastError : ""), "server_error", 504);
 }
 
 // 修復 LobeChat 等客戶端發送畸形 JSON（缺少 "messages" key，裸陣列直接出現在物件中）
@@ -1048,11 +1091,18 @@ async function handleChatRequest(c) {
       const enc = new TextEncoder();
 
       c.executionCtx.waitUntil((async () => {
-        const streamOk = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
-        await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "");
-        await flushResponseTime(c.env.DB);
-        await flushHealthWrites(c.env);
-        try { await w.close(); } catch (e) {}
+        try {
+          await sseComment(w, enc, "connected");
+          const streamOk = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
+          await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "");
+          await flushResponseTime(c.env.DB);
+          await flushHealthWrites(c.env);
+        } catch (e) {
+          console.error("[stream] worker error:", e.message);
+          await writeStreamError(w, enc, "Gateway stream failed: " + (e.message || "unknown error"));
+        } finally {
+          try { await w.close(); } catch (e) {}
+        }
       })());
 
       return new Response(out, { headers: SSE_CHUNK_HEADERS });

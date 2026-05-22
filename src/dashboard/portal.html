@@ -155,7 +155,7 @@
                 <th style="width: 80px" class="border-0 text-center align-middle">
                   <div class="d-flex align-items-center justify-content-center gap-1">
                     <span>ON/OFF</span>
-                    <input type="checkbox" class="form-check-input" onchange="toggleAllChannels(this.checked)" title="全啟用/全關閉">
+                    <input type="checkbox" class="form-check-input" onchange="toggleAllChannels(this.checked)" title="全啟用/全關閉" />
                   </div>
                 </th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
@@ -187,7 +187,7 @@
                 <th style="width: 120px" class="align-middle">
                   <div class="d-flex align-items-center justify-content-center gap-1">
                     <span>ON/OFF</span>
-                    <input type="checkbox" class="form-check-input" onchange="toggleAllFilters(this.checked)" title="全啟用/全關閉">
+                    <input type="checkbox" class="form-check-input" onchange="toggleAllFilters(this.checked)" title="全啟用/全關閉" />
                   </div>
                 </th>
                 <th class="align-middle">Keyword <i class="bi bi-info-circle" title="要過濾的關鍵字"></i></th>
@@ -551,13 +551,18 @@
       // Single batch endpoint that returns everything at once
       const batch = await api('/admin/api/init', 'GET', null, true);
       if (!batch) return;
-      document.getElementById('cfg-token').value = batch.config?.token || '';
-      document.getElementById('cfg-recovery-period').value = batch.config?.recovery_period || 300;
-      channels = batch.channels || [];
-      filters = batch.filters || [];
+      const config = batch.config && typeof batch.config === 'object' ? batch.config : {};
+      channels = Array.isArray(batch.channels) ? batch.channels : [];
+      filters = Array.isArray(batch.filters) ? batch.filters : [];
+      window._lastStats = { stats: batch.stats || null };
+      document.getElementById('cfg-token').value = config.token || '';
+      document.getElementById('cfg-recovery-period').value = config.recovery_period || 300;
       renderStats();
       renderChannels();
       renderFilters();
+      if (!Array.isArray(batch.channels) || !Array.isArray(batch.filters)) {
+        toast('Dashboard 資料格式異常，請重新整理或檢查 Worker 快取', 'danger');
+      }
     };
 
     const renderStats = () => {
@@ -1220,6 +1225,10 @@
       try {
         const res = await api('/admin/api/channels', 'GET', null, false);
         if (!res) return;
+        if (!Array.isArray(res)) {
+          console.warn('[refreshHealthOnly] unexpected response', res);
+          return;
+        }
         const now = Math.floor(Date.now() / 1000);
         res.forEach(nc => {
           const realIdx = channels.findIndex(c => Number(c.id) === Number(nc.id));

@@ -5,6 +5,10 @@ const rateBuffer = new Map();
 const RATE_BUF_MAX = 200;
 const responseTimeBuffer = new Map();
 const RESP_BUF_MAX = 500;
+const usageBuffer = new Map();
+const USAGE_BUF_MAX = 500;
+const RT_FLUSH_MIN_INTERVAL_MS = 60_000;
+let lastResponseTimeFlush = 0;
 
 async function retry(fn, retries = 2) {
   for (let i = 0; i <= retries; i++) {
@@ -37,8 +41,10 @@ export function bufferResponseTime(chId, responseTime) {
   responseTimeBuffer.set(chId, { responseTime, ts: Date.now() });
 }
 
-export async function flushResponseTime(DB) {
+export async function flushResponseTime(DB, force = false) {
   if (responseTimeBuffer.size === 0) return 0;
+  const nowMs = Date.now();
+  if (!force && nowMs - lastResponseTimeFlush < RT_FLUSH_MIN_INTERVAL_MS) return 0;
   const stmts = [];
   for (const [id, data] of responseTimeBuffer) {
     stmts.push(
@@ -48,6 +54,7 @@ export async function flushResponseTime(DB) {
   if (stmts.length === 0) return 0;
   await retry(() => DB.batch(stmts));
   responseTimeBuffer.clear();
+  lastResponseTimeFlush = nowMs;
   return stmts.length;
 }
 
@@ -67,6 +74,56 @@ async function flushRateBuffer(DB) {
   if (stmts.length === 0) return 0;
   await retry(() => DB.batch(stmts));
   rateBuffer.clear();
+  return stmts.length;
+}
+
+function usageDay(ts = Date.now()) {
+  return new Date(ts).toISOString().slice(0, 10);
+}
+
+function compactModelName(model) {
+  const value = String(model || "").trim();
+  return value.length > 120 ? value.slice(0, 120) : value;
+}
+
+export function bufferUsage(model, tokensIn, tokensOut, durationMs, status) {
+  if (usageBuffer.size >= USAGE_BUF_MAX) {
+    const firstKey = usageBuffer.keys().next().value;
+    if (firstKey) usageBuffer.delete(firstKey);
+  }
+  const key = [usageDay(), compactModelName(model), status || 0].join("|");
+  const cur = usageBuffer.get(key) || {
+    day: usageDay(),
+    model: compactModelName(model),
+    status: status || 0,
+    requests: 0,
+    tokensIn: 0,
+    tokensOut: 0,
+    durationMs: 0,
+  };
+  cur.requests += 1;
+  cur.tokensIn += tokensIn || 0;
+  cur.tokensOut += tokensOut || 0;
+  cur.durationMs += durationMs || 0;
+  usageBuffer.set(key, cur);
+}
+
+export async function flushUsageBuffer(DB) {
+  if (usageBuffer.size === 0) return 0;
+  const rows = [...usageBuffer.values()];
+  usageBuffer.clear();
+  const stmts = rows.map((r) =>
+    DB.prepare(
+      `INSERT INTO usage_stats (day, model, status, requests, tokens_in, tokens_out, duration_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(day, model, status) DO UPDATE SET
+         requests = requests + excluded.requests,
+         tokens_in = tokens_in + excluded.tokens_in,
+         tokens_out = tokens_out + excluded.tokens_out,
+         duration_ms = duration_ms + excluded.duration_ms`
+    ).bind(r.day, r.model, r.status, r.requests, r.tokensIn, r.tokensOut, r.durationMs)
+  );
+  if (stmts.length > 0) await retry(() => DB.batch(stmts));
   return stmts.length;
 }
 
@@ -119,7 +176,8 @@ export function registerMaintenance(app) {
     } catch (e) { actions.logs_purged = -1; }
 
     actions.rate_flushed = await flushRateBuffer(DB);
-    actions.rt_flushed = await flushResponseTime(DB);
+    actions.rt_flushed = await flushResponseTime(DB, true);
+    actions.usage_flushed = await flushUsageBuffer(DB);
 
     const { results: allChs } = await DB.prepare(
       "SELECT id, name, model, is_enabled, consecutive_errors, cooldown_until, response_time, last_429 FROM channels ORDER BY id"
@@ -149,11 +207,5 @@ export function registerMaintenance(app) {
 }
 
 export async function logRequest(DB, channelId, model, tokensIn, tokensOut, durationMs, status, errorMsg) {
-  try {
-    await DB.prepare(
-      "INSERT INTO request_logs (channel_id, model, tokens_in, tokens_out, duration_ms, status, error_msg) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).bind(channelId || 0, model || "", tokensIn || 0, tokensOut || 0, durationMs || 0, status || 0, errorMsg || "").run();
-  } catch (e) {
-    console.error("[log] failed:", e.message);
-  }
+  bufferUsage(model, tokensIn, tokensOut, durationMs, status);
 }

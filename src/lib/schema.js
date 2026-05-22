@@ -75,6 +75,17 @@ const REQUEST_LOGS_DDL = `CREATE TABLE IF NOT EXISTS request_logs (
   created_at  INTEGER NOT NULL DEFAULT (unixepoch())
 )`;
 
+const USAGE_STATS_DDL = `CREATE TABLE IF NOT EXISTS usage_stats (
+  day         TEXT    NOT NULL,
+  model       TEXT    NOT NULL DEFAULT '',
+  status      INTEGER NOT NULL DEFAULT 0,
+  requests    INTEGER NOT NULL DEFAULT 0,
+  tokens_in   INTEGER NOT NULL DEFAULT 0,
+  tokens_out  INTEGER NOT NULL DEFAULT 0,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, model, status)
+)`;
+
 const CHANNEL_TYPES = new Set(["chat", "image_gen", "image_edit", "audio_tts", "audio_stt", "embeddings"]);
 
 const TABLES = [
@@ -114,6 +125,11 @@ const TABLES = [
     ddl: REQUEST_LOGS_DDL,
     migrationCols: [],
   },
+  {
+    name: "usage_stats",
+    ddl: USAGE_STATS_DDL,
+    migrationCols: [],
+  },
 ];
 
 const INDEXES = [
@@ -142,6 +158,7 @@ const EXPECTED_COLS = {
   filters: parseDDLColumns(FILTERS_DDL),
   config: parseDDLColumns(CONFIG_DDL),
   request_logs: parseDDLColumns(REQUEST_LOGS_DDL),
+  usage_stats: parseDDLColumns(USAGE_STATS_DDL),
 };
 
 /** startup 全自動 migration：建表 → 補欄位 → 建索引 → 型別警告 */
