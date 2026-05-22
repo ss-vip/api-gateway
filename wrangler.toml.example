@@ -11,7 +11,7 @@ rules = [
   { type = "Text", globs = ["**/*.html"] }
 ]
 
-# 在 CF Dashboard 建立 D1: npx wrangler d1 create api-gateway-db 取得資料填入
+# 在 Cloudflare 建立 D1: npx wrangler d1 create api-gateway-db 取得 UUID 填入 database_id
 [[d1_databases]]
 binding = "DB"
 database_name = "api-gateway-db"

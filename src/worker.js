@@ -3,26 +3,14 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import registerGateway, { clearCache } from "./gateway.js";
 import createDashboardApp from "./dashboard/index.js";
+import { setPepper } from "./dashboard/resources.js";
 import { registerMaintenance } from "./routes/maintenance.js";
 import { generateToken } from "./lib/db.js";
+import { ensureSchema } from "./lib/schema.js";
 
 async function initConfig(env) {
-  // 自動檢查並補齊新版新增的欄位（針對舊版升級用戶）
-  const newCols = [
-    "support_stream INTEGER NOT NULL DEFAULT 1",
-    "support_image_gen INTEGER NOT NULL DEFAULT 0",
-    "support_audio_tts INTEGER NOT NULL DEFAULT 0",
-    "support_audio_stt INTEGER NOT NULL DEFAULT 0",
-    "support_image_edit INTEGER NOT NULL DEFAULT 0",
-    "support_embeddings INTEGER NOT NULL DEFAULT 0"
-  ];
-  for (const colDef of newCols) {
-    try {
-      await env.DB.prepare(`ALTER TABLE channels ADD COLUMN ${colDef}`).run();
-    } catch (e) {
-      // 欄位若已存在會拋出錯誤，直接忽略即可
-    }
-  }
+  setPepper(env.PASSWORD_PEPPER || "");
+  try { await ensureSchema(env); } catch (e) { console.error("[schema]", e.message); }
 
   try {
     const cf = await env.DB.prepare("SELECT client_token FROM config WHERE id=1").first();

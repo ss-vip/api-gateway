@@ -124,7 +124,7 @@
             <div class="col-md-4">
               <div class="input-group input-group-sm">
                 <span class="input-group-text fw-bold small">Recovery Delay (s)</span>
-                <input type="number" id="cfg-recovery-period" class="form-control" />
+                <input type="number" id="cfg-recovery-period" class="form-control" min="30" max="86400" />
               </div>
             </div>
           </div>
@@ -152,10 +152,10 @@
             <thead class="table-light">
               <tr class="text-uppercase text-muted small" style="letter-spacing: 0.5px;">
                 <th style="width: 60px" class="border-0 cursor-pointer" onclick="toggleSort('id')">ID <i id="sort-id" class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 110px" class="border-0">
-                  <div class="d-flex align-items-center">
-                    <input type="checkbox" class="form-check-input me-2" id="master-toggle" title="全選/全取消" onclick="toggleAllChannels(this.checked)">
-                    <span class="cursor-pointer" onclick="toggleSort('is_enabled')">ON/OFF <i id="sort-is_enabled" class="bi bi-arrow-down-up opacity-25"></i></span>
+                <th style="width: 80px" class="border-0 text-center align-middle">
+                  <div class="d-flex align-items-center justify-content-center gap-1">
+                    <span>ON/OFF</span>
+                    <input type="checkbox" class="form-check-input" onchange="toggleAllChannels(this.checked)" title="全啟用/全關閉">
                   </div>
                 </th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
@@ -184,10 +184,10 @@
             <thead class="table-light">
               <tr>
                 <th style="width: 60px" class="align-middle">ID</th>
-                <th style="width: 100px" class="align-middle">
+                <th style="width: 120px" class="align-middle">
                   <div class="d-flex align-items-center justify-content-center gap-1">
-                    <input type="checkbox" class="form-check-input" onchange="toggleAllFilters(this.checked)" title="全選/全取消">
-                    <span class="small">ON/OFF</span>
+                    <span class="small text-muted">ON/OFF</span>
+                    <input type="checkbox" class="form-check-input" onchange="toggleAllFilters(this.checked)" title="全啟用/全關閉">
                   </div>
                 </th>
                 <th class="align-middle">Keyword <i class="bi bi-info-circle" title="要過濾的關鍵字"></i></th>
@@ -269,41 +269,32 @@
         </div>
       </div>
       <div class="row g-2 mb-2">
-        <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-100)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="100" value="50" required /></div>
-        <div class="col-6"><label class="form-label mini-label fw-bold">Max Tokens</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" value="0" /></div>
+        <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-1000)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required /></div>
+        <div class="col-6"><label class="form-label mini-label fw-bold">Context Limit</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" max="1000000" value="0" /><span class="text-muted small" style="font-size:0.6rem">Input + output (0 = unlimited)</span></div>
       </div>
       <div class="row g-1 mb-2">
-        <div class="col-6"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" value="0" /></div>
-        <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" value="0" /></div>
+        <div class="col-6"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" max="100000" value="0" /></div>
+        <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" max="100000" value="0" /></div>
       </div>
-      <div class="row g-2 mt-3 pt-2 border-top">
-        <div class="col-4 d-flex flex-column align-items-center mb-1">
-          <label class="form-check-label small fw-bold mb-1" for="ch-vision">&#x1F441;&#xFE0F; Vision</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
+      <div class="row g-2 mt-3 pt-2 border-top align-items-center">
+        <div class="col-4">
+          <label class="form-label mini-label fw-bold mb-0" for="ch-type">Type</label>
+          <select id="ch-type" class="form-select form-select-sm">
+            <option value="chat">&#x1F4AC; Chat</option>
+            <option value="image_gen">&#x1F5BC;&#xFE0F; Image Gen</option>
+            <option value="image_edit">&#x270F;&#xFE0F; Image Edit</option>
+            <option value="audio_tts">&#x1F50A; TTS</option>
+            <option value="audio_stt">&#x1F3A4; STT</option>
+            <option value="embeddings">&#x1F4DA; Embed</option>
+          </select>
         </div>
-        <div class="col-4 d-flex flex-column align-items-center mb-1">
-          <label class="form-check-label small fw-bold mb-1" for="ch-image-gen">&#x1F5BC;&#xFE0F; Image</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-image-gen"></div>
+        <div class="col-4 text-center">
+          <label class="form-label mini-label fw-bold mb-0" for="ch-vision">&#x1F441;&#xFE0F; Vision</label>
+          <div class="mt-1"><div class="form-check form-switch d-inline-block mb-0"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div></div>
         </div>
-        <div class="col-4 d-flex flex-column align-items-center mb-1">
-          <label class="form-check-label small fw-bold mb-1" for="ch-image-edit">&#x270F;&#xFE0F; Edit</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-image-edit"></div>
-        </div>
-        <div class="col-4 d-flex flex-column align-items-center mb-1">
-          <label class="form-check-label small fw-bold mb-1" for="ch-audio-tts">&#x1F399;&#xFE0F; TTS</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-audio-tts"></div>
-        </div>
-        <div class="col-4 d-flex flex-column align-items-center mb-1">
-          <label class="form-check-label small fw-bold mb-1" for="ch-audio-stt">&#x1F3A4; STT</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-audio-stt"></div>
-        </div>
-        <div class="col-4 d-flex flex-column align-items-center mb-1">
-          <label class="form-check-label small fw-bold mb-1" for="ch-embeddings">&#x1F4DA; Embed</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-embeddings"></div>
-        </div>
-        <div class="col-4 d-flex flex-column align-items-center">
-          <label class="form-check-label small fw-bold mb-1" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
-          <div class="form-check form-switch"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
+        <div class="col-4 text-center">
+          <label class="form-label mini-label fw-bold mb-0" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
+          <div class="mt-1"><div class="form-check form-switch d-inline-block mb-0"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div></div>
         </div>
       </div>
       </div>
@@ -668,7 +659,7 @@
         (c.model || '').toLowerCase().includes(query)
       );
 
-      ['id','name','model','weight','status','is_enabled','response_time'].forEach(k => {
+      ['id','name','model','weight','status','response_time'].forEach(k => {
         const icon = document.getElementById('sort-' + k);
         if (!icon) return;
         icon.className = 'bi bi-arrow-down-up opacity-25';
@@ -698,24 +689,24 @@
           h = '<span class="badge bg-dark health-badge" title="RPD exhausted: ' + c.rpd_count + '/' + c.rpd_limit + '" onclick="showDebug(' + realIdx + ')" style="cursor:pointer">限額</span>';
         }
 
-        const visionIcon = c.is_vision ? " \u{1F441}\u{FE0F}" : "";
-        const imageGenIcon = c.support_image_gen ? " \u{1F5BC}\u{FE0F}" : "";
-        const audioTtsIcon = c.support_audio_tts ? " \u{1F399}\u{FE0F}" : "";
-        const audioSttIcon = c.support_audio_stt ? " \u{1F3A4}" : "";
-        const imageEditIcon = c.support_image_edit ? " \u{270F}\u{FE0F}" : "";
-        const embeddingsIcon = c.support_embeddings ? " \u{1F4DA}" : "";
+        const typeLabel = c.channel_type === 'image_gen' ? '\u{1F5BC}\u{FE0F}'
+          : c.channel_type === 'image_edit' ? '\u{270F}\u{FE0F}'
+          : c.channel_type === 'audio_tts' ? '\u{1F50A}'
+          : c.channel_type === 'audio_stt' ? '\u{1F3A4}'
+          : c.channel_type === 'embeddings' ? '\u{1F4DA}'
+          : '\u{1F4AC}';
         const modelName = esc(c.model || "");
         const displayName = esc(c.model || "-");
 
         let row = '<tr>';
         row += '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>';
-        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block">';
-        row += '<input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()">';
-        row += '</div></td>';
+        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>';
         const providerLabel = c.provider || (c.base_url ? (c.base_url.includes('googleapis') || c.base_url.includes('generativelanguage') ? 'Google' : c.base_url.includes('anthropic') ? 'Claude' : 'OpenAI') : '');
         const providerTitle = providerLabel ? ' title="Provider: ' + esc(providerLabel) + '"' : '';
-        row += '<td class="fw-bold align-middle" style="cursor:help"' + providerTitle + '>' + esc(c.name) + '</td>';
-        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + visionIcon + imageGenIcon + audioTtsIcon + audioSttIcon + imageEditIcon + embeddingsIcon + '</td>';
+        row += '<td class="fw-bold align-middle" style="cursor:help"' + providerTitle + '>';
+        row += esc(c.name);
+        row += '</td>';
+        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + (c.is_vision ? ' \u{1F441}\u{FE0F}' : '') + ' <span class="badge bg-secondary" style="font-size:0.6rem">' + typeLabel + '</span></td>';
         row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
         row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
         row += '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>';
@@ -778,16 +769,16 @@
           const idx = channels.findIndex(c => c.id === id);
           if (idx !== -1) {
             const ch2 = channels[idx];
-            if (!r.capabilities.vision.ok && ch2.is_vision) ch2.is_vision = 0;
-            if (!r.capabilities.tools.ok && ch2.support_tools !== 0) ch2.support_tools = 0;
+            if (r.capabilities.vision && !r.capabilities.vision.ok && ch2.is_vision) ch2.is_vision = 0;
+            if (r.capabilities.tools && !r.capabilities.tools.ok && ch2.support_tools !== 0) ch2.support_tools = 0;
             if (r.capabilities.stream && !r.capabilities.stream.ok && ch2.support_stream !== 0) ch2.support_stream = 0;
           }
           renderChannels();
         }
         if (r.ok) {
-          toast('✅ 測試回應成功 ' + (r.status || 200), 'success');
+          toast('✅ 測試 ' + (ch.channel_type || 'chat') + ' 成功 ' + (r.status || 200), 'success');
         } else {
-          toast('❌ 測試回應失敗 ' + (r.status || '連線'), 'danger');
+          toast('❌ 測試 ' + (ch.channel_type || 'chat') + ' 失敗 ' + (r.status || '連線'), 'danger');
         }
       }
     };
@@ -814,7 +805,7 @@
       document.getElementById('filter-list').innerHTML = filters.map((f, i) => {
         let row = '<tr>';
         row += '<td class="text-muted small align-middle">' + (f.id || '-') + '</td>';
-        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
+        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
         row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>';
         row += '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
         row += '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
@@ -827,6 +818,7 @@
     const saveConfig = async () => {
       const token = document.getElementById('cfg-token').value;
       const period = parseInt(document.getElementById('cfg-recovery-period').value) || 300;
+      if (period < 30 || period > 86400) return toast('Recovery Delay 需介於 30–86400 秒', 'warning');
       if (await api('/admin/api/config', 'POST', { token, recovery_period: period })) {
         toast('設定已儲存', 'success');
         init();
@@ -851,9 +843,11 @@
 
     const saveEverything = async () => {
       const cfgEl = document.getElementById('cfg-token');
+      const period = parseInt(document.getElementById('cfg-recovery-period')?.value) || 300;
+      if (period < 30 || period > 86400) { toast('Recovery Delay 需介於 30–86400 秒', 'warning'); return; }
       if (cfgEl) await api('/admin/api/config', 'POST', {
         token: cfgEl.value,
-        recovery_period: document.getElementById('cfg-recovery-period')?.value || 300,
+        recovery_period: period,
       });
       const channelsOk = await api('/admin/api/batch-channels', 'POST', channels);
       if (!channelsOk) { toast('渠道儲存失敗，請檢查連線', 'danger'); return; }
@@ -882,11 +876,7 @@
       ['ch-rpm','ch-rpd','ch-tokens'].forEach(i => document.getElementById(i).value = 0);
       document.getElementById('ch-enabled').checked = true;
       document.getElementById('ch-vision').checked = false;
-      document.getElementById('ch-image-gen').checked = false;
-      document.getElementById('ch-image-edit').checked = false;
-      document.getElementById('ch-audio-tts').checked = false;
-      document.getElementById('ch-audio-stt').checked = false;
-      document.getElementById('ch-embeddings').checked = false;
+      document.getElementById('ch-type').value = 'chat';
       document.getElementById('ch-absolute-url').checked = false;
       // Reset Log tab for new channel
       document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
@@ -919,11 +909,7 @@
       document.getElementById('ch-rpm').value = c.rpm_limit || 0;
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
       document.getElementById('ch-vision').checked = c.is_vision == 1;
-      document.getElementById('ch-image-gen').checked = c.support_image_gen == 1;
-      document.getElementById('ch-image-edit').checked = c.support_image_edit == 1;
-      document.getElementById('ch-audio-tts').checked = c.support_audio_tts == 1;
-      document.getElementById('ch-audio-stt').checked = c.support_audio_stt == 1;
-      document.getElementById('ch-embeddings').checked = c.support_embeddings == 1;
+      document.getElementById('ch-type').value = c.channel_type || 'chat';
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
       // Populate Log tab — show ALL health states with <li> format
@@ -1044,7 +1030,13 @@
       const name = document.getElementById('ch-name').value.trim();
       if (!name) return toast('請輸入名稱', 'warning');
       const weight = parseInt(document.getElementById('ch-weight').value);
-      if (isNaN(weight) || weight < 1 || weight > 100) return toast('Weight 需介於 1-100', 'warning');
+      if (isNaN(weight) || weight < 1 || weight > 1000) return toast('Weight 需介於 1-1000', 'warning');
+      const rpm = parseInt(document.getElementById('ch-rpm').value);
+      if (isNaN(rpm) || rpm < 0 || rpm > 100000) return toast('RPM 需介於 0-100,000', 'warning');
+      const rpd = parseInt(document.getElementById('ch-rpd').value);
+      if (isNaN(rpd) || rpd < 0 || rpd > 100000) return toast('RPD 需介於 0-100,000', 'warning');
+      const maxTokens = parseInt(document.getElementById('ch-tokens').value);
+      if (isNaN(maxTokens) || maxTokens < 0 || maxTokens > 1000000) return toast('Max Tokens 需介於 0-1,000,000', 'warning');
       const url = document.getElementById('ch-url').value.trim().replace(/\/+$/, '');
       if (!url) return toast('請輸入 Base URL', 'warning');
 
@@ -1058,17 +1050,13 @@
         model: document.getElementById('ch-model').value,
         fallback_model: document.getElementById('ch-fallback-model').value,
         weight,
-        max_tokens: parseInt(document.getElementById('ch-tokens').value) || 0,
-        rpm_limit: parseInt(document.getElementById('ch-rpm').value) || 0,
-        rpd_limit: parseInt(document.getElementById('ch-rpd').value) || 0,
+        max_tokens: maxTokens,
+        rpm_limit: rpm,
+        rpd_limit: rpd,
         is_vision: document.getElementById('ch-vision').checked ? 1 : 0,
         support_tools: prev ? (prev.support_tools !== 0 ? 1 : 0) : 1,
         support_stream: prev ? (prev.support_stream !== 0 ? 1 : 0) : 1,
-        support_image_gen: document.getElementById('ch-image-gen').checked ? 1 : 0,
-        support_audio_tts: document.getElementById('ch-audio-tts').checked ? 1 : 0,
-        support_audio_stt: document.getElementById('ch-audio-stt').checked ? 1 : 0,
-        support_image_edit: document.getElementById('ch-image-edit').checked ? 1 : 0,
-        support_embeddings: document.getElementById('ch-embeddings').checked ? 1 : 0,
+        channel_type: document.getElementById('ch-type').value,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
         last_429: prev ? prev.last_429||0 : 0,
         consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
@@ -1247,11 +1235,7 @@
           oc.is_vision = nc.is_vision;
           oc.support_tools = nc.support_tools;
           oc.support_stream = nc.support_stream;
-          oc.support_image_gen = nc.support_image_gen;
-          oc.support_audio_tts = nc.support_audio_tts;
-          oc.support_audio_stt = nc.support_audio_stt;
-          oc.support_image_edit = nc.support_image_edit;
-          oc.support_embeddings = nc.support_embeddings;
+          oc.channel_type = nc.channel_type;
 
           const healthEl = document.getElementById('ch-health-' + oc.id);
           if (healthEl) {
@@ -1301,11 +1285,7 @@
         max_tokens: c.max_tokens || 0,
         support_tools: c.support_tools !== 0 ? 1 : 0,
         support_stream: c.support_stream !== 0 ? 1 : 0,
-        support_image_gen: c.support_image_gen ? 1 : 0,
-        support_audio_tts: c.support_audio_tts ? 1 : 0,
-        support_audio_stt: c.support_audio_stt ? 1 : 0,
-        support_image_edit: c.support_image_edit ? 1 : 0,
-        support_embeddings: c.support_embeddings ? 1 : 0,
+        channel_type: c.channel_type || 'chat',
         provider: c.provider || "",
         headers: c.headers || null,
         provider_options: c.provider_options || null,

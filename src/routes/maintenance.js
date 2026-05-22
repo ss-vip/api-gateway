@@ -4,6 +4,16 @@ import { pruneLoginState } from "../dashboard/index.js";
 const rateBuffer = new Map();
 const RATE_BUF_MAX = 200;
 const responseTimeBuffer = new Map();
+const RESP_BUF_MAX = 500;
+
+async function retry(fn, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try { return await fn(); } catch (e) {
+      if (i === retries) throw e;
+      await new Promise(r => setTimeout(r, 100 * Math.pow(2, i)));
+    }
+  }
+}
 
 export function bufferRate(chId, rpmCount, rpmResetAt, rpdCount, rpdResetAt) {
   if (rateBuffer.size >= RATE_BUF_MAX) {
@@ -19,10 +29,15 @@ export function getBufferedRate(chId) {
 }
 
 export function bufferResponseTime(chId, responseTime) {
+  if (responseTimeBuffer.size >= RESP_BUF_MAX) {
+    const entries = [...responseTimeBuffer.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    const remove = Math.ceil(RESP_BUF_MAX * 0.2);
+    for (let i = 0; i < remove; i++) responseTimeBuffer.delete(entries[i][0]);
+  }
   responseTimeBuffer.set(chId, { responseTime, ts: Date.now() });
 }
 
-async function flushResponseTime(DB) {
+export async function flushResponseTime(DB) {
   if (responseTimeBuffer.size === 0) return 0;
   const stmts = [];
   for (const [id, data] of responseTimeBuffer) {
@@ -31,7 +46,7 @@ async function flushResponseTime(DB) {
     );
   }
   if (stmts.length === 0) return 0;
-  await DB.batch(stmts);
+  await retry(() => DB.batch(stmts));
   responseTimeBuffer.clear();
   return stmts.length;
 }
@@ -50,7 +65,7 @@ async function flushRateBuffer(DB) {
     }
   }
   if (stmts.length === 0) return 0;
-  await DB.batch(stmts);
+  await retry(() => DB.batch(stmts));
   rateBuffer.clear();
   return stmts.length;
 }
@@ -87,15 +102,21 @@ export function registerMaintenance(app) {
     ).bind(nowUnix, nowUnix).all();
 
     if (recovered && recovered.length > 0) {
-      await DB.batch(
+      await retry(() => DB.batch(
         recovered.map(r =>
           DB.prepare(
             "UPDATE channels SET consecutive_errors=0, last_error_msg='', cooldown_until=0 WHERE id=?"
           ).bind(r.id)
         )
-      );
+      ));
     }
     actions.channels_recovered = (recovered || []).length;
+
+    // request_logs TTL 7 天，逐批清理控制寫入成本
+    try {
+      const purge = await DB.prepare("DELETE FROM request_logs WHERE created_at < unixepoch() - 604800 LIMIT 5000").run();
+      actions.logs_purged = purge?.meta?.changes || 0;
+    } catch (e) { actions.logs_purged = -1; }
 
     actions.rate_flushed = await flushRateBuffer(DB);
     actions.rt_flushed = await flushResponseTime(DB);
@@ -125,4 +146,14 @@ export function registerMaintenance(app) {
       duration_ms: Date.now() - start,
     });
   });
+}
+
+export async function logRequest(DB, channelId, model, tokensIn, tokensOut, durationMs, status, errorMsg) {
+  try {
+    await DB.prepare(
+      "INSERT INTO request_logs (channel_id, model, tokens_in, tokens_out, duration_ms, status, error_msg) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(channelId || 0, model || "", tokensIn || 0, tokensOut || 0, durationMs || 0, status || 0, errorMsg || "").run();
+  } catch (e) {
+    console.error("[log] failed:", e.message);
+  }
 }
