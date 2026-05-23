@@ -3,12 +3,12 @@ import { pruneLoginState } from "../dashboard/index.js";
 
 const rateBuffer = new Map();
 const RATE_BUF_MAX = 200;
-const responseTimeBuffer = new Map();
-const RESP_BUF_MAX = 500;
 const usageBuffer = new Map();
 const USAGE_BUF_MAX = 500;
-const RT_FLUSH_MIN_INTERVAL_MS = 60_000;
-let lastResponseTimeFlush = 0;
+// Rate & ResponseTime buffers are in-memory only (no D1 flush).
+// This keeps D1 writes under 100k/day free tier limit regardless of channel count.
+// Only usage_stats and health state are persisted to D1 (~19k/day worst case with 100 channels).
+const FLUSH_MIN_INTERVAL_MS = 120_000;
 
 async function retry(fn, retries = 2) {
   for (let i = 0; i <= retries; i++) {
@@ -32,50 +32,10 @@ export function getBufferedRate(chId) {
   return rateBuffer.get(chId) || null;
 }
 
-export function bufferResponseTime(chId, responseTime) {
-  if (responseTimeBuffer.size >= RESP_BUF_MAX) {
-    const entries = [...responseTimeBuffer.entries()].sort((a, b) => a[1].ts - b[1].ts);
-    const remove = Math.ceil(RESP_BUF_MAX * 0.2);
-    for (let i = 0; i < remove; i++) responseTimeBuffer.delete(entries[i][0]);
-  }
-  responseTimeBuffer.set(chId, { responseTime, ts: Date.now() });
-}
-
-export async function flushResponseTime(DB, force = false) {
-  if (responseTimeBuffer.size === 0) return 0;
-  const nowMs = Date.now();
-  if (!force && nowMs - lastResponseTimeFlush < RT_FLUSH_MIN_INTERVAL_MS) return 0;
-  const stmts = [];
-  for (const [id, data] of responseTimeBuffer) {
-    stmts.push(
-      DB.prepare("UPDATE channels SET response_time=? WHERE id=?").bind(data.responseTime, id)
-    );
-  }
-  if (stmts.length === 0) return 0;
-  await retry(() => DB.batch(stmts));
-  responseTimeBuffer.clear();
-  lastResponseTimeFlush = nowMs;
-  return stmts.length;
-}
-
-async function flushRateBuffer(DB) {
-  if (rateBuffer.size === 0) return 0;
-  const now = Math.floor(Date.now() / 1000);
-  const stmts = [];
-  for (const [id, data] of rateBuffer) {
-    if (now - Math.floor(data.ts / 1000) < 120) {
-      stmts.push(
-        DB.prepare(
-          "UPDATE channels SET rpm_count=?, rpm_reset_at=?, rpd_count=?, rpd_reset_at=? WHERE id=?"
-        ).bind(data.rpmCount, data.rpmResetAt, data.rpdCount, data.rpdResetAt, id)
-      );
-    }
-  }
-  if (stmts.length === 0) return 0;
-  await retry(() => DB.batch(stmts));
-  rateBuffer.clear();
-  return stmts.length;
-}
+// flushResponseTime, bufferResponseTime, and flushRateBuffer removed intentionally.
+// Rate counters and response times are kept in-memory only.
+// On worker restart, they rebuild automatically within seconds.
+// See: coder-agent.md session summary for the D1 write budget decision.
 
 function usageDay(ts = Date.now()) {
   return new Date(ts).toISOString().slice(0, 10);
@@ -108,8 +68,12 @@ export function bufferUsage(model, tokensIn, tokensOut, durationMs, status) {
   usageBuffer.set(key, cur);
 }
 
-export async function flushUsageBuffer(DB) {
+let lastUsageFlush = 0;
+
+export async function flushUsageBuffer(DB, force = false) {
   if (usageBuffer.size === 0) return 0;
+  const nowMs = Date.now();
+  if (!force && nowMs - lastUsageFlush < FLUSH_MIN_INTERVAL_MS) return 0;
   const rows = [...usageBuffer.values()];
   usageBuffer.clear();
   const stmts = rows.map((r) =>
@@ -124,6 +88,7 @@ export async function flushUsageBuffer(DB) {
     ).bind(r.day, r.model, r.status, r.requests, r.tokensIn, r.tokensOut, r.durationMs)
   );
   if (stmts.length > 0) await retry(() => DB.batch(stmts));
+  lastUsageFlush = nowMs;
   return stmts.length;
 }
 
@@ -218,14 +183,6 @@ export function registerMaintenance(app) {
     }
     actions.channels_recovered = (recovered || []).length;
 
-    // request_logs TTL 7 天，逐批清理控制寫入成本
-    try {
-      const purge = await DB.prepare("DELETE FROM request_logs WHERE created_at < unixepoch() - 604800 LIMIT 5000").run();
-      actions.logs_purged = purge?.meta?.changes || 0;
-    } catch (e) { actions.logs_purged = -1; }
-
-    actions.rate_flushed = await flushRateBuffer(DB);
-    actions.rt_flushed = await flushResponseTime(DB, true);
     actions.usage_flushed = await flushUsageBuffer(DB);
 
     const { results: allChs } = await DB.prepare(

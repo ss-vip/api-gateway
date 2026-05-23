@@ -126,7 +126,9 @@ function validateChannelData(channels) {
       errors.push(`[${i}] Invalid rpd_limit ${ch.rpd_limit}, must be 0–100,000`);
     if (ch.max_tokens !== undefined && (typeof ch.max_tokens !== "number" || ch.max_tokens < 0 || ch.max_tokens > 1000000))
       errors.push(`[${i}] Invalid context_limit ${ch.max_tokens}, must be 0–1,000,000`);
-    if (ch.base_url && typeof ch.base_url === "string" && ch.base_url.length > 0) {
+    if (!ch.base_url || (typeof ch.base_url === "string" && ch.base_url.trim().length === 0)) {
+      errors.push(`[${i}] base_url is required`);
+    } else if (ch.base_url && typeof ch.base_url === "string") {
       try { new URL(ch.base_url); } catch (e) { errors.push(`[${i}] Invalid base_url "${ch.base_url}"`); }
     }
   }

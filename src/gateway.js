@@ -4,7 +4,7 @@ import {
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
   getRequestTimeout, getGlobalTimeout,
 } from "./lib/constants.js";
-import { bufferRate, getBufferedRate, bufferResponseTime, flushResponseTime, logRequest } from "./routes/maintenance.js";
+import { bufferRate, getBufferedRate, logRequest } from "./routes/maintenance.js";
 import { SSE_CHUNK_HEADERS, RollingFilter, sseEvent, sseComment, writeStreamError, writeSimulatedStream } from "./lib/sse.js";
 import { requestId, logStructured, errResponse, hasVisionContent, estimateInputTokens, tryRepairChatJson } from "./lib/request.js";
 import { shouldSimulateTools, prepareRequestBody, processXmlToolCallStream, extractXmlToolCallsFromContent } from "./lib/tool-sim.js";
@@ -94,6 +94,7 @@ export function clearCache() {
   cache.data = null;
   cache.ts = 0;
   lastPersistedState.clear();
+  ewmaLatency.clear();
 }
 
 function exponentialCooldown(consecutiveErrors) {
@@ -503,6 +504,13 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
                 emittedToolCalls = true;
                 streamFinishedNormally = true;
                 if (tcResult.afterText) {
+                  // Support multiple <tool_call> blocks in a single stream:
+                  // if afterText contains another <tool_call>, continue buffering
+                  if (tcResult.afterText.includes('<tool_call>')) {
+                    tcState.buffering = true;
+                    tcState.buf = tcResult.afterText;
+                    continue;
+                  }
                   delta.content = tcResult.afterText;
                 } else {
                   continue;
@@ -639,7 +647,6 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     ch.last_error_at = 0;
     ch.response_time = responseTime;
     updateEwma(ch.id, responseTime);
-    bufferResponseTime(ch.id, responseTime);
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
     deferPersist(c, ch);
   }
@@ -725,7 +732,6 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         applySuccess(ch);
         ch.response_time = rt;
         updateEwma(ch.id, rt);
-        bufferResponseTime(ch.id, rt);
         if (hasVision && !ch.is_vision) ch.is_vision = 1;
         deferPersist(c, ch);
         await writeSimulatedStream(w, enc, jsonResponse);
@@ -762,7 +768,6 @@ function finalizeNonStream(c, winner, data, hasVision) {
   ch.last_error_at = 0;
   ch.response_time = responseTime;
   updateEwma(ch.id, responseTime);
-  bufferResponseTime(ch.id, responseTime);
   if (hasVision && !ch.is_vision) ch.is_vision = 1;
   deferPersist(c, ch);
 
@@ -837,6 +842,20 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         deferPersist(c, ch);
         lastError = "Invalid JSON from upstream: " + e.message;
         continue;
+      }
+
+      // Tools-ignored detection: if tools were in the request but the response
+      // has no tool_calls and no XML <tool_call> pattern, the upstream likely
+      // doesn't support function calling. Mark support_tools=0 and retry.
+      const msg = json?.choices?.[0]?.message;
+      if (shouldSimulateTools(body) && msg && !msg.tool_calls) {
+        const content = msg.content || '';
+        if (!content.includes('<tool_call>')) {
+          ch.support_tools = 0;
+          markChannelError(ch, null, "Channel ignored tool calls", rt, data);
+          deferPersist(c, ch);
+          continue;
+        }
       }
 
       return finalizeNonStream(c, { ch, json, responseTime: rt }, data, hasVision);
@@ -929,7 +948,6 @@ async function handleChatRequest(c) {
           // Close stream immediately so client (LobeChat) does not hang waiting for end-of-stream
           try { await w.close(); } catch (e) {}
           await logRequest(c.env.DB, streamResult.channelId || 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "", rid);
-          await flushResponseTime(c.env.DB);
           await flushHealthWrites(c.env);
         } catch (e) {
           logStructured("error", "stream worker error", { rid, error: e.message });
@@ -947,7 +965,6 @@ async function handleChatRequest(c) {
       if (result.status !== 200) {
         await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, result?.status || 0, "", rid);
       }
-      await flushResponseTime(c.env.DB);
       await flushHealthWrites(c.env);
     })());
     return result;
@@ -1048,7 +1065,6 @@ async function proxyEndpoint(c, endpointType) {
         ch.last_error_at = 0;
         ch.response_time = rt;
         updateEwma(ch.id, rt);
-        bufferResponseTime(ch.id, rt);
         deferPersist(c, ch);
 
         const responseHeaders = { "Content-Type": res.headers.get("Content-Type") || "application/json" };
@@ -1065,7 +1081,6 @@ async function proxyEndpoint(c, endpointType) {
         }
         c.executionCtx.waitUntil((async () => {
           await logRequest(c.env.DB, ch.id, ch.model || "", 0, 0, rt, 200, "");
-          await flushResponseTime(c.env.DB);
           await flushHealthWrites(c.env);
         })());
         return new Response(res.body, { status: 200, headers: { ...responseHeaders, "X-Request-Id": rid } });
@@ -1081,7 +1096,7 @@ async function proxyEndpoint(c, endpointType) {
       }
     }
 
-    c.executionCtx.waitUntil((async () => { await flushResponseTime(c.env.DB); await flushHealthWrites(c.env); })());
+    c.executionCtx.waitUntil((async () => { await flushHealthWrites(c.env); })());
 
     if (lastError) {
       return errResponse(c, "All available channels failed: " + lastError, "server_error", 502);
