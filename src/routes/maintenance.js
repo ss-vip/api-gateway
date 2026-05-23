@@ -130,6 +130,53 @@ export async function flushUsageBuffer(DB) {
 let lastHealthRun = 0;
 const HEALTH_MIN_INTERVAL = 10_000;
 
+let lastUrlHealthCheck = 0;
+const URL_HEALTH_INTERVAL_MS = 300_000; // 5 分鐘
+
+async function performUrlHealthCheck(DB) {
+  const now = Math.floor(Date.now() / 1000);
+  const { results: channels } = await DB.prepare(
+    `SELECT id, base_url FROM channels
+     WHERE is_enabled=1
+     AND (cooldown_until=0 OR cooldown_until<?)`
+  ).bind(now).all();
+
+  if (!channels || channels.length === 0) return { checked: 0, ok: 0, fail: 0 };
+
+  const urlSet = new Set();
+  for (const ch of channels) {
+    const url = (ch.base_url || '').trim();
+    if (url) urlSet.add(url);
+  }
+
+  const timeoutMs = 3000;
+  let ok = 0, fail = 0;
+
+  await Promise.allSettled([...urlSet].map(async (url) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      await fetch(url, { method: 'HEAD', signal: ac.signal });
+      ok++;
+      await DB.prepare(
+        `UPDATE channels SET cooldown_until=0, last_error_msg='', last_error_at=0
+         WHERE base_url=? AND last_error_msg LIKE '[health]%'`
+      ).bind(url).run();
+    } catch (e) {
+      fail++;
+      const reason = e.name === 'AbortError' ? 'timeout' : (e.message || 'unreachable').slice(0, 60);
+      await DB.prepare(
+        `UPDATE channels SET cooldown_until=?, last_error_msg=?, last_error_at=?
+         WHERE base_url=? AND is_enabled=1`
+      ).bind(now + 300, '[health] ' + reason, now, url).run();
+    } finally {
+      clearTimeout(timer);
+    }
+  }));
+
+  return { checked: urlSet.size, ok, fail };
+}
+
 export function registerMaintenance(app) {
   app.get("/health", async (c) => {
     const now = Date.now();
@@ -142,12 +189,14 @@ export function registerMaintenance(app) {
     const actions = {};
     const nowUnix = Math.floor(now / 1000);
 
+    if (now - lastUrlHealthCheck >= URL_HEALTH_INTERVAL_MS) {
+      lastUrlHealthCheck = now;
+      actions.url_health = await performUrlHealthCheck(DB);
+    }
+
     pruneSetupRateLimit();
     pruneLoginState();
 
-    // 恢復兩種渠道：
-    // 1. 有 cooldown_until 且已到期
-    // 2. 無 cooldown_until 但 last_error_at 超過 1h（backoff max = 3600s）
     const { results: recovered } = await DB.prepare(
       `SELECT id FROM channels 
        WHERE consecutive_errors > 0 
@@ -206,6 +255,6 @@ export function registerMaintenance(app) {
   });
 }
 
-export async function logRequest(DB, channelId, model, tokensIn, tokensOut, durationMs, status, errorMsg) {
+export async function logRequest(DB, channelId, model, tokensIn, tokensOut, durationMs, status, errorMsg, requestId) {
   bufferUsage(model, tokensIn, tokensOut, durationMs, status);
 }

@@ -5,6 +5,11 @@
 //   - 型別不符 → log 警告（SQLite 不支援 ALTER COLUMN）
 //   - 多餘 column → log 通知（非錯誤，可能是舊版遺留）
 // 參考: DDL 定義在 git 中即為唯一真相來源
+//
+// 在 Cloudflare Workers 中，此函數僅在 isolate 冷啟動時執行一次（I/O-bound，
+// 不計入 10ms CPU limit）。schemaReady 旗標防止同一 isolate 重覆執行 PRAGMA。
+
+let schemaReady = false;
 
 const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,6 +168,7 @@ const EXPECTED_COLS = {
 
 /** startup 全自動 migration：建表 → 補欄位 → 建索引 → 型別警告 */
 export async function ensureSchema(env) {
+  if (schemaReady) return;
   let totalAdded = 0;
   let totalIndexes = 0;
   const warnings = [];
@@ -229,6 +235,7 @@ export async function ensureSchema(env) {
     }
   }
 
+  // ── 5. 確保 config row 存在 ───────────────────────────────
   try {
     await env.DB.prepare(
       "INSERT OR IGNORE INTO config (id, client_token, admin_password, recovery_period) VALUES (1, '', '', 300)"
@@ -240,6 +247,7 @@ export async function ensureSchema(env) {
   if (totalAdded > 0 || totalIndexes > 0) console.log(`[schema] auto-migration: ${totalAdded} col(s), ${totalIndexes} index(es)`);
   for (const w of warnings) console.warn(w);
 
+  schemaReady = true;
   return { added: totalAdded, indexes: totalIndexes, warnings };
 }
 

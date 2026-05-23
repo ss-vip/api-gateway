@@ -2,30 +2,12 @@ import { buildUrl, buildEndpointUrl } from "./lib/providers/openai.js";
 import {
   BACKOFF_ERROR_THRESHOLD, BACKOFF_429_SECONDS, BACKOFF_MAX_SECONDS,
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
-  REQUEST_TIMEOUT_SECONDS,
-  GLOBAL_TIMEOUT_MS,
+  getRequestTimeout, getGlobalTimeout,
 } from "./lib/constants.js";
 import { bufferRate, getBufferedRate, bufferResponseTime, flushResponseTime, logRequest } from "./routes/maintenance.js";
-
-const SSE_CHUNK_HEADERS = {
-  "Content-Type": "text/event-stream",
-  "Cache-Control": "no-cache",
-  "X-Accel-Buffering": "no",
-};
-
-const ERROR_CODE_MAP = {
-  auth_error: "invalid_api_key",
-  invalid_request_error: "invalid_request_error",
-  server_error: "api_error",
-  rate_limit_error: "rate_limit_exceeded",
-  upstream_error: "upstream_error",
-};
-
-const TOOL_SIMULATION_SCHEMA_CHAR_LIMIT = 12_000;
-
-function errResponse(c, message, type, status, code) {
-  return c.json({ error: { message, type, param: null, code: code || ERROR_CODE_MAP[type] || type } }, status);
-}
+import { SSE_CHUNK_HEADERS, RollingFilter, sseEvent, sseComment, writeStreamError, writeSimulatedStream } from "./lib/sse.js";
+import { requestId, logStructured, errResponse, hasVisionContent, estimateInputTokens, tryRepairChatJson } from "./lib/request.js";
+import { shouldSimulateTools, prepareRequestBody, processXmlToolCallStream, extractXmlToolCallsFromContent } from "./lib/tool-sim.js";
 
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
@@ -35,6 +17,33 @@ const lastPersistedState = new Map();
 
 // C3: 批次健康寫入 — 累積後在一次 batch 中寫入 D1，而非每次變更都寫
 const pendingHealth = new Map();
+
+const EWMA_ALPHA = 0.3;
+const ewmaLatency = new Map();
+
+/** Phase-in recovery constant: on first success after cooldown, set errors here */
+const PHASE_IN_ERRORS = 2;
+
+function applySuccess(ch) {
+  const prev = ch.consecutive_errors || 0;
+  // Half-open / cooldown zone: don't jump to full health, phase-in gradually
+  if (prev >= BACKOFF_ERROR_THRESHOLD) {
+    ch.consecutive_errors = PHASE_IN_ERRORS;
+    return;
+  }
+  ch.consecutive_errors = Math.max(0, prev - 1);
+}
+
+function updateEwma(chId, rt) {
+  const prev = ewmaLatency.get(chId);
+  const smoothed = prev !== undefined ? EWMA_ALPHA * rt + (1 - EWMA_ALPHA) * prev : rt;
+  ewmaLatency.set(chId, smoothed);
+  return smoothed;
+}
+
+function getEwmaLatency(chId) {
+  return ewmaLatency.get(chId);
+}
 
 async function retry(fn, retries = 2) {
   for (let i = 0; i <= retries; i++) {
@@ -71,7 +80,7 @@ async function loadCache(env) {
         };
         return cache.data;
       } catch (e) {
-        console.error("[cache] load failed:", e.message);
+        logStructured("error", "cache load failed", { error: e.message });
         if (cache.data) return cache.data;
         throw e;
       }
@@ -160,8 +169,11 @@ function selectChannel(channels, originalModel, isStream, body) {
     if (!ch.is_enabled) return false;
     if (isStream && ch.support_stream === 0) return false;
     if (ch.max_tokens > 0 && inputTokens >= ch.max_tokens) return false;
-    if (ch.consecutive_errors >= BACKOFF_ERROR_THRESHOLD &&
-        now - (ch.last_error_at || 0) <= exponentialCooldown(ch.consecutive_errors)) return false;
+    const errs = ch.consecutive_errors || 0;
+
+    if (errs >= BACKOFF_ERROR_THRESHOLD &&
+        now - (ch.last_error_at || 0) <= exponentialCooldown(errs)) return false;
+
     if (ch.last_429 > 0 && ch.last_429 > now) return false;
     if (ch.cooldown_until > 0 && ch.cooldown_until > now) return false;
     const buf = getBufferedRate(ch.id);
@@ -201,7 +213,7 @@ function selectChannel(channels, originalModel, isStream, body) {
     }, { ch: null, load: Infinity }).ch;
   }
 
-  const rtValues = healthy.map(ch => ch.response_time || 0).filter(v => v > 0);
+  const rtValues = healthy.map(ch => getEwmaLatency(ch.id) || ch.response_time || 0).filter(v => v > 0);
   const avgRt = rtValues.length > 0 ? rtValues.reduce((s, v) => s + v, 0) / rtValues.length : 0;
 
   let totalW = 0;
@@ -216,10 +228,15 @@ function selectChannel(channels, originalModel, isStream, body) {
     else w *= 0.1;
 
     const err = ch.consecutive_errors || 0;
-    if (err >= 4) w *= 0.2;
+    // Half-open: cooldown expired but still high error count → probe with minimal weight
+    if (err >= BACKOFF_ERROR_THRESHOLD) {
+      w *= 0.05;
+    } else if (err >= 4) w *= 0.2;
     else if (err === 3) w *= 0.4;
     else if (err === 2) w *= 0.6;
     else if (err === 1) w *= 0.8;
+
+    if (body && shouldSimulateTools(body) && ch.support_tools) w *= 5;
 
     const buf = getBufferedRate(ch.id);
     const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
@@ -228,7 +245,7 @@ function selectChannel(channels, originalModel, isStream, body) {
     if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpm.active && rpm.count / effectiveRpm > 0.8) w *= 0.5;
     if (ch.rpd_limit > 0 && rpd.active && rpd.count / ch.rpd_limit > 0.8) w *= 0.5;
 
-    const rt = ch.response_time || 0;
+    const rt = getEwmaLatency(ch.id) || ch.response_time || 0;
     if (rt > 0 && avgRt > 0) {
       if (rt > avgRt * 2) w *= 0.3;
       else if (rt > avgRt * 1.5) w *= 0.5;
@@ -268,8 +285,6 @@ function updateRateCounters(ch, nowSec) {
 }
 
 
-// ─── 模型列表端點 ───────────────────────────────────────────────────
-
 async function handleModels(c) {
   try {
     let data;
@@ -299,6 +314,7 @@ async function handleModels(c) {
 
     return c.json({ object: "list", data: list });
   } catch (e) {
+    logStructured("error", "models unhandled", { error: e.message, stack: e.stack?.slice(0, 500) });
     return errResponse(c, "Server error", "server_error", 500);
   }
 }
@@ -315,253 +331,6 @@ function truncateErrorBody(text) {
   return text.slice(0, 8192) + "... [truncated]";
 }
 
-function hasVisionContent(body) {
-  if (!body?.messages) return false;
-  for (const msg of body.messages) {
-    if (Array.isArray(msg.content)) {
-      for (const part of msg.content) {
-        if (part?.type === "image_url") return true;
-      }
-    }
-    if (msg?.content && typeof msg.content === "string" && msg.content.includes("data:image/")) return true;
-  }
-  return false;
-}
-
-function estimateInputTokens(body) {
-  if (!body?.messages) return 0;
-  let chars = 0;
-  for (const msg of body.messages) {
-    if (typeof msg?.content === "string") {
-      chars += msg.content.length;
-      continue;
-    }
-    if (Array.isArray(msg?.content)) {
-      for (const part of msg.content) {
-        if (typeof part?.text === "string") chars += part.text.length;
-        else if (part?.type === "image_url") chars += 1024;
-        else chars += JSON.stringify(part || {}).length;
-      }
-      continue;
-    }
-    chars += JSON.stringify(msg || {}).length;
-  }
-  if (Array.isArray(body.tools)) chars += Math.min(JSON.stringify(body.tools).length, 20_000);
-  return Math.ceil(chars / 4);
-}
-
-
-
-
-class RollingFilter {
-  constructor(filters) {
-    this.filters = (filters || []).filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
-    this.buf = "";
-    this.safe = this.filters.reduce((m, f) => Math.max(m, f.text.length - 1), 0);
-    this.truncated = false;
-  }
-  transform(chunk) {
-    if (this.filters.length === 0) return chunk;
-    if (this.truncated) return "";
-    this.buf += chunk;
-    for (const f of this.filters) {
-      if (f.mode === 1) {
-        const idx = this.buf.indexOf(f.text);
-        if (idx !== -1) { this.buf = this.buf.substring(0, idx); this.truncated = true; break; }
-      } else {
-        this.buf = this.buf.split(f.text).join("");
-      }
-    }
-    if (this.truncated) { const out = this.buf; this.buf = ""; return out; }
-    const flush = Math.max(0, this.buf.length - this.safe);
-    const out = this.buf.slice(0, flush);
-    this.buf = this.buf.slice(flush);
-    return out;
-  }
-  flush() {
-    if (this.truncated) return "";
-    const out = this.buf; this.buf = ""; return out;
-  }
-  static applyStatic(text, filters) {
-    if (!text || !filters || filters.length === 0) return text;
-    const enabled = filters.filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
-    let out = text;
-    for (const f of enabled) {
-      if (f.mode === 1) { const idx = out.indexOf(f.text); if (idx !== -1) out = out.substring(0, idx); }
-      else { out = out.split(f.text).join(""); }
-    }
-    return out;
-  }
-}
-
-
-function hasTools(body) {
-  return body.tools && Array.isArray(body.tools) && body.tools.length > 0;
-}
-
-function shouldSimulateTools(body) {
-  return hasTools(body) && body.tool_choice !== "none";
-}
-
-function toolSchemaText(body) {
-  return (body.tools || []).map(formatToolSchema).join('\n');
-}
-
-function canSimulateTools(body) {
-  if (!shouldSimulateTools(body)) return false;
-  return toolSchemaText(body).length <= TOOL_SIMULATION_SCHEMA_CHAR_LIMIT;
-}
-
-let idCounter = 0;
-function nextToolCallId() {
-  const ts = Date.now().toString(36);
-  const counter = (++idCounter % 1e6).toString(36).padStart(4, "0");
-  const rand = Math.random().toString(36).slice(2, 6);
-  return "call_" + ts + counter + rand;
-}
-
-function formatToolSchema(tool) {
-  const fn = tool.function || {};
-  let desc = `- ${fn.name}: ${fn.description || 'No description'}`;
-  if (fn.parameters) {
-    try {
-      const params = typeof fn.parameters === "string" ? JSON.parse(fn.parameters) : fn.parameters;
-      const props = params.properties || {};
-      const required = params.required || [];
-      const propLines = Object.entries(props).map(([k, v]) => {
-        const req = required.includes(k) ? " (required)" : "";
-        const typeDesc = (v.type === "object" && v.properties)
-          ? "object (" + Object.keys(v.properties).join(", ") + ")"
-          : v.description || v.type || "any";
-        return `    ${k}${req}: ${typeDesc}`;
-      });
-      desc += "\n  Parameters:\n" + propLines.join("\n");
-    } catch (e) { /* skip if unparseable */ }
-  }
-  return desc;
-}
-
-function extractJsonFromContent(content) {
-  if (!content) return null;
-  const trimmed = content.trim();
-
-  try { return JSON.parse(trimmed); } catch (e) {}
-
-  const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-  if (fenceMatch) {
-    try { return JSON.parse(fenceMatch[1].trim()); } catch (e) {}
-  }
-
-  const firstBrace = trimmed.indexOf('{');
-  const firstBracket = trimmed.indexOf('[');
-  const start = (firstBrace === -1 && firstBracket === -1) ? -1
-    : (firstBrace === -1) ? firstBracket
-    : (firstBracket === -1) ? firstBrace
-    : Math.min(firstBrace, firstBracket);
-  if (start === -1) return null;
-
-  const endChar = trimmed[start] === '{' ? '}' : ']';
-  let depth = 0;
-  let inStr = false;
-  let esc = false;
-
-  for (let i = start; i < trimmed.length; i++) {
-    const c = trimmed[i];
-    if (esc) { esc = false; continue; }
-    if (c === '\\' && inStr) { esc = true; continue; }
-    if (c === '"') { inStr = !inStr; continue; }
-    if (inStr) continue;
-    if (c === '{' || c === '[') depth++;
-    if (c === '}' || c === ']') {
-      depth--;
-      if (depth === 0) {
-        try { return JSON.parse(trimmed.slice(start, i + 1)); } catch (e) { return null; }
-      }
-    }
-  }
-  return null;
-}
-
-function prepareRequestBody(body, ch, originalModel) {
-  const reqBody = { ...body, model: ch.model || originalModel };
-
-  if (shouldSimulateTools(body) && !ch.support_tools) {
-    delete reqBody.tools;
-    delete reqBody.tool_choice;
-
-    if (!canSimulateTools(body)) {
-      return reqBody;
-    }
-
-    const toolDesc = toolSchemaText(body);
-    const toolInstruction =
-      `You have access to these tools:\n${toolDesc}\n\n` +
-      `When you need to call a tool, respond ONLY with JSON: {"tool":"name","arguments":{...}} or ` +
-      `an array [{"tool":"name","arguments":{...}}] for multiple tools. ` +
-      `"name" is the tool name and "arguments" is an object with the required parameters. ` +
-      `Otherwise respond normally.`;
-
-    const msgs = body.messages || [];
-    if (msgs.length > 0 && msgs[0].role === "system") {
-      reqBody.messages = [
-        { role: "system", content: msgs[0].content + "\n\n" + toolInstruction },
-        ...msgs.slice(1),
-      ];
-    } else {
-      reqBody.messages = [
-        { role: "system", content: toolInstruction },
-        ...msgs,
-      ];
-    }
-  }
-
-  if (ch.max_tokens > 0) {
-    const inputTokens = estimateInputTokens(body);
-    const remaining = Math.max(1, ch.max_tokens - inputTokens);
-    reqBody.max_tokens = Math.min(reqBody.max_tokens || remaining, remaining, 1000000);
-  }
-
-  return reqBody;
-}
-
-function wrapToolResponse(json, ch, body) {
-  if (!hasTools(body) || ch.support_tools) return json;
-  const msg = json?.choices?.[0]?.message;
-  if (!msg?.content) return json;
-
-  const parsed = extractJsonFromContent(msg.content);
-  if (!parsed) return json;
-
-  const toolCalls = [];
-  const items = Array.isArray(parsed) ? parsed : [parsed];
-
-  for (const item of items) {
-    if (item && typeof item === 'object' && item.tool && item.arguments) {
-      toolCalls.push({
-        id: nextToolCallId(),
-        type: "function",
-        function: { name: item.tool, arguments: JSON.stringify(item.arguments) },
-      });
-    }
-  }
-
-  if (toolCalls.length > 0) {
-    json.choices[0].message = {
-      role: "assistant",
-      content: null,
-      tool_calls: toolCalls,
-    };
-    json.choices[0].finish_reason = "tool_calls";
-    const origContent = msg.content || "";
-    if (json.usage) {
-      json.usage.completion_tokens = (json.usage.completion_tokens || 0) + origContent.length;
-    }
-  }
-
-  return json;
-}
-
-
 function buildChannelConfig(ch, body, originalModel, deadline, stream) {
   const effectiveModel = ch.model || originalModel || "gpt-4o";
   const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, stream);
@@ -575,13 +344,12 @@ function buildChannelConfig(ch, body, originalModel, deadline, stream) {
 
   const requestHeaders = {
     "Content-Type": "application/json",
-    Authorization: "Bearer " + ch.api_key,
     ...channelHeaders,
   };
-  if (!requestHeaders.Authorization) delete requestHeaders.Authorization;
+  if (ch.api_key) requestHeaders.Authorization = "Bearer " + ch.api_key;
 
   const remainingMs = Math.max(2000, deadline - Date.now());
-  const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
+  const chTimeout = Math.min(remainingMs, getRequestTimeout() * 1000);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), chTimeout);
 
@@ -599,100 +367,10 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
 }
 
 
-function pickChannels(pool, originalModel, maxCount, isStream) {
-  const picked = [];
-  for (let i = 0; i < maxCount && pool.length > 0; i++) {
-    const ch = selectChannel(pool, originalModel, isStream);
-    if (!ch) break;
-    removePoolItem(pool, ch);
-    picked.push(ch);
-  }
-  return picked;
-}
-
-
-function sseEvent(w, enc, data) {
-  return w.write(enc.encode("data: " + JSON.stringify(data) + "\n\n"));
-}
-
-function sseComment(w, enc, comment) {
-  return w.write(enc.encode(": " + comment + "\n\n"));
-}
-
-function buildErrorChunk(msg) {
-  return {
-    id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
-    choices: [{ index: 0, delta: { content: "\n\n" + msg }, finish_reason: "stop" }],
-  };
-}
-
-async function writeStreamError(w, enc, msg) {
-  try {
-    await sseEvent(w, enc, buildErrorChunk(msg));
-  } catch (e) {}
-  try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
-}
-
-
-function abortAll(infos) {
-  for (const info of infos) {
-    clearTimeout(info.timeoutId);
-    info.controller.abort();
-  }
-}
-
-
-async function writeSimulatedStream(w, enc, json) {
-  try {
-    const msg = json?.choices?.[0]?.message;
-    const finishReason = json?.choices?.[0]?.finish_reason || "stop";
-    const id = json.id || ("chatcmpl-" + Date.now());
-    const created = json.created || Math.floor(Date.now() / 1000);
-    const model = json.model || "";
-
-    // Write initChunk first
-    await sseEvent(w, enc, {
-      id, object: "chat.completion.chunk", created, model,
-      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-    });
-
-    if (msg?.tool_calls && msg.tool_calls.length > 0) {
-      await sseEvent(w, enc, {
-        id, object: "chat.completion.chunk", created, model,
-        choices: [{
-          index: 0,
-          delta: { tool_calls: msg.tool_calls.map(tc => ({
-            index: 0, id: tc.id, type: tc.type,
-            function: tc.function,
-          }))},
-          finish_reason: "tool_calls",
-        }],
-      });
-    } else if (msg?.content) {
-      await sseEvent(w, enc, {
-        id, object: "chat.completion.chunk", created, model,
-        choices: [{ index: 0, delta: { content: msg.content }, finish_reason }],
-      });
-    }
-
-    if (json.usage) {
-      await sseEvent(w, enc, {
-        id, object: "chat.completion.chunk", created, model,
-        choices: [],
-        usage: json.usage,
-      });
-    }
-
-    await w.write(enc.encode("data: [DONE]\n\n"));
-  } catch (e) {
-    try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
-  }
-}
-
 
 async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel) {
   const { ch, res, responseTime } = winner;
+  logStructured("info", "stream start", { channelId: ch.id, model: ch.model, responseTime });
 
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
 
@@ -706,6 +384,8 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
   let streamError = null;
   const contentFilter = new RollingFilter(data.filters || []);
   const clientSignal = c.req.raw.signal;
+  const tcState = { buffering: false, buf: '' };
+  let emittedToolCalls = false;
 
   try {
     let lastLine = "";
@@ -716,11 +396,14 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
       sseBuf += decoder.decode(value, { stream: true });
       const lines = sseBuf.split("\n");
       sseBuf = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
+      for (const rawLine of lines) {
+        if (rawLine.startsWith(":")) continue;
+        const trimmed = rawLine.trimStart();
+        if (!trimmed.startsWith("data:")) continue;
+        const line = rawLine;
         lastLine = line;
 
-        if (line.includes("[DONE]")) {
+        if (line.trim() === "data: [DONE]") {
           streamFinishedNormally = true;
           const tail = contentFilter.flush();
           if (tail) {
@@ -741,10 +424,26 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           const chunk = JSON.parse(jsonStr);
           const choice = chunk?.choices?.[0];
           const delta = choice?.delta;
-          if (delta?.content || delta?.tool_calls) streamHadContent = true;
+          if (delta?.content || delta?.tool_calls || delta?.reasoning_content) streamHadContent = true;
           if (choice?.finish_reason) streamFinishedNormally = true;
 
+          // Normalize reasoning_content for LobeChat compatibility:
+          // Some upstream providers send reasoning_content (empty/null/whitespace)
+          // in every chunk even after thinking is done. LobeChat's transformOpenAIStream
+          // checks typeof reasoning_content === 'string' and returns { type: 'reasoning' },
+          // causing the "深度思考中" indicator to persist indefinitely.
+          //
+          // Fix: nullify reasoning_content when it carries no actual thinking text.
+          // refs: https://github.com/lobehub/lobe-chat/issues/5681 (siliconflow)
+          if (delta && 'reasoning_content' in delta) {
+            const rc = delta.reasoning_content;
+            if (rc === null || rc === '' || (typeof rc === 'string' && rc.trim() === '')) {
+              delta.reasoning_content = null;
+            }
+          }
+
           if (!hasWrittenInit) {
+            logStructured("info", "stream first chunk", { channelId: ch.id, responseTime });
             await sseEvent(w, enc, {
               id: chunk.id || ("chatcmpl-" + Date.now()),
               object: "chat.completion.chunk",
@@ -756,46 +455,141 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
             hasWrittenInit = true;
           }
 
-          if (delta && typeof delta.content === "string") {
-            const filtered = contentFilter.transform(delta.content);
-            if (filtered) {
-              delta.content = filtered;
-              if (choice?.finish_reason) {
-                const tail = contentFilter.flush();
-                if (tail) {
-                  delta.content = filtered + tail;
+          // Some upstreams lack proper function calling support and return
+          // tool invocations as XML in the content field (<tool_call>...).
+          // Detect and convert to OpenAI tool_calls chunks for MCP dispatch.
+          if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
+            const tcResult = processXmlToolCallStream(delta.content, tcState);
+
+            if (tcResult) {
+              if (tcResult.action === 'buffer') {
+                bytesWritten = true;
+                if (choice?.finish_reason) streamFinishedNormally = true;
+                continue;
+              }
+
+              if (tcResult.action === 'emit' && tcResult.toolCalls) {
+                streamHadContent = true;
+                if (!hasWrittenInit) {
+                  await sseEvent(w, enc, {
+                    id: chunk.id || ("chatcmpl-" + Date.now()),
+                    object: "chat.completion.chunk",
+                    created: chunk.created || Math.floor(Date.now() / 1000),
+                    model: originalModel || chunk.model || "unknown",
+                    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+                  });
+                  bytesWritten = true;
+                  hasWrittenInit = true;
+                }
+                if (tcResult.textBefore) {
+                  await sseEvent(w, enc, {
+                    ...chunk,
+                    choices: [{ index: 0, delta: { content: tcResult.textBefore }, finish_reason: null }],
+                  });
+                  bytesWritten = true;
+                }
+                for (const tc of tcResult.toolCalls) {
+                  await sseEvent(w, enc, {
+                    ...chunk,
+                    choices: [{ index: 0, delta: { tool_calls: [tc] }, finish_reason: null }],
+                  });
+                  bytesWritten = true;
+                }
+                await sseEvent(w, enc, {
+                  ...chunk,
+                  choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+                });
+                bytesWritten = true;
+                emittedToolCalls = true;
+                streamFinishedNormally = true;
+                if (tcResult.afterText) {
+                  delta.content = tcResult.afterText;
+                } else {
+                  continue;
                 }
               }
-              await sseEvent(w, enc, chunk);
-              bytesWritten = true;
-            } else if (choice?.finish_reason) {
-              const tail = contentFilter.flush();
-              if (tail) {
-                delta.content = tail;
+
+              if (tcResult.action === 'text_before') {
+                delta.content = tcResult.text;
+                if (delta.content.length === 0) {
+                  bytesWritten = true;
+                  continue;
+                }
+              }
+            }
+          }
+
+          if (delta && typeof delta.content === "string") {
+            if (delta.content.length > 0) {
+              const filtered = contentFilter.transform(delta.content);
+              if (filtered) {
+                delta.content = filtered;
+                if (choice?.finish_reason) {
+                  const tail = contentFilter.flush();
+                  if (tail) {
+                    delta.content = filtered + tail;
+                  }
+                }
                 await sseEvent(w, enc, chunk);
                 bytesWritten = true;
+              } else if (choice?.finish_reason) {
+                const tail = contentFilter.flush();
+                if (tail) {
+                  delta.content = tail;
+                  await sseEvent(w, enc, chunk);
+                  bytesWritten = true;
+                } else {
+                  await sseEvent(w, enc, chunk);
+                  bytesWritten = true;
+                }
               } else {
                 await sseEvent(w, enc, chunk);
                 bytesWritten = true;
               }
+            } else {
+              await sseEvent(w, enc, chunk);
+              bytesWritten = true;
             }
             if (contentFilter.truncated) {
               try { await w.write(enc.encode("data: [DONE]\n\n")); bytesWritten = true; } catch (e) {}
               streamDone = true; break;
             }
           } else {
-            if (choice?.finish_reason) {
-              const tail = contentFilter.flush();
-              if (tail) {
-                choice.delta = choice.delta || {};
-                choice.delta.content = tail;
+              if (emittedToolCalls) {
+                if (choice?.finish_reason) {
+                  streamFinishedNormally = true;
+                }
+              } else if (choice?.finish_reason) {
+                const tail = contentFilter.flush();
+                if (tail) {
+                  choice.delta = choice.delta || {};
+                  choice.delta.content = tail;
+                  await sseEvent(w, enc, chunk);
+                  bytesWritten = true;
+                } else {
+                  await sseEvent(w, enc, chunk);
+                  bytesWritten = true;
+                }
+              } else {
                 await sseEvent(w, enc, chunk);
                 bytesWritten = true;
-              } else {
-                try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
               }
-            } else {
-              try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
+          }
+
+          // Ensure a finish_reason-only stop signal is emitted when the upstream
+          // sends finish_reason bundled with content. LobeChat's transformOpenAIStream
+          // returns { type: 'text' } instead of { type: 'stop' } for such chunks,
+          // so the reasoning block ("深度思考中") never receives the collapse signal.
+          // Sending a separate stop-only chunk ensures event: stop reaches the client.
+          // refs: https://github.com/lobehub/lobe-chat/issues/5681 (siliconflow / reasoning block collapse)
+          if (!emittedToolCalls && choice?.finish_reason === "stop" && !streamDone) {
+            if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
+              const stopChunk = {
+                ...chunk,
+                choices: [{ ...choice, delta: {}, finish_reason: "stop" }],
+              };
+              await sseEvent(w, enc, stopChunk);
+              bytesWritten = true;
             }
           }
         } catch (e) {
@@ -807,15 +601,19 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
 
 
     if (!streamHadContent && !streamFinishedNormally) {
-      ch.last_error_msg = "Empty response (no content)";
-      ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
-      ch.last_error_at = Math.floor(Date.now() / 1000);
-      deferPersist(c, ch);
-      if (!bytesWritten) {
-        return false;
+      if (clientSignal.aborted) {
+        logStructured("warn", "stream client disconnect", { channelId: ch.id });
+      } else {
+        ch.last_error_msg = "Empty response (no content)";
+        ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
+        ch.last_error_at = Math.floor(Date.now() / 1000);
+        deferPersist(c, ch);
+        if (!bytesWritten) {
+          return false;
+        }
+        await writeStreamError(w, enc, "The upstream service returned an empty response — no content was generated");
+        return true;
       }
-      await writeStreamError(w, enc, "The upstream service returned an empty response — no content was generated");
-      return true;
     }
 
     if (!lastLine.includes("[DONE]")) {
@@ -823,7 +621,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     }
   } catch (e) {
     streamError = e;
-    console.error("[stream] read error:", ch.id, e.message);
+    logStructured("error", "stream read error", { channelId: ch.id, error: e.message.slice(0, 120) });
     ch.last_error_msg = "Stream error: " + e.message.slice(0, 120);
     ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
     ch.last_error_at = Math.floor(Date.now() / 1000);
@@ -835,10 +633,12 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
   }
 
   if (streamHadContent && !streamError) {
-    ch.consecutive_errors = Math.max(0, (ch.consecutive_errors || 0) - 1);
+    logStructured("info", "stream completed", { channelId: ch.id, responseTime });
+    applySuccess(ch);
     ch.last_error_msg = "";
     ch.last_error_at = 0;
     ch.response_time = responseTime;
+    updateEwma(ch.id, responseTime);
     bufferResponseTime(ch.id, responseTime);
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
     deferPersist(c, ch);
@@ -847,24 +647,19 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
 }
 
 
-// C1: Sequential-only fallback（無 race mode，節省 upstream API 用量）
 async function fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision) {
   let lastError = "";
+  let lastWinnerId = 0;
   const clientSignal = c.req.raw.signal;
-  const needToolSim = shouldSimulateTools(body);
 
   while (pool.length > 0 && Date.now() < requestDeadline && !clientSignal.aborted) {
     const ch = selectChannel(pool, originalModel, true, body);
     if (!ch) { lastError = "all channels in cooldown or rate-limited"; break; }
     removePoolItem(pool, ch);
+    logStructured("info", "stream fallback attempt", { channelId: ch.id, model: ch.model, remaining: pool.length });
 
     const cfg = buildChannelConfig(ch, body, originalModel, requestDeadline, true);
     if (!cfg) continue;
-
-    const needSim = needToolSim && !ch.support_tools && canSimulateTools(body);
-    if (needSim) {
-      cfg.reqBody.stream = false;
-    }
 
     const fetchStart = Date.now();
     try {
@@ -883,58 +678,103 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
       }
 
       const contentType = res.headers.get("Content-Type") || "";
-      if (needSim || contentType.includes("application/json")) {
+      let jsonResponse = null;
+
+      if (contentType.includes("application/json")) {
         const resText = await res.text();
         if (resText.length > 4 * 1024 * 1024) continue;
-        let json;
-        try { json = JSON.parse(resText); } catch (e) { continue; }
-        json = wrapToolResponse(json, ch, body);
+        try { jsonResponse = JSON.parse(resText); } catch (e) { continue; }
+      } else if (!contentType || contentType.includes("text/plain")) {
+        // Content sniffing: some upstreams set no/wrong Content-Type
+        const peekText = await res.text();
+        if (peekText.length > 4 * 1024 * 1024) continue;
+        const trimmed = peekText.trim();
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          try {
+            const sniffed = JSON.parse(peekText);
+            if (sniffed?.choices) jsonResponse = sniffed;
+          } catch (e) {}
+        }
+        if (!jsonResponse) {
+          // Not JSON — reconstruct response for SSE parsing
+          const reconstructedRes = new Response(peekText, {
+            status: res.status, statusText: res.statusText, headers: res.headers,
+          });
+          const winner = { ch, res: reconstructedRes, cfg, responseTime: rt };
+          const streamOk = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel);
+          if (streamOk) {
+            lastWinnerId = ch.id;
+            return { ok: true, channelId: lastWinnerId };
+          }
+          lastError = ch.last_error_msg || "Stream failed early (no content)";
+          continue;
+        }
+      }
 
-        // 空回應視為 channel 錯誤，嘗試下一個渠道
+      if (jsonResponse) {
+        if (jsonResponse?.choices?.[0]?.message?.content) {
+          const msg = jsonResponse.choices[0].message;
+          const extracted = extractXmlToolCallsFromContent(msg.content);
+          if (extracted) {
+            msg.content = extracted.content;
+            msg.tool_calls = extracted.tool_calls;
+            jsonResponse.choices[0].finish_reason = 'tool_calls';
+          }
+        }
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
-        ch.consecutive_errors = Math.max(0, (ch.consecutive_errors || 0) - 1);
+        applySuccess(ch);
         ch.response_time = rt;
+        updateEwma(ch.id, rt);
         bufferResponseTime(ch.id, rt);
         if (hasVision && !ch.is_vision) ch.is_vision = 1;
         deferPersist(c, ch);
-        await writeSimulatedStream(w, enc, json);
-        return true;
+        await writeSimulatedStream(w, enc, jsonResponse);
+        return { ok: true, channelId: ch.id };
       }
 
       const winner = { ch, res, cfg, responseTime: rt };
-      const ok = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel);
-      if (ok) {
-        return true;
+      const streamOk = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel);
+      if (streamOk) {
+        lastWinnerId = ch.id;
+        return { ok: true, channelId: lastWinnerId };
       }
       lastError = ch.last_error_msg || "Stream failed early (no content)";
       continue;
     } catch (e) {
       clearTimeout(cfg.timeoutId);
       const rt = Date.now() - fetchStart;
+      logStructured("error", "stream fetch error", { channelId: ch.id, error: e.message, stack: e.stack?.slice(0, 300) });
       markChannelError(ch, null, e.message, rt, data);
-      if (e.name === 'AbortError') {
-        ch.cooldown_until = Math.floor(Date.now() / 1000) + Math.min(5 * Math.pow(2, ch.consecutive_errors || 0), 60);
-      }
       deferPersist(c, ch);
-      lastError = (e.message || "Request failed").slice(0, 200);
+      continue;
     }
   }
-
-  await writeStreamError(w, enc, "All upstream channels failed" + (lastError ? ": " + lastError : ""));
-  return false;
+  return { ok: false, channelId: lastWinnerId };
 }
+
 
 
 function finalizeNonStream(c, winner, data, hasVision) {
   const { ch, json, responseTime } = winner;
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
-  ch.consecutive_errors = Math.max(0, (ch.consecutive_errors || 0) - 1);
+  applySuccess(ch);
   ch.last_error_msg = "";
   ch.last_error_at = 0;
   ch.response_time = responseTime;
+  updateEwma(ch.id, responseTime);
   bufferResponseTime(ch.id, responseTime);
   if (hasVision && !ch.is_vision) ch.is_vision = 1;
   deferPersist(c, ch);
+
+  if (json?.choices?.[0]?.message?.content) {
+    const msg = json.choices[0].message;
+    const extracted = extractXmlToolCallsFromContent(msg.content);
+    if (extracted) {
+      msg.content = extracted.content;
+      msg.tool_calls = extracted.tool_calls;
+      json.choices[0].finish_reason = 'tool_calls';
+    }
+  }
 
   if (json?.choices?.[0]?.message?.content && data.filters?.length > 0) {
     json.choices[0].message.content = RollingFilter.applyStatic(
@@ -998,7 +838,6 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         lastError = "Invalid JSON from upstream: " + e.message;
         continue;
       }
-      json = wrapToolResponse(json, ch, body);
 
       return finalizeNonStream(c, { ch, json, responseTime: rt }, data, hasVision);
     } catch (e) {
@@ -1011,44 +850,29 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
       lastError = (e.name === 'AbortError' ? "Upstream request timed out" : (e.message || "Request failed")).slice(0, 300);
     }
   }
-  return errResponse(c, "All upstream channels failed or the request timed out after " + (GLOBAL_TIMEOUT_MS / 1000) + "s" + (lastError ? ": " + lastError : ""), "server_error", 504);
+  return errResponse(c, "All upstream channels failed or the request timed out after " + (getGlobalTimeout() / 1000) + "s" + (lastError ? ": " + lastError : ""), "server_error", 504);
 }
 
-// 修復 LobeChat 等客戶端發送畸形 JSON（缺少 "messages" key，裸陣列直接出現在物件中）
-function tryRepairChatJson(text) {
-  if (!text || text.length < 3) return null;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  let lastNonWS = '';
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (escape) { escape = false; continue; }
-    if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"') { inString = !inString; if (!inString) lastNonWS = '"'; continue; }
-    if (inString) continue;
-
-    if (ch === '{') { depth++; lastNonWS = '{'; continue; }
-    if (ch === '}') { depth--; lastNonWS = '}'; continue; }
-    if (ch === '[') {
-      // 在物件的第一層遇到裸 [ 且前面不是 ':'，代表缺少 key
-      if (depth === 1 && lastNonWS !== ':') {
-        const repaired = text.slice(0, i) + '"messages": ' + text.slice(i);
-        try { return JSON.parse(repaired); } catch (_) { return null; }
-      }
-      depth++; lastNonWS = '['; continue;
-    }
-    if (ch === ']') { depth--; lastNonWS = ']'; continue; }
-    if (ch.trim()) lastNonWS = ch;
-  }
-  return null;
-}
+/**
+ * LobeChat compatibility: some versions emit JSON with a bare array at position 0
+ * instead of {"messages": [...]}. This scans on JSON parse failure (~0.5ms/100KB,
+ * Free Tier CPU), inserts "messages": before the array, and retries.
+ *
+ * Decision: KEPT per P7 architecture — transport gateway must tolerate
+ * client-side quirks. Cost is negligible (single-pass char scan, only on parse error).
+ * Not needed once LobeChat fixes the client, but zero-risk to retain.
+ */
 
 async function handleChatRequest(c) {
+  const rid = requestId();
   try {
     const data = await loadCache(c.env).catch(() => null);
     if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
+
+    if (!data.channels || !Array.isArray(data.channels)) {
+      logStructured("error", "invalid cache data", { rid, channels: typeof data.channels });
+      return errResponse(c, "The server had an error processing your request", "server_error", 500);
+    }
 
     const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
@@ -1061,13 +885,12 @@ async function handleChatRequest(c) {
       bodyText = await c.req.text();
       body = JSON.parse(bodyText);
     } catch (e) {
-      // 嘗試自動修復缺少 "messages" key 的畸形 JSON（LobeChat 已知問題）
       const repaired = tryRepairChatJson(bodyText);
       if (repaired) {
-        console.log("[gateway] Auto-repaired malformed JSON (missing 'messages' key), length:", bodyText?.length);
+        logStructured("info", "Auto-repaired malformed JSON", { rid, length: bodyText?.length });
         body = repaired;
       } else {
-        console.error("[gateway] JSON parse error:", e.message, "Length:", bodyText?.length, "Raw body snippet:", bodyText?.slice(0, 500));
+        logStructured("error", "JSON parse error", { rid, error: e.message, length: bodyText?.length });
         return errResponse(c, "We could not parse the JSON body of your request: " + e.message, "invalid_request_error", 400);
       }
     }
@@ -1080,10 +903,18 @@ async function handleChatRequest(c) {
     const isStream = body.stream !== false;
     const hasVision = hasVisionContent(body);
 
-    let pool = data.channels.filter((ch) => ch.is_enabled).map(ch => ({ ...ch }));
-    if (pool.length === 0) return errResponse(c, "No available channels — all upstream services are in cooldown, rate-limited, or disabled", "server_error", 503);
+    logStructured("info", "chat request", { rid, model: originalModel, stream: isStream });
 
-    const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
+    let pool = data.channels.filter((ch) => ch.is_enabled && (!ch.channel_type || ch.channel_type === "chat")).map(ch => ({ ...ch }));
+    if (pool.length === 0) {
+      const hasChatChannels = data.channels.some(ch => !ch.channel_type || ch.channel_type === "chat");
+      return errResponse(c, hasChatChannels
+        ? "All chat channels are in cooldown, rate-limited, or disabled"
+        : "No chat-configured channels available — add a channel with type Chat to handle this request",
+        "server_error", 503);
+    }
+
+    const requestDeadline = Date.now() + getGlobalTimeout();
 
     if (isStream) {
       const { readable: out, writable } = new TransformStream();
@@ -1093,25 +924,28 @@ async function handleChatRequest(c) {
       c.executionCtx.waitUntil((async () => {
         try {
           await sseComment(w, enc, "connected");
-          const streamOk = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
-          await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "");
+          const streamResult = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
+          const streamOk = streamResult.ok;
+          // Close stream immediately so client (LobeChat) does not hang waiting for end-of-stream
+          try { await w.close(); } catch (e) {}
+          await logRequest(c.env.DB, streamResult.channelId || 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "", rid);
           await flushResponseTime(c.env.DB);
           await flushHealthWrites(c.env);
         } catch (e) {
-          console.error("[stream] worker error:", e.message);
+          logStructured("error", "stream worker error", { rid, error: e.message });
           await writeStreamError(w, enc, "Gateway stream failed: " + (e.message || "unknown error"));
-        } finally {
-          try { await w.close(); } catch (e) {}
+          try { await w.close(); } catch (e2) {}
         }
       })());
 
-      return new Response(out, { headers: SSE_CHUNK_HEADERS });
+      return new Response(out, { headers: { ...SSE_CHUNK_HEADERS, "X-Request-Id": rid } });
     }
 
     const result = await fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision);
+    result.headers.set("X-Request-Id", rid);
     c.executionCtx.waitUntil((async () => {
       if (result.status !== 200) {
-        await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, result?.status || 0, "");
+        await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, result?.status || 0, "", rid);
       }
       await flushResponseTime(c.env.DB);
       await flushHealthWrites(c.env);
@@ -1119,16 +953,21 @@ async function handleChatRequest(c) {
     return result;
 
   } catch (e) {
-    console.error("[gateway] unhandled:", e.message);
+    logStructured("error", "chat request unhandled", { rid, error: e.message, stack: e.stack?.slice(0, 500) });
     return errResponse(c, "The server had an error processing your request", "server_error", 500);
   }
 }
 
 
 async function proxyEndpoint(c, endpointType) {
+  const rid = requestId();
   try {
     const data = await loadCache(c.env).catch(() => null);
     if (!data) return errResponse(c, "Unable to load configuration — the database is temporarily unavailable", "server_error", 500);
+    if (!data.channels || !Array.isArray(data.channels)) {
+      logStructured("error", "invalid cache data", { rid, endpoint: endpointType, channels: typeof data.channels });
+      return errResponse(c, "The server had an error processing your request", "server_error", 500);
+    }
 
     const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
@@ -1145,12 +984,15 @@ async function proxyEndpoint(c, endpointType) {
       return errResponse(c, "No available channels support this endpoint type", "invalid_request_error", 400, "unsupported_endpoint");
     }
 
-    const requestDeadline = Date.now() + GLOBAL_TIMEOUT_MS;
+    const requestDeadline = Date.now() + getGlobalTimeout();
     const reqBodyBuffer = await c.req.arrayBuffer();
+
+    const clientSignal = c.req.raw.signal;
+    let clientGone = clientSignal.aborted;
 
     let lastError = "";
 
-    while (pool.length > 0 && Date.now() < requestDeadline) {
+    while (pool.length > 0 && Date.now() < requestDeadline && !clientGone) {
       const ch = selectChannel(pool, "", false);
       if (!ch) break;
 
@@ -1161,14 +1003,18 @@ async function proxyEndpoint(c, endpointType) {
       }
 
       const remainingMs = Math.max(2000, requestDeadline - Date.now());
-      const chTimeout = Math.min(remainingMs, REQUEST_TIMEOUT_SECONDS * 1000);
+      const chTimeout = Math.min(remainingMs, getRequestTimeout() * 1000);
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), chTimeout);
+      if (!clientSignal.aborted) {
+        clientSignal.addEventListener('abort', () => { controller.abort(); clientGone = true; }, { once: true });
+      }
 
       let channelHeaders = {};
       if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
       else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
-      const reqHeaders = { Authorization: "Bearer " + ch.api_key, ...channelHeaders };
+      const reqHeaders = { ...channelHeaders };
+      if (ch.api_key) reqHeaders.Authorization = "Bearer " + ch.api_key;
       const ct = c.req.header("Content-Type");
       if (ct) {
         reqHeaders["Content-Type"] = ct;
@@ -1197,10 +1043,11 @@ async function proxyEndpoint(c, endpointType) {
         }
 
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
-        ch.consecutive_errors = Math.max(0, (ch.consecutive_errors || 0) - 1);
+        applySuccess(ch);
         ch.last_error_msg = "";
         ch.last_error_at = 0;
         ch.response_time = rt;
+        updateEwma(ch.id, rt);
         bufferResponseTime(ch.id, rt);
         deferPersist(c, ch);
 
@@ -1221,7 +1068,7 @@ async function proxyEndpoint(c, endpointType) {
           await flushResponseTime(c.env.DB);
           await flushHealthWrites(c.env);
         })());
-        return new Response(res.body, { status: 200, headers: responseHeaders });
+        return new Response(res.body, { status: 200, headers: { ...responseHeaders, "X-Request-Id": rid } });
       } catch (e) {
         clearTimeout(timeoutId);
         markChannelError(ch, null, e.message, Date.now() - startTime, data);
@@ -1241,18 +1088,20 @@ async function proxyEndpoint(c, endpointType) {
     }
     return errResponse(c, "All channels are rate-limited or temporarily unavailable", "rate_limit_error", 429);
   } catch (e) {
-    console.error("[proxy] unhandled:", e.message);
+    logStructured("error", "proxy unhandled", { rid, endpoint: endpointType, error: e.message, stack: e.stack?.slice(0, 500) });
     return errResponse(c, "The server had an error processing your request", "server_error", 500);
   }
 }
 
 export default function registerGateway(app) {
-  app.post("/chat/completions", async (c) => handleChatRequest(c));
-  app.post("/v1/chat/completions", async (c) => handleChatRequest(c));
-  for (const p of ["/models", "/v1/models"]) app.get(p, async (c) => handleModels(c));
-  for (const p of ["/images/generations", "/v1/images/generations"]) app.post(p, async (c) => proxyEndpoint(c, "image_gen"));
-  for (const p of ["/audio/speech", "/v1/audio/speech"]) app.post(p, async (c) => proxyEndpoint(c, "audio_tts"));
-  for (const p of ["/audio/transcriptions", "/v1/audio/transcriptions"]) app.post(p, async (c) => proxyEndpoint(c, "audio_stt"));
-  for (const p of ["/images/edits", "/v1/images/edits"]) app.post(p, async (c) => proxyEndpoint(c, "image_edit"));
-  for (const p of ["/embeddings", "/v1/embeddings"]) app.post(p, async (c) => proxyEndpoint(c, "embeddings"));
+  const V = ["", "/v1", "/api/v1"];
+  for (const v of V) {
+    app.post(v + "/chat/completions", async (c) => handleChatRequest(c));
+    app.get(v + "/models", async (c) => handleModels(c));
+    app.post(v + "/images/generations", async (c) => proxyEndpoint(c, "image_gen"));
+    app.post(v + "/audio/speech", async (c) => proxyEndpoint(c, "audio_tts"));
+    app.post(v + "/audio/transcriptions", async (c) => proxyEndpoint(c, "audio_stt"));
+    app.post(v + "/images/edits", async (c) => proxyEndpoint(c, "image_edit"));
+    app.post(v + "/embeddings", async (c) => proxyEndpoint(c, "embeddings"));
+  }
 }

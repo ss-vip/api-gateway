@@ -64,10 +64,8 @@ async function verifyPassword(password, storedHash) {
   return bytesToHex(new Uint8Array(bits)) === hashHex;
 }
 async function getAdminPass(c) {
-  try {
-    const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first();
-    return cf?.admin_password || null;
-  } catch { return null; }
+  const cf = await c.env.DB.prepare("SELECT admin_password FROM config WHERE id=1").first();
+  return cf?.admin_password || null;
 }
 
 export { getAdminPass, verifyPassword, setPepper };
@@ -90,16 +88,16 @@ const SETUP_BAN_MS = 10 * 60 * 1000; // 10 minutes
 
 function checkSetupRateLimit(ip) {
   const state = setupRateLimit.get(ip) || { count: 0, banUntil: 0 };
+  const attempt = state.count + 1;
   if (Date.now() < state.banUntil) return { blocked: true, remaining: 0 };
-  if (state.count >= SETUP_MAX_ATTEMPTS) {
+  if (attempt > SETUP_MAX_ATTEMPTS) {
     setupRateLimit.set(ip, { count: 0, banUntil: Date.now() + SETUP_BAN_MS });
     return { blocked: true, remaining: 0 };
   }
-  setupRateLimit.set(ip, { count: state.count + 1, banUntil: 0 });
-  return { blocked: false, remaining: SETUP_MAX_ATTEMPTS - state.count - 1 };
+  setupRateLimit.set(ip, { count: attempt, banUntil: 0 });
+  return { blocked: false, remaining: SETUP_MAX_ATTEMPTS - attempt };
 }
 
-// Periodic cleanup: remove expired bans + cap size
 export function pruneSetupRateLimit() {
   const now = Date.now();
   for (const [ip, state] of setupRateLimit) {
@@ -117,6 +115,9 @@ function validateChannelData(channels) {
     const ch = channels[i];
     if (ch.channel_type && !CHANNEL_TYPES.has(ch.channel_type))
       errors.push(`[${i}] Invalid channel_type "${ch.channel_type}", valid: ${[...CHANNEL_TYPES].join(", ")}`);
+    if (ch.channel_type && ch.channel_type !== "chat") {
+      ch.is_vision = 0;
+    }
     if (ch.weight !== undefined && (typeof ch.weight !== "number" || ch.weight < 1 || ch.weight > 1000))
       errors.push(`[${i}] Invalid weight ${ch.weight}, must be 1–1000`);
     if (ch.rpm_limit !== undefined && (typeof ch.rpm_limit !== "number" || ch.rpm_limit < 0 || ch.rpm_limit > 100000))
@@ -132,7 +133,6 @@ function validateChannelData(channels) {
   return errors;
 }
 
-// ── 多模態測試 handler registry（Open Design） ──────────────
 const CHANNEL_TESTS = new Map();
 
 export function registerChannelTest(type, handler) {

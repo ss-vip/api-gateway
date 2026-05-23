@@ -7,8 +7,10 @@ import { setPepper } from "./dashboard/resources.js";
 import { registerMaintenance } from "./routes/maintenance.js";
 import { generateToken } from "./lib/db.js";
 import { ensureSchema } from "./lib/schema.js";
+import { setTimeouts } from "./lib/constants.js";
 
 async function initConfig(env) {
+  setTimeouts(env);
   setPepper(env.PASSWORD_PEPPER || "");
   try { await ensureSchema(env); } catch (e) { console.error("[schema]", e.message); }
 

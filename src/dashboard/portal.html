@@ -30,10 +30,39 @@
       .card-header span { font-size: 0.85rem; }
       .input-group-text { font-size: 0.7rem; }
     }
+    @media (max-width: 991.98px) {
+      .table th, .table td { padding: 0.4rem 0.3rem; }
+      .table td .btn-sm { padding: 0.15rem 0.35rem; font-size: 0.65rem; }
+      #stat-content .card-body { padding: 0.75rem; }
+      #stat-content .h3 { font-size: 1.25rem; }
+    }
+    @media (max-width: 767.98px) {
+      .container { padding-left: 0.5rem; padding-right: 0.5rem; }
+      .table th, .table td { padding: 0.3rem 0.2rem; font-size: 0.7rem; }
+      #stat-content .h3 { font-size: 1rem; }
+      #stat-content .card-body { padding: 0.5rem; }
+      #ch-form .modal-body { padding: 0.75rem; }
+      #chModal .modal-dialog { margin: 0.25rem; max-width: calc(100vw - 0.5rem) !important; }
+    }
+    @media (max-width: 575.98px) {
+      .navbar .container { padding-left: 0.25rem; padding-right: 0.25rem; }
+      #chModal .modal-dialog { margin: 0; min-height: 100vh; border-radius: 0; }
+      #chModal .modal-content { border-radius: 0; min-height: 100vh; }
+      #ch-form .modal-body .tab-content .row > div { padding-left: 0.25rem; padding-right: 0.25rem; }
+      #ch-form .input-group { flex-wrap: nowrap; }
+      .nav-tabs .nav-link { padding: 0.4rem 0.6rem; font-size: 0.75rem; }
+    }
     #loading-overlay .spinner-border { display: inline-block; width: 2rem; height: 2rem; border: 0.25em solid #fff; border-right-color: transparent; border-radius: 50%; animation: spinner-border 0.75s linear infinite; }
-    .tab-content-equal { display: grid; }
-    .tab-content-equal > .tab-pane { grid-area: 1/1/1/1; visibility: hidden; opacity: 0; transition: opacity 0.15s; }
+    .tab-content-equal { display: grid; min-height: 300px; }
+    .tab-content-equal > .tab-pane { grid-area: 1/1/1/1; visibility: hidden; opacity: 0; transition: opacity 0.15s; display: flex; flex-direction: column; }
     .tab-content-equal > .tab-pane.active { visibility: visible; opacity: 1; position: static; }
+    .tab-content-equal > .tab-pane .scroll-fill { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+    /* Channel edit modal: form wraps body+footer, needs flex to fill modal-content */
+    #ch-form { display: flex; flex-direction: column; overflow: hidden; flex: 1; min-height: 0; }
+    #ch-form .modal-body { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+    #ch-form .modal-footer { flex-shrink: 0; }
+    /* Reduce label sizes for tighter form */
+    .mini-label { font-size: 0.65rem; margin-bottom: 0.1rem; }
   </style>
 </head>
 <body>
@@ -82,7 +111,7 @@
     <nav class="navbar navbar-expand border-bottom sticky-top mb-4 py-2">
       <div class="container">
         <a class="navbar-brand fw-bold text-primary" href="javascript:location.reload()">API Gateway</a>
-        <div class="ms-auto d-flex gap-2 align-items-center">
+        <div class="ms-auto d-flex gap-2 align-items-center flex-wrap justify-content-end">
           <button onclick="saveEverything()" class="btn btn-sm btn-primary fw-bold px-3">SAVE ALL</button>
           <div class="dropdown">
             <button class="btn btn-sm btn-outline-secondary dropdown-toggle fw-bold" data-bs-toggle="dropdown">TOOLS</button>
@@ -132,19 +161,21 @@
       </div>
 
       <div class="card mb-4 border-0 shadow-sm">
-        <div class="card-header bg-transparent fw-bold d-flex justify-content-between align-items-center py-3 border-0">
-          <div class="d-flex align-items-center gap-3 flex-grow-1">
-            <span class="d-none d-md-inline">Channels</span>
-            <div class="input-group input-group-sm" style="max-width: 250px;">
-              <span class="input-group-text bg-transparent border-end-0"><i class="bi bi-search"></i></span>
-              <input type="text" id="ch-search" class="form-control border-start-0 ps-0" placeholder="Search..." oninput="renderChannels()" />
-              <button class="input-group-text bg-transparent border-start-0" onclick="clearSearch()" style="cursor:pointer;border:0"><i class="bi bi-x-lg"></i></button>
+        <div class="card-header bg-transparent fw-bold py-3 border-0">
+          <div class="d-flex flex-column flex-md-row justify-content-between align-items-stretch align-items-md-center gap-2">
+            <div class="d-flex align-items-center gap-2 flex-grow-1">
+              <span class="d-none d-md-inline fw-bold">Channels</span>
+              <div class="input-group input-group-sm" style="min-width:80px;max-width:260px">
+                <span class="input-group-text bg-transparent border-end-0"><i class="bi bi-search"></i></span>
+                <input type="text" id="ch-search" class="form-control border-start-0 ps-0" placeholder="Search..." oninput="renderChannels()" />
+                <button class="input-group-text bg-transparent border-start-0" onclick="clearSearch()" style="cursor:pointer;border:0"><i class="bi bi-x-lg"></i></button>
+              </div>
             </div>
-          </div>
-          <div class="d-flex gap-2">
-            <button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold">ADD</button>
-            <button onclick="resetAllHealth()" class="btn btn-outline-success btn-sm px-3 fw-bold">RESET ALL HEALTH</button>
-            <button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE</button>
+            <div class="d-flex gap-2 flex-wrap">
+              <button onclick="openChannelModal()" class="btn btn-outline-primary btn-sm px-3 fw-bold flex-fill flex-md-grow-0">ADD</button>
+              <button onclick="resetAllHealth()" class="btn btn-outline-success btn-sm px-3 fw-bold flex-fill flex-md-grow-0">RESET ALL HEALTH</button>
+              <button onclick="saveAllChannels()" class="btn btn-primary btn-sm px-3 fw-bold flex-fill flex-md-grow-0">SAVE</button>
+            </div>
           </div>
         </div>
         <div class="table-responsive">
@@ -160,8 +191,8 @@
                 </th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i class="bi bi-info-circle" title="優先調用相符的模型名、視覺、工具使用"></i> <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 100px" class="d-none d-sm-table-cell border-0 cursor-pointer" onclick="toggleSort('response_time')">Latency <i id="sort-response_time" class="bi bi-arrow-down-up opacity-25"></i></th>
+                <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-arrow-down-up opacity-25"></i></th>
+                <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('response_time')">Latency <i id="sort-response_time" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 120px" class="border-0 cursor-pointer" onclick="toggleSort('status')">Health <i id="sort-status" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 150px" class="text-center border-0">Actions</th>
               </tr>
@@ -172,11 +203,20 @@
       </div>
 
       <div class="card border-0 shadow-sm">
-        <div class="card-header bg-transparent fw-bold d-flex justify-content-between align-items-center py-3 border-0">
-          <span>Filters</span>
-          <div class="d-flex gap-2">
-            <button onclick="addFilter()" class="btn btn-outline-info btn-sm px-3 fw-bold">ADD</button>
-            <button onclick="saveAllFilters()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE</button>
+        <div class="card-header bg-transparent fw-bold py-3 border-0">
+          <div class="d-flex flex-column flex-md-row justify-content-between align-items-stretch align-items-md-center gap-2">
+            <div class="d-flex align-items-center gap-2">
+              <span class="d-none d-md-inline fw-bold">Filters</span>
+              <div class="input-group input-group-sm" style="min-width:80px;max-width:260px">
+                <span class="input-group-text bg-transparent border-end-0"><i class="bi bi-search"></i></span>
+                <input type="text" id="fl-search" class="form-control border-start-0 ps-0" placeholder="Search..." oninput="renderFilters()" />
+                <button class="input-group-text bg-transparent border-start-0" onclick="document.getElementById('fl-search').value='';renderFilters()" style="cursor:pointer;border:0"><i class="bi bi-x-lg"></i></button>
+              </div>
+            </div>
+            <div class="d-flex gap-2">
+              <button onclick="addFilter()" class="btn btn-outline-info btn-sm px-3 fw-bold">ADD</button>
+              <button onclick="saveAllFilters()" class="btn btn-primary btn-sm px-3 fw-bold">SAVE</button>
+            </div>
           </div>
         </div>
         <div class="table-responsive">
@@ -191,7 +231,7 @@
                   </div>
                 </th>
                 <th class="align-middle">Keyword <i class="bi bi-info-circle" title="要過濾的關鍵字"></i></th>
-                <th style="width: 120px" class="d-none d-sm-table-cell align-middle">Mode <i class="bi bi-info-circle" title="Truncate: 切除關鍵字及其後內容；Delete: 僅刪除關鍵字"></i></th>
+                <th style="width: 120px" class="d-none d-md-table-cell align-middle">Mode <i class="bi bi-info-circle" title="Truncate: 切除關鍵字及其後內容；Delete: 僅刪除關鍵字"></i></th>
                 <th style="width: 60px" class="align-middle">Actions</th>
               </tr>
             </thead>
@@ -210,7 +250,7 @@
     <div class="modal-footer border-0 pt-0"><button onclick="updateAdminPass()" class="btn btn-warning w-100 fw-bold">UPDATE & LOGOUT</button></div>
   </div></div></div>
 
-  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable" style="max-width:680px;height:520px"><div class="modal-content" style="height:100%">
+  <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable" style="max-width:680px"><div class="modal-content">
     <div class="modal-header border-0 pb-0">
       <div class="d-flex align-items-center gap-2">
         <h5 class="fw-bold small mb-0">Channel Editor</h5>
@@ -232,8 +272,13 @@
       </ul>
       <div class="tab-content tab-content-equal border border-top-0 rounded-bottom p-3">
       <div class="tab-pane fade show active" id="basic-tab" role="tabpanel">
-      <div class="mb-2"><label class="form-label mini-label fw-bold">Name *</label><input type="text" id="ch-name" class="form-control form-control-sm" required /></div>
-      <div class="mb-2" style="position:relative">
+      <!-- Row 1: Name -->
+      <div class="mb-1">
+        <label class="form-label mini-label fw-bold">Name *</label>
+        <input type="text" id="ch-name" class="form-control form-control-sm" required />
+      </div>
+      <!-- Row 2: API Key -->
+      <div class="mb-1" style="position:relative">
         <label class="form-label mini-label fw-bold">API Key *</label>
         <!-- Hidden dummy field to fool browser password managers -->
         <input type="password" style="position:absolute;width:0;height:0;padding:0;border:0;opacity:0" tabindex="-1" aria-hidden="true" readonly />
@@ -242,7 +287,8 @@
           <button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button>
         </div>
       </div>
-      <div class="mb-2">
+      <!-- Row 3: Base URL -->
+      <div class="mb-1">
         <label class="form-label mini-label fw-bold">Base URL *</label>
         <div class="input-group input-group-sm">
           <input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" oninput="checkFetchModelsBtn()" required />
@@ -252,7 +298,8 @@
           </div>
         </div>
       </div>
-      <div class="mb-2">
+      <!-- Row 4: Primary Model + Clear + FETCH -->
+      <div class="mb-1">
         <label class="form-label mini-label fw-bold">Primary Model *</label>
         <div class="input-group input-group-sm">
           <input type="text" id="ch-model" class="form-control form-control-sm" required />
@@ -260,7 +307,8 @@
           <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models-primary" onclick="fetchModels('primary')" disabled>FETCH</button>
         </div>
       </div>
-      <div class="mb-2">
+      <!-- Row 5: Secondary Model + Clear + FETCH -->
+      <div class="mb-1">
         <label class="form-label mini-label fw-bold">Secondary Model <span class="text-muted fw-normal" style="font-size:0.6rem">Fallback, Optional</span></label>
         <div class="input-group input-group-sm">
           <input type="text" id="ch-fallback-model" class="form-control form-control-sm" />
@@ -268,17 +316,17 @@
           <button class="btn btn-outline-primary fw-bold" type="button" id="btn-fetch-models-fallback" onclick="fetchModels('fallback')" disabled>FETCH</button>
         </div>
       </div>
-      <div class="row g-2 mb-2">
-        <div class="col-6"><label class="form-label mini-label fw-bold">Weight (1-1000)</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required /></div>
-        <div class="col-6"><label class="form-label mini-label fw-bold">Context Limit</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" max="1000000" value="0" /><span class="text-muted small" style="font-size:0.6rem">Input + output (0 = unlimited)</span></div>
+      <!-- Row 6: Weight + Context + RPM + RPD (2 欄 on md, 4 欄 on lg+) -->
+      <div class="row g-2 mb-1">
+        <div class="col-6 col-md-3" title="Channel selection weight (higher = more preferred)"><label class="form-label mini-label fw-bold">Weight</label><input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required /></div>
+        <div class="col-6 col-md-3" title="Max context tokens (0 = no limit)"><label class="form-label mini-label fw-bold">Context</label><input type="number" id="ch-tokens" class="form-control form-control-sm" min="0" max="1000000" value="0" /></div>
+        <div class="col-6 col-md-3" title="Requests per minute limit (0 = no limit)"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm" min="0" max="100000" value="0" /></div>
+        <div class="col-6 col-md-3" title="Requests per day limit (0 = no limit)"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm" min="0" max="100000" value="0" /></div>
       </div>
-      <div class="row g-1 mb-2">
-        <div class="col-6"><label class="form-label mini-label fw-bold">RPM</label><input type="number" id="ch-rpm" class="form-control form-control-sm p-1" min="0" max="100000" value="0" /></div>
-        <div class="col-6"><label class="form-label mini-label fw-bold">RPD</label><input type="number" id="ch-rpd" class="form-control form-control-sm p-1" min="0" max="100000" value="0" /></div>
-      </div>
-      <div class="row g-2 mt-3 pt-2 border-top align-items-center">
-        <div class="col-4">
-          <label class="form-label mini-label fw-bold mb-0" for="ch-type">Type</label>
+      <!-- Row 7: Type + Vision (emoji+text+換行+開關) + Enabled (emoji+text+換行+開關) -->
+      <div class="row g-2">
+        <div class="col-4 d-flex flex-column justify-content-center">
+          <label class="form-label mini-label fw-bold mb-0">Type</label>
           <select id="ch-type" class="form-select form-select-sm">
             <option value="chat">&#x1F4AC; Chat</option>
             <option value="image_gen">&#x1F5BC;&#xFE0F; Image Gen</option>
@@ -288,40 +336,40 @@
             <option value="embeddings">&#x1F4DA; Embed</option>
           </select>
         </div>
-        <div class="col-4 text-center">
-          <label class="form-label mini-label fw-bold mb-0" for="ch-vision">&#x1F441;&#xFE0F; Vision</label>
-          <div class="mt-1"><div class="form-check form-switch d-inline-block mb-0"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div></div>
+        <div class="col-4 d-flex flex-column align-items-center justify-content-center">
+          <label for="ch-vision" class="form-label mini-label fw-bold mb-0" style="cursor:pointer">&#x1F441;&#xFE0F; Vision</label>
+          <div class="form-check form-switch d-inline-block mb-0 mt-1" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" id="ch-vision" checked></div>
         </div>
-        <div class="col-4 text-center">
-          <label class="form-label mini-label fw-bold mb-0" for="ch-enabled">&#x2714;&#xFE0F; Enabled</label>
-          <div class="mt-1"><div class="form-check form-switch d-inline-block mb-0"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div></div>
+        <div class="col-4 d-flex flex-column align-items-center justify-content-center">
+          <label for="ch-enabled" class="form-label mini-label fw-bold mb-0" style="cursor:pointer">&#x2714;&#xFE0F; Enabled</label>
+          <div class="form-check form-switch d-inline-block mb-0 mt-1" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" id="ch-enabled" checked></div>
         </div>
       </div>
       </div>
-      <div class="tab-pane fade" id="log-tab" role="tabpanel">
+      <div class="tab-pane fade d-flex flex-column" id="log-tab" role="tabpanel">
       <div class="d-flex justify-content-between align-items-center mb-1">
         <label class="form-label mini-label fw-bold mb-0">&#x1F4C5; Last Call</label>
         <span id="ch-log-time" class="text-muted small"></span>
       </div>
-      <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="d-flex justify-content-between align-items-center mb-1">
         <label class="form-label mini-label fw-bold mb-0">&#x1F3AF; Health Status</label>
         <span id="ch-log-status" class="small"></span>
       </div>
-      <div class="mb-1">
-        <label class="form-label mini-label fw-bold">&#x1F4AC; Detail</label>
-        <textarea id="ch-log-msg" class="form-control form-control-sm" rows="8" readonly style="font-size:0.7rem"></textarea>
-      </div>
-      <div class="mb-1" id="ch-log-url-wrapper">
+      <div class="mb-1" id="ch-log-url-wrapper" style="display:none">
         <label class="form-label mini-label fw-bold">&#x1F517; Target URL</label>
         <input type="text" id="ch-log-url" class="form-control form-control-sm" readonly style="font-size:0.7rem" />
       </div>
-      <div class="mb-1" id="ch-log-req-wrapper">
-        <label class="form-label mini-label fw-bold">&#x1F4E8; Request</label>
-        <textarea id="ch-log-req" class="form-control form-control-sm" rows="8" readonly style="font-size:0.65rem"></textarea>
+      <div class="mb-1">
+        <label class="form-label mini-label fw-bold">&#x1F4AC; Detail</label>
+        <textarea id="ch-log-msg" class="form-control form-control-sm" rows="3" readonly style="font-size:0.7rem;resize:none"></textarea>
       </div>
-      <div class="mb-1" id="ch-log-res-wrapper">
+      <div class="mb-1 flex-fill d-flex flex-column" id="ch-log-req-wrapper" style="display:none">
+        <label class="form-label mini-label fw-bold">&#x1F4E8; Request</label>
+        <textarea id="ch-log-req" class="form-control form-control-sm flex-fill" readonly style="font-size:0.65rem;resize:none"></textarea>
+      </div>
+      <div class="flex-fill d-flex flex-column" id="ch-log-res-wrapper" style="display:none">
         <label class="form-label mini-label fw-bold">&#x1F4E9; Response</label>
-        <textarea id="ch-log-res" class="form-control form-control-sm" rows="8" readonly style="font-size:0.65rem"></textarea>
+        <textarea id="ch-log-res" class="form-control form-control-sm flex-fill" readonly style="font-size:0.65rem;resize:none"></textarea>
       </div>
       </div>
       </div>
@@ -385,12 +433,22 @@
       [chModal, passModal, debugModal, modelsModal].forEach(m => { if (m) m.hide(); });
     };
 
+    const syncVisionByType = () => {
+      const type = document.getElementById('ch-type').value;
+      const vision = document.getElementById('ch-vision');
+      if (type !== 'chat') {
+        vision.checked = false;
+        vision.disabled = true;
+      } else {
+        vision.disabled = false;
+      }
+    };
+
     const loading = (show) => {
       const el = document.getElementById('loading-overlay');
       if (show) {
         pendingRequests++;
         el.classList.remove('hide');
-        // Safety timeout: 60s max for any loader that may hang
         setTimeout(() => {
           if (pendingRequests > 0) { pendingRequests = 0; el.classList.add('hide'); }
         }, 60000);
@@ -438,12 +496,14 @@
       document.getElementById('admin-view').style.display = 'none';
       document.getElementById('setup-view').style.display = 'none';
       document.getElementById('login-view').style.display = 'block';
+      document.getElementById('login-pass')?.focus();
       loading(false);
     };
     const showSetup = () => {
       document.getElementById('admin-view').style.display = 'none';
       document.getElementById('login-view').style.display = 'none';
       document.getElementById('setup-view').style.display = 'block';
+      document.getElementById('setup-pass')?.focus();
       loading(false);
     };
     const showAdmin = async () => {
@@ -548,7 +608,6 @@
     };
 
     const init = async () => {
-      // Single batch endpoint that returns everything at once
       const batch = await api('/admin/api/init', 'GET', null, true);
       if (!batch) return;
       const config = batch.config && typeof batch.config === 'object' ? batch.config : {};
@@ -583,9 +642,9 @@
       // Daily usage stats (from server)
       const statsData = window._lastStats?.stats;
       const dailyStatsHtml = statsData && statsData.requests > 0
-        ? '<div class="col-12"><div class="card border-0 shadow-sm"><div class="card-body p-3">' +
+        ? '<div class="col-12"><div class="card border-0 shadow-sm"><div class="card-body p-2 p-md-3">' +
           '<div class="small text-muted text-uppercase fw-bold mb-1">📊 本日用量 (' + statsData.date + ')</div>' +
-          '<div class="d-flex gap-4 flex-wrap">' +
+          '<div class="d-flex gap-3 flex-wrap">' +
           '<span>請求: <strong>' + statsData.requests + '</strong></span>' +
           '<span>Token: <strong>' + (statsData.tokens || 0).toLocaleString() + '</strong></span>' +
           '</div></div></div></div>'
@@ -599,13 +658,13 @@
         { label: 'Recovery', val: cooling, cls: 'text-info' },
       ];
 
-      let html = '<div class="row g-3 mb-3">';
+      let html = '<div class="row g-2 g-md-3 mb-3">';
       html += stats.map(s =>
-        '<div class="col-6 col-md-auto flex-grow-1">' +
+        '<div class="col-6 col-md-4 col-xl-auto flex-grow-1">' +
           '<div class="card border-0 shadow-sm h-100">' +
-            '<div class="card-body p-3">' +
-              '<div class="small text-muted text-uppercase fw-bold mb-1">' + s.label + '</div>' +
-              '<div class="h3 mb-0 fw-normal ' + s.cls + '">' + s.val + '</div>' +
+            '<div class="card-body p-2 p-md-3">' +
+              '<div class="small text-muted text-uppercase fw-bold mb-0 mb-md-1">' + s.label + '</div>' +
+              '<div class="h4 h-md-3 mb-0 fw-normal ' + s.cls + '">' + s.val + '</div>' +
             '</div>' +
           '</div>' +
         '</div>'
@@ -630,7 +689,7 @@
       html +=
         '<div class="col-12">' +
           '<div class="card border-0 shadow-sm">' +
-            '<div class="card-body p-3">' + rpdContent + '</div>' +
+            '<div class="card-body p-2 p-md-3">' + rpdContent + '</div>' +
           '</div>' +
         '</div></div>';
 
@@ -712,25 +771,26 @@
         row += esc(c.name);
         row += '</td>';
         row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code>' + (c.is_vision ? ' \u{1F441}\u{FE0F}' : '') + ' <span class="badge bg-secondary" style="font-size:0.6rem">' + typeLabel + '</span></td>';
-        row += '<td class="d-none d-sm-table-cell align-middle">' + c.weight + '</td>';
-        row += '<td id="ch-latency-' + c.id + '" class="d-none d-sm-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
+        row += '<td class="d-none d-lg-table-cell align-middle">' + c.weight + '</td>';
+        row += '<td id="ch-latency-' + c.id + '" class="d-none d-lg-table-cell align-middle small text-muted">' + (c.response_time ? (c.response_time + 'ms') : '-') + '</td>';
         row += '<td id="ch-health-' + c.id + '" class="align-middle">' + h + '</td>';
-        row += '<td class="align-middle">';
-        row += '  <div class="d-none d-md-flex justify-content-center gap-1">';
-        row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
+        row += '<td class="align-middle" style="min-width:90px">';
+        row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
         row += '    <button onclick="testChannel(' + c.id + ')" class="btn btn-sm btn-outline-info py-1 px-2" title="Test Channel"><i class="bi bi-play-fill"></i></button>';
         row += '    <button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-1 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>';
+        row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
         row += '    <button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>';
         row += '  </div>';
-        row += '  <div class="d-md-none dropdown">';
-        row += '    <button class="btn btn-sm btn-light py-1 px-2" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>';
+        row += '  <div class="d-lg-none dropdown">';
+        row += '    <button class="btn btn-sm btn-outline-secondary py-1 px-2" data-bs-toggle="dropdown" title="Actions"><i class="bi bi-three-dots-vertical"></i></button>';
         row += '    <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
-        row += '      <li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small">Edit</button></li>';
-        row += '      <li><button onclick="testChannel(' + c.id + ')" class="dropdown-item small">Test</button></li>';
-        row += '      <li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small">Reset Health</button></li>';
-        row += '      <li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small">Copy</button></li>';
-        row += '      <li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small text-danger">Delete</button></li>';
+        row += '      <li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small py-2"><i class="bi bi-pencil me-2"></i>Edit</button></li>';
+        row += '      <li><button onclick="testChannel(' + c.id + ')" class="dropdown-item small py-2"><i class="bi bi-play-fill me-2"></i>Test</button></li>';
+        row += '      <li><button onclick="resetHealth(' + c.id + ')" class="dropdown-item small py-2"><i class="bi bi-arrow-repeat me-2"></i>Reset Health</button></li>';
+        row += '      <li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small py-2"><i class="bi bi-copy me-2"></i>Copy</button></li>';
+        row += '      <li><hr class="dropdown-divider"></li>';
+        row += '      <li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small py-2 text-danger"><i class="bi bi-trash me-2"></i>Delete</button></li>';
         row += '    </ul>';
         row += '  </div>';
         row += '</td>';
@@ -807,13 +867,18 @@
     };
 
     const renderFilters = () => {
-      document.getElementById('filter-list').innerHTML = filters.map((f, i) => {
+      const query = document.getElementById('fl-search')?.value?.toLowerCase() || '';
+      const display = query ? filters.filter(f =>
+        (f.text || '').toLowerCase().includes(query)
+      ) : filters;
+      document.getElementById('filter-list').innerHTML = display.map((f, i) => {
+        const realIdx = filters.indexOf(f);
         let row = '<tr>';
         row += '<td class="text-muted small align-middle">' + (f.id || '-') + '</td>';
-        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + i + '].is_enabled=this.checked"></div></td>';
-        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + i + '].text=this.value"></td>';
-        row += '<td class="d-none d-sm-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + i + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
-        row += '<td class="align-middle"><button onclick="filters.splice(' + i + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
+        row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + realIdx + '].is_enabled=this.checked;renderFilters()"></div></td>';
+        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + realIdx + '].text=this.value"></td>';
+        row += '<td class="d-none d-md-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + realIdx + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
+        row += '<td class="align-middle"><button onclick="filters.splice(' + realIdx + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
         row += '</tr>';
         return row;
       }).join('') || '<tr><td colspan="5" class="py-4 text-muted">No filters.</td></tr>';
@@ -882,8 +947,8 @@
       document.getElementById('ch-enabled').checked = true;
       document.getElementById('ch-vision').checked = false;
       document.getElementById('ch-type').value = 'chat';
+      syncVisionByType();
       document.getElementById('ch-absolute-url').checked = false;
-      // Reset Log tab for new channel
       document.getElementById('ch-log-time').textContent = '📭 新渠道，尚無記錄';
       document.getElementById('ch-log-msg').value = '';
       document.getElementById('ch-log-url').value = '';
@@ -915,9 +980,9 @@
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
       document.getElementById('ch-vision').checked = c.is_vision == 1;
       document.getElementById('ch-type').value = c.channel_type || 'chat';
+      syncVisionByType();
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
       document.getElementById('ch-absolute-url').checked = c.absolute_url == 1;
-      // Populate Log tab — show ALL health states with <li> format
       const now = Math.floor(Date.now() / 1000);
       let healthLabel = '', healthColor = '';
       let isError = false;
@@ -940,7 +1005,6 @@
       document.getElementById('ch-log-status').textContent = healthLabel;
       document.getElementById('ch-log-status').style.color = healthColor;
 
-      // Last call time (use response_time as evidence of successful call)
       if (c.last_error_at) {
         document.getElementById('ch-log-time').textContent = new Date(c.last_error_at * 1000).toLocaleString() + ' (錯誤)';
       } else if (c.response_time) {
@@ -949,7 +1013,6 @@
         document.getElementById('ch-log-time').textContent = '尚無錯誤記錄';
       }
 
-      // Build detail message using <li> lines (no emojis in textarea)
       const lines = [];
       if (c.last_429 > now) {
         const r = c.last_429 - now;
@@ -974,7 +1037,6 @@
       if (c.response_time) lines.push('• 最後延遲：' + c.response_time + 'ms');
       if (c.rpm_limit > 0) lines.push('• RPM：' + (c.rpm_count || 0) + '/' + c.rpm_limit);
       if (c.rpd_limit > 0) lines.push('• RPD：' + (c.rpd_count || 0) + '/' + c.rpd_limit);
-      // Response time history (from server-side stats)
       if (c._rtHistory && c._rtHistory.length > 0) {
         const avg = Math.round(c._rtHistory.reduce((s, v) => s + v, 0) / c._rtHistory.length);
         const max = Math.max(...c._rtHistory);
@@ -1010,7 +1072,6 @@
         document.getElementById('ch-log-res-wrapper').style.display = 'none';
       }
       document.getElementById('ch-log-msg').value = detail;
-      // No red text for normal state
       document.getElementById('ch-log-msg').style.color = isError ? '#dc3545' : '#212529';
       checkFetchModelsBtn();
       chModal.show();
@@ -1020,9 +1081,7 @@
       if (!chModal) { toast('Modal 尚未準備好', 'danger'); return; }
       const c = channels[idx];
       if (!c) return toast('無渠道資訊', 'warning');
-      // Open channel editor on Log tab (reuses editChannel to populate all tabs)
       editChannel(idx);
-      // After modal opens, switch to Log tab
       chModal._element.addEventListener('shown.bs.modal', function switchTab() {
         document.getElementById('log-tab-btn')?.click();
         chModal._element.removeEventListener('shown.bs.modal', switchTab);
@@ -1058,10 +1117,10 @@
         max_tokens: maxTokens,
         rpm_limit: rpm,
         rpd_limit: rpd,
-        is_vision: document.getElementById('ch-vision').checked ? 1 : 0,
+        channel_type: document.getElementById('ch-type').value,
+        is_vision: document.getElementById('ch-type').value === 'chat' && document.getElementById('ch-vision').checked ? 1 : 0,
         support_tools: prev ? (prev.support_tools !== 0 ? 1 : 0) : 1,
         support_stream: prev ? (prev.support_stream !== 0 ? 1 : 0) : 1,
-        channel_type: document.getElementById('ch-type').value,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
         last_429: prev ? prev.last_429||0 : 0,
         consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
@@ -1119,7 +1178,6 @@
     let fetchedModels = [];
     let currentModelTarget = 'primary';
 
-    // Mirror backend detectProvider — auto-select provider from URL
     const checkFetchModelsBtn = () => {
       const url = document.getElementById('ch-url').value.trim();
       const disabled = url.length === 0;
@@ -1202,15 +1260,26 @@
     };
 
     const toggleAllChannels = (val) => {
-      channels.forEach(c => c.is_enabled = val);
+      const query = document.getElementById('ch-search').value.toLowerCase();
+      const target = query ? channels.filter(c =>
+        (c.name || '').toLowerCase().includes(query) ||
+        (c.model || '').toLowerCase().includes(query)
+      ) : channels;
+      if (target.length === 0) return toast('沒有符合的渠道', 'warning');
+      target.forEach(c => c.is_enabled = val);
       renderChannels();
       renderStats();
-      toast(val ? '已開啟所有渠道' : '已關閉所有渠道', 'info');
+      toast('已更新，請存檔生效', 'info');
     };
     const toggleAllFilters = (val) => {
-      filters.forEach(f => f.is_enabled = val);
+      const query = document.getElementById('fl-search')?.value?.toLowerCase() || '';
+      const target = query ? filters.filter(f =>
+        (f.text || '').toLowerCase().includes(query)
+      ) : filters;
+      if (target.length === 0) return toast('沒有符合的過濾器', 'warning');
+      target.forEach(f => f.is_enabled = val);
       renderFilters();
-      toast(val ? '已啟用所有過濾器' : '已停用所有過濾器', 'info');
+      toast('已更新，請存檔生效', 'info');
     };
 
     const resetAllHealth = async () => {
@@ -1391,6 +1460,9 @@
             document.getElementById('basic-tab-btn')?.click();
           });
           passModal = new bootstrap.Modal(document.getElementById('passModal'), { backdrop: 'static' });
+          document.getElementById('passModal').addEventListener('shown.bs.modal', () => {
+            document.getElementById('new-admin-pass')?.focus();
+          });
           debugModal = new bootstrap.Modal(document.getElementById('debugModal'), { backdrop: 'static' });
           modelsModal = new bootstrap.Modal(document.getElementById('modelsModal'), { backdrop: 'static' });
           modelsModal._element.addEventListener('hidden.bs.modal', () => { if (chModal) chModal.show(); });
@@ -1398,6 +1470,7 @@
             el.addEventListener('hide.bs.modal', () => { if (document.activeElement?.closest('.modal')) document.activeElement?.blur(); });
           });
         } catch (e) { console.warn('[modal]', e); }
+          document.getElementById('ch-type').addEventListener('change', syncVisionByType);
         const goTopBtn = document.getElementById('go-top-btn');
         if (goTopBtn) {
           const updateGoTop = () => {
