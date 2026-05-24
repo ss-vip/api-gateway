@@ -844,17 +844,17 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         continue;
       }
 
-      // Tools-ignored detection: if tools were in the request but the response
-      // has no tool_calls and no XML <tool_call> pattern, the upstream likely
-      // doesn't support function calling. Mark support_tools=0 and retry.
+      // Tools-ignored detection: when the upstream returns a valid HTTP 200
+      // response (with text content) but no tool_calls and no XML <tool_call>,
+      // the upstream simply doesn't support function calling. Mark it for
+      // future selection weighting, but DO NOT discard the response — it's
+      // a valid chat completion. LobeChat handles text-only responses fine.
       const msg = json?.choices?.[0]?.message;
       if (shouldSimulateTools(body) && msg && !msg.tool_calls) {
         const content = msg.content || '';
         if (!content.includes('<tool_call>')) {
           ch.support_tools = 0;
-          markChannelError(ch, null, "Channel ignored tool calls", rt, data);
           deferPersist(c, ch);
-          continue;
         }
       }
 
