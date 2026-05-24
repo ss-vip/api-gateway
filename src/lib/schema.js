@@ -91,7 +91,7 @@ const USAGE_STATS_DDL = `CREATE TABLE IF NOT EXISTS usage_stats (
   PRIMARY KEY (day, model, status)
 )`;
 
-const CHANNEL_TYPES = new Set(["chat", "image_gen", "image_edit", "audio_tts", "audio_stt", "embeddings"]);
+const CHANNEL_TYPES = new Set(["chat", "image_gen", "image_edit", "audio_tts", "audio_stt", "embeddings", "video_gen"]);
 
 const TABLES = [
   {

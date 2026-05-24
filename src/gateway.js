@@ -8,6 +8,7 @@ import { bufferRate, getBufferedRate, logRequest } from "./routes/maintenance.js
 import { SSE_CHUNK_HEADERS, RollingFilter, sseEvent, sseComment, writeStreamError, writeSimulatedStream } from "./lib/sse.js";
 import { requestId, logStructured, errResponse, hasVisionContent, estimateInputTokens, tryRepairChatJson } from "./lib/request.js";
 import { shouldSimulateTools, prepareRequestBody, processXmlToolCallStream, extractXmlToolCallsFromContent } from "./lib/tool-sim.js";
+import { retry } from "./lib/retry.js";
 
 let cache = { data: null, ts: 0 };
 let cacheFlight = null;
@@ -43,15 +44,6 @@ function updateEwma(chId, rt) {
 
 function getEwmaLatency(chId) {
   return ewmaLatency.get(chId);
-}
-
-async function retry(fn, retries = 2) {
-  for (let i = 0; i <= retries; i++) {
-    try { return await fn(); } catch (e) {
-      if (i === retries) throw e;
-      await new Promise(r => setTimeout(r, 100 * Math.pow(2, i)));
-    }
-  }
 }
 
 async function loadCache(env) {
@@ -163,8 +155,23 @@ function deferPersist(c, ch) {
 function selectChannel(channels, originalModel, isStream, body) {
   const now = Math.floor(Date.now() / 1000);
   const model = (originalModel || '').trim();
-
   const inputTokens = estimateInputTokens(body);
+
+  // 快取 RPM/RPD 計算避免每條 channel 重複呼叫 normalizeRateWindow 高達 3 次
+  const rateCache = new Map();
+  function getRate(ch) {
+    let r = rateCache.get(ch.id);
+    if (!r) {
+      const buf = getBufferedRate(ch.id);
+      r = {
+        rpm: normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now),
+        rpd: normalizeRateWindow(buf ? buf.rpdCount : ch.rpd_count, buf ? buf.rpdResetAt : ch.rpd_reset_at, RPD_WINDOW_SECONDS, now),
+        rpmCount: buf ? buf.rpmCount : (ch.rpm_count || 0),
+      };
+      rateCache.set(ch.id, r);
+    }
+    return r;
+  }
 
   const healthy = channels.filter(ch => {
     if (!ch.is_enabled) return false;
@@ -177,9 +184,7 @@ function selectChannel(channels, originalModel, isStream, body) {
 
     if (ch.last_429 > 0 && ch.last_429 > now) return false;
     if (ch.cooldown_until > 0 && ch.cooldown_until > now) return false;
-    const buf = getBufferedRate(ch.id);
-    const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
-    const rpd = normalizeRateWindow(buf ? buf.rpdCount : ch.rpd_count, buf ? buf.rpdResetAt : ch.rpd_reset_at, RPD_WINDOW_SECONDS, now);
+    const { rpm, rpd } = getRate(ch);
     if (ch.rpd_limit > 0 && rpd.active && rpd.count >= ch.rpd_limit) return false;
     if (ch.rpm_limit > 0) {
       const effectiveRpm = getEffectiveRpm(ch);
@@ -202,14 +207,13 @@ function selectChannel(channels, originalModel, isStream, body) {
     if (!ch.rpm_limit) return false;
     const effectiveRpm = getEffectiveRpm(ch);
     if (!effectiveRpm) return false;
-    const buf = getBufferedRate(ch.id);
-    const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
+    const { rpm } = getRate(ch);
     if (!rpm.active) return false;
     return rpm.count / effectiveRpm > 0.5;
   });
   if (highLoad && healthy.length > 1) {
     return healthy.reduce((best, ch) => {
-      const load = (getBufferedRate(ch.id)?.rpmCount || 0) / (ch.weight || 50);
+      const load = getRate(ch).rpmCount / (ch.weight || 50);
       return load < best.load ? { ch, load } : best;
     }, { ch: null, load: Infinity }).ch;
   }
@@ -239,9 +243,7 @@ function selectChannel(channels, originalModel, isStream, body) {
 
     if (body && shouldSimulateTools(body) && ch.support_tools) w *= 5;
 
-    const buf = getBufferedRate(ch.id);
-    const rpm = normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now);
-    const rpd = normalizeRateWindow(buf ? buf.rpdCount : ch.rpd_count, buf ? buf.rpdResetAt : ch.rpd_reset_at, RPD_WINDOW_SECONDS, now);
+    const { rpm, rpd } = getRate(ch);
     const effectiveRpm = getEffectiveRpm(ch);
     if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpm.active && rpm.count / effectiveRpm > 0.8) w *= 0.5;
     if (ch.rpd_limit > 0 && rpd.active && rpd.count / ch.rpd_limit > 0.8) w *= 0.5;
@@ -293,13 +295,14 @@ async function handleModels(c) {
     if (!data) data = await loadCache(c.env).catch(() => null);
     if (!data) return errResponse(c, "Unable to load configuration", "server_error", 500);
 
-    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
+    const authHeader = (c.req.header("Authorization") || "");
+    const token = authHeader.replace(/^[Bb]earer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
       return errResponse(c, "Incorrect API key provided", "invalid_request_error", 401, "invalid_api_key");
     }
 
     const modelMap = {};
-    data.channels.filter(ch => ch.is_enabled).forEach(ch => {
+    data.channels.filter(ch => ch.is_enabled && (!ch.channel_type || ch.channel_type === "chat")).forEach(ch => {
       if (ch.model) ch.model.split(',').map(m => m.trim()).filter(Boolean).forEach(m => {
         if (!modelMap[m]) modelMap[m] = { vision: false, tools: false, stream: false };
         if (ch.is_vision) modelMap[m].vision = true;
@@ -369,7 +372,7 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
 
 
 
-async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel) {
+async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline) {
   const { ch, res, responseTime } = winner;
   logStructured("info", "stream start", { channelId: ch.id, model: ch.model, responseTime });
 
@@ -388,10 +391,12 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
   const tcState = { buffering: false, buf: '' };
   let emittedToolCalls = false;
 
+  let streamUsage = null;
+
   try {
     let lastLine = "";
     let streamDone = false;
-    while (!streamDone && !clientSignal.aborted) {
+    while (!streamDone && !clientSignal.aborted && Date.now() < requestDeadline) {
       const { done, value } = await reader.read();
       if (done) { streamDone = true; break; }
       sseBuf += decoder.decode(value, { stream: true });
@@ -427,6 +432,10 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           const delta = choice?.delta;
           if (delta?.content || delta?.tool_calls || delta?.reasoning_content) streamHadContent = true;
           if (choice?.finish_reason) streamFinishedNormally = true;
+          // 追蹤串流用量（OpenAI 最後一個 chunk 會附 usage）
+          if (chunk && typeof chunk.usage === 'object' && chunk.usage !== null && chunk.usage.prompt_tokens !== undefined) {
+            streamUsage = chunk.usage;
+          }
 
           // Normalize reasoning_content for LobeChat compatibility:
           // Some upstream providers send reasoning_content (empty/null/whitespace)
@@ -559,6 +568,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
               bytesWritten = true;
             }
             if (contentFilter.truncated) {
+              streamFinishedNormally = true;
               try { await w.write(enc.encode("data: [DONE]\n\n")); bytesWritten = true; } catch (e) {}
               streamDone = true; break;
             }
@@ -585,18 +595,17 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           }
 
           // Ensure a finish_reason-only stop signal is emitted when the upstream
-          // sends finish_reason bundled with content. LobeChat's transformOpenAIStream
-          // returns { type: 'text' } instead of { type: 'stop' } for such chunks,
-          // so the reasoning block ("深度思考中") never receives the collapse signal.
-          // Sending a separate stop-only chunk ensures event: stop reaches the client.
-          // refs: https://github.com/lobehub/lobe-chat/issues/5681 (siliconflow / reasoning block collapse)
-          if (!emittedToolCalls && choice?.finish_reason === "stop" && !streamDone) {
+          // sends finish_reason bundled with content. Some clients need a clean
+          // { finish_reason } chunk to correctly trigger completion logic
+          // (e.g. LobeChat reasoning block collapse).
+          // refs: https://github.com/lobehub/lobe-chat/issues/5681
+          if (!emittedToolCalls && choice?.finish_reason && !streamDone) {
             if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
-              const stopChunk = {
+              const cleanChunk = {
                 ...chunk,
-                choices: [{ ...choice, delta: {}, finish_reason: "stop" }],
+                choices: [{ ...choice, delta: {}, finish_reason: choice.finish_reason }],
               };
-              await sseEvent(w, enc, stopChunk);
+              await sseEvent(w, enc, cleanChunk);
               bytesWritten = true;
             }
           }
@@ -611,6 +620,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     if (!streamHadContent && !streamFinishedNormally) {
       if (clientSignal.aborted) {
         logStructured("warn", "stream client disconnect", { channelId: ch.id });
+        if (!bytesWritten) return false; // 無任何資料送出 → 允許 fallback
       } else {
         ch.last_error_msg = "Empty response (no content)";
         ch.consecutive_errors = (ch.consecutive_errors || 0) + 1;
@@ -620,13 +630,13 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           return false;
         }
         await writeStreamError(w, enc, "The upstream service returned an empty response — no content was generated");
-        return true;
+        return { usage: null };
       }
     }
 
-    if (!lastLine.includes("[DONE]")) {
-      try { await w.write(enc.encode("data: [DONE]\n\n")); bytesWritten = true; } catch (e) {}
-    }
+    if (!streamFinishedNormally && !lastLine.includes("[DONE]")) {
+        try { await w.write(enc.encode("data: [DONE]\n\n")); bytesWritten = true; } catch (e) {}
+      }
   } catch (e) {
     streamError = e;
     logStructured("error", "stream read error", { channelId: ch.id, error: e.message.slice(0, 120) });
@@ -638,9 +648,11 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
       return false;
     }
     try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e2) {}
+    // 有寫入部分資料但發生錯誤 → 回傳無用量
+    return { usage: null };
   }
 
-  if (streamHadContent && !streamError) {
+  if ((streamHadContent || streamFinishedNormally) && !streamError) {
     logStructured("info", "stream completed", { channelId: ch.id, responseTime });
     applySuccess(ch);
     ch.last_error_msg = "";
@@ -649,8 +661,11 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     updateEwma(ch.id, responseTime);
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
     deferPersist(c, ch);
+    // 回傳用量讓外層可以記錄（串流 token 數來自上游最後一個 chunk 的 usage 欄位）
+    return { usage: streamUsage };
   }
-  return true;
+  // 完全無內容 → 回傳 false 讓外層進行 fallback
+  return false;
 }
 
 
@@ -708,10 +723,10 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
             status: res.status, statusText: res.statusText, headers: res.headers,
           });
           const winner = { ch, res: reconstructedRes, cfg, responseTime: rt };
-          const streamOk = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel);
-          if (streamOk) {
+          const streamResult = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline);
+          if (streamResult) {
             lastWinnerId = ch.id;
-            return { ok: true, channelId: lastWinnerId };
+            return { ok: true, channelId: lastWinnerId, usage: streamResult.usage || null };
           }
           lastError = ch.last_error_msg || "Stream failed early (no content)";
           continue;
@@ -735,14 +750,14 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         if (hasVision && !ch.is_vision) ch.is_vision = 1;
         deferPersist(c, ch);
         await writeSimulatedStream(w, enc, jsonResponse);
-        return { ok: true, channelId: ch.id };
+        return { ok: true, channelId: ch.id, usage: jsonResponse.usage || null };
       }
 
       const winner = { ch, res, cfg, responseTime: rt };
-      const streamOk = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel);
-      if (streamOk) {
+      const streamResult = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline);
+      if (streamResult) {
         lastWinnerId = ch.id;
-        return { ok: true, channelId: lastWinnerId };
+        return { ok: true, channelId: lastWinnerId, usage: streamResult.usage || null };
       }
       lastError = ch.last_error_msg || "Stream failed early (no content)";
       continue;
@@ -893,7 +908,8 @@ async function handleChatRequest(c) {
       return errResponse(c, "The server had an error processing your request", "server_error", 500);
     }
 
-    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
+    const authHeader = (c.req.header("Authorization") || "");
+    const token = authHeader.replace(/^[Bb]earer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
       return errResponse(c, "Incorrect API key provided", "invalid_request_error", 401, "invalid_api_key");
     }
@@ -919,7 +935,8 @@ async function handleChatRequest(c) {
     }
 
     const originalModel = body.model;
-    const isStream = body.stream !== false;
+    // OpenAI spec: stream 預設為 false — 只有明確傳 stream=true 才啟用串流
+    const isStream = body.stream === true;
     const hasVision = hasVisionContent(body);
 
     logStructured("info", "chat request", { rid, model: originalModel, stream: isStream });
@@ -939,15 +956,20 @@ async function handleChatRequest(c) {
       const { readable: out, writable } = new TransformStream();
       const w = writable.getWriter();
       const enc = new TextEncoder();
+      const reqStart = Date.now();
 
       c.executionCtx.waitUntil((async () => {
         try {
           await sseComment(w, enc, "connected");
           const streamResult = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
           const streamOk = streamResult.ok;
+          const durationMs = Date.now() - reqStart;
           // Close stream immediately so client (LobeChat) does not hang waiting for end-of-stream
           try { await w.close(); } catch (e) {}
-          await logRequest(c.env.DB, streamResult.channelId || 0, originalModel || "", 0, 0, 0, streamOk ? 200 : 502, "", rid);
+          const usage = streamResult.usage || {};
+          await logRequest(c.env.DB, streamResult.channelId || 0, originalModel || "",
+            usage.prompt_tokens || 0, usage.completion_tokens || 0,
+            durationMs, streamOk ? 200 : 502, "", rid);
           await flushHealthWrites(c.env);
         } catch (e) {
           logStructured("error", "stream worker error", { rid, error: e.message });
@@ -986,7 +1008,8 @@ async function proxyEndpoint(c, endpointType) {
       return errResponse(c, "The server had an error processing your request", "server_error", 500);
     }
 
-    const token = (c.req.header("Authorization") || "").replace(/^Bearer\s+/, "");
+    const authHeader = (c.req.header("Authorization") || "");
+    const token = authHeader.replace(/^[Bb]earer\s+/, "");
     if (data.config.client_token && token !== data.config.client_token) {
       return errResponse(c, "Incorrect API key provided", "invalid_request_error", 401, "invalid_api_key");
     }
@@ -1008,12 +1031,13 @@ async function proxyEndpoint(c, endpointType) {
     let clientGone = clientSignal.aborted;
 
     let lastError = "";
+    let onAbort = null; // 追蹤上一輪的 abort listener 以便清除
 
     while (pool.length > 0 && Date.now() < requestDeadline && !clientGone) {
       const ch = selectChannel(pool, "", false);
       if (!ch) break;
 
-      const url = buildEndpointUrl(ch.base_url, endpointType);
+      const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, endpointType);
       if (!url) {
         removePoolItem(pool, ch);
         continue;
@@ -1024,7 +1048,9 @@ async function proxyEndpoint(c, endpointType) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), chTimeout);
       if (!clientSignal.aborted) {
-        clientSignal.addEventListener('abort', () => { controller.abort(); clientGone = true; }, { once: true });
+        if (onAbort) clientSignal.removeEventListener('abort', onAbort);
+        onAbort = () => { controller.abort(); clientGone = true; };
+        clientSignal.addEventListener('abort', onAbort, { once: true });
       }
 
       let channelHeaders = {};
@@ -1035,7 +1061,7 @@ async function proxyEndpoint(c, endpointType) {
       const ct = c.req.header("Content-Type");
       if (ct) {
         reqHeaders["Content-Type"] = ct;
-      } else if (endpointType === "image_gen" || endpointType === "audio_tts" || endpointType === "embeddings") {
+      } else if (endpointType === "image_gen" || endpointType === "audio_tts" || endpointType === "embeddings" || endpointType === "video_gen") {
         reqHeaders["Content-Type"] = "application/json";
       }
 
@@ -1118,5 +1144,6 @@ export default function registerGateway(app) {
     app.post(v + "/audio/transcriptions", async (c) => proxyEndpoint(c, "audio_stt"));
     app.post(v + "/images/edits", async (c) => proxyEndpoint(c, "image_edit"));
     app.post(v + "/embeddings", async (c) => proxyEndpoint(c, "embeddings"));
+    app.post(v + "/video/generations", async (c) => proxyEndpoint(c, "video_gen"));
   }
 }

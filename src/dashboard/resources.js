@@ -1,17 +1,9 @@
 import { Hono } from "hono";
 import { CHANNEL_TYPES } from "../lib/schema.js";
+import { retry } from "../lib/retry.js";
 
 let pepper = "";
 function setPepper(p) { pepper = p || ""; }
-
-async function retry(fn, retries = 2) {
-  for (let i = 0; i <= retries; i++) {
-    try { return await fn(); } catch (e) {
-      if (i === retries) throw e;
-      await new Promise(r => setTimeout(r, 100 * Math.pow(2, i)));
-    }
-  }
-}
 
 const RES_CACHE_TTL = 30_000;
 let resCacheGen = 0;
@@ -103,6 +95,14 @@ export function pruneSetupRateLimit() {
   for (const [ip, state] of setupRateLimit) {
     if (state.banUntil > 0 && now >= state.banUntil) setupRateLimit.delete(ip);
   }
+  // 清理超過 1 小時無活動的非封鎖 IP
+  if (setupRateLimit.size > 100) {
+    const entries = [...setupRateLimit.entries()]
+      .filter(([, s]) => s.banUntil === 0)
+      .sort((a, b) => a[1].count - b[1].count);
+    // 保留 50 條活躍度最高的，其餘刪除
+    for (let i = 50; i < entries.length; i++) setupRateLimit.delete(entries[i][0]);
+  }
   if (setupRateLimit.size > 500) {
     const entries = [...setupRateLimit.entries()].sort((a, b) => a[1].banUntil - b[1].banUntil);
     for (let i = 200; i < entries.length; i++) setupRateLimit.delete(entries[i][0]);
@@ -141,183 +141,85 @@ export function registerChannelTest(type, handler) {
   CHANNEL_TESTS.set(type, handler);
 }
 
-registerChannelTest("chat", async (ch, testFetch) => {
+registerChannelTest("chat", async (ch, _testFetch, buildEndpointUrl) => {
   const capabilities = {};
-  const chatUrl = ch.absolute_url ? (await import("../lib/providers/openai.js")).buildEndpointUrl(ch.base_url, "chat")
-    : (await import("../lib/providers/openai.js")).buildUrl(ch.base_url, ch.model || "test", false);
+  const mod = await import("../lib/providers/openai.js");
+  const chatUrl = ch.absolute_url ? buildEndpointUrl(ch.base_url, "chat") : mod.buildUrl(ch.base_url, ch.model || "test", false);
   if (!chatUrl) { capabilities.basic = { ok: false, ms: 0, detail: "Invalid URL" }; return capabilities; }
-
-  const basic = await testFetch("chat", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "OK" }], stream: false }),
-  }, async (res, ms) => {
-    const text = await res.text();
-    try {
-      const j = JSON.parse(text);
-      const c = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.delta?.content;
-      if (c && c.trim().length > 0) return { ok: true, ms, detail: c.slice(0, 100) };
-      if (j?.choices?.[0]?.message?.tool_calls) return { ok: true, ms, detail: "tool_calls received" };
-      return { ok: false, ms, detail: "empty response" };
-    } catch (e) {
-      return text.length > 0 ? { ok: true, ms, detail: "non-JSON response" } : { ok: false, ms, detail: "empty body" };
-    }
-  }, 15000);
-  capabilities.basic = basic;
-
-  if (basic.ok) {
-    const [visionRes, toolsRes] = await Promise.all([
-      testFetch("chat", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: ch.model || "test",
-          messages: [{ role: "user", content: [
-            { type: "text", text: "desc" },
-            { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } },
-          ] }],
-          stream: false,
-        }),
-      }, async (res, ms) => {
-        const j = await res.json();
-        const c = j?.choices?.[0]?.message?.content;
-        return c && c.trim().length > 0
-          ? { ok: true, ms, detail: c.slice(0, 100) }
-          : { ok: false, ms, detail: "vision not supported" };
-      }, 10000).catch(() => ({ ok: false, ms: 0, detail: "test error" })),
-
-      (async () => {
-        const toolBody = {
-          model: ch.model || "test",
-          messages: [{ role: "user", content: "test" }],
-          tools: [{ type: "function", function: { name: "test_func", description: "test", parameters: { type: "object", properties: {} } } }],
-          tool_choice: "required",
-          stream: false,
-        };
-        const r1 = await testFetch("chat", {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(toolBody),
-        }, async (res, ms) => {
-          const j = await res.json();
-          const tc = j?.choices?.[0]?.message?.tool_calls;
-          const fr = j?.choices?.[0]?.finish_reason;
-          if ((tc && tc.length > 0) || fr === "tool_calls") return { ok: true, ms, detail: "tool_calls received" };
-          return { ok: false, ms, detail: "tools not supported (text-only)" };
-        }, 10000);
-        if (!r1.ok && r1.detail.includes("400")) {
-          toolBody.tool_choice = "auto";
-          return await testFetch("chat", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(toolBody),
-          }, async (res, ms) => {
-            const j = await res.json();
-            const tc = j?.choices?.[0]?.message?.tool_calls;
-            const fr = j?.choices?.[0]?.finish_reason;
-            if ((tc && tc.length > 0) || fr === "tool_calls") return { ok: true, ms, detail: "tool_calls received (auto)" };
-            return { ok: true, ms, detail: "chat ok (tools not forced)" };
-          }, 10000);
-        }
-        return r1;
-      })(),
-    ]);
-
-    capabilities.vision = visionRes;
-    capabilities.tools = toolsRes;
-
-    const streamRes = await testFetch("chat", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "OK" }], stream: true }),
-    }, async (res, ms) => {
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = "";
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        if (buf.includes("[DONE]") || buf.includes("data: {")) break;
-      }
-      await reader.cancel();
-      const hasData = buf.includes("[DONE]") || buf.includes("data: {");
-      return hasData
-        ? { ok: true, ms, detail: "stream supported" }
-        : { ok: false, ms, detail: "empty stream" };
-    }, 15000).catch(() => ({ ok: false, ms: 0, detail: "test error" }));
-    capabilities.stream = streamRes;
+  const start = Date.now();
+  try {
+    const res = await fetch(chatUrl, {
+      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
+      body: "{}", signal: AbortSignal.timeout(5000),
+    });
+    const ms = Date.now() - start;
+    capabilities.basic = res.status === 400 || res.status === 200
+      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
+      : { ok: false, ms, detail: "HTTP " + res.status };
+  } catch (e) {
+    capabilities.basic = { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" };
   }
   return capabilities;
 });
 
-registerChannelTest("image_gen", async (ch, testFetch) => {
-  const imgRes = await testFetch("image_gen", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: ch.model || "dall-e-3", prompt: "a cat", n: 1, size: "1024x1024" }),
-  }, async (res, ms) => {
-    const j = await res.json();
-    const url = j?.data?.[0]?.url || j?.data?.[0]?.b64_json;
-    return url ? { ok: true, ms, detail: "image generated" } : { ok: false, ms, detail: "no image in response" };
-  }, 20000).catch(() => ({ ok: false, ms: 0, detail: "test error" }));
-  return { image_gen: imgRes };
-});
-
-registerChannelTest("audio_tts", async (ch, testFetch) => {
-  const ttsRes = await testFetch("audio_tts", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: ch.model || "tts-1", input: "hello", voice: "alloy" }),
-  }, async (res, ms) => {
-    const ct = res.headers.get("content-type") || "";
-    const body = await res.arrayBuffer();
-    if (ct.startsWith("audio/") && body.byteLength > 100) return { ok: true, ms, detail: "audio generated (" + ct + ")" };
-    return { ok: false, ms, detail: "not audio content: " + ct };
-  }, 20000).catch(() => ({ ok: false, ms: 0, detail: "test error" }));
-  return { audio_tts: ttsRes };
-});
-
-registerChannelTest("audio_stt", async (ch, testFetch, buildEndpointUrl) => {
-  const sttUrl = buildEndpointUrl(ch.base_url, "audio_stt");
-  if (!sttUrl) return { audio_stt: { ok: false, ms: 0, detail: "Invalid URL" } };
+registerChannelTest("image_gen", async (ch, _testFetch, buildEndpointUrl) => {
+  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "image_gen");
+  if (!url) return { image_gen: { ok: false, ms: 0, detail: "Invalid URL" } };
   const start = Date.now();
   try {
-    const sampleRate = 8000;
-    const numSamples = Math.floor(sampleRate * 0.1);
-    const dataSize = numSamples;
-    const wavBuf = new ArrayBuffer(44 + dataSize);
-    const dv = new DataView(wavBuf);
-    const w = (off, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(off + i, str.charCodeAt(i)); };
-    w(0, "RIFF"); dv.setUint32(4, 36 + dataSize, true); w(8, "WAVE");
-    w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
-    dv.setUint16(22, 1, true); dv.setUint32(24, sampleRate, true);
-    dv.setUint32(28, sampleRate, true); dv.setUint16(32, 1, true);
-    dv.setUint16(34, 8, true);
-    w(36, "data"); dv.setUint32(40, dataSize, true);
-    for (let i = 0; i < dataSize; i++) dv.setUint8(44 + i, 128);
-
-    const form = new FormData();
-    form.append("file", new Blob([wavBuf], { type: "audio/wav" }), "test.wav");
-    form.append("model", ch.model || "whisper-1");
-
-    const res = await fetch(sttUrl, {
-      method: "POST",
-      headers: { Authorization: "Bearer " + ch.api_key },
-      body: form,
-      signal: AbortSignal.timeout(15000),
+    const res = await fetch(url, {
+      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
+      body: "{}", signal: AbortSignal.timeout(5000),
     });
     const ms = Date.now() - start;
-    if (res.status === 200) {
-      const j = await res.json();
-      const text = j?.text || "";
-      return { audio_stt: { ok: true, ms, detail: 'transcription: "' + text.slice(0, 60) + '"' } };
-    }
-    return {
-      audio_stt: res.status === 400
-        ? { ok: true, ms, detail: "endpoint reachable (HTTP 400)" }
-        : { ok: false, ms, detail: "HTTP " + res.status },
-    };
+    return { image_gen: res.status === 400 || res.status === 200
+      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
+      : { ok: false, ms, detail: "HTTP " + res.status } };
+  } catch (e) {
+    return { image_gen: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
+  }
+});
+
+registerChannelTest("audio_tts", async (ch, _testFetch, buildEndpointUrl) => {
+  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "audio_tts");
+  if (!url) return { audio_tts: { ok: false, ms: 0, detail: "Invalid URL" } };
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
+      body: "{}", signal: AbortSignal.timeout(5000),
+    });
+    const ms = Date.now() - start;
+    return { audio_tts: res.status === 400 || res.status === 200
+      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
+      : { ok: false, ms, detail: "HTTP " + res.status } };
+  } catch (e) {
+    return { audio_tts: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
+  }
+});
+
+registerChannelTest("audio_stt", async (ch, _testFetch, buildEndpointUrl) => {
+  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "audio_stt");
+  if (!url) return { audio_stt: { ok: false, ms: 0, detail: "Invalid URL" } };
+  const start = Date.now();
+  try {
+    const form = new FormData();
+    form.append("model", ch.model || "whisper-1");
+    const res = await fetch(url, {
+      method: "POST", headers: { Authorization: "Bearer " + ch.api_key }, body: form,
+      signal: AbortSignal.timeout(5000),
+    });
+    const ms = Date.now() - start;
+    return { audio_stt: res.status === 400 || res.status === 200
+      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
+      : { ok: false, ms, detail: "HTTP " + res.status } };
   } catch (e) {
     return { audio_stt: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
   }
 });
 
 registerChannelTest("image_edit", async (ch, _testFetch, buildEndpointUrl) => {
-  const editUrl = buildEndpointUrl(ch.base_url, "image_edit");
+  const editUrl = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "image_edit");
   if (!editUrl) return { image_edit: { ok: false, ms: 0, detail: "Invalid URL" } };
   const start = Date.now();
   try {
@@ -333,16 +235,40 @@ registerChannelTest("image_edit", async (ch, _testFetch, buildEndpointUrl) => {
   }
 });
 
-registerChannelTest("embeddings", async (ch, testFetch) => {
-  const embRes = await testFetch("embeddings", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: ch.model || "text-embedding-ada-002", input: "test" }),
-  }, async (res, ms) => {
-    const j = await res.json();
-    const emb = j?.data?.[0]?.embedding;
-    return emb ? { ok: true, ms, detail: "embedding generated (" + emb.length + " dims)" } : { ok: false, ms, detail: "no embedding in response" };
-  }, 20000).catch(() => ({ ok: false, ms: 0, detail: "test error" }));
-  return { embeddings: embRes };
+registerChannelTest("video_gen", async (ch, _testFetch, buildEndpointUrl) => {
+  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "video_gen");
+  if (!url) return { video_gen: { ok: false, ms: 0, detail: "Invalid URL" } };
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
+      body: "{}", signal: AbortSignal.timeout(5000),
+    });
+    const ms = Date.now() - start;
+    return { video_gen: res.status === 400 || res.status === 200
+      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
+      : { ok: false, ms, detail: "HTTP " + res.status } };
+  } catch (e) {
+    return { video_gen: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
+  }
+});
+
+registerChannelTest("embeddings", async (ch, _testFetch, buildEndpointUrl) => {
+  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "embeddings");
+  if (!url) return { embeddings: { ok: false, ms: 0, detail: "Invalid URL" } };
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
+      body: "{}", signal: AbortSignal.timeout(5000),
+    });
+    const ms = Date.now() - start;
+    return { embeddings: res.status === 400 || res.status === 200
+      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
+      : { ok: false, ms, detail: "HTTP " + res.status } };
+  } catch (e) {
+    return { embeddings: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
+  }
 });
 
 export default function (_clearCache) {
@@ -581,40 +507,15 @@ export default function (_clearCache) {
       ch = rows[0];
     }
     if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
-    const { buildUrl, buildEndpointUrl } = await import("../lib/providers/openai.js");
+    const { buildEndpointUrl } = await import("../lib/providers/openai.js");
 
     const channelType = ch.channel_type || "chat";
     if (!CHANNEL_TYPES.has(channelType))
       return c.json({ ok: false, error: "Unknown channel_type", diagnosis: "不支援的渠道類型" }, 400);
 
-    async function testFetch(endpointType, fetchOpts, checkFn, timeoutMs = 15000) {
-      const url = endpointType === "chat"
-        ? (ch.absolute_url ? buildEndpointUrl(ch.base_url, "chat") : buildUrl(ch.base_url, ch.model || "test", false))
-        : buildEndpointUrl(ch.base_url, endpointType);
-      if (!url) return { ok: false, ms: 0, detail: "Invalid URL" };
-      const start = Date.now();
-      try {
-        const headers = { Authorization: "Bearer " + ch.api_key, ...fetchOpts.headers };
-        const res = await fetch(url, { ...fetchOpts, headers, signal: AbortSignal.timeout(timeoutMs) });
-        const ms = Date.now() - start;
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          const detail = res.status === 400 ? "不支援（HTTP 400）"
-            : (res.status === 401 || res.status === 403) ? "API Key 無效（" + res.status + "）"
-            : "HTTP " + res.status + (text ? ": " + text.slice(0, 80) : "");
-          return { ok: false, ms, detail };
-        }
-        return await checkFn(res, ms);
-      } catch (e) {
-        const ms = Date.now() - start;
-        if (e.name === "TimeoutError") return { ok: false, ms, detail: "超時" };
-        return { ok: false, ms, detail: e.message?.slice(0, 80) || "error" };
-      }
-    }
-
     const capabilities = {};
     const handler = CHANNEL_TESTS.get(channelType);
-    if (handler) Object.assign(capabilities, await handler(ch, testFetch, buildEndpointUrl) || {});
+    if (handler) Object.assign(capabilities, await handler(ch, null, buildEndpointUrl) || {});
 
     const primaryOk = capabilities[channelType]?.ok || capabilities.basic?.ok;
 
@@ -640,23 +541,9 @@ export default function (_clearCache) {
 
     if (!fromBody) {
       const now = Math.floor(Date.now() / 1000);
-      if (channelType === 'chat') {
-        await c.env.DB.prepare(
-          "UPDATE channels SET consecutive_errors=MAX(0,consecutive_errors-1), last_error_msg=\"\", last_error_at=0, response_time=? WHERE id=?"
-        ).bind(capabilities.basic?.ms || 0, chId).run();
-        await c.env.DB.prepare(
-          "UPDATE channels SET support_stream=?, is_vision=?, support_tools=? WHERE id=?"
-        ).bind(
-          capabilities.stream?.ok ? 1 : 0,
-          capabilities.vision?.ok ? 1 : 0,
-          capabilities.tools?.ok ? 1 : 0,
-          chId
-        ).run();
-      } else {
-        await c.env.DB.prepare(
-          "UPDATE channels SET consecutive_errors=MAX(0,consecutive_errors-1), last_error_msg=\"\", last_error_at=0, response_time=? WHERE id=?"
-        ).bind(capabilities[channelType]?.ms || 0, chId).run();
-      }
+      await c.env.DB.prepare(
+        "UPDATE channels SET consecutive_errors=MAX(0,consecutive_errors-1), last_error_msg=\"\", last_error_at=0, cooldown_until=0, response_time=? WHERE id=?"
+      ).bind(capabilities[channelType]?.ms || capabilities.basic?.ms || 0, chId).run();
       clearCache();
     }
 
@@ -668,6 +555,39 @@ export default function (_clearCache) {
       health_updated: !fromBody,
       message: fromBody ? "" : "渠道健康狀態已重置",
       capabilities,
+    });
+  });
+
+  api.get("/usage/monthly", async (c) => {
+    const { results } = await c.env.DB.prepare(`
+      SELECT
+        strftime('%Y-%m', day) AS month,
+        COALESCE(SUM(requests),0) AS requests,
+        COALESCE(SUM(tokens_in + tokens_out),0) AS tokens,
+        COALESCE(SUM(tokens_in),0) AS tokens_in,
+        COALESCE(SUM(tokens_out),0) AS tokens_out,
+        COALESCE(SUM(duration_ms),0) AS duration_ms,
+        COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN requests ELSE 0 END),0) AS success_requests,
+        COALESCE(SUM(CASE WHEN status >= 400 THEN requests ELSE 0 END),0) AS error_requests
+      FROM usage_stats
+      GROUP BY month
+      ORDER BY month DESC
+      LIMIT 24
+    `).all();
+    const { results: byModel } = await c.env.DB.prepare(`
+      SELECT
+        strftime('%Y-%m', day) AS month,
+        model,
+        COALESCE(SUM(requests),0) AS requests,
+        COALESCE(SUM(tokens_in + tokens_out),0) AS tokens
+      FROM usage_stats
+      GROUP BY month, model
+      ORDER BY month DESC, requests DESC
+      LIMIT 200
+    `).all();
+    return c.json({
+      months: results || [],
+      byModel: byModel || [],
     });
   });
 

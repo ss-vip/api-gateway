@@ -64,8 +64,12 @@ function buildErrorChunk(msg) {
 export async function writeStreamError(w, enc, msg) {
   try {
     await sseEvent(w, enc, buildErrorChunk(msg));
-  } catch (e) {}
-  try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {}
+  } catch (e) {
+    // Stream already closed — expected when client disconnects
+  }
+  try { await w.write(enc.encode("data: [DONE]\n\n")); } catch (e) {
+    // [DONE] write failure is normal if client disconnected first
+  }
 }
 
 export async function writeSimulatedStream(w, enc, json) {
@@ -82,17 +86,25 @@ export async function writeSimulatedStream(w, enc, json) {
     });
 
     if (msg?.tool_calls && msg.tool_calls.length > 0) {
-      await sseEvent(w, enc, {
-        id, object: "chat.completion.chunk", created, model,
-        choices: [{
-          index: 0,
-          delta: { tool_calls: msg.tool_calls.map(tc => ({
-            index: 0, id: tc.id, type: tc.type,
-            function: tc.function,
-          }))},
-          finish_reason: "tool_calls",
-        }],
-      });
+      // OpenAI 規格：每個 tool_call chunk 應有獨立 index
+      for (let i = 0; i < msg.tool_calls.length; i++) {
+        const tc = msg.tool_calls[i];
+        await sseEvent(w, enc, {
+          id, object: "chat.completion.chunk", created, model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: tc.index ?? i,
+                id: tc.id,
+                type: tc.type,
+                function: tc.function,
+              }],
+            },
+            finish_reason: i === msg.tool_calls.length - 1 ? "tool_calls" : null,
+          }],
+        });
+      }
     } else if (msg?.content) {
       await sseEvent(w, enc, {
         id, object: "chat.completion.chunk", created, model,

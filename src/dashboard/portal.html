@@ -118,6 +118,7 @@
             <ul class="dropdown-menu dropdown-menu-end shadow border-0">
               <li><button class="dropdown-item py-2 small" onclick="if(passModal)passModal.show()"><i class="bi bi-shield-lock me-2"></i>Change PW</button></li>
               <li><button class="dropdown-item py-2 small" onclick="showSystemHealth()"><i class="bi bi-heart-pulse me-2"></i>System Health</button></li>
+              <li><button class="dropdown-item py-2 small" onclick="showUsageReport()"><i class="bi bi-graph-up me-2"></i>Usage Report</button></li>
               <li><button class="dropdown-item py-2 small" onclick="exportJson()"><i class="bi bi-download me-2"></i>Export JSON</button></li>
               <li><label class="dropdown-item py-2 small mb-0" style="cursor:pointer"><i class="bi bi-upload me-2"></i>Import JSON<input type="file" onchange="importJson(event)" style="display:none" /></label></li>
               <li><hr class="dropdown-divider"></li>
@@ -258,6 +259,13 @@
     </div>
   </div></div></div>
 
+  <div class="modal fade" id="usageModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable"><div class="modal-content">
+    <div class="modal-header border-0 pb-0"><h5 class="fw-bold">📈 Monthly Usage Report</h5><button type="button" class="btn-close ms-auto" data-bs-dismiss="modal" aria-label="Close"></button></div>
+    <div class="modal-body p-4" id="usage-modal-body">
+      <div class="text-center py-4"><div class="spinner-border text-primary" role="status"></div><p class="mt-2 text-muted small">Loading usage data...</p></div>
+    </div>
+  </div></div></div>
+
   <div class="modal fade" id="chModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable" style="max-width:680px"><div class="modal-content">
     <div class="modal-header border-0 pb-0">
       <div class="d-flex align-items-center gap-2">
@@ -342,6 +350,7 @@
             <option value="audio_tts">&#x1F50A; TTS</option>
             <option value="audio_stt">&#x1F3A4; STT</option>
             <option value="embeddings">&#x1F4DA; Embed</option>
+            <option value="video_gen">&#x1F3AC; Video</option>
           </select>
         </div>
         <div class="col-4 d-flex flex-column align-items-center justify-content-center">
@@ -466,8 +475,10 @@
       }
     };
 
-    const api = async (u, m='GET', b=null, showLoader=true) => {
+    const api = async (u, m='GET', b=null, showLoader=true, opts={}) => {
       if (showLoader) loading(true);
+      const ac = new AbortController();
+      const to = setTimeout(() => ac.abort(), opts.timeout || 8000);
       try {
         const r = await fetch(u, {
           method: m,
@@ -476,7 +487,9 @@
             'X-Admin-Token': sessionStorage.getItem('adminToken') || '',
           },
           body: b ? JSON.stringify(b) : null,
+          signal: ac.signal,
         });
+        clearTimeout(to);
         if (r.status === 401) {
           dismissAllModals();
           toast('登入階段已過期，請重新登入', 'warning');
@@ -485,12 +498,17 @@
         }
         if (!r.ok) {
           const err = await r.json().catch(() => ({}));
-          toast(err.error || 'Request Failed', 'danger');
+          if (!opts.silent) toast(err.error || 'Request Failed', 'danger');
           return null;
         }
         return await r.json();
       } catch (e) {
-        toast('Network error: ' + e.message, 'danger');
+        clearTimeout(to);
+        if (e.name === 'AbortError') {
+          if (!opts.silent) toast('請求逾時', 'warning');
+        } else {
+          if (!opts.silent) toast('Network error: ' + e.message, 'danger');
+        }
         return null;
       } finally {
         if (showLoader) loading(false);
@@ -650,7 +668,7 @@
       // Daily usage stats (from server)
       const statsData = window._lastStats?.stats;
       const dailyStatsHtml = statsData && statsData.requests > 0
-        ? '<div class="col-md-6"><div class="card border-0 shadow-sm h-100"><div class="card-body p-2 p-md-3">' +
+        ? '<div class="col-12 col-md-6"><div class="card border-0 shadow-sm h-100"><div class="card-body p-2 p-md-3">' +
           '<div class="small text-muted text-uppercase fw-bold mb-1">📊 本日用量 (' + statsData.date + ')</div>' +
           '<div class="d-flex gap-3 flex-wrap">' +
           '<span>請求: <strong>' + statsData.requests + '</strong></span>' +
@@ -677,6 +695,7 @@
           '</div>' +
         '</div>'
       ).join('');
+      html += '</div>';
 
       let rpdContent = '';
       if (rpdTotal > 0) {
@@ -693,13 +712,24 @@
         rpdContent = '<div class="text-muted small py-1"><i class="bi bi-info-circle me-1"></i> No RPD limits configured.</div>';
       }
 
-      html += dailyStatsHtml;
-      html +=
-        '<div class="col-md-6">' +
-          '<div class="card border-0 shadow-sm h-100">' +
-            '<div class="card-body p-2 p-md-3">' + rpdContent + '</div>' +
-          '</div>' +
-        '</div></div>';
+      html += '<div class="row g-2 g-md-3 mb-3">';
+      if (dailyStatsHtml) {
+        html += dailyStatsHtml;
+        html +=
+          '<div class="col-12 col-md-6">' +
+            '<div class="card border-0 shadow-sm h-100">' +
+              '<div class="card-body p-2 p-md-3">' + rpdContent + '</div>' +
+            '</div>' +
+          '</div>';
+      } else {
+        html +=
+          '<div class="col-12">' +
+            '<div class="card border-0 shadow-sm h-100">' +
+              '<div class="card-body p-2 p-md-3">' + rpdContent + '</div>' +
+            '</div>' +
+          '</div>';
+      }
+      html += '</div>';
 
       document.getElementById('stat-content').innerHTML = html;
     };
@@ -766,6 +796,7 @@
           : c.channel_type === 'audio_tts' ? '\u{1F50A}'
           : c.channel_type === 'audio_stt' ? '\u{1F3A4}'
           : c.channel_type === 'embeddings' ? '\u{1F4DA}'
+          : c.channel_type === 'video_gen' ? '\u{1F3AC}'
           : '\u{1F4AC}';
         const modelName = esc(c.model || "");
         const displayName = esc(c.model || "-");
@@ -785,7 +816,7 @@
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
-        row += '    <button onclick="testChannel(' + c.id + ')" class="btn btn-sm btn-outline-info py-1 px-2" title="Test Channel"><i class="bi bi-play-fill"></i></button>';
+        row += '    <button onclick="testChannel(' + c.id + ')" class="btn btn-sm btn-outline-info py-1 px-2" title="僅測試目標URL是否正常可連線"><i class="bi bi-play-fill"></i></button>';
         row += '    <button onclick="resetHealth(' + c.id + ')" class="btn btn-sm btn-outline-success py-1 px-2" title="Reset Health"><i class="bi bi-arrow-repeat"></i></button>';
         row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
         row += '    <button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>';
@@ -829,7 +860,7 @@
       if (!ch) return toast('渠道不存在', 'warning');
       const btns = document.querySelectorAll('button[onclick*="testChannel(' + id + ')"]');
       btns.forEach(b => { b._orig = b.innerHTML; b.innerHTML = '<span class="spinner-border spinner-border-sm"></span>'; b.disabled = true; });
-      toast('測試中...', 'info');
+      toast('連線測試中...', 'info');
       const r = await api('/admin/api/channels/' + id + '/test', 'POST', {
         base_url: ch.base_url,
         api_key: ch.api_key,
@@ -1309,10 +1340,13 @@
       });
     };
 
+    let _refreshing = false;
     const refreshHealthOnly = async () => {
+      if (_refreshing) return;
       if (document.body.classList.contains('modal-open')) return;
+      _refreshing = true;
       try {
-        const res = await api('/admin/api/channels', 'GET', null, false);
+        const res = await api('/admin/api/channels', 'GET', null, false, { silent: true });
         if (!res) return;
         if (!Array.isArray(res)) {
           console.warn('[refreshHealthOnly] unexpected response', res);
@@ -1356,7 +1390,11 @@
           if (latencyEl) latencyEl.textContent = oc.response_time ? (oc.response_time + 'ms') : '-';
         });
         renderStats();
-      } catch (e) { }
+      } catch (e) {
+        // silent
+      } finally {
+        _refreshing = false;
+      }
     };
 
     const startAutoRefresh = () => {
@@ -1452,6 +1490,68 @@
           '</div>';
       } catch (e) {
         body.innerHTML = '<div class="text-center py-4"><div class="text-danger mb-2"><i class="bi bi-exclamation-triangle-fill" style="font-size:2rem"></i></div><p class="text-muted small">Failed to fetch health data: ' + (e.message || 'unknown') + '</p><button class="btn btn-sm btn-outline-primary" onclick="showSystemHealth()">Retry</button></div>';
+      }
+    };
+
+    const showUsageReport = async () => {
+      const modal = new bootstrap.Modal(document.getElementById('usageModal'));
+      modal.show();
+      const body = document.getElementById('usage-modal-body');
+      try {
+        const r = await api('/admin/api/usage/monthly', 'GET', null, false);
+        if (!r || !r.months) throw new Error('Invalid response');
+        if (r.months.length === 0) {
+          body.innerHTML = '<div class="text-center py-4"><p class="text-muted small">尚無用量資料。</p></div>';
+          return;
+        }
+        const maxReqs = Math.max(...r.months.map(m => m.requests));
+        let html = '<div class="small mb-3">' +
+          '<div class="d-flex justify-content-between text-muted fw-bold border-bottom pb-1 mb-2" style="font-size:0.75rem">' +
+            '<span style="width:80px">月份</span>' +
+            '<span style="width:70px" class="text-end">請求</span>' +
+            '<span style="width:80px" class="text-end">Token</span>' +
+            '<span style="width:60px" class="text-end">成功率</span>' +
+            '<span style="flex:1"></span>' +
+          '</div>';
+        for (const m of r.months) {
+          const pct = m.requests > 0 ? Math.round(m.success_requests / m.requests * 100) : 0;
+          const barW = Math.round((m.requests / maxReqs) * 100);
+          html += '<div class="d-flex align-items-center mb-1" style="font-size:0.8rem">' +
+            '<span class="text-nowrap" style="width:80px;font-weight:600">' + m.month + '</span>' +
+            '<span class="text-end text-nowrap" style="width:70px">' + Number(m.requests).toLocaleString() + '</span>' +
+            '<span class="text-end text-nowrap text-muted" style="width:80px">' + Number(m.tokens).toLocaleString() + '</span>' +
+            '<span class="text-end text-nowrap" style="width:60px;color:' + (pct >= 95 ? 'var(--bs-success)' : pct >= 80 ? 'var(--bs-warning)' : 'var(--bs-danger)') + '">' + pct + '%</span>' +
+            '<div style="flex:1;height:6px;background:var(--bs-secondary-bg);border-radius:3px;margin-left:8px">' +
+              '<div style="width:' + barW + '%;height:100%;background:var(--bs-primary);border-radius:3px;transition:width 0.3s"></div>' +
+            '</div>' +
+          '</div>';
+        }
+        html += '</div>';
+
+        // Per-model breakdown
+        if (r.byModel && r.byModel.length > 0) {
+          const grouped = {};
+          for (const row of r.byModel) {
+            if (!grouped[row.month]) grouped[row.month] = [];
+            grouped[row.month].push(row);
+          }
+          html += '<hr class="my-2" />';
+          html += '<div class="small text-muted text-uppercase fw-bold mb-2">By Model</div>';
+          for (const [month, models] of Object.entries(grouped)) {
+            html += '<div class="mb-2"><span class="fw-bold small">' + month + '</span>';
+            html += '<div class="d-flex flex-wrap gap-1 mt-1">';
+            for (const md of models.slice(0, 8)) {
+              html += '<span class="badge bg-light text-dark border px-2 py-1" style="font-size:0.7rem">' +
+                esc(md.model || '?') + ' <span class="fw-bold ms-1">' + Number(md.requests).toLocaleString() + '</span></span>';
+            }
+            if (models.length > 8) html += '<span class="badge bg-secondary px-2 py-1" style="font-size:0.7rem">+' + (models.length - 8) + ' more</span>';
+            html += '</div></div>';
+          }
+        }
+
+        body.innerHTML = html;
+      } catch (e) {
+        body.innerHTML = '<div class="text-center py-4"><div class="text-danger mb-2"><i class="bi bi-exclamation-triangle-fill" style="font-size:2rem"></i></div><p class="text-muted small">載入用量資料失敗: ' + (e.message || 'unknown') + '</p><button class="btn btn-sm btn-outline-primary" onclick="showUsageReport()">Retry</button></div>';
       }
     };
 

@@ -1,5 +1,6 @@
 import { pruneSetupRateLimit } from "../dashboard/resources.js";
 import { pruneLoginState } from "../dashboard/index.js";
+import { retry } from "../lib/retry.js";
 
 const rateBuffer = new Map();
 const RATE_BUF_MAX = 200;
@@ -9,15 +10,6 @@ const USAGE_BUF_MAX = 500;
 // This keeps D1 writes under 100k/day free tier limit regardless of channel count.
 // Only usage_stats and health state are persisted to D1 (~19k/day worst case with 100 channels).
 const FLUSH_MIN_INTERVAL_MS = 120_000;
-
-async function retry(fn, retries = 2) {
-  for (let i = 0; i <= retries; i++) {
-    try { return await fn(); } catch (e) {
-      if (i === retries) throw e;
-      await new Promise(r => setTimeout(r, 100 * Math.pow(2, i)));
-    }
-  }
-}
 
 export function bufferRate(chId, rpmCount, rpmResetAt, rpdCount, rpdResetAt) {
   if (rateBuffer.size >= RATE_BUF_MAX) {
@@ -94,6 +86,8 @@ export async function flushUsageBuffer(DB, force = false) {
 
 let lastHealthRun = 0;
 const HEALTH_MIN_INTERVAL = 10_000;
+let lastChannelsQuery = 0;
+const CHANNELS_QUERY_INTERVAL = 30_000; // 全表掃描最多每 30s 一次
 
 let lastUrlHealthCheck = 0;
 const URL_HEALTH_INTERVAL_MS = 300_000; // 5 分鐘
@@ -185,9 +179,15 @@ export function registerMaintenance(app) {
 
     actions.usage_flushed = await flushUsageBuffer(DB);
 
-    const { results: allChs } = await DB.prepare(
-      "SELECT id, name, model, is_enabled, consecutive_errors, cooldown_until, response_time, last_429 FROM channels ORDER BY id"
-    ).all();
+    let allChs = null;
+    const nowMs = Date.now();
+    if (nowMs - lastChannelsQuery > CHANNELS_QUERY_INTERVAL) {
+      const { results } = await DB.prepare(
+        "SELECT id, name, model, is_enabled, consecutive_errors, cooldown_until, response_time, last_429 FROM channels ORDER BY id"
+      ).all();
+      allChs = results || [];
+      lastChannelsQuery = nowMs;
+    }
     actions.channel_count = (allChs || []).length;
 
     const summary = {
