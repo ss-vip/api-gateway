@@ -7,9 +7,9 @@ const RATE_BUF_MAX = 200;
 const usageBuffer = new Map();
 const USAGE_BUF_MAX = 500;
 // Rate & ResponseTime buffers are in-memory only (no D1 flush).
-// This keeps D1 writes under 100k/day free tier limit regardless of channel count.
-// Only usage_stats and health state are persisted to D1 (~19k/day worst case with 100 channels).
-const FLUSH_MIN_INTERVAL_MS = 120_000;
+// This keeps D1 writes under 100k/month free tier limit.
+// Only usage_stats and health state are persisted to D1 (~67k/month worst case with 100 channels).
+const FLUSH_MIN_INTERVAL_MS = 300_000; // 5 分鐘（原 2 分鐘），減少 D1 write units
 
 export function bufferRate(chId, rpmCount, rpmResetAt, rpdCount, rpdResetAt) {
   if (rateBuffer.size >= RATE_BUF_MAX) {
@@ -85,12 +85,12 @@ export async function flushUsageBuffer(DB, force = false) {
 }
 
 let lastHealthRun = 0;
-const HEALTH_MIN_INTERVAL = 10_000;
+const HEALTH_MIN_INTERVAL = 600_000; // 10 分鐘：cron 每 5 分打一次，隔次拿 cached；full check D1 reads 從 1.9M/month → 0.2M/month
 let lastChannelsQuery = 0;
-const CHANNELS_QUERY_INTERVAL = 30_000; // 全表掃描最多每 30s 一次
+const CHANNELS_QUERY_INTERVAL = 600_000; // 10 分鐘：與 health interval 同步
 
 let lastUrlHealthCheck = 0;
-const URL_HEALTH_INTERVAL_MS = 300_000; // 5 分鐘
+const URL_HEALTH_INTERVAL_MS = 600_000; // 10 分鐘（原 5 分鐘）
 
 async function performUrlHealthCheck(DB) {
   const now = Math.floor(Date.now() / 1000);

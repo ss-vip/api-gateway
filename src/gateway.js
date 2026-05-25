@@ -47,7 +47,7 @@ function getEwmaLatency(chId) {
 }
 
 async function loadCache(env) {
-  const TTL = 60_000;
+  const TTL = 180_000; // 3 分鐘快取，減少 D1 reads（100 channels × 3 tables × 480 reloads/day = ~53k reads/day）
   if (cache.data && Date.now() - cache.ts < TTL) return cache.data;
   if (!cacheFlight) {
     const gen = cacheGen;
@@ -372,7 +372,7 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
 
 
 
-async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline) {
+async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline, body) {
   const { ch, res, responseTime } = winner;
   logStructured("info", "stream start", { channelId: ch.id, model: ch.model, responseTime });
 
@@ -388,10 +388,12 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
   let streamError = null;
   const contentFilter = new RollingFilter(data.filters || []);
   const clientSignal = c.req.raw.signal;
-  const tcState = { buffering: false, buf: '' };
+  const tcState = { buffering: false, buf: '', toolCallIndex: 0 };
   let emittedToolCalls = false;
 
   let streamUsage = null;
+  let usageEmitted = false;
+  let sawToolCalls = false;
 
   try {
     let lastLine = "";
@@ -436,6 +438,11 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           if (chunk && typeof chunk.usage === 'object' && chunk.usage !== null && chunk.usage.prompt_tokens !== undefined) {
             streamUsage = chunk.usage;
           }
+
+          // 追蹤是否已送出 usage chunk（避免重複注入）
+          if (chunk?.usage) usageEmitted = true;
+          // 追蹤是否收到原生 tool_calls（用於 tools-ignored 偵測）
+          if (delta?.tool_calls) sawToolCalls = true;
 
           // Normalize reasoning_content for LobeChat compatibility:
           // Some upstream providers send reasoning_content (empty/null/whitespace)
@@ -617,6 +624,20 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     }
 
 
+    // 注入 usage chunk（OpenCode/Vercel AI SDK 在串流結束前需要 usage 來正確關閉）
+    if (streamUsage && !usageEmitted) {
+      try {
+        await sseEvent(w, enc, {
+          id: "chatcmpl-" + Date.now(),
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: originalModel || "unknown",
+          choices: [],
+          usage: streamUsage,
+        });
+      } catch (e) {}
+    }
+
     if (!streamHadContent && !streamFinishedNormally) {
       if (clientSignal.aborted) {
         logStructured("warn", "stream client disconnect", { channelId: ch.id });
@@ -660,6 +681,11 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     ch.response_time = responseTime;
     updateEwma(ch.id, responseTime);
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
+    // Streaming tools-ignored detection：若上游有回應內容但未回傳 tool_calls
+    // （原生、XML 模擬皆無），則標記該渠道不支援工具呼叫
+    if (body && shouldSimulateTools(body) && !sawToolCalls && !emittedToolCalls) {
+      ch.support_tools = 0;
+    }
     deferPersist(c, ch);
     // 回傳用量讓外層可以記錄（串流 token 數來自上游最後一個 chunk 的 usage 欄位）
     return { usage: streamUsage };
@@ -723,7 +749,7 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
             status: res.status, statusText: res.statusText, headers: res.headers,
           });
           const winner = { ch, res: reconstructedRes, cfg, responseTime: rt };
-          const streamResult = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline);
+          const streamResult = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline, body);
           if (streamResult) {
             lastWinnerId = ch.id;
             return { ok: true, channelId: lastWinnerId, usage: streamResult.usage || null };
@@ -733,6 +759,7 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         }
       }
 
+      // Non-streaming fallback: json path
       if (jsonResponse) {
         if (jsonResponse?.choices?.[0]?.message?.content) {
           const msg = jsonResponse.choices[0].message;
@@ -754,7 +781,7 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
       }
 
       const winner = { ch, res, cfg, responseTime: rt };
-      const streamResult = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline);
+      const streamResult = await streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline, body);
       if (streamResult) {
         lastWinnerId = ch.id;
         return { ok: true, channelId: lastWinnerId, usage: streamResult.usage || null };

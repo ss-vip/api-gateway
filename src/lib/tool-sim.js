@@ -121,10 +121,12 @@ export function processXmlToolCallStream(content, state) {
 
     const parsed = parseXmlToolCall(xml);
     if (parsed && parsed.name) {
+      const idx = state.toolCallIndex ?? 0;
+      state.toolCallIndex = idx + 1;
       return {
         action: 'emit',
         toolCalls: [{
-          index: 0,
+          index: idx,
           id: nextToolCallId(),
           type: 'function',
           function: { name: parsed.name, arguments: parsed.arguments },
@@ -154,11 +156,13 @@ export function processXmlToolCallStream(content, state) {
 
     const parsed = parseXmlToolCall(xml);
     if (parsed && parsed.name) {
+      const idx = state.toolCallIndex ?? 0;
+      state.toolCallIndex = idx + 1;
       return {
         action: 'emit',
         textBefore: beforeText || undefined,
         toolCalls: [{
-          index: 0,
+          index: idx,
           id: nextToolCallId(),
           type: 'function',
           function: { name: parsed.name, arguments: parsed.arguments },
