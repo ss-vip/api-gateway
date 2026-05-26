@@ -32,23 +32,13 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   rpd_reset_at      INTEGER NOT NULL DEFAULT 0,
   max_tokens        INTEGER NOT NULL DEFAULT 0,
   support_tools     INTEGER NOT NULL DEFAULT 1,
-  simulate_tools    INTEGER NOT NULL DEFAULT 0,
   support_stream    INTEGER NOT NULL DEFAULT 1,
-  support_image_gen INTEGER NOT NULL DEFAULT 0,
-  support_audio_tts INTEGER NOT NULL DEFAULT 0,
-  support_audio_stt INTEGER NOT NULL DEFAULT 0,
-  support_image_edit INTEGER NOT NULL DEFAULT 0,
-  support_embeddings INTEGER NOT NULL DEFAULT 0,
   response_time     INTEGER NOT NULL DEFAULT 0,
   fallback_model    TEXT    NOT NULL DEFAULT '',
-  headers           TEXT,
-  provider_options  TEXT,
   provider          TEXT    NOT NULL DEFAULT '',
   absolute_url      INTEGER NOT NULL DEFAULT 0,
   channel_type      TEXT    NOT NULL DEFAULT 'chat',
-  cooldown_until    INTEGER NOT NULL DEFAULT 0,
-  created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at        INTEGER NOT NULL DEFAULT (unixepoch())
+  cooldown_until    INTEGER NOT NULL DEFAULT 0
 )`;
 
 const FILTERS_DDL = `CREATE TABLE IF NOT EXISTS filters (
@@ -101,15 +91,8 @@ const TABLES = [
     migrationCols: [
       "support_tools INTEGER NOT NULL DEFAULT 1",
       "support_stream INTEGER NOT NULL DEFAULT 1",
-      "support_image_gen INTEGER NOT NULL DEFAULT 0",
-      "support_audio_tts INTEGER NOT NULL DEFAULT 0",
-      "support_audio_stt INTEGER NOT NULL DEFAULT 0",
-      "support_image_edit INTEGER NOT NULL DEFAULT 0",
-      "support_embeddings INTEGER NOT NULL DEFAULT 0",
       "response_time INTEGER NOT NULL DEFAULT 0",
       "fallback_model TEXT NOT NULL DEFAULT ''",
-      "headers TEXT",
-      "provider_options TEXT",
       "provider TEXT NOT NULL DEFAULT ''",
       "absolute_url INTEGER NOT NULL DEFAULT 0",
       "channel_type TEXT NOT NULL DEFAULT 'chat'",

@@ -24,10 +24,6 @@ export function nextToolCallId() {
   return 'call_' + Date.now().toString(36) + '_' + (++toolCallIdCounter).toString(36);
 }
 
-export function hasTools(body) {
-  return body.tools && Array.isArray(body.tools) && body.tools.length > 0;
-}
-
 export function stripToolXmlTags(content) {
   if (!content || typeof content !== 'string') return content;
   let cleaned = content.replace(/<tool_call(?:\s[^>]*)?>[\s\S]*?<\/tool_call>/gi, '');
@@ -226,4 +222,47 @@ export function normalizeToolCallNames(toolCalls, body) {
       if (o.includes(raw)) { tc.function.name = o; break; }
     }
   }
+}
+
+/**
+ * 為不支援原生 tool_calls 的模型建立 XML 模擬提示詞。
+ * 注入到 system message 結尾，教模型以 <tool_call> XML 格式回應。
+ */
+export function buildToolSimPrompt(tools) {
+  if (!tools || !Array.isArray(tools) || tools.length === 0) return '';
+  const parts = [
+    '\n\n## Available Functions (XML format)',
+    'When you need to call a function, respond with XML in this exact format (do NOT wrap in markdown code blocks):',
+    '',
+    '<tool_call>',
+    'function_name',
+    '  <arg_key>parameter_name_1</arg_key>',
+    '  <arg_value>parameter_value_1</arg_value>',
+    '  <arg_key>parameter_name_2</arg_key>',
+    '  <arg_value>parameter_value_2</arg_value>',
+    '</tool_call>',
+    '',
+    'Available functions:',
+  ];
+
+  for (const tool of tools) {
+    const fn = tool.function || tool;
+    if (!fn.name) continue;
+    parts.push(`\n### ${fn.name}`);
+    if (fn.description) parts.push(fn.description);
+    if (fn.parameters) {
+      const props = fn.parameters.properties;
+      if (props) {
+        const required = new Set(fn.parameters.required || []);
+        const paramList = Object.entries(props).map(([k, v]) => {
+          const req = required.has(k) ? '(required)' : '(optional)';
+          return `  - ${k}: ${v.type || 'string'} ${req}${v.description ? ' — ' + v.description : ''}`;
+        });
+        if (paramList.length > 0) parts.push(`Parameters:\n${paramList.join('\n')}`);
+      }
+    }
+  }
+
+  parts.push('\nReturn function calls using the XML format above when needed.');
+  return parts.join('\n');
 }

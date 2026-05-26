@@ -56,12 +56,6 @@ export function estimateInputTokens(body) {
   return Math.ceil(chars / 4);
 }
 
-export function nextToolCallId() {
-  // crypto.randomUUID is available in Workers (global) — no shared counter race
-  const id = crypto.randomUUID().split("-").join("").slice(0, 28);
-  return "call_" + id;
-}
-
 /**
  * LobeChat compatibility: some versions emit JSON with a bare array at position 0
  * instead of {"messages": [...]}. This scans on JSON parse failure (~0.5ms/100KB,

@@ -1,6 +1,21 @@
 import { Hono } from "hono";
 import { CHANNEL_TYPES } from "../lib/schema.js";
 import { retry } from "../lib/retry.js";
+import { maskApiKey } from "../lib/logger.js";
+
+const D1_BATCH_LIMIT = 99; // D1 單次 batch 最多 99 筆
+
+/**
+ * Split an array of D1 statements into chunks and execute sequentially.
+ */
+async function batchChunked(db, stmts) {
+  for (let i = 0; i < stmts.length; i += D1_BATCH_LIMIT) {
+    const chunk = stmts.slice(i, i + D1_BATCH_LIMIT);
+    if (chunk.length > 0) {
+      await retry(() => db.batch(chunk));
+    }
+  }
+}
 
 let pepper = "";
 function setPepper(p) { pepper = p || ""; }
@@ -305,8 +320,11 @@ export default function (_clearCache) {
       ).bind(today).first().catch(() => ({ requests: 0, tokens: 0 })),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
+    const channels = (ch.results || []).map(ch => ({
+      ...ch, api_key: maskApiKey(ch.api_key || ''),
+    }));
     return {
-      channels: ch.results || [],
+      channels,
       filters: fl.results || [],
       config: { token: cf?.client_token || "", recovery_period: parseInt(cf?.recovery_period) || 300 },
       stats: { date: today, requests: Number(stats?.requests || 0), tokens: Number(stats?.tokens || 0) },
@@ -315,7 +333,7 @@ export default function (_clearCache) {
 
   const channelsListHandler = withCache(async (c) => {
     const { results } = await c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all();
-    return results || [];
+    return (results || []).map(ch => ({ ...ch, api_key: maskApiKey(ch.api_key || '') }));
   });
 
   api.get("/", channelsListHandler);
@@ -333,24 +351,22 @@ export default function (_clearCache) {
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of channels) {
       const apiKey = ch.api_key || (allKeys[ch.id] || "");
-      const h = ch.headers ? (typeof ch.headers === "object" ? JSON.stringify(ch.headers) : ch.headers) : null;
-      const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
       batch.push(
         c.env.DB.prepare(
-          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url, channel_type, cooldown_until, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, provider, absolute_url, channel_type, cooldown_until, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
           ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
           ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
           ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
           ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
-          h, po, ch.provider || "", ch.absolute_url ? 1 : 0,
+          ch.provider || "", ch.absolute_url ? 1 : 0,
           ch.channel_type || "chat",
           ch.cooldown_until || 0, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0
         )
       );
     }
-    await retry(() => c.env.DB.batch(batch));
+    await batchChunked(c.env.DB, batch);
     clearCache();
     return c.json({ ok: true });
   });
@@ -374,12 +390,13 @@ export default function (_clearCache) {
 
   api.post("/filters", async (c) => {
     const filters = await c.req.json();
-    await retry(() => c.env.DB.batch([
+    const stmts = [
       c.env.DB.prepare("DELETE FROM filters"),
       ...filters.map((f) =>
         c.env.DB.prepare("INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)").bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0)
       ),
-    ]));
+    ];
+    await batchChunked(c.env.DB, stmts);
     clearCache();
     return c.json({ ok: true });
   });
@@ -598,18 +615,16 @@ export default function (_clearCache) {
       for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
       for (const ch of d.channels) {
         const apiKey = ch.api_key || (allKeys[ch.id] || "");
-        const h = ch.headers ? (typeof ch.headers === "object" ? JSON.stringify(ch.headers) : ch.headers) : null;
-        const po = ch.provider_options ? (typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : ch.provider_options) : null;
         batch.push(
           c.env.DB.prepare(
-            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, headers, provider_options, provider, absolute_url, channel_type, cooldown_until, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, provider, absolute_url, channel_type, cooldown_until, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
             ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
             ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
             ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
             ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
-            h, po, ch.provider || "", ch.absolute_url ? 1 : 0,
+            ch.provider || "", ch.absolute_url ? 1 : 0,
             ch.channel_type || "chat",
             ch.cooldown_until || 0, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0
           )

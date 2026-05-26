@@ -4,10 +4,13 @@ import {
   RPM_WINDOW_SECONDS, RPD_WINDOW_SECONDS,
   getRequestTimeout, getGlobalTimeout,
 } from "./lib/constants.js";
+import { selectChannel, lockModel, isModelLocked, updateEwma, clearEwma } from "./lib/router.js";
 import { bufferRate, getBufferedRate, logRequest } from "./routes/maintenance.js";
 import { SSE_CHUNK_HEADERS, RollingFilter, sseEvent, writeStreamError, writeSimulatedStream } from "./lib/sse.js";
 import { requestId, logStructured, errResponse, hasVisionContent, estimateInputTokens, tryRepairChatJson } from "./lib/request.js";
-import { processXmlToolCallStream, extractXmlToolCallsFromContent, normalizeToolCallNames, stripToolXmlTags } from "./lib/tool-sim.js";
+import { processXmlToolCallStream, extractXmlToolCallsFromContent, normalizeToolCallNames, stripToolXmlTags, buildToolSimPrompt } from "./lib/tool-sim.js";
+import { classifyError, cooldownFor } from "./lib/errors.js";
+import { maskApiKey } from "./lib/logger.js";
 import { retry } from "./lib/retry.js";
 
 let cache = { data: null, ts: 0 };
@@ -15,15 +18,11 @@ let cacheFlight = null;
 let cacheGen = 0;
 
 const lastPersistedState = new Map();
-// Throttle health writes to prevent D1 write exhaustion
 let lastHealthFlush = 0;
 const HEALTH_FLUSH_INTERVAL_MS = 30_000; // 30 seconds
 
 // C3: 批次健康寫入 — 累積後在一次 batch 中寫入 D1，而非每次變更都寫
 const pendingHealth = new Map();
-
-const EWMA_ALPHA = 0.3;
-const ewmaLatency = new Map();
 
 /** Phase-in recovery constant: on first success after cooldown, set errors here */
 const PHASE_IN_ERRORS = 2;
@@ -36,17 +35,6 @@ function applySuccess(ch) {
     return;
   }
   ch.consecutive_errors = Math.max(0, prev - 1);
-}
-
-function updateEwma(chId, rt) {
-  const prev = ewmaLatency.get(chId);
-  const smoothed = prev !== undefined ? EWMA_ALPHA * rt + (1 - EWMA_ALPHA) * prev : rt;
-  ewmaLatency.set(chId, smoothed);
-  return smoothed;
-}
-
-function getEwmaLatency(chId) {
-  return ewmaLatency.get(chId);
 }
 
 async function loadCache(env) {
@@ -89,27 +77,7 @@ export function clearCache() {
   cache.data = null;
   cache.ts = 0;
   lastPersistedState.clear();
-  ewmaLatency.clear();
-}
-
-function exponentialCooldown(consecutiveErrors) {
-  if (consecutiveErrors <= BACKOFF_ERROR_THRESHOLD) return 0;
-  const exponent = Math.min(consecutiveErrors - BACKOFF_ERROR_THRESHOLD, 4);
-  return Math.min(BACKOFF_429_SECONDS * Math.pow(2, exponent), BACKOFF_MAX_SECONDS);
-}
-
-
-function getEffectiveRpm(ch) {
-  if (!ch.rpm_limit || ch.rpm_limit <= 0) return 0;
-  return Math.max(1, Math.round(ch.rpm_limit * (ch.weight || 50) / 50));
-}
-
-function normalizeRateWindow(count, resetAt, windowSeconds, now) {
-  const reset = Number(resetAt || 0);
-  const value = Number(count || 0);
-  if (!reset || reset > now + windowSeconds) return { count: 0, resetAt: now, active: false };
-  if (now - reset >= windowSeconds) return { count: 0, resetAt: now, active: false };
-  return { count: value, resetAt: reset, active: true };
+  clearEwma();
 }
 
 function persistStateKey(ch) {
@@ -160,124 +128,6 @@ function deferPersist(c, ch) {
   if (!ch || !ch.id) return;
   pendingHealth.set(ch.id, { ...ch });
 }
-
-function selectChannel(channels, originalModel, isStream, body) {
-  const now = Math.floor(Date.now() / 1000);
-  const model = (originalModel || '').trim();
-  const inputTokens = estimateInputTokens(body);
-
-  // 快取 RPM/RPD 計算避免每條 channel 重複呼叫 normalizeRateWindow 高達 3 次
-  const rateCache = new Map();
-  // 效能注意：當 channels 數量 > 50 時，此函數的權重計算可能成為瓶頸。
-  // 若需優化，可考慮：(1) 預先計算權重並快取 (2) 簡化權重因素 (3) 使用更輕量的選擇策略
-  function getRate(ch) {
-    let r = rateCache.get(ch.id);
-    if (!r) {
-      const buf = getBufferedRate(ch.id);
-      r = {
-        rpm: normalizeRateWindow(buf ? buf.rpmCount : ch.rpm_count, buf ? buf.rpmResetAt : ch.rpm_reset_at, RPM_WINDOW_SECONDS, now),
-        rpd: normalizeRateWindow(buf ? buf.rpdCount : ch.rpd_count, buf ? buf.rpdResetAt : ch.rpd_reset_at, RPD_WINDOW_SECONDS, now),
-        rpmCount: buf ? buf.rpmCount : (ch.rpm_count || 0),
-      };
-      rateCache.set(ch.id, r);
-    }
-    return r;
-  }
-
-  const healthy = channels.filter(ch => {
-    if (!ch.is_enabled) return false;
-    if (isStream && ch.support_stream === 0) return false;
-    if (ch.max_tokens > 0 && inputTokens >= ch.max_tokens) return false;
-    const errs = ch.consecutive_errors || 0;
-
-    if (errs >= BACKOFF_ERROR_THRESHOLD &&
-        now - (ch.last_error_at || 0) <= exponentialCooldown(errs)) return false;
-
-    if (ch.last_429 > 0 && ch.last_429 > now) return false;
-    if (ch.cooldown_until > 0 && ch.cooldown_until > now) return false;
-    const { rpm, rpd } = getRate(ch);
-    if (ch.rpd_limit > 0 && rpd.active && rpd.count >= ch.rpd_limit) return false;
-    if (ch.rpm_limit > 0) {
-      const effectiveRpm = getEffectiveRpm(ch);
-      if (rpm.active && rpm.count >= effectiveRpm) return false;
-      const usage = rpm.active ? rpm.count / effectiveRpm : 0;
-      if (usage > 0.7 && Math.random() < (usage - 0.7) * 3) return false;
-    }
-    return true;
-  });
-  if (healthy.length === 0) return null;
-
-  const allRpm1 = healthy.every(ch => ch.rpm_limit === 1);
-  if (allRpm1 && healthy.length > 1) {
-    healthy.sort((a, b) => (b.weight || 50) - (a.weight || 50));
-    lastRRIdx = (lastRRIdx + 1) % healthy.length;
-    return healthy[lastRRIdx];
-  }
-
-  const highLoad = healthy.every(ch => {
-    if (!ch.rpm_limit) return false;
-    const effectiveRpm = getEffectiveRpm(ch);
-    if (!effectiveRpm) return false;
-    const { rpm } = getRate(ch);
-    if (!rpm.active) return false;
-    return rpm.count / effectiveRpm > 0.5;
-  });
-  if (highLoad && healthy.length > 1) {
-    return healthy.reduce((best, ch) => {
-      const load = getRate(ch).rpmCount / (ch.weight || 50);
-      return load < best.load ? { ch, load } : best;
-    }, { ch: null, load: Infinity }).ch;
-  }
-
-  const rtValues = healthy.map(ch => getEwmaLatency(ch.id) || ch.response_time || 0).filter(v => v > 0);
-  const avgRt = rtValues.length > 0 ? rtValues.reduce((s, v) => s + v, 0) / rtValues.length : 0;
-
-  let totalW = 0;
-  const weights = [];
-  for (const ch of healthy) {
-    let w = ch.weight || 50;
-
-    const models = (ch.model || '').split(',').map(s => s.trim()).filter(Boolean);
-    const fallbacks = (ch.fallback_model || '').split(',').map(s => s.trim()).filter(Boolean);
-    if (models.includes(model)) w *= 10;
-    else if (fallbacks.includes(model)) w *= 5;
-    else w *= 0.1;
-
-    const err = ch.consecutive_errors || 0;
-    // Half-open: cooldown expired but still high error count → probe with minimal weight
-    if (err >= BACKOFF_ERROR_THRESHOLD) {
-      w *= 0.05;
-    } else if (err >= 4) w *= 0.2;
-    else if (err === 3) w *= 0.4;
-    else if (err === 2) w *= 0.6;
-    else if (err === 1) w *= 0.8;
-
-    const { rpm, rpd } = getRate(ch);
-    const effectiveRpm = getEffectiveRpm(ch);
-    if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpm.active && rpm.count / effectiveRpm > 0.8) w *= 0.5;
-    if (ch.rpd_limit > 0 && rpd.active && rpd.count / ch.rpd_limit > 0.8) w *= 0.5;
-
-    const rt = getEwmaLatency(ch.id) || ch.response_time || 0;
-    if (rt > 0 && avgRt > 0) {
-      if (rt > avgRt * 2) w *= 0.3;
-      else if (rt > avgRt * 1.5) w *= 0.5;
-      else if (rt > avgRt * 1.2) w *= 0.75;
-    }
-
-    w = Math.max(1, Math.min(1000, Math.round(w)));
-    weights.push(w);
-    totalW += w;
-  }
-
-  let r = Math.random() * totalW;
-  for (let i = 0; i < healthy.length; i++) {
-    r -= weights[i];
-    if (r <= 0) return healthy[i];
-  }
-  return healthy[healthy.length - 1];
-}
-
-let lastRRIdx = -1;
 
 function updateRateCounters(ch, nowSec) {
   if (!ch) return;
@@ -339,8 +189,10 @@ function removePoolItem(pool, ch) {
 
 function truncateErrorBody(text) {
   if (!text || typeof text !== "string") return text || "";
-  if (text.length <= 8192) return text;
-  return text.slice(0, 8192) + "... [truncated]";
+  // 遮罩可能包含在錯誤訊息中的 API key（不影響轉發，僅限日誌/UI）
+  const masked = maskApiKey(text);
+  if (masked.length <= 8192) return masked;
+  return masked.slice(0, 8192) + "... [truncated]";
 }
 
 function buildChannelConfig(ch, body, originalModel, deadline, stream) {
@@ -350,13 +202,27 @@ function buildChannelConfig(ch, body, originalModel, deadline, stream) {
 
   const reqBody = { ...body, model: ch.model || originalModel };
 
-  let channelHeaders = {};
-  if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
-  else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
+  // 輔助模擬：當上游不支援原生 tool_calls 時，附加 XML 模擬指令至 system message，
+  // 但保留原生 tools 陣列（上游若支援仍可使用原生）。這樣兩條路都通。
+  if (ch.support_tools === 0) {
+    const bodyTools = body?.tools;
+    if (bodyTools && Array.isArray(bodyTools) && bodyTools.length > 0) {
+      const simPrompt = buildToolSimPrompt(bodyTools);
+      if (simPrompt) {
+        const msgs = [...(reqBody.messages || [])];
+        const sysIdx = msgs.findIndex(m => m.role === 'system');
+        if (sysIdx >= 0) {
+          msgs[sysIdx] = { ...msgs[sysIdx], content: (msgs[sysIdx].content || '') + simPrompt };
+        } else {
+          msgs.unshift({ role: 'system', content: simPrompt });
+        }
+        reqBody.messages = msgs;
+      }
+    }
+  }
 
   const requestHeaders = {
     "Content-Type": "application/json",
-    ...channelHeaders,
   };
   if (ch.api_key) requestHeaders.Authorization = "Bearer " + ch.api_key;
 
@@ -373,8 +239,22 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
   ch.last_error_at = Math.floor(Date.now() / 1000);
   ch.last_error_msg = truncateErrorBody(errMsg || ("HTTP " + status));
   ch.response_time = responseTime || 0;
-  if (status === 429) {
+
+  // 使用 9Router-inspired 錯誤分類引擎決定 cooldown 策略
+  const classified = classifyError(status, errMsg || '');
+  if (classified.type === 'rate_limit' || status === 429) {
     ch.last_429 = Math.floor(Date.now() / 1000) + (data?.config?.recovery_period || 300);
+  }
+
+  // 永久性錯誤 (auth/permanent) → 停用渠道
+  if (classified.action === 'disable' && ch.is_enabled) {
+    ch.is_enabled = 0;
+  }
+
+  // Model-level lock：丟棄整類錯誤到特定模型上
+  if (classified.type === 'quota') {
+    const chModel = (ch.model || '').trim();
+    if (chModel) lockModel(chModel, cooldownFor('quota', ch.consecutive_errors) * 1000);
   }
 }
 
@@ -428,10 +308,9 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
         if (rawLine.startsWith(":")) continue;
         const trimmed = rawLine.trimStart();
         if (!trimmed.startsWith("data:")) continue;
-        const line = rawLine;
-        lastLine = line;
+        lastLine = rawLine;
 
-        if (line.trim() === "data: [DONE]") {
+        if (rawLine.trim() === "data: [DONE]") {
           streamFinishedNormally = true;
           const tail = contentFilter.flush();
           if (tail) {
@@ -442,13 +321,13 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
             });
             bytesWritten = true;
           }
-          try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
+          try { await w.write(enc.encode(rawLine + "\n\n")); bytesWritten = true; } catch (e) {}
           streamDone = true; break;
         }
 
         try {
-          const colonIdx = line.indexOf(":");
-          const jsonStr = line.slice(colonIdx + 1).trim();
+          const colonIdx = rawLine.indexOf(":");
+          const jsonStr = rawLine.slice(colonIdx + 1).trim();
           const chunk = JSON.parse(jsonStr);
           const choice = chunk?.choices?.[0];
           const delta = choice?.delta;
@@ -498,9 +377,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
             hasWrittenInit = true;
           }
 
-          // Forward upstream delta content as-is
-          // Detect XML tool calls (<tool_call>...) in streaming content and
-          // convert to OpenAI tool_calls chunks for MCP dispatch.
+          // Detect XML tool calls in streaming content, convert to OpenAI tool_calls chunks
           if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
             const tcResult = processXmlToolCallStream(delta.content, tcState);
 
@@ -663,7 +540,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
             }
           }
         } catch (e) {
-          try { await w.write(enc.encode(line + "\n\n")); bytesWritten = true; } catch (e) {}
+          try { await w.write(enc.encode(rawLine + "\n\n")); bytesWritten = true; } catch (e) {}
         }
 
       }
@@ -727,6 +604,15 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     ch.response_time = responseTime;
     updateEwma(ch.id, responseTime);
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
+
+    // 串流 tools-ignored 偵測：簡單標記，不做請求體修改
+    const bodyTools = body?.tools;
+    if (bodyTools && Array.isArray(bodyTools) && bodyTools.length > 0 && !emittedToolCalls) {
+      ch.support_tools = 0;
+    } else if (bodyTools && emittedToolCalls) {
+      ch.support_tools = 1;
+    }
+
     deferPersist(c, ch);
     return { usage: streamUsage };
   }
@@ -817,7 +703,6 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
               normalizeToolCallNames(msg.tool_calls, body);
             }
           }
-          // Safety net: strip any remaining XML tool tags
           msg.content = stripToolXmlTags(msg.content);
         }
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
@@ -893,9 +778,7 @@ function finalizeNonStream(c, winner, data, hasVision, body) {
         }
       }
     }
-    // Safety net: strip any remaining XML tool tags
     msg.content = stripToolXmlTags(msg.content);
-    // Clean up empty tool_calls that some upstreams include by default
     if (msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length === 0) {
       delete msg.tool_calls;
     }
@@ -964,13 +847,14 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         continue;
       }
 
-      // Detect if upstream ignored tools: mark for future routing, but
-      // keep the response — it's still a valid text completion.
+      // Detect if upstream ignored tools: simple mark, no body modification
       if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
         const msg = json?.choices?.[0]?.message;
         if (msg && !msg.tool_calls && !(msg.content || '').includes('<tool_call>')) {
           ch.support_tools = 0;
           deferPersist(c, ch);
+        } else {
+          ch.support_tools = 1;
         }
       }
 
@@ -1017,6 +901,11 @@ async function handleChatRequest(c) {
 
     let body;
     let bodyText = "";
+    // Content-Length 檢查：防止 OOM（Workers 記憶體 128MB）
+    const contentLen = parseInt(c.req.header("Content-Length") || "0");
+    if (contentLen > 5 * 1024 * 1024) {
+      return errResponse(c, "Request body too large — maximum is 5MB", "invalid_request_error", 413);
+    }
     try {
       bodyText = await c.req.text();
       body = JSON.parse(bodyText);
@@ -1059,14 +948,16 @@ async function handleChatRequest(c) {
       const reqStart = Date.now();
 
       c.executionCtx.waitUntil((async () => {
+        let streamOk = false;
         try {
+          // 立即寫入首 byte 建立連線，避免 client 掛住
+          try { await w.write(enc.encode(": connected\n\n")); } catch (e) {}
           const streamResult = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
-          const streamOk = streamResult.ok;
+          streamOk = streamResult.ok;
           const durationMs = Date.now() - reqStart;
           if (!streamOk) {
-            await writeStreamError(w, enc, streamResult.lastError || "All upstream channels failed — please check channel status");
+            try { await writeStreamError(w, enc, streamResult.lastError || "All upstream channels failed — please check channel status"); } catch (e) {}
           }
-          // Close stream immediately so client (LobeChat) does not hang waiting for end-of-stream
           try { await w.close(); } catch (e) {}
           const usage = streamResult.usage || {};
           await logRequest(c.env.DB, streamResult.channelId || 0, originalModel || "",
@@ -1075,7 +966,6 @@ async function handleChatRequest(c) {
           await flushHealthWrites(c.env);
         } catch (e) {
           logStructured("error", "stream worker error", { rid, error: e.message });
-          await writeStreamError(w, enc, "Gateway stream failed: " + (e.message || "unknown error"));
           try { await w.close(); } catch (e2) {}
         }
       })());
@@ -1084,8 +974,7 @@ async function handleChatRequest(c) {
     }
 
     const result = await fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision);
-    const respHeaders = new Headers(result.headers);
-    respHeaders.set("X-Request-Id", rid);
+    result.headers.set("X-Request-Id", rid);
     c.executionCtx.waitUntil((async () => {
       if (result.status !== 200) {
         await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, result?.status || 0, "", rid);
@@ -1156,10 +1045,7 @@ async function proxyEndpoint(c, endpointType) {
         clientSignal.addEventListener('abort', onAbort, { once: true });
       }
 
-      let channelHeaders = {};
-      if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
-      else if (ch.headers && typeof ch.headers === "string") try { channelHeaders = JSON.parse(ch.headers); } catch (e) {}
-      const reqHeaders = { ...channelHeaders };
+      const reqHeaders = {};
       if (ch.api_key) reqHeaders.Authorization = "Bearer " + ch.api_key;
       const ct = c.req.header("Content-Type");
       if (ct) {

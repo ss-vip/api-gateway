@@ -1151,8 +1151,6 @@
 
       const prev = idx !== '' ? channels[idx] : null;
       const idVal = document.getElementById('ch-id').value;
-      const h = prev && prev.headers ? (typeof prev.headers === 'object' ? JSON.stringify(prev.headers) : prev.headers) : null;
-      const po = prev && prev.provider_options ? (typeof prev.provider_options === 'object' ? JSON.stringify(prev.provider_options) : prev.provider_options) : null;
       const ch = {
         id: idVal ? parseInt(idVal) : undefined,
         name,
@@ -1169,8 +1167,6 @@
         support_tools: prev ? (prev.support_tools !== 0 ? 1 : 0) : 1,
         support_stream: prev ? (prev.support_stream !== 0 ? 1 : 0) : 1,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
-        headers: h,
-        provider_options: po,
         provider: prev ? (prev.provider || '') : '',
         last_429: prev ? prev.last_429||0 : 0,
         consecutive_errors: prev ? prev.consecutive_errors||0 : 0,
@@ -1429,8 +1425,6 @@
         support_stream: c.support_stream !== 0 ? 1 : 0,
         channel_type: c.channel_type || 'chat',
         provider: c.provider || "",
-        headers: c.headers || null,
-        provider_options: c.provider_options || null,
         absolute_url: c.absolute_url ? 1 : 0,
       }));
       const cleanFilters = filters.map(f => ({ text: f.text, mode: f.mode || 1, is_enabled: f.is_enabled ? 1 : 0 }));

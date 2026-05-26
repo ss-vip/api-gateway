@@ -49,10 +49,6 @@ export function sseEvent(w, enc, data) {
   return w.write(enc.encode("data: " + JSON.stringify(data) + "\n\n"));
 }
 
-export function sseComment(w, enc, comment) {
-  return w.write(enc.encode(": " + comment + "\n\n"));
-}
-
 function buildErrorChunk(msg) {
   return {
     id: "chatcmpl-" + Date.now(), object: "chat.completion.chunk",
