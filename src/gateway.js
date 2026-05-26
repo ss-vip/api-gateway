@@ -5,9 +5,9 @@ import {
   getRequestTimeout, getGlobalTimeout,
 } from "./lib/constants.js";
 import { bufferRate, getBufferedRate, logRequest } from "./routes/maintenance.js";
-import { SSE_CHUNK_HEADERS, RollingFilter, sseEvent, sseComment, writeStreamError, writeSimulatedStream } from "./lib/sse.js";
+import { SSE_CHUNK_HEADERS, RollingFilter, sseEvent, writeStreamError, writeSimulatedStream } from "./lib/sse.js";
 import { requestId, logStructured, errResponse, hasVisionContent, estimateInputTokens, tryRepairChatJson } from "./lib/request.js";
-import { shouldSimulateTools, prepareRequestBody, processXmlToolCallStream, extractXmlToolCallsFromContent } from "./lib/tool-sim.js";
+import { processXmlToolCallStream, extractXmlToolCallsFromContent, normalizeToolCallNames, stripToolXmlTags } from "./lib/tool-sim.js";
 import { retry } from "./lib/retry.js";
 
 let cache = { data: null, ts: 0 };
@@ -15,6 +15,9 @@ let cacheFlight = null;
 let cacheGen = 0;
 
 const lastPersistedState = new Map();
+// Throttle health writes to prevent D1 write exhaustion
+let lastHealthFlush = 0;
+const HEALTH_FLUSH_INTERVAL_MS = 30_000; // 30 seconds
 
 // C3: 批次健康寫入 — 累積後在一次 batch 中寫入 D1，而非每次變更都寫
 const pendingHealth = new Map();
@@ -123,7 +126,12 @@ function persistStateKey(ch) {
 }
 
 async function flushHealthWrites(env) {
-  if (pendingHealth.size === 0) return;
+  // Throttle health writes to prevent D1 write exhaustion
+  const nowMs = Date.now();
+  if (!pendingHealth.size || nowMs - lastHealthFlush < HEALTH_FLUSH_INTERVAL_MS) {
+    return;
+  }
+  
   const batch = [];
   for (const [id, ch] of pendingHealth) {
     const key = persistStateKey(ch);
@@ -145,6 +153,7 @@ async function flushHealthWrites(env) {
   }
   pendingHealth.clear();
   if (batch.length > 0) await retry(() => env.DB.batch(batch));
+  lastHealthFlush = nowMs;
 }
 
 function deferPersist(c, ch) {
@@ -159,6 +168,8 @@ function selectChannel(channels, originalModel, isStream, body) {
 
   // 快取 RPM/RPD 計算避免每條 channel 重複呼叫 normalizeRateWindow 高達 3 次
   const rateCache = new Map();
+  // 效能注意：當 channels 數量 > 50 時，此函數的權重計算可能成為瓶頸。
+  // 若需優化，可考慮：(1) 預先計算權重並快取 (2) 簡化權重因素 (3) 使用更輕量的選擇策略
   function getRate(ch) {
     let r = rateCache.get(ch.id);
     if (!r) {
@@ -241,8 +252,6 @@ function selectChannel(channels, originalModel, isStream, body) {
     else if (err === 2) w *= 0.6;
     else if (err === 1) w *= 0.8;
 
-    if (body && shouldSimulateTools(body) && ch.support_tools) w *= 5;
-
     const { rpm, rpd } = getRate(ch);
     const effectiveRpm = getEffectiveRpm(ch);
     if (ch.rpm_limit > 0 && effectiveRpm > 0 && rpm.active && rpm.count / effectiveRpm > 0.8) w *= 0.5;
@@ -304,16 +313,15 @@ async function handleModels(c) {
     const modelMap = {};
     data.channels.filter(ch => ch.is_enabled && (!ch.channel_type || ch.channel_type === "chat")).forEach(ch => {
       if (ch.model) ch.model.split(',').map(m => m.trim()).filter(Boolean).forEach(m => {
-        if (!modelMap[m]) modelMap[m] = { vision: false, tools: false, stream: false };
+        if (!modelMap[m]) modelMap[m] = { vision: false, stream: false };
         if (ch.is_vision) modelMap[m].vision = true;
-        if (ch.support_tools) modelMap[m].tools = true;
         if (ch.support_stream) modelMap[m].stream = true;
       });
     });
 
     const list = Object.entries(modelMap).map(([id, caps]) => ({
       id, object: "model", created: 1686935002, owned_by: "api-gateway",
-      capabilities: { vision: caps.vision, function_calling: caps.tools, streaming: caps.stream },
+      capabilities: { vision: caps.vision, function_calling: true, streaming: caps.stream },
     }));
 
     return c.json({ object: "list", data: list });
@@ -340,7 +348,7 @@ function buildChannelConfig(ch, body, originalModel, deadline, stream) {
   const url = ch.absolute_url ? ch.base_url : buildUrl(ch.base_url, effectiveModel, stream);
   if (!url) return null;
 
-  const reqBody = prepareRequestBody(body, ch, originalModel);
+  const reqBody = { ...body, model: ch.model || originalModel };
 
   let channelHeaders = {};
   if (ch.headers && typeof ch.headers === "object") channelHeaders = ch.headers;
@@ -372,6 +380,19 @@ function markChannelError(ch, status, errMsg, responseTime, data) {
 
 
 
+function normalizeToolCallNameInStream(rawName, tools) {
+  if (!rawName || !tools) return rawName;
+  for (const t of tools) {
+    const fn = t.function || t;
+    const orig = fn?.name;
+    if (!orig) continue;
+    if (rawName === orig) return orig;
+    if (rawName.replace(/_+/g, '_') === orig.replace(/_+/g, '_')) return orig;
+    if (orig.includes(rawName)) return orig;
+  }
+  return rawName;
+}
+
 async function streamChannelResponse(c, winner, data, w, enc, hasVision, originalModel, requestDeadline, body) {
   const { ch, res, responseTime } = winner;
   logStructured("info", "stream start", { channelId: ch.id, model: ch.model, responseTime });
@@ -393,7 +414,6 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
 
   let streamUsage = null;
   let usageEmitted = false;
-  let sawToolCalls = false;
 
   try {
     let lastLine = "";
@@ -433,6 +453,14 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           const choice = chunk?.choices?.[0];
           const delta = choice?.delta;
           if (delta?.content || delta?.tool_calls || delta?.reasoning_content) streamHadContent = true;
+          if (delta?.tool_calls) {
+            const tools = body?.tools;
+            for (const tc of delta.tool_calls) {
+              if (tc.function?.name) {
+                tc.function.name = normalizeToolCallNameInStream(tc.function.name, tools);
+              }
+            }
+          }
           if (choice?.finish_reason) streamFinishedNormally = true;
           // 追蹤串流用量（OpenAI 最後一個 chunk 會附 usage）
           if (chunk && typeof chunk.usage === 'object' && chunk.usage !== null && chunk.usage.prompt_tokens !== undefined) {
@@ -441,8 +469,6 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
 
           // 追蹤是否已送出 usage chunk（避免重複注入）
           if (chunk?.usage) usageEmitted = true;
-          // 追蹤是否收到原生 tool_calls（用於 tools-ignored 偵測）
-          if (delta?.tool_calls) sawToolCalls = true;
 
           // Normalize reasoning_content for LobeChat compatibility:
           // Some upstream providers send reasoning_content (empty/null/whitespace)
@@ -472,9 +498,9 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
             hasWrittenInit = true;
           }
 
-          // Some upstreams lack proper function calling support and return
-          // tool invocations as XML in the content field (<tool_call>...).
-          // Detect and convert to OpenAI tool_calls chunks for MCP dispatch.
+          // Forward upstream delta content as-is
+          // Detect XML tool calls (<tool_call>...) in streaming content and
+          // convert to OpenAI tool_calls chunks for MCP dispatch.
           if (delta && typeof delta.content === 'string' && delta.content.length > 0) {
             const tcResult = processXmlToolCallStream(delta.content, tcState);
 
@@ -508,7 +534,12 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
                 for (const tc of tcResult.toolCalls) {
                   await sseEvent(w, enc, {
                     ...chunk,
-                    choices: [{ index: 0, delta: { tool_calls: [tc] }, finish_reason: null }],
+                    choices: [{ index: 0, delta: { tool_calls: [{ index: tc.index ?? 0, id: tc.id, type: tc.type, function: { name: tc.function.name } }] }, finish_reason: null }],
+                  });
+                  bytesWritten = true;
+                  await sseEvent(w, enc, {
+                    ...chunk,
+                    choices: [{ index: 0, delta: { tool_calls: [{ index: tc.index ?? 0, function: { arguments: tc.function.arguments } }] }, finish_reason: null }],
                   });
                   bytesWritten = true;
                 }
@@ -520,8 +551,6 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
                 emittedToolCalls = true;
                 streamFinishedNormally = true;
                 if (tcResult.afterText) {
-                  // Support multiple <tool_call> blocks in a single stream:
-                  // if afterText contains another <tool_call>, continue buffering
                   if (tcResult.afterText.includes('<tool_call>')) {
                     tcState.buffering = true;
                     tcState.buf = tcResult.afterText;
@@ -544,7 +573,9 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
           }
 
           if (delta && typeof delta.content === "string") {
-            if (delta.content.length > 0) {
+            if (emittedToolCalls) {
+              if (choice?.finish_reason) streamFinishedNormally = true;
+            } else if (delta.content.length > 0) {
               const filtered = contentFilter.transform(delta.content);
               if (filtered) {
                 delta.content = filtered;
@@ -570,6 +601,18 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
                 await sseEvent(w, enc, chunk);
                 bytesWritten = true;
               }
+            } else if (choice?.finish_reason === 'tool_calls') {
+              // upstream claims tool_calls without real TC delta - skip
+            } else if (choice?.finish_reason) {
+              const tail = contentFilter.flush();
+              if (tail) {
+                delta.content = tail;
+                await sseEvent(w, enc, chunk);
+                bytesWritten = true;
+              } else {
+                await sseEvent(w, enc, chunk);
+                bytesWritten = true;
+              }
             } else {
               await sseEvent(w, enc, chunk);
               bytesWritten = true;
@@ -580,25 +623,28 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
               streamDone = true; break;
             }
           } else {
-              if (emittedToolCalls) {
-                if (choice?.finish_reason) {
-                  streamFinishedNormally = true;
-                }
-              } else if (choice?.finish_reason) {
-                const tail = contentFilter.flush();
-                if (tail) {
-                  choice.delta = choice.delta || {};
-                  choice.delta.content = tail;
-                  await sseEvent(w, enc, chunk);
-                  bytesWritten = true;
-                } else {
-                  await sseEvent(w, enc, chunk);
-                  bytesWritten = true;
-                }
-              } else {
+            if (emittedToolCalls) {
+              if (choice?.finish_reason) {
                 await sseEvent(w, enc, chunk);
                 bytesWritten = true;
+                streamFinishedNormally = true;
               }
+            } else if (delta?.tool_calls) {
+              const cleanDelta = { ...delta };
+              delete cleanDelta.role;
+              await sseEvent(w, enc, {
+                ...chunk,
+                choices: [{ ...choice, delta: cleanDelta }],
+              });
+              bytesWritten = true;
+              emittedToolCalls = true;
+              streamFinishedNormally = true;
+            } else if (choice?.finish_reason === 'tool_calls') {
+              // upstream claims tool_calls without real TC delta - skip
+            } else if (choice?.finish_reason) {
+              await sseEvent(w, enc, chunk);
+              bytesWritten = true;
+            }
           }
 
           // Ensure a finish_reason-only stop signal is emitted when the upstream
@@ -681,13 +727,7 @@ async function streamChannelResponse(c, winner, data, w, enc, hasVision, origina
     ch.response_time = responseTime;
     updateEwma(ch.id, responseTime);
     if (hasVision && !ch.is_vision) ch.is_vision = 1;
-    // Streaming tools-ignored detection：若上游有回應內容但未回傳 tool_calls
-    // （原生、XML 模擬皆無），則標記該渠道不支援工具呼叫
-    if (body && shouldSimulateTools(body) && !sawToolCalls && !emittedToolCalls) {
-      ch.support_tools = 0;
-    }
     deferPersist(c, ch);
-    // 回傳用量讓外層可以記錄（串流 token 數來自上游最後一個 chunk 的 usage 欄位）
     return { usage: streamUsage };
   }
   // 完全無內容 → 回傳 false 讓外層進行 fallback
@@ -763,18 +803,29 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
       if (jsonResponse) {
         if (jsonResponse?.choices?.[0]?.message?.content) {
           const msg = jsonResponse.choices[0].message;
+          const isFollowUp = (body?.messages || []).some(m => m.role === 'tool');
           const extracted = extractXmlToolCallsFromContent(msg.content);
           if (extracted) {
-            msg.content = extracted.content;
-            msg.tool_calls = extracted.tool_calls;
-            jsonResponse.choices[0].finish_reason = 'tool_calls';
+            if (isFollowUp) {
+              // 跟進輪次：只清理 XML 標籤，不產生新的 tool_calls
+              // 若提取後 content 為空則保留原始內容
+              msg.content = extracted.content || msg.content;
+            } else {
+              msg.content = extracted.content;
+              msg.tool_calls = extracted.tool_calls;
+              jsonResponse.choices[0].finish_reason = 'tool_calls';
+              normalizeToolCallNames(msg.tool_calls, body);
+            }
           }
+          // Safety net: strip any remaining XML tool tags
+          msg.content = stripToolXmlTags(msg.content);
         }
         updateRateCounters(ch, Math.floor(Date.now() / 1000));
         applySuccess(ch);
         ch.response_time = rt;
         updateEwma(ch.id, rt);
         if (hasVision && !ch.is_vision) ch.is_vision = 1;
+
         deferPersist(c, ch);
         await writeSimulatedStream(w, enc, jsonResponse);
         return { ok: true, channelId: ch.id, usage: jsonResponse.usage || null };
@@ -786,8 +837,8 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
         lastWinnerId = ch.id;
         return { ok: true, channelId: lastWinnerId, usage: streamResult.usage || null };
       }
-      lastError = ch.last_error_msg || "Stream failed early (no content)";
-      continue;
+       lastError = ch.last_error_msg || "Stream failed early (no content)";
+       continue;
     } catch (e) {
       clearTimeout(cfg.timeoutId);
       const rt = Date.now() - fetchStart;
@@ -797,12 +848,12 @@ async function fallbackSequential(c, pool, body, originalModel, data, w, enc, re
       continue;
     }
   }
-  return { ok: false, channelId: lastWinnerId };
+  return { ok: false, channelId: lastWinnerId, lastError };
 }
 
 
 
-function finalizeNonStream(c, winner, data, hasVision) {
+function finalizeNonStream(c, winner, data, hasVision, body) {
   const { ch, json, responseTime } = winner;
   updateRateCounters(ch, Math.floor(Date.now() / 1000));
   applySuccess(ch);
@@ -815,11 +866,38 @@ function finalizeNonStream(c, winner, data, hasVision) {
 
   if (json?.choices?.[0]?.message?.content) {
     const msg = json.choices[0].message;
+    const isFollowUp = (body?.messages || []).some(m => m.role === 'tool');
     const extracted = extractXmlToolCallsFromContent(msg.content);
-    if (extracted) {
-      msg.content = extracted.content;
-      msg.tool_calls = extracted.tool_calls;
-      json.choices[0].finish_reason = 'tool_calls';
+      if (extracted) {
+        if (isFollowUp) {
+          // 跟進輪次：只清理 XML 標籤，不產生新的 tool_calls（避免工具回呼迴圈）
+          // 若提取後 content 為空則保留原始內容（原始內容可能不含 XML 而是模型幻覺空白）
+          msg.content = extracted.content || msg.content;
+        } else {
+        msg.content = extracted.content;
+        msg.tool_calls = extracted.tool_calls;
+        json.choices[0].finish_reason = 'tool_calls';
+        normalizeToolCallNames(msg.tool_calls, body);
+        // 過濾：只保留工具名稱與原始定義完全匹配的呼叫
+        // 避免模型幻覺（hallucination）產生不存在的工具
+        if (body?.tools && Array.isArray(body.tools)) {
+          const validNames = new Set(body.tools.map(t => {
+            const fn = t.function || t;
+            return fn?.name;
+          }).filter(Boolean));
+          msg.tool_calls = msg.tool_calls.filter(tc => validNames.has(tc.function?.name));
+          if (msg.tool_calls.length === 0) {
+            delete msg.tool_calls;
+            json.choices[0].finish_reason = 'stop';
+          }
+        }
+      }
+    }
+    // Safety net: strip any remaining XML tool tags
+    msg.content = stripToolXmlTags(msg.content);
+    // Clean up empty tool_calls that some upstreams include by default
+    if (msg.tool_calls && Array.isArray(msg.tool_calls) && msg.tool_calls.length === 0) {
+      delete msg.tool_calls;
     }
   }
 
@@ -886,21 +964,17 @@ async function fallbackNonStreamSequential(c, pool, body, originalModel, data, r
         continue;
       }
 
-      // Tools-ignored detection: when the upstream returns a valid HTTP 200
-      // response (with text content) but no tool_calls and no XML <tool_call>,
-      // the upstream simply doesn't support function calling. Mark it for
-      // future selection weighting, but DO NOT discard the response — it's
-      // a valid chat completion. LobeChat handles text-only responses fine.
-      const msg = json?.choices?.[0]?.message;
-      if (shouldSimulateTools(body) && msg && !msg.tool_calls) {
-        const content = msg.content || '';
-        if (!content.includes('<tool_call>')) {
+      // Detect if upstream ignored tools: mark for future routing, but
+      // keep the response — it's still a valid text completion.
+      if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+        const msg = json?.choices?.[0]?.message;
+        if (msg && !msg.tool_calls && !(msg.content || '').includes('<tool_call>')) {
           ch.support_tools = 0;
           deferPersist(c, ch);
         }
       }
 
-      return finalizeNonStream(c, { ch, json, responseTime: rt }, data, hasVision);
+      return finalizeNonStream(c, { ch, json, responseTime: rt }, data, hasVision, body);
     } catch (e) {
       clearTimeout(cfg.timeoutId);
       markChannelError(ch, null, e.message, Date.now() - startTime, data);
@@ -962,8 +1036,7 @@ async function handleChatRequest(c) {
     }
 
     const originalModel = body.model;
-    // OpenAI spec: stream 預設為 false — 只有明確傳 stream=true 才啟用串流
-    const isStream = body.stream === true;
+    const isStream = body.stream === true || body.stream === "true";
     const hasVision = hasVisionContent(body);
 
     logStructured("info", "chat request", { rid, model: originalModel, stream: isStream });
@@ -987,10 +1060,12 @@ async function handleChatRequest(c) {
 
       c.executionCtx.waitUntil((async () => {
         try {
-          await sseComment(w, enc, "connected");
           const streamResult = await fallbackSequential(c, pool, body, originalModel, data, w, enc, requestDeadline, hasVision);
           const streamOk = streamResult.ok;
           const durationMs = Date.now() - reqStart;
+          if (!streamOk) {
+            await writeStreamError(w, enc, streamResult.lastError || "All upstream channels failed — please check channel status");
+          }
           // Close stream immediately so client (LobeChat) does not hang waiting for end-of-stream
           try { await w.close(); } catch (e) {}
           const usage = streamResult.usage || {};
@@ -1009,7 +1084,8 @@ async function handleChatRequest(c) {
     }
 
     const result = await fallbackNonStreamSequential(c, pool, body, originalModel, data, requestDeadline, hasVision);
-    result.headers.set("X-Request-Id", rid);
+    const respHeaders = new Headers(result.headers);
+    respHeaders.set("X-Request-Id", rid);
     c.executionCtx.waitUntil((async () => {
       if (result.status !== 200) {
         await logRequest(c.env.DB, 0, originalModel || "", 0, 0, 0, result?.status || 0, "", rid);

@@ -32,6 +32,7 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   rpd_reset_at      INTEGER NOT NULL DEFAULT 0,
   max_tokens        INTEGER NOT NULL DEFAULT 0,
   support_tools     INTEGER NOT NULL DEFAULT 1,
+  simulate_tools    INTEGER NOT NULL DEFAULT 0,
   support_stream    INTEGER NOT NULL DEFAULT 1,
   support_image_gen INTEGER NOT NULL DEFAULT 0,
   support_audio_tts INTEGER NOT NULL DEFAULT 0,

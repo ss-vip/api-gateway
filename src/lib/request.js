@@ -73,6 +73,7 @@ export function nextToolCallId() {
  */
 export function tryRepairChatJson(text) {
   if (!text || text.length < 3) return null;
+  const startTs = Date.now();
   let depth = 0;
   let inString = false;
   let escape = false;
@@ -90,7 +91,11 @@ export function tryRepairChatJson(text) {
     if (ch === '[') {
       if (depth === 1 && lastNonWS !== ':') {
         const repaired = text.slice(0, i) + '"messages": ' + text.slice(i);
-        try { return JSON.parse(repaired); } catch (_) { return null; }
+        try {
+          const elapsed = Date.now() - startTs;
+          if (elapsed > 10) console.warn("[request] tryRepairChatJson took", elapsed, "ms for", text.length, "chars");
+          return JSON.parse(repaired);
+        } catch (_) { return null; }
       }
       depth++; lastNonWS = '['; continue;
     }

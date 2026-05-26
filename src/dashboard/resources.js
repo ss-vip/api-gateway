@@ -298,17 +298,7 @@ export default function (_clearCache) {
   api.get("/init", withCache(async (c) => {
     const today = new Date().toISOString().slice(0, 10);
     const [ch, fl, stats] = await Promise.all([
-      c.env.DB.prepare(
-        "SELECT id, name, base_url, api_key, model, weight,\
-                is_enabled, is_vision, last_429, consecutive_errors,\
-                last_error_msg, last_error_at,\
-                rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
-                rpd_count, rpd_reset_at, max_tokens,                 support_tools,\
-                support_stream, response_time, fallback_model, headers,\
-                provider_options, provider, absolute_url,\
-                channel_type, cooldown_until\
-         FROM channels ORDER BY id"
-      ).all(),
+      c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
       c.env.DB.prepare(
         "SELECT COALESCE(SUM(requests),0) AS requests, COALESCE(SUM(tokens_in + tokens_out),0) AS tokens FROM usage_stats WHERE day=?"
@@ -324,17 +314,7 @@ export default function (_clearCache) {
   }));
 
   const channelsListHandler = withCache(async (c) => {
-    const { results } = await c.env.DB.prepare(
-      "SELECT id, name, base_url, api_key, model, weight,\
-              is_enabled, is_vision, last_429, consecutive_errors,\
-              last_error_msg, last_error_at,\
-              rpm_limit, rpd_limit, rpm_count, rpm_reset_at,\
-              rpd_count, rpd_reset_at, max_tokens, support_tools,\
-              support_stream, response_time, fallback_model, headers,\
-              provider_options, provider, absolute_url,\
-               channel_type, cooldown_until\
-        FROM channels ORDER BY id"
-    ).all();
+    const { results } = await c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all();
     return results || [];
   });
 
@@ -611,7 +591,7 @@ export default function (_clearCache) {
       if (errs.length > 0) return c.json({ ok: false, error: "Validation failed", details: errs }, 400);
     }
     const batch = [];
-    if (d.channels) {
+    if (d.channels && d.channels.length > 0) {
       const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
       batch.push(c.env.DB.prepare("DELETE FROM channels"));
       const allKeys = {};
@@ -636,7 +616,7 @@ export default function (_clearCache) {
         );
       }
     }
-    if (d.filters) {
+    if (d.filters && d.filters.length > 0) {
       batch.push(c.env.DB.prepare("DELETE FROM filters"));
       for (const f of d.filters) {
         batch.push(c.env.DB.prepare("INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)").bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0));

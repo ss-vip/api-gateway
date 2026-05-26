@@ -1,22 +1,22 @@
-import { estimateInputTokens } from "./request.js";
-
-// ─── XML Tool Call Format ──────────────────────────────────────────
-// Some upstream providers don't support structured function calling (tool_calls)
-// but instead return tool invocation as XML in the content field:
+// ─── XML Tool Call Extraction ───────────────────────────────────────
+// Some upstream providers don't support structured function calling
+// (tool_calls) but may return tool invocation as XML in the content field:
 //
 //   <tool_call>
 //   function_name
 //     <arg_key>param1</arg_key>
 //     <arg_value>value1</arg_value>
-//     <arg_key>param2</arg_key>
-//     <arg_value>value2</arg_value>
 //   </tool_call>
 //
-// These functions detect and convert this format to OpenAI-compatible
-// tool_calls chunks so LobeChat can properly dispatch MCP tools.
+// or attribute style:
+//   <tool_call tool="name" arg1="val1" arg2="val2">
+//
+// These utilities detect and convert this format to OpenAI-compatible
+// tool_calls for MCP dispatch.
 
 const TOOL_CALL_START = '<tool_call>';
 const TOOL_CALL_END = '</tool_call>';
+const TOOL_CALL_START_RE = /<tool_call(?:\s[^>]*)?>/gi;
 
 let toolCallIdCounter = 0;
 
@@ -28,41 +28,40 @@ export function hasTools(body) {
   return body.tools && Array.isArray(body.tools) && body.tools.length > 0;
 }
 
-export function shouldSimulateTools(body) {
-  return hasTools(body) && body.tool_choice !== "none";
+export function stripToolXmlTags(content) {
+  if (!content || typeof content !== 'string') return content;
+  let cleaned = content.replace(/<tool_call(?:\s[^>]*)?>[\s\S]*?<\/tool_call>/gi, '');
+  cleaned = cleaned.replace(/<tool_call(?:\s[^>]*)?>/gi, '');
+  cleaned = cleaned.replace(/<\/tool_call>/gi, '');
+  cleaned = cleaned.replace(/<\/?(?:arg_key|arg_value)>/gi, '');
+  return cleaned.trim();
 }
 
-export function prepareRequestBody(body, ch, originalModel) {
-  const reqBody = { ...body, model: ch.model || originalModel };
-
-  // Note: tools are always kept in the request body regardless of ch.support_tools.
-  // The upstream model will either respond with proper tool_calls or ignore them.
-  // Previously stripped when !ch.support_tools, but that broke MCP tool flows.
-  // Tool call detection in streaming response is handled by the downstream client.
-
-  if (ch.max_tokens > 0) {
-    const inputTokens = estimateInputTokens(body);
-    const remaining = Math.max(1, ch.max_tokens - inputTokens);
-    reqBody.max_tokens = Math.min(reqBody.max_tokens || remaining, remaining, 1000000);
+function parseXmlToolCallAttribute(xml, decode) {
+  const attrMatch = xml.match(/<tool_call\s+([^>]*)>/i);
+  if (!attrMatch) return null;
+  const attrsStr = attrMatch[1];
+  const attrs = {};
+  const attrRe = /(\w+)\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = attrRe.exec(attrsStr)) !== null) {
+    attrs[decode(m[1])] = decode(m[2]);
   }
-
-  return reqBody;
+  const toolName = attrs.tool || attrs.name || null;
+  if (!toolName) return null;
+  const args = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k !== 'tool' && k !== 'name') args[k] = v;
+  }
+  return { name: toolName, arguments: JSON.stringify(args) };
 }
 
-/**
- * Parse a complete XML tool call string into { name, arguments }.
- *
- * Input:  "<tool_call>\nfetch\n<arg_key>url</arg_key>..."
- * Output: { name: "fetch", arguments: '{"url":"...","description":"..."}' }
- */
 export function parseXmlToolCall(xml) {
-  // Tool name: first non-whitespace, non-tag text after <tool_call>
   const nameMatch = xml.match(/<tool_call>\s*([^\s<]+)/);
   if (!nameMatch) return null;
   const name = nameMatch[1].trim();
   if (!name) return null;
 
-  // Key-value pairs
   const keys = [];
   const values = [];
   const keyRe = /<arg_key>([^<]*)<\/arg_key>/g;
@@ -72,19 +71,18 @@ export function parseXmlToolCall(xml) {
   while ((m = keyRe.exec(xml)) !== null) keys.push(m[1]);
   while ((m = valRe.exec(xml)) !== null) values.push(m[1]);
 
-  const args = {};
-  // Simple decode: restore &lt; &gt; &amp; &quot; &#39;
   const decode = (s) => s
     .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
     .replace(/&amp;/g, '&').replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
 
-  if (keys.length > 0) {
-    keys.forEach((k, i) => {
-      args[decode(k)] = decode(values[i] || '');
-    });
-  }
+  const attrFormat = parseXmlToolCallAttribute(xml, decode);
+  if (attrFormat) return attrFormat;
 
+  const args = {};
+  if (keys.length > 0) {
+    keys.forEach((k, i) => { args[decode(k)] = decode(values[i] || ''); });
+  }
   return { name, arguments: JSON.stringify(args) };
 }
 
@@ -93,15 +91,13 @@ export function parseXmlToolCall(xml) {
  *
  * Usage:
  *   const state = { buffering: false, buf: '' };
- *   // For each streaming chunk with content:
  *   const result = processXmlToolCallStream(content, state);
  *
- * Returns an object describing what to do with the content:
- *   { action: 'none' }              — no tool call detected, forward as-is
- *   { action: 'buffer' }            — currently buffering XML, skip content
- *   { action: 'text_before', text } — text before <tool_call>, forward this text
+ * Returns:
+ *   { action: 'none' }              — no tool call, forward as-is
+ *   { action: 'buffer' }            — buffering XML, skip content
+ *   { action: 'text_before', text } — text before <tool_call>
  *   { action: 'emit', toolCalls[], afterText } — parse complete, emit tool calls
- *   { action: 'after', afterText }  — text after </tool_call>, forward this text
  */
 export function processXmlToolCallStream(content, state) {
   if (state.buffering) {
@@ -110,12 +106,10 @@ export function processXmlToolCallStream(content, state) {
     if (endIdx === -1) {
       return { action: 'buffer' };
     }
-    // Complete XML found in buffer
     const xml = state.buf.slice(0, endIdx + TOOL_CALL_END.length);
     state.buf = state.buf.slice(endIdx + TOOL_CALL_END.length);
     state.buffering = false;
 
-    // If there's leftover content in buffer, it's text after </tool_call>
     const afterXml = state.buf;
     state.buf = '';
 
@@ -125,32 +119,24 @@ export function processXmlToolCallStream(content, state) {
       state.toolCallIndex = idx + 1;
       return {
         action: 'emit',
-        toolCalls: [{
-          index: idx,
-          id: nextToolCallId(),
-          type: 'function',
-          function: { name: parsed.name, arguments: parsed.arguments },
-        }],
+        toolCalls: [{ index: idx, id: nextToolCallId(), type: 'function', function: { name: parsed.name, arguments: parsed.arguments } }],
         afterText: afterXml || undefined,
       };
     }
-    // Parse failed — treat as regular text
-    return { action: 'text_before', text: xml + afterXml };
+    const stripped = stripToolXmlTags(xml);
+    return { action: 'text_before', text: (stripped + afterXml).trim() || undefined };
   }
 
-  // Check for <tool_call> in current content
-  const startIdx = content.indexOf(TOOL_CALL_START);
-  if (startIdx === -1) {
-    return { action: 'none' };
-  }
+  TOOL_CALL_START_RE.lastIndex = 0;
+  const startMatch = TOOL_CALL_START_RE.exec(content);
+  if (!startMatch) return { action: 'none' };
 
+  const startIdx = startMatch.index;
   const beforeText = content.slice(0, startIdx);
   const fromStart = content.slice(startIdx);
 
-  // Check if complete in this chunk
   const endIdx = fromStart.indexOf(TOOL_CALL_END);
   if (endIdx !== -1) {
-    // Complete in single chunk
     const xml = fromStart.slice(0, endIdx + TOOL_CALL_END.length);
     const afterXml = fromStart.slice(endIdx + TOOL_CALL_END.length);
 
@@ -161,85 +147,83 @@ export function processXmlToolCallStream(content, state) {
       return {
         action: 'emit',
         textBefore: beforeText || undefined,
-        toolCalls: [{
-          index: idx,
-          id: nextToolCallId(),
-          type: 'function',
-          function: { name: parsed.name, arguments: parsed.arguments },
-        }],
+        toolCalls: [{ index: idx, id: nextToolCallId(), type: 'function', function: { name: parsed.name, arguments: parsed.arguments } }],
         afterText: afterXml || undefined,
       };
     }
-    // Parse failed — treat as regular text
-    return { action: 'text_before', text: content };
+    const stripped = stripToolXmlTags(fromStart);
+    return { action: 'text_before', text: (beforeText + stripped).trim() || undefined };
   }
 
-  // Start buffering
   state.buffering = true;
   state.buf = fromStart;
-
-  if (beforeText) {
-    return { action: 'text_before', text: beforeText };
-  }
-  return { action: 'buffer' };
+  return beforeText ? { action: 'text_before', text: beforeText } : { action: 'buffer' };
 }
 
-/**
- * Extract tool call XML from a complete (non-streaming) response content string.
- * Parses all <tool_call>...</tool_call> blocks and returns structured data
- * for modifying the response JSON, or null if no tool calls found.
- *
- * @param {string} content — the message.content from upstream JSON
- * @returns {null|{content: string, tool_calls: object[]}}
- */
 export function extractXmlToolCallsFromContent(content) {
   if (!content || typeof content !== 'string') return null;
-  if (!content.includes(TOOL_CALL_START)) return null;
+  TOOL_CALL_START_RE.lastIndex = 0;
+  if (!TOOL_CALL_START_RE.test(content)) return null;
 
   const textParts = [];
   const toolCalls = [];
   let remaining = content;
 
   while (remaining.length > 0) {
-    const startIdx = remaining.indexOf(TOOL_CALL_START);
-    if (startIdx === -1) {
+    TOOL_CALL_START_RE.lastIndex = 0;
+    const startMatch = TOOL_CALL_START_RE.exec(remaining);
+    if (!startMatch) {
       textParts.push(remaining);
       break;
     }
-
-    // Text before <tool_call>
-    if (startIdx > 0) {
-      textParts.push(remaining.slice(0, startIdx));
-    }
+    const startIdx = startMatch.index;
+    if (startIdx > 0) textParts.push(remaining.slice(0, startIdx));
 
     const endIdx = remaining.indexOf(TOOL_CALL_END, startIdx);
     if (endIdx === -1) {
-      // No closing tag — treat as regular text
-      textParts.push(remaining.slice(startIdx));
+      const afterTag = remaining.slice(startIdx + startMatch[0].length);
+      textParts.push(afterTag);
       break;
     }
-
     const xml = remaining.slice(startIdx, endIdx + TOOL_CALL_END.length);
     const parsed = parseXmlToolCall(xml);
     if (parsed && parsed.name) {
       toolCalls.push({
-        index: toolCalls.length,
         id: nextToolCallId(),
         type: 'function',
         function: { name: parsed.name, arguments: parsed.arguments },
       });
-    } else {
-      // Parse failed — treat as regular text
-      textParts.push(xml);
     }
-
     remaining = remaining.slice(endIdx + TOOL_CALL_END.length);
   }
 
   if (toolCalls.length === 0) return null;
+  return { content: textParts.join('') || null, tool_calls: toolCalls };
+}
 
-  return {
-    content: textParts.join(''),
-    tool_calls: toolCalls,
-  };
+export function normalizeToolCallNames(toolCalls, body) {
+  if (!toolCalls || toolCalls.length === 0 || !body?.tools) return;
+  const origNames = [];
+  for (const t of body.tools) {
+    const fn = t.function || t;
+    if (fn?.name) origNames.push(fn.name);
+  }
+  if (origNames.length === 0) return;
+  const norm = (s) => s.replace(/_+/g, '_');
+  const lookup = {};
+  for (const n of origNames) lookup[norm(n)] = n;
+
+  for (const tc of toolCalls) {
+    if (!tc.function?.name) continue;
+    const raw = tc.function.name;
+    if (origNames.includes(raw)) continue;
+    const key = norm(raw);
+    if (lookup[key]) {
+      tc.function.name = lookup[key];
+      continue;
+    }
+    for (const o of origNames) {
+      if (o.includes(raw)) { tc.function.name = o; break; }
+    }
+  }
 }

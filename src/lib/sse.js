@@ -80,38 +80,73 @@ export async function writeSimulatedStream(w, enc, json) {
     const created = json.created || Math.floor(Date.now() / 1000);
     const model = json.model || "";
 
+    // 1) 角色 chunk
     await sseEvent(w, enc, {
       id, object: "chat.completion.chunk", created, model,
       choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
     });
 
+    // 2) 文字內容（若有的話，可能位於 tool_calls 之前）
+    if (msg?.content) {
+      await sseEvent(w, enc, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta: { content: msg.content }, finish_reason: null }],
+      });
+    }
+
+    // 3) tool_calls — 採用 OpenAI 規格的多 chunk 格式
     if (msg?.tool_calls && msg.tool_calls.length > 0) {
-      // OpenAI 規格：每個 tool_call chunk 應有獨立 index
       for (let i = 0; i < msg.tool_calls.length; i++) {
         const tc = msg.tool_calls[i];
+        const idx = tc.index ?? i;
+
+        // 3a) 名稱 chunk：id + type + function.name
         await sseEvent(w, enc, {
           id, object: "chat.completion.chunk", created, model,
           choices: [{
             index: 0,
             delta: {
               tool_calls: [{
-                index: tc.index ?? i,
+                index: idx,
                 id: tc.id,
-                type: tc.type,
-                function: tc.function,
+                type: tc.type || 'function',
+                function: { name: tc.function.name },
               }],
             },
-            finish_reason: i === msg.tool_calls.length - 1 ? "tool_calls" : null,
+            finish_reason: null,
+          }],
+        });
+
+        // 3b) 參數 chunk：function.arguments（完整 JSON）
+        await sseEvent(w, enc, {
+          id, object: "chat.completion.chunk", created, model,
+          choices: [{
+            index: 0,
+            delta: {
+              tool_calls: [{
+                index: idx,
+                function: { arguments: tc.function.arguments },
+              }],
+            },
+            finish_reason: null,
           }],
         });
       }
-    } else if (msg?.content) {
+
+      // 3c) 結束 chunk：空 delta + finish_reason
       await sseEvent(w, enc, {
         id, object: "chat.completion.chunk", created, model,
-        choices: [{ index: 0, delta: { content: msg.content }, finish_reason }],
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+      });
+    } else {
+      // 無 tool_calls → 直接送 finish_reason 結束 chunk
+      await sseEvent(w, enc, {
+        id, object: "chat.completion.chunk", created, model,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
       });
     }
 
+    // 4) 用量
     if (json.usage) {
       await sseEvent(w, enc, {
         id, object: "chat.completion.chunk", created, model,

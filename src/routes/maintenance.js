@@ -96,8 +96,8 @@ async function performUrlHealthCheck(DB) {
   const now = Math.floor(Date.now() / 1000);
   const { results: channels } = await DB.prepare(
     `SELECT id, base_url FROM channels
-     WHERE is_enabled=1
-     AND (cooldown_until=0 OR cooldown_until<?)`
+      WHERE is_enabled=1
+      AND (cooldown_until=0 OR cooldown_until<?)`
   ).bind(now).all();
 
   if (!channels || channels.length === 0) return { checked: 0, ok: 0, fail: 0 };
@@ -110,28 +110,45 @@ async function performUrlHealthCheck(DB) {
 
   const timeoutMs = 3000;
   let ok = 0, fail = 0;
+  const updateStmts = [];
 
-  await Promise.allSettled([...urlSet].map(async (url) => {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
-    try {
-      await fetch(url, { method: 'HEAD', signal: ac.signal });
-      ok++;
-      await DB.prepare(
-        `UPDATE channels SET cooldown_until=0, last_error_msg='', last_error_at=0
-         WHERE base_url=? AND last_error_msg LIKE '[health]%'`
-      ).bind(url).run();
-    } catch (e) {
-      fail++;
-      const reason = e.name === 'AbortError' ? 'timeout' : (e.message || 'unreachable').slice(0, 60);
-      await DB.prepare(
-        `UPDATE channels SET cooldown_until=?, last_error_msg=?, last_error_at=?
-         WHERE base_url=? AND is_enabled=1`
-      ).bind(now + 300, '[health] ' + reason, now, url).run();
-    } finally {
-      clearTimeout(timer);
-    }
-  }));
+  // Process URLs in batches to avoid exceeding Cloudflare Workers subrequest limit
+  const urlArray = [...urlSet];
+  const BATCH_SIZE = 8; // Process 8 URLs concurrently to stay well under 50 limit
+  
+  for (let i = 0; i < urlArray.length; i += BATCH_SIZE) {
+    const batch = urlArray.slice(i, i + BATCH_SIZE);
+    await Promise.allSettled(batch.map(async (url) => {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      try {
+        await fetch(url, { method: 'HEAD', signal: ac.signal });
+        ok++;
+        updateStmts.push(
+          DB.prepare(
+            `UPDATE channels SET cooldown_until=0, last_error_msg='', last_error_at=0
+             WHERE base_url=? AND last_error_msg LIKE '[health]%'`
+          ).bind(url)
+        );
+      } catch (e) {
+        fail++;
+        const reason = e.name === 'AbortError' ? 'timeout' : (e.message || 'unreachable').slice(0, 60);
+        updateStmts.push(
+          DB.prepare(
+            `UPDATE channels SET cooldown_until=?, last_error_msg=?, last_error_at=?
+             WHERE base_url=? AND is_enabled=1`
+          ).bind(now + 300, '[health] ' + reason, now, url)
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+    }));
+  }
+
+  // Execute all D1 updates in a single batch
+  if (updateStmts.length > 0) {
+    await retry(() => DB.batch(updateStmts));
+  }
 
   return { checked: urlSet.size, ok, fail };
 }
