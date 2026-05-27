@@ -6,11 +6,6 @@ compatibility_flags = ["nodejs_compat"]
 [placement]
 mode = "smart"
 
-# 允許載入 .html 檔案
-rules = [
-  { type = "Text", globs = ["**/*.html"] }
-]
-
 # 建立 D1: npx wrangler d1 create api-gateway-db 取得 UUID 填入 database_id
 [[d1_databases]]
 binding = "DB"

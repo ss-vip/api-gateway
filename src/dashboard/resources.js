@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { CHANNEL_TYPES } from "../lib/schema.js";
 import { retry } from "../lib/retry.js";
 import { maskApiKey } from "../lib/logger.js";
 
@@ -86,7 +85,7 @@ function generateFallbackToken() {
   return t;
 }
 function getDefaults() {
-  return { token: generateFallbackToken(), recovery_period: 300 };
+  return { token: generateFallbackToken() };
 }
 
 const setupRateLimit = new Map();
@@ -94,6 +93,13 @@ const SETUP_MAX_ATTEMPTS = 5;
 const SETUP_BAN_MS = 10 * 60 * 1000; // 10 minutes
 
 function checkSetupRateLimit(ip) {
+  if (setupRateLimit.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of setupRateLimit) {
+      if (v.banUntil > 0 && now >= v.banUntil) setupRateLimit.delete(k);
+    }
+    if (setupRateLimit.size > 500) setupRateLimit.clear();
+  }
   const state = setupRateLimit.get(ip) || { count: 0, banUntil: 0 };
   const attempt = state.count + 1;
   if (Date.now() < state.banUntil) return { blocked: true, remaining: 0 };
@@ -105,42 +111,12 @@ function checkSetupRateLimit(ip) {
   return { blocked: false, remaining: SETUP_MAX_ATTEMPTS - attempt };
 }
 
-export function pruneSetupRateLimit() {
-  const now = Date.now();
-  for (const [ip, state] of setupRateLimit) {
-    if (state.banUntil > 0 && now >= state.banUntil) setupRateLimit.delete(ip);
-  }
-  // 清理超過 1 小時無活動的非封鎖 IP
-  if (setupRateLimit.size > 100) {
-    const entries = [...setupRateLimit.entries()]
-      .filter(([, s]) => s.banUntil === 0)
-      .sort((a, b) => a[1].count - b[1].count);
-    // 保留 50 條活躍度最高的，其餘刪除
-    for (let i = 50; i < entries.length; i++) setupRateLimit.delete(entries[i][0]);
-  }
-  if (setupRateLimit.size > 500) {
-    const entries = [...setupRateLimit.entries()].sort((a, b) => a[1].banUntil - b[1].banUntil);
-    for (let i = 200; i < entries.length; i++) setupRateLimit.delete(entries[i][0]);
-  }
-}
-
 function validateChannelData(channels) {
   const errors = [];
   for (let i = 0; i < channels.length; i++) {
     const ch = channels[i];
-    if (ch.channel_type && !CHANNEL_TYPES.has(ch.channel_type))
-      errors.push(`[${i}] Invalid channel_type "${ch.channel_type}", valid: ${[...CHANNEL_TYPES].join(", ")}`);
-    if (ch.channel_type && ch.channel_type !== "chat") {
-      ch.is_vision = 0;
-    }
     if (ch.weight !== undefined && (typeof ch.weight !== "number" || ch.weight < 1 || ch.weight > 1000))
       errors.push(`[${i}] Invalid weight ${ch.weight}, must be 1–1000`);
-    if (ch.rpm_limit !== undefined && (typeof ch.rpm_limit !== "number" || ch.rpm_limit < 0 || ch.rpm_limit > 100000))
-      errors.push(`[${i}] Invalid rpm_limit ${ch.rpm_limit}, must be 0–100,000`);
-    if (ch.rpd_limit !== undefined && (typeof ch.rpd_limit !== "number" || ch.rpd_limit < 0 || ch.rpd_limit > 100000))
-      errors.push(`[${i}] Invalid rpd_limit ${ch.rpd_limit}, must be 0–100,000`);
-    if (ch.max_tokens !== undefined && (typeof ch.max_tokens !== "number" || ch.max_tokens < 0 || ch.max_tokens > 1000000))
-      errors.push(`[${i}] Invalid context_limit ${ch.max_tokens}, must be 0–1,000,000`);
     if (!ch.base_url || (typeof ch.base_url === "string" && ch.base_url.trim().length === 0)) {
       errors.push(`[${i}] base_url is required`);
     } else if (ch.base_url && typeof ch.base_url === "string") {
@@ -150,141 +126,8 @@ function validateChannelData(channels) {
   return errors;
 }
 
-const CHANNEL_TESTS = new Map();
-
-export function registerChannelTest(type, handler) {
-  CHANNEL_TESTS.set(type, handler);
-}
-
-registerChannelTest("chat", async (ch, _testFetch, buildEndpointUrl) => {
-  const capabilities = {};
-  const mod = await import("../lib/providers/openai.js");
-  const chatUrl = ch.absolute_url ? buildEndpointUrl(ch.base_url, "chat") : mod.buildUrl(ch.base_url, ch.model || "test", false);
-  if (!chatUrl) { capabilities.basic = { ok: false, ms: 0, detail: "Invalid URL" }; return capabilities; }
-  const start = Date.now();
-  try {
-    const res = await fetch(chatUrl, {
-      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
-      body: "{}", signal: AbortSignal.timeout(5000),
-    });
-    const ms = Date.now() - start;
-    capabilities.basic = res.status === 400 || res.status === 200
-      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-      : { ok: false, ms, detail: "HTTP " + res.status };
-  } catch (e) {
-    capabilities.basic = { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" };
-  }
-  return capabilities;
-});
-
-registerChannelTest("image_gen", async (ch, _testFetch, buildEndpointUrl) => {
-  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "image_gen");
-  if (!url) return { image_gen: { ok: false, ms: 0, detail: "Invalid URL" } };
-  const start = Date.now();
-  try {
-    const res = await fetch(url, {
-      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
-      body: "{}", signal: AbortSignal.timeout(5000),
-    });
-    const ms = Date.now() - start;
-    return { image_gen: res.status === 400 || res.status === 200
-      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-      : { ok: false, ms, detail: "HTTP " + res.status } };
-  } catch (e) {
-    return { image_gen: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
-  }
-});
-
-registerChannelTest("audio_tts", async (ch, _testFetch, buildEndpointUrl) => {
-  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "audio_tts");
-  if (!url) return { audio_tts: { ok: false, ms: 0, detail: "Invalid URL" } };
-  const start = Date.now();
-  try {
-    const res = await fetch(url, {
-      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
-      body: "{}", signal: AbortSignal.timeout(5000),
-    });
-    const ms = Date.now() - start;
-    return { audio_tts: res.status === 400 || res.status === 200
-      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-      : { ok: false, ms, detail: "HTTP " + res.status } };
-  } catch (e) {
-    return { audio_tts: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
-  }
-});
-
-registerChannelTest("audio_stt", async (ch, _testFetch, buildEndpointUrl) => {
-  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "audio_stt");
-  if (!url) return { audio_stt: { ok: false, ms: 0, detail: "Invalid URL" } };
-  const start = Date.now();
-  try {
-    const form = new FormData();
-    form.append("model", ch.model || "whisper-1");
-    const res = await fetch(url, {
-      method: "POST", headers: { Authorization: "Bearer " + ch.api_key }, body: form,
-      signal: AbortSignal.timeout(5000),
-    });
-    const ms = Date.now() - start;
-    return { audio_stt: res.status === 400 || res.status === 200
-      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-      : { ok: false, ms, detail: "HTTP " + res.status } };
-  } catch (e) {
-    return { audio_stt: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
-  }
-});
-
-registerChannelTest("image_edit", async (ch, _testFetch, buildEndpointUrl) => {
-  const editUrl = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "image_edit");
-  if (!editUrl) return { image_edit: { ok: false, ms: 0, detail: "Invalid URL" } };
-  const start = Date.now();
-  try {
-    const res = await fetch(editUrl, { method: "POST", headers: { Authorization: "Bearer " + ch.api_key }, signal: AbortSignal.timeout(5000) });
-    const ms = Date.now() - start;
-    return {
-      image_edit: res.status === 400 || res.status === 200
-        ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-        : { ok: false, ms, detail: "HTTP " + res.status },
-    };
-  } catch (e) {
-    return { image_edit: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
-  }
-});
-
-registerChannelTest("video_gen", async (ch, _testFetch, buildEndpointUrl) => {
-  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "video_gen");
-  if (!url) return { video_gen: { ok: false, ms: 0, detail: "Invalid URL" } };
-  const start = Date.now();
-  try {
-    const res = await fetch(url, {
-      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
-      body: "{}", signal: AbortSignal.timeout(5000),
-    });
-    const ms = Date.now() - start;
-    return { video_gen: res.status === 400 || res.status === 200
-      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-      : { ok: false, ms, detail: "HTTP " + res.status } };
-  } catch (e) {
-    return { video_gen: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
-  }
-});
-
-registerChannelTest("embeddings", async (ch, _testFetch, buildEndpointUrl) => {
-  const url = ch.absolute_url ? ch.base_url : buildEndpointUrl(ch.base_url, "embeddings");
-  if (!url) return { embeddings: { ok: false, ms: 0, detail: "Invalid URL" } };
-  const start = Date.now();
-  try {
-    const res = await fetch(url, {
-      method: "POST", headers: { Authorization: "Bearer " + ch.api_key, "Content-Type": "application/json" },
-      body: "{}", signal: AbortSignal.timeout(5000),
-    });
-    const ms = Date.now() - start;
-    return { embeddings: res.status === 400 || res.status === 200
-      ? { ok: true, ms, detail: "endpoint reachable (HTTP " + res.status + ")" }
-      : { ok: false, ms, detail: "HTTP " + res.status } };
-  } catch (e) {
-    return { embeddings: { ok: false, ms: Date.now() - start, detail: e.message?.slice(0, 60) || "error" } };
-  }
-});
+const CHANNEL_INSERT_COLS = "id, name, base_url, api_key, model, weight, is_enabled";
+const CHANNEL_INSERT_PLACEHOLDERS = "?, ?, ?, ?, ?, ?, ?";
 
 export default function (_clearCache) {
   const api = new Hono();
@@ -311,13 +154,9 @@ export default function (_clearCache) {
   });
 
   api.get("/init", withCache(async (c) => {
-    const today = new Date().toISOString().slice(0, 10);
-    const [ch, fl, stats] = await Promise.all([
+    const [ch, fl] = await Promise.all([
       c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
-      c.env.DB.prepare(
-        "SELECT COALESCE(SUM(requests),0) AS requests, COALESCE(SUM(tokens_in + tokens_out),0) AS tokens FROM usage_stats WHERE day=?"
-      ).bind(today).first().catch(() => ({ requests: 0, tokens: 0 })),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
     const channels = (ch.results || []).map(ch => ({
@@ -326,8 +165,7 @@ export default function (_clearCache) {
     return {
       channels,
       filters: fl.results || [],
-      config: { token: cf?.client_token || "", recovery_period: parseInt(cf?.recovery_period) || 300 },
-      stats: { date: today, requests: Number(stats?.requests || 0), tokens: Number(stats?.tokens || 0) },
+      config: { token: cf?.client_token || "" },
     };
   }));
 
@@ -353,32 +191,14 @@ export default function (_clearCache) {
       const apiKey = ch.api_key || (allKeys[ch.id] || "");
       batch.push(
         c.env.DB.prepare(
-          "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, provider, absolute_url, channel_type, cooldown_until, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          `INSERT INTO channels (${CHANNEL_INSERT_COLS}) VALUES (${CHANNEL_INSERT_PLACEHOLDERS})`
         ).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey,
-          ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
-          ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
-          ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
-          ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
-          ch.provider || "", ch.absolute_url ? 1 : 0,
-          ch.channel_type || "chat",
-          ch.cooldown_until || 0, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0
+          ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0
         )
       );
     }
     await batchChunked(c.env.DB, batch);
-    clearCache();
-    return c.json({ ok: true });
-  });
-
-  api.post("/channels/:id/reset-health", async (c) => {
-    await c.env.DB.prepare("UPDATE channels SET last_429=0,consecutive_errors=0,last_error_msg='',last_error_at=0,cooldown_until=0 WHERE id=?").bind(c.req.param("id")).run();
-    clearCache();
-    return c.json({ ok: true });
-  });
-
-  api.post("/channels/reset-all-health", async (c) => {
-    await c.env.DB.prepare("UPDATE channels SET last_429=0,consecutive_errors=0,last_error_msg='',last_error_at=0,cooldown_until=0").run();
     clearCache();
     return c.json({ ok: true });
   });
@@ -406,10 +226,9 @@ export default function (_clearCache) {
       const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
       return c.json({
         token: cf?.client_token || getDefaults().token,
-        recovery_period: cf?.recovery_period || getDefaults().recovery_period,
       });
     } catch (e) {
-      return c.json({ token: getDefaults().token, recovery_period: getDefaults().recovery_period });
+      return c.json({ token: getDefaults().token });
     }
   });
 
@@ -432,43 +251,22 @@ export default function (_clearCache) {
 
   api.post("/config", async (c) => {
     const b = await c.req.json();
-    const ex = await c.env.DB.prepare("SELECT client_token, recovery_period FROM config WHERE id=1").first();
+    const ex = await c.env.DB.prepare("SELECT client_token FROM config WHERE id=1").first();
     const existingToken = ex?.client_token || "";
-    const existingPeriod = ex?.recovery_period ? parseInt(ex.recovery_period) : null;
     try {
       const token = b.token || existingToken || getDefaults().token;
-      const period = Math.max(30, Math.min(86400, parseInt(b.recovery_period) || existingPeriod || getDefaults().recovery_period));
       if (ex) {
-        await c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1")
-          .bind(token, period).run();
+        await c.env.DB.prepare("UPDATE config SET client_token=? WHERE id=1")
+          .bind(token).run();
       } else {
-        await c.env.DB.prepare("INSERT INTO config (id, client_token, recovery_period) VALUES (1, ?, ?)")
-          .bind(token, period).run();
+        await c.env.DB.prepare("INSERT INTO config (id, client_token) VALUES (1, ?)")
+          .bind(token).run();
       }
     } catch (e) {
       return c.json({ error: e.message }, 500);
     }
     clearCache();
     return c.json({ ok: true });
-  });
-
-  api.post("/proxy-models", async (c) => {
-    const { url, key } = await c.req.json();
-    if (!url) return c.json({ error: "Missing URL" }, 400);
-    let target = url.trim().replace(/\/+$/, "");
-    if (!target.endsWith("/models")) {
-      if (target.endsWith("/chat/completions")) target = target.replace("/chat/completions", "/models");
-      else if (/\/v[\w]+\//.test(target + "/")) target = `${target}/models`;
-      else if (/\/v\d+$/.test(target)) target = `${target}/models`;
-      else target += "/v1/models";
-    }
-    try {
-      const res = await fetch(target, { headers: { Authorization: `Bearer ${key}` } });
-      if (!res.ok) return c.json({ error: `Upstream error: ${res.status}` }, res.status);
-      return c.json(await res.json());
-    } catch (e) {
-      return c.json({ error: e.message }, 500);
-    }
   });
 
   api.post("/admin-pass", async (c) => {
@@ -504,149 +302,37 @@ export default function (_clearCache) {
       ch = rows[0];
     }
     if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
-    const { buildEndpointUrl } = await import("../lib/providers/openai.js");
 
-    const channelType = ch.channel_type || "chat";
-    if (!CHANNEL_TYPES.has(channelType))
-      return c.json({ ok: false, error: "Unknown channel_type", diagnosis: "不支援的渠道類型" }, 400);
-
-    const capabilities = {};
-    const handler = CHANNEL_TESTS.get(channelType);
-    if (handler) Object.assign(capabilities, await handler(ch, null, buildEndpointUrl) || {});
-
-    const primaryOk = capabilities[channelType]?.ok || capabilities.basic?.ok;
-
-    if (!primaryOk) {
-      const result = Object.values(capabilities).find(v => v && typeof v === "object" && "detail" in v)
-        || { ms: 0, detail: "unknown error" };
-      let diagnosis = "連線失敗";
-      let httpStatus = 0;
-      if (result.detail.includes("無效")) { diagnosis = "API Key 無效或已失效"; httpStatus = 401; }
-      else if (result.detail.includes("400")) { diagnosis = "請求被拒絕，模型可能不支援"; httpStatus = 400; }
-      else if (result.detail.includes("超時")) { diagnosis = "連線超時，渠道可能無回應"; httpStatus = 0; }
-      else if (result.detail.includes("empty") || result.detail.includes("no image") || result.detail.includes("no embedding")) { diagnosis = "回應內容為空"; httpStatus = 200; }
-      if (!fromBody) {
-        const now = Math.floor(Date.now() / 1000);
-        await c.env.DB.prepare(
-          "UPDATE channels SET consecutive_errors=?, last_error_msg=?, last_error_at=?, response_time=? WHERE id=?"
-        ).bind((ch.consecutive_errors || 0) + 1, diagnosis, now, 0, chId).run();
-        clearCache();
-      }
-      return c.json({ ok: false, status: httpStatus, ms: result.ms, diagnosis,
-        health_updated: !fromBody, message: fromBody ? "" : "渠道已標記為異常" });
+    const baseUrl = ch.base_url || "";
+    const testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+    const start = Date.now();
+    try {
+      const res = await fetch(testUrl, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + (ch.api_key || ""),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const ms = Date.now() - start;
+      const ok = res.status === 200 || res.status === 400;
+      return c.json({
+        ok,
+        status: res.status,
+        ms,
+        diagnosis: ok ? "連線正常" : `HTTP ${res.status}`,
+      });
+    } catch (e) {
+      const ms = Date.now() - start;
+      return c.json({
+        ok: false,
+        status: 0,
+        ms,
+        diagnosis: "連線失敗: " + (e.message?.slice(0, 60) || "unknown"),
+      });
     }
-
-    if (!fromBody) {
-      const now = Math.floor(Date.now() / 1000);
-      await c.env.DB.prepare(
-        "UPDATE channels SET consecutive_errors=MAX(0,consecutive_errors-1), last_error_msg=\"\", last_error_at=0, cooldown_until=0, response_time=? WHERE id=?"
-      ).bind(capabilities[channelType]?.ms || capabilities.basic?.ms || 0, chId).run();
-      clearCache();
-    }
-
-    return c.json({
-      ok: true,
-      status: 200,
-      ms: capabilities.basic?.ms || 0,
-      diagnosis: "連線正常",
-      health_updated: !fromBody,
-      message: fromBody ? "" : "渠道健康狀態已重置",
-      capabilities,
-    });
-  });
-
-  api.get("/usage/monthly", async (c) => {
-    const { results } = await c.env.DB.prepare(`
-      SELECT
-        strftime('%Y-%m', day) AS month,
-        COALESCE(SUM(requests),0) AS requests,
-        COALESCE(SUM(tokens_in + tokens_out),0) AS tokens,
-        COALESCE(SUM(tokens_in),0) AS tokens_in,
-        COALESCE(SUM(tokens_out),0) AS tokens_out,
-        COALESCE(SUM(duration_ms),0) AS duration_ms,
-        COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN requests ELSE 0 END),0) AS success_requests,
-        COALESCE(SUM(CASE WHEN status >= 400 THEN requests ELSE 0 END),0) AS error_requests
-      FROM usage_stats
-      GROUP BY month
-      ORDER BY month DESC
-      LIMIT 24
-    `).all();
-    const { results: byModel } = await c.env.DB.prepare(`
-      SELECT
-        strftime('%Y-%m', day) AS month,
-        model,
-        COALESCE(SUM(requests),0) AS requests,
-        COALESCE(SUM(tokens_in + tokens_out),0) AS tokens
-      FROM usage_stats
-      GROUP BY month, model
-      ORDER BY month DESC, requests DESC
-      LIMIT 200
-    `).all();
-    return c.json({
-      months: results || [],
-      byModel: byModel || [],
-    });
-  });
-
-  api.get("/export", async (c) => {
-    const [channels, filters] = await Promise.all([
-      c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
-      c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
-    ]);
-    const config = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
-    return c.json({
-      channels: channels.results || [],
-      filters: filters.results || [],
-      config: config ? { token: config.client_token, recovery_period: config.recovery_period } : {},
-    });
-  });
-
-  api.post("/import-all", async (c) => {
-    const d = await c.req.json();
-    if (d.channels && d.channels.length > 0) {
-      const errs = validateChannelData(d.channels);
-      if (errs.length > 0) return c.json({ ok: false, error: "Validation failed", details: errs }, 400);
-    }
-    const batch = [];
-    if (d.channels && d.channels.length > 0) {
-      const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
-      batch.push(c.env.DB.prepare("DELETE FROM channels"));
-      const allKeys = {};
-      for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
-      for (const ch of d.channels) {
-        const apiKey = ch.api_key || (allKeys[ch.id] || "");
-        batch.push(
-          c.env.DB.prepare(
-            "INSERT INTO channels (id, name, base_url, api_key, model, weight, is_enabled, is_vision, last_429, consecutive_errors, last_error_msg, last_error_at, rpm_limit, rpd_limit, max_tokens, support_tools, support_stream, response_time, fallback_model, provider, absolute_url, channel_type, cooldown_until, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          ).bind(
-          ch.id || null, ch.name || "", ch.base_url || "", apiKey,
-            ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0, ch.is_vision ? 1 : 0,
-            ch.last_429 || 0, ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
-            ch.rpm_limit || 0, ch.rpd_limit || 0, ch.max_tokens || 0,
-            ch.support_tools ? 1 : 0, ch.support_stream === 0 ? 0 : 1, ch.response_time || 0, ch.fallback_model || "",
-            ch.provider || "", ch.absolute_url ? 1 : 0,
-            ch.channel_type || "chat",
-            ch.cooldown_until || 0, ch.rpm_count || 0, ch.rpm_reset_at || 0, ch.rpd_count || 0, ch.rpd_reset_at || 0
-          )
-        );
-      }
-    }
-    if (d.filters && d.filters.length > 0) {
-      batch.push(c.env.DB.prepare("DELETE FROM filters"));
-      for (const f of d.filters) {
-        batch.push(c.env.DB.prepare("INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)").bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0));
-      }
-    }
-    if (d.config) {
-      const currentPass = await getAdminPass(c);
-      batch.push(
-        c.env.DB.prepare("INSERT OR REPLACE INTO config (id, client_token, admin_password, recovery_period) VALUES (1, ?, ?, ?)")
-          .bind(d.config.token || getDefaults().token, currentPass || "", Math.max(30, Math.min(86400, parseInt(d.config.recovery_period) || getDefaults().recovery_period)))
-      );
-    }
-    if (batch.length > 0) await retry(() => c.env.DB.batch(batch));
-    clearCache();
-    return c.json({ ok: true });
   });
 
   api.post("/reset", async (c) => {
@@ -654,7 +340,7 @@ export default function (_clearCache) {
     await retry(() => c.env.DB.batch([
       c.env.DB.prepare("DELETE FROM channels"),
       c.env.DB.prepare("DELETE FROM filters"),
-      c.env.DB.prepare("UPDATE config SET client_token=?, recovery_period=? WHERE id=1").bind(freshToken, getDefaults().recovery_period),
+      c.env.DB.prepare("UPDATE config SET client_token=? WHERE id=1").bind(freshToken),
     ]));
     clearCache();
     return c.json({ ok: true, new_token: freshToken });
