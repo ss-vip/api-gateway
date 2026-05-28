@@ -142,7 +142,8 @@
                 <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 90px" class="d-none d-lg-table-cell border-0">Type</th>
+                <th style="width: 90px" class="d-none d-lg-table-cell border-0">Stream</th>
+                <th style="width: 80px" class="d-none d-lg-table-cell border-0">Ch Type</th>
                 <th style="width: 150px" class="text-center border-0">Actions</th>
               </tr>
             </thead>
@@ -241,11 +242,11 @@
             <input type="text" id="ch-model" class="form-control form-control-sm" required />
           </div>
           <div class="row g-2 mb-1">
-            <div class="col-4 d-flex flex-column justify-content-center">
+            <div class="col-3 d-flex flex-column justify-content-center">
               <label class="form-label mini-label fw-bold">Weight</label>
               <input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required />
             </div>
-            <div class="col-4 d-flex flex-column justify-content-center">
+            <div class="col-3 d-flex flex-column justify-content-center">
               <label class="form-label mini-label fw-bold">Stream Type</label>
               <select id="ch-stream" class="form-select form-select-sm">
                 <option value="both">both</option>
@@ -253,7 +254,22 @@
                 <option value="nonstream">nonstream</option>
               </select>
             </div>
-            <div class="col-4 d-flex flex-column align-items-center justify-content-center">
+            <div class="col-3 d-flex flex-column justify-content-center">
+              <label class="form-label mini-label fw-bold">Channel Type</label>
+              <select id="ch-type" class="form-select form-select-sm">
+                <option value="chat">chat</option>
+                <option value="image_gen">image_gen</option>
+                <option value="image_edit">image_edit</option>
+                <option value="tts">tts</option>
+                <option value="stt">stt</option>
+                <option value="embed">embed</option>
+                <option value="moderate">moderate</option>
+                <option value="assistant">assistant</option>
+                <option value="fine_tune">fine_tune</option>
+                <option value="file">file</option>
+              </select>
+            </div>
+            <div class="col-3 d-flex flex-column align-items-center justify-content-center">
               <label class="form-label mini-label fw-bold text-center">Enabled</label>
               <button type="button" id="ch-enabled-btn" class="btn btn-sm btn-outline-success px-3 fw-bold" onclick="chEnabled=!chEnabled;updateEnabledBtn()">已啟用</button>
             </div>
@@ -594,6 +610,7 @@
         row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code></td>';
         row += '<td class="d-none d-lg-table-cell align-middle">' + c.weight + '</td>';
         row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' bg-opacity-25 text-dark small">' + esc(c.stream_type || 'both') + '</span></td>';
+        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-primary bg-opacity-10 text-dark small">' + esc(c.channel_type || 'chat') + '</span></td>';
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
@@ -694,7 +711,7 @@
         toast(invalid.length + ' 個過濾器關鍵字無效（1-30字），已跳過', 'warning');
       }
       toast('全部已儲存', 'success');
-      init();
+      await init();
     };
 
     const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
@@ -717,6 +734,7 @@
       chEnabled = true;
       updateEnabledBtn();
       document.getElementById('ch-stream').value = 'both';
+      document.getElementById('ch-type').value = 'chat';
       chHeaders = [];
       renderHeaders();
       switchTab('basic');
@@ -739,6 +757,7 @@
       chEnabled = c.is_enabled == 1;
       updateEnabledBtn();
       document.getElementById('ch-stream').value = c.stream_type || 'both';
+      document.getElementById('ch-type').value = c.channel_type || 'chat';
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
       switchTab('basic');
@@ -765,6 +784,7 @@
         weight,
         is_enabled: chEnabled ? 1 : 0,
         stream_type: document.getElementById('ch-stream').value,
+        channel_type: document.getElementById('ch-type').value,
         headers: chHeaders.filter(h => h.key && h.key.trim()),
       };
       if (idx !== '') channels[parseInt(idx)] = ch;

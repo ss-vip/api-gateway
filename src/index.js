@@ -16,6 +16,31 @@ const SETUP_MAX_ATTEMPTS = 5;
 const SETUP_BAN_MS = 10 * 60 * 1000;
 const API_PREFIXES = ["/v1", "/v1beta", "/v2", "/v3", "/v4"];
 const STREAM_TYPES = ["both", "stream", "nonstream"];
+const CHANNEL_TYPES = ["chat", "image_gen", "image_edit", "tts", "stt", "embed", "moderate", "assistant", "fine_tune", "file", "responses", "batches", "models"];
+const CHANNEL_TYPE_ROUTES = {
+  chat:       ["/chat/completions", "/completions"],
+  image_gen:  ["/images/generations"],
+  image_edit: ["/images/edits", "/images/variations"],
+  stt:        ["/audio/transcriptions", "/audio/translations"],
+  tts:        ["/audio/speech"],
+  embed:      ["/embeddings"],
+  moderate:   ["/moderations"],
+  assistant:  ["/assistants", "/threads", "/vector-stores"],
+  fine_tune:  ["/fine-tuning", "/fine_tuning"],
+  file:       ["/files"],
+  responses:  ["/responses"],
+  batches:    ["/batches"],
+  models:     ["/models"],
+};
+
+function getPathChannelType(suffix) {
+  for (const [type, routes] of Object.entries(CHANNEL_TYPE_ROUTES)) {
+    for (const route of routes) {
+      if (suffix === route || suffix.startsWith(route + "/")) return type;
+    }
+  }
+  return "chat";
+}
 
 function generateToken() {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -34,6 +59,10 @@ function maskApiKey(str) {
     if (key.length > 8) return pre + key.slice(0, 8) + "***";
     return pre + "***";
   });
+}
+
+function getDefaults() {
+  return { token: generateToken() };
 }
 
 function requestId() {
@@ -111,7 +140,46 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   weight      INTEGER NOT NULL DEFAULT 50,
   is_enabled  INTEGER NOT NULL DEFAULT 1,
   stream_type TEXT    NOT NULL DEFAULT 'both',
-  headers     TEXT    NOT NULL DEFAULT '[]'
+  channel_type TEXT   NOT NULL DEFAULT 'chat',
+  headers     TEXT    NOT NULL DEFAULT '[]',
+  provider_options TEXT NOT NULL DEFAULT '[]',
+  provider     TEXT    NOT NULL DEFAULT '',
+  absolute_url INTEGER NOT NULL DEFAULT 0,
+  cooldown_until INTEGER NOT NULL DEFAULT 0,
+  created_at  INTEGER NOT NULL DEFAULT unixepoch(),
+  updated_at  INTEGER NOT NULL DEFAULT unixepoch(),
+  support_tools INTEGER NOT NULL DEFAULT 1,
+  response_time INTEGER NOT NULL DEFAULT 0,
+  fallback_model TEXT NOT NULL DEFAULT '',
+  max_tokens INTEGER NOT NULL DEFAULT 0,
+  rpm_limit INTEGER NOT NULL DEFAULT 0,
+  rpd_limit INTEGER NOT NULL DEFAULT 0,
+  rpm_count INTEGER NOT NULL DEFAULT 0,
+  rpm_reset_at INTEGER NOT NULL DEFAULT 0,
+  rpd_count INTEGER NOT NULL DEFAULT 0,
+  rpd_reset_at INTEGER NOT NULL DEFAULT 0,
+  consecutive_errors INTEGER NOT NULL DEFAULT 0,
+  last_error_msg TEXT NOT NULL DEFAULT '',
+  last_error_at INTEGER NOT NULL DEFAULT 0,
+  support_stream INTEGER NOT NULL DEFAULT 1,
+  support_image_gen INTEGER NOT NULL DEFAULT 0,
+  support_audio_tts INTEGER NOT NULL DEFAULT 0,
+  support_audio_stt INTEGER NOT NULL DEFAULT 0,
+  support_image_edit INTEGER NOT NULL DEFAULT 0,
+  support_embeddings INTEGER NOT NULL DEFAULT 0,
+  health_check_enabled INTEGER NOT NULL DEFAULT 0,
+  health_check_interval INTEGER NOT NULL DEFAULT 300,
+  health_check_timeout INTEGER NOT NULL DEFAULT 5,
+  consecutive_successes INTEGER NOT NULL DEFAULT 0,
+  canary_enabled INTEGER NOT NULL DEFAULT 0,
+  canary_percentage INTEGER NOT NULL DEFAULT 10,
+  canary_channels TEXT NOT NULL DEFAULT '[]',
+  cache_enabled INTEGER NOT NULL DEFAULT 0,
+  cache_ttl INTEGER NOT NULL DEFAULT 3600,
+  rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm',
+  rate_limit_capacity INTEGER NOT NULL DEFAULT 0,
+  rate_limit_rate INTEGER NOT NULL DEFAULT 0,
+  rate_limit_key TEXT NOT NULL DEFAULT ''
 )`;
 
 const FILTERS_DDL = `CREATE TABLE IF NOT EXISTS filters (
@@ -158,6 +226,43 @@ async function ensureSchema(env) {
   if (ok > 0) console.log(`[schema] ${ok}/${ALL_DDLS.length} tables ready`);
   try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'both'`).run(); } catch (e) {}
   try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'chat'`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN provider_options TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN provider TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN absolute_url INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_tools INTEGER NOT NULL DEFAULT 1`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN response_time INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN fallback_model TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpd_limit INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpm_count INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpm_reset_at INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpd_count INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpd_reset_at INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN last_error_msg TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN last_error_at INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_image_gen INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_audio_tts INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_audio_stt INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_image_edit INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_embeddings INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN health_check_enabled INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN health_check_interval INTEGER NOT NULL DEFAULT 300`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN health_check_timeout INTEGER NOT NULL DEFAULT 5`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN canary_enabled INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN canary_percentage INTEGER NOT NULL DEFAULT 10`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN canary_channels TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN cache_ttl INTEGER NOT NULL DEFAULT 3600`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm'`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_capacity INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_rate INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_key TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
   schemaReady = true;
 }
 
@@ -214,7 +319,7 @@ async function loadChannels(env) {
   loadPromise = (async () => {
     try {
       const { results } = await env.DB.prepare(
-        "SELECT id, name, base_url, api_key, weight, stream_type, headers FROM channels WHERE is_enabled = 1 ORDER BY weight DESC"
+        "SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers FROM channels WHERE is_enabled = 1 ORDER BY weight DESC"
       ).all();
       cachedChannels = results || [];
     } catch (e) {
@@ -372,12 +477,14 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   if (eligible.length === 0) eligible = channels;
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
+  const requiredType = getPathChannelType(suffix);
+  const typed = eligible.filter(c => c.channel_type === requiredType);
+  if (typed.length > 0) eligible = typed;
   const attempted = new Set();
   for (let i = 0; i < Math.min(3, eligible.length); i++) {
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
     const channel = selectChannel(eligible, attempted);
     if (!channel) break;
-    attempted.add(channel.id);
     const upstreamPath = suffix;
     const url = channel.base_url.replace(/\/+$/, "") + upstreamPath;
     const headers = new Headers(baseHeaders);
@@ -617,6 +724,8 @@ function validateChannelData(channels) {
     }
     if (ch.stream_type && !STREAM_TYPES.includes(ch.stream_type))
       errors.push(`[${i}] Invalid stream_type "${ch.stream_type}", must be one of: ${STREAM_TYPES.join(", ")}`);
+    if (ch.channel_type && !CHANNEL_TYPES.includes(ch.channel_type))
+      errors.push(`[${i}] Invalid channel_type "${ch.channel_type}", must be one of: ${CHANNEL_TYPES.join(", ")}`);
     if (ch.headers !== undefined) {
       if (!Array.isArray(ch.headers)) errors.push(`[${i}] headers must be an array`);
       else {
@@ -657,7 +766,11 @@ function createDashboardApi() {
       c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
     ]);
     const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
-    const channels = (ch.results || []).map(ch => ({ ...ch, api_key: maskApiKey(ch.api_key || '') }));
+    const channels = (ch.results || []).map(ch => {
+      let headers = ch.headers || [];
+      if (typeof headers === "string") try { headers = JSON.parse(headers); } catch (e) { headers = []; }
+      return { ...ch, api_key: maskApiKey(ch.api_key || ''), headers };
+    });
     return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "" } });
   });
 
@@ -669,15 +782,15 @@ function createDashboardApi() {
     const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, headers";
-    const ph = "?, ?, ?, ?, ?, ?, ?, ?, ?";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers";
+    const ph = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
       const apiKey = ch.api_key || (allKeys[ch.id] || "");
       batch.push(
         c.env.DB.prepare(`INSERT INTO channels (${cols}) VALUES (${ph})`).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0,
-          ch.stream_type || "both", JSON.stringify(ch.headers || [])
+          ch.stream_type || "both", ch.channel_type || "chat", JSON.stringify(ch.headers || [])
         )
       );
     }
@@ -695,7 +808,7 @@ function createDashboardApi() {
     const stmts = [
       c.env.DB.prepare("DELETE FROM filters"),
       ...filters.map((f) =>
-        c.env.DB.prepare("INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)").bind(f.text, f.mode || 1, f.is_enabled ? 1 : 0)
+        c.env.DB.prepare("INSERT INTO filters (text, mode, is_enabled) VALUES (?, ?, ?)").bind(f.text, f.mode !== undefined ? f.mode : 1, f.is_enabled ? 1 : 0)
       ),
     ];
     for (let i = 0; i < stmts.length; i += D1_BATCH_LIMIT) {
