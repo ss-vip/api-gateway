@@ -8,6 +8,30 @@ const CHANNEL_COOLDOWN_MS = UPSTREAM_TIMEOUT_MS;
 const STREAM_IDLE_TIMEOUT_MS = 60_000;
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
+const SESSION_TTL = 86400000;
+const SESSION_PRUNE_INTERVAL = 50;
+const adminSessions = new Map();
+let sessionPruneCounter = 0;
+
+function generateSessionToken() {
+  const token = generateToken();
+  adminSessions.set(token, Date.now() + SESSION_TTL);
+  return token;
+}
+
+function isValidSession(token) {
+  const expiry = adminSessions.get(token);
+  if (!expiry) return false;
+  if (Date.now() > expiry) { adminSessions.delete(token); return false; }
+  return true;
+}
+
+function maybePruneSessions() {
+  if (++sessionPruneCounter % SESSION_PRUNE_INTERVAL !== 0) return;
+  const now = Date.now();
+  for (const [k, v] of adminSessions) { if (now > v) adminSessions.delete(k); }
+  if (adminSessions.size > 10000) adminSessions.clear();
+}
 const REFRESH_MS = 60_000;
 const D1_BATCH_LIMIT = 99;
 const LOGIN_MAX_FAILURES = 10;
@@ -16,7 +40,8 @@ const SETUP_MAX_ATTEMPTS = 5;
 const SETUP_BAN_MS = 10 * 60 * 1000;
 const API_PREFIXES = ["/v1", "/v1beta", "/v2", "/v3", "/v4"];
 const STREAM_TYPES = ["both", "stream", "nonstream"];
-const CHANNEL_TYPES = ["chat", "image_gen", "image_edit", "tts", "stt", "embed", "moderate", "assistant", "fine_tune", "file", "responses", "batches", "models"];
+const BLOCKED_CUSTOM_HEADERS = new Set(["authorization", "content-type", "content-length", "host", "connection", "transfer-encoding"]);
+const CHANNEL_TYPES = ["chat", "image_gen", "image_edit", "tts", "stt", "embed", "moderate", "assistant", "fine_tune", "file", "responses", "batches", "models", "realtime"];
 const CHANNEL_TYPE_ROUTES = {
   chat:       ["/chat/completions", "/completions"],
   image_gen:  ["/images/generations"],
@@ -31,6 +56,7 @@ const CHANNEL_TYPE_ROUTES = {
   responses:  ["/responses"],
   batches:    ["/batches"],
   models:     ["/models"],
+  realtime:   ["/realtime"],
 };
 
 function getPathChannelType(suffix) {
@@ -195,8 +221,13 @@ const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS config (
   admin_password  TEXT    NOT NULL DEFAULT ''
 )`;
 
-const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL];
-const ALL_TABLES = ["channels", "filters", "config"];
+const SCHEMA_META_DDL = `CREATE TABLE IF NOT EXISTS schema_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+)`;
+
+const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL, SCHEMA_META_DDL];
+const ALL_TABLES = ["channels", "filters", "config", "schema_meta"];
 
 async function ensureSchema(env) {
   if (schemaReady) return;
@@ -224,45 +255,60 @@ async function ensureSchema(env) {
     console.error("[schema] failed to ensure config row:", e.message);
   }
   if (ok > 0) console.log(`[schema] ${ok}/${ALL_DDLS.length} tables ready`);
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'both'`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'chat'`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN provider_options TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN provider TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN absolute_url INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_tools INTEGER NOT NULL DEFAULT 1`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN response_time INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN fallback_model TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpd_limit INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpm_count INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpm_reset_at INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpd_count INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rpd_reset_at INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN last_error_msg TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN last_error_at INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_image_gen INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_audio_tts INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_audio_stt INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_image_edit INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN support_embeddings INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN health_check_enabled INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN health_check_interval INTEGER NOT NULL DEFAULT 300`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN health_check_timeout INTEGER NOT NULL DEFAULT 5`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN canary_enabled INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN canary_percentage INTEGER NOT NULL DEFAULT 10`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN canary_channels TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN cache_ttl INTEGER NOT NULL DEFAULT 3600`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm'`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_capacity INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_rate INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
-  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN rate_limit_key TEXT NOT NULL DEFAULT ''`).run(); } catch (e) {}
+  // 用 DB flag 判斷 migration 是否已完成，避免重複 39 次 ALTER TABLE probe
+  let schemaVer = "0";
+  try {
+    const meta = await env.DB.prepare("SELECT value FROM schema_meta WHERE key='schema_ver'").first();
+    schemaVer = meta?.value || "0";
+  } catch (e) { /* schema_meta 表格尚未就緒 */ }
+  if (schemaVer < "2") {
+    const migrations = [
+      "ALTER TABLE channels ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'both'",
+      "ALTER TABLE channels ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'chat'",
+      "ALTER TABLE channels ADD COLUMN provider_options TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE channels ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE channels ADD COLUMN absolute_url INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN support_tools INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE channels ADD COLUMN response_time INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN fallback_model TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE channels ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rpd_limit INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rpm_count INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rpm_reset_at INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rpd_count INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rpd_reset_at INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN last_error_msg TEXT NOT NULL DEFAULT ''",
+      "ALTER TABLE channels ADD COLUMN last_error_at INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1",
+      "ALTER TABLE channels ADD COLUMN support_image_gen INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN support_audio_tts INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN support_audio_stt INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN support_image_edit INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN support_embeddings INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN health_check_enabled INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN health_check_interval INTEGER NOT NULL DEFAULT 300",
+      "ALTER TABLE channels ADD COLUMN health_check_timeout INTEGER NOT NULL DEFAULT 5",
+      "ALTER TABLE channels ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN canary_enabled INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN canary_percentage INTEGER NOT NULL DEFAULT 10",
+      "ALTER TABLE channels ADD COLUMN canary_channels TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE channels ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN cache_ttl INTEGER NOT NULL DEFAULT 3600",
+      "ALTER TABLE channels ADD COLUMN rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm'",
+      "ALTER TABLE channels ADD COLUMN rate_limit_capacity INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rate_limit_rate INTEGER NOT NULL DEFAULT 0",
+      "ALTER TABLE channels ADD COLUMN rate_limit_key TEXT NOT NULL DEFAULT ''",
+    ];
+    for (const sql of migrations) {
+      try { await env.DB.prepare(sql).run(); } catch (e) { /* 欄位已存在則略過 */ }
+    }
+  }
+  // migration 完成後寫入 DB flag，下次冷啟動直接跳過
+  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '2')").run();
   schemaReady = true;
 }
 
@@ -312,23 +358,36 @@ let lastLoad = 0;
 let loadPromise = null;
 const degradedUntil = new Map();
 
-async function loadChannels(env) {
+async function loadChannels(env, channelType) {
   const now = Date.now();
-  if (cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
-  if (loadPromise) return loadPromise;
+  // 無類型過濾時才走快取；類型查詢每次從 DB 讀取（量小，避免快取污染）
+  if (!channelType && cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
+  if (loadPromise && !channelType) return loadPromise;
+  const pKey = loadPromise;
   loadPromise = (async () => {
     try {
-      const { results } = await env.DB.prepare(
-        "SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers FROM channels WHERE is_enabled = 1 ORDER BY weight DESC"
-      ).all();
-      cachedChannels = results || [];
+      let sql = "SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers, cooldown_until FROM channels WHERE is_enabled = 1";
+      const params = [];
+      if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
+      sql += " ORDER BY weight DESC";
+      const { results } = await env.DB.prepare(sql).bind(...params).all();
+      const rows = results || [];
+      const nowMs = Date.now();
+      const active = rows.filter(ch => !ch.cooldown_until || ch.cooldown_until <= nowMs);
+      for (const ch of rows) {
+        if (ch.cooldown_until > 0 && ch.cooldown_until <= nowMs) {
+          env.DB.prepare("UPDATE channels SET cooldown_until=0 WHERE id=?").bind(ch.id).run().catch(() => {});
+        }
+        if (ch.cooldown_until > nowMs) { degradedUntil.set(ch.id, ch.cooldown_until); }
+      }
+      // 只有無類型查詢才更新快取
+      if (!channelType) { cachedChannels = active; lastLoad = Date.now(); }
+      return active;
     } catch (e) {
       console.error("[channel] load error:", e.message);
-      cachedChannels = cachedChannels || [];
+      if (!channelType) cachedChannels = cachedChannels || [];
+      return cachedChannels || [];
     }
-    lastLoad = Date.now();
-    loadPromise = null;
-    return cachedChannels;
   })();
   return loadPromise;
 }
@@ -350,12 +409,19 @@ function selectChannel(channels, exclude = new Set()) {
   return healthy[healthy.length - 1];
 }
 
-function markDegraded(channelId) {
-  degradedUntil.set(channelId, Date.now() + CHANNEL_COOLDOWN_MS);
+function markDegraded(channelId, env) {
+  const until = Date.now() + CHANNEL_COOLDOWN_MS;
+  degradedUntil.set(channelId, until);
+  if (env) {
+    env.DB.prepare("UPDATE channels SET cooldown_until=? WHERE id=?").bind(until, channelId).run().catch(() => {});
+  }
 }
 
-function markHealthy(channelId) {
+function markHealthy(channelId, env) {
   degradedUntil.delete(channelId);
+  if (env) {
+    env.DB.prepare("UPDATE channels SET cooldown_until=0 WHERE id=?").bind(channelId).run().catch(() => {});
+  }
 }
 
 function isDegraded(channelId) {
@@ -404,6 +470,7 @@ function buildBaseHeaders(reqHeaders, rid) {
   const headers = new Headers(reqHeaders);
   headers.set("X-Request-Id", rid);
   headers.delete("host");
+  headers.delete("content-length");
   headers.delete("cf-connecting-ip");
   headers.delete("cf-ray");
   headers.delete("cf-worker");
@@ -438,14 +505,24 @@ function createFilterTransform(filters) {
           if (payload === "[DONE]") { controller.enqueue(encoder.encode(line + "\n")); continue; }
           try {
             const parsed = JSON.parse(payload);
-            const delta = parsed?.choices?.[0]?.delta;
-            if (delta?.content) delta.content = RollingFilter.applyStatic(delta.content, filters);
+            if (parsed.choices) {
+              for (const choice of parsed.choices) {
+                const delta = choice?.delta || {};
+                if (delta.content) delta.content = RollingFilter.applyStatic(delta.content, filters);
+                if (delta.refusal) delta.refusal = RollingFilter.applyStatic(delta.refusal, filters);
+                if (delta.tool_calls) {
+                  for (const tc of delta.tool_calls) {
+                    if (tc.function?.arguments) tc.function.arguments = RollingFilter.applyStatic(tc.function.arguments, filters);
+                  }
+                }
+              }
+            }
             controller.enqueue(encoder.encode("data: " + JSON.stringify(parsed) + "\n"));
           } catch { controller.enqueue(encoder.encode(line + "\n")); }
         } else { controller.enqueue(encoder.encode(line + "\n")); }
       }
     },
-    flush(controller) { if (buf) controller.enqueue(encoder.encode(buf)); },
+    flush(controller) { if (buf) controller.enqueue(encoder.encode(buf + "\n")); },
   });
 }
 
@@ -471,15 +548,24 @@ function createIdleTimeoutStream(readable, idleMs) {
 }
 
 async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
-  const channels = await loadChannels(env);
-  if (channels.length === 0) return { error: { message: "No upstream channels available", status: 503 } };
-  let eligible = streamType ? channels.filter(c => c.stream_type === "both" || c.stream_type === streamType) : channels;
-  if (eligible.length === 0) eligible = channels;
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
   const requiredType = getPathChannelType(suffix);
-  const typed = eligible.filter(c => c.channel_type === requiredType);
-  if (typed.length > 0) eligible = typed;
+  // SQL 層先過濾 channel_type，減少 D1 rows_read 與 JS 陣列操作
+  let channels = await loadChannels(env, requiredType);
+  if (channels.length === 0) {
+    if (requiredType !== "chat") {
+      return { error: { message: `No enabled channel with type "${requiredType}" for path "${suffix}"`, status: 503 } };
+    }
+    // fallback: 非 chat 以外的請求才容許任類型 channel
+    channels = await loadChannels(env);
+    if (channels.length === 0) return { error: { message: "No upstream channels available", status: 503 } };
+  }
+  let eligible = streamType ? channels.filter(c => c.stream_type === "both" || c.stream_type === streamType) : channels;
+  if (eligible.length === 0) {
+    logStructured("warn", "no channels match stream_type, falling back to all", { streamType, path, rid });
+    eligible = channels;
+  }
   const attempted = new Set();
   for (let i = 0; i < Math.min(3, eligible.length); i++) {
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
@@ -494,10 +580,21 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         const customHeaders = typeof channel.headers === "string" ? JSON.parse(channel.headers) : channel.headers;
         if (Array.isArray(customHeaders)) {
           for (const h of customHeaders) {
-            if (h.key && h.key.trim()) headers.set(h.key.trim(), h.value || "");
+            if (h.key && h.key.trim() && !BLOCKED_CUSTOM_HEADERS.has(h.key.trim().toLowerCase())) headers.set(h.key.trim(), h.value || "");
           }
         }
       } catch (e) {}
+    }
+    let timer;
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    // 先 addEventListener 再檢查 aborted，避免 race（abort 事件不會在同步程式碼中觸發）
+    if (clientSignal) {
+      clientSignal.addEventListener("abort", onAbort, { once: true });
+      if (clientSignal.aborted) {
+        clientSignal.removeEventListener("abort", onAbort);
+        controller.abort();
+      }
     }
     try {
       let reqBody = body;
@@ -511,26 +608,24 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           }
         } catch (e) {}
       }
-      const controller = new AbortController();
-      const onAbort = () => controller.abort();
-      if (clientSignal) {
-        if (clientSignal.aborted) { controller.abort(); }
-        else clientSignal.addEventListener("abort", onAbort, { once: true });
-      }
-      const timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
+      timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
       const res = await fetch(url, { method, headers, body: reqBody, signal: controller.signal });
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
-      if (res.ok) { markHealthy(channel.id); return { response: res, channel }; }
+      if (res.ok) { markHealthy(channel.id, env); return { response: res, channel }; }
       if (res.status >= 500 || res.status === 429) {
-        markDegraded(channel.id);
+        // 消耗 body 避免連線懸掛
+        res.body?.cancel().catch(() => {});
+        markDegraded(channel.id, env);
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
         continue;
       }
       return { response: res };
     } catch (err) {
+      clearTimeout(timer);
+      if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
       if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
-      markDegraded(channel.id);
+      markDegraded(channel.id, env);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
       continue;
     }
@@ -565,11 +660,17 @@ async function handleChatCompletions(c) {
         try { return c.json(JSON.parse(text), upstream.status); } catch (e) { return c.text(text, upstream.status); }
       }
       const filters = await loadFilters(c.env);
-      return new Response(nonStreamToStream(text, filters), { status: 200, headers: { ...resHeaders, "Content-Type": "text/event-stream" } });
+      const sseHeaders = new Headers(resHeaders);
+      sseHeaders.set("Content-Type", "text/event-stream");
+      sseHeaders.set("Cache-Control", "no-cache");
+      sseHeaders.set("X-Accel-Buffering", "no");
+      return new Response(nonStreamToStream(text, filters), { status: 200, headers: sseHeaders });
     }
     let sseBody = createIdleTimeoutStream(upstream.body, STREAM_IDLE_TIMEOUT_MS);
     const filters = await loadFilters(c.env);
     if (filters.length > 0) sseBody = sseBody.pipeThrough(createFilterTransform(filters));
+    resHeaders.set("Cache-Control", "no-cache");
+    resHeaders.set("X-Accel-Buffering", "no");
     return new Response(sseBody, { status: upstream.status, headers: resHeaders });
   }
   return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
@@ -586,7 +687,16 @@ function nonStreamToStream(bodyText, filters) {
       const id = p.id || "chatcmpl-" + Date.now();
       const created = p.created || Math.floor(Date.now() / 1000);
       const model = p.model || "unknown";
-      for (const ch of p.choices || []) {
+      if (!Array.isArray(p.choices) || p.choices.length === 0) {
+        await w.write(enc.encode("data: " + JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }) + "\n\n"));
+        if (p.usage) {
+          await sse({ id, object: "chat.completion.chunk", created, model, choices: [], usage: p.usage });
+        }
+        await w.write(enc.encode("data: [DONE]\n\n"));
+        await w.close();
+        return;
+      }
+      for (const ch of p.choices) {
         const idx = ch.index || 0;
         const msg = ch.message || {};
         const finish = ch.finish_reason || null;
@@ -601,7 +711,8 @@ function nonStreamToStream(bodyText, filters) {
           for (const tc of msg.tool_calls) {
             await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { tool_calls: [{ index: tc.index || 0, id: tc.id, type: tc.type || "function", function: { name: tc.function?.name || "", arguments: "" } }] }, finish_reason: null }] });
             if (tc.function?.arguments) {
-              await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { tool_calls: [{ index: tc.index || 0, function: { arguments: tc.function.arguments } }] }, finish_reason: null }] });
+              const filteredArgs = filters?.length > 0 ? RollingFilter.applyStatic(tc.function.arguments, filters) : tc.function.arguments;
+              await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { tool_calls: [{ index: tc.index || 0, function: { arguments: filteredArgs } }] }, finish_reason: null }] });
             }
           }
         }
@@ -611,8 +722,15 @@ function nonStreamToStream(bodyText, filters) {
         await sse({ id, object: "chat.completion.chunk", created, model, choices: [], usage: p.usage });
       }
       await w.write(enc.encode("data: [DONE]\n\n"));
-    } catch (e) { logStructured("error", "non-stream to stream conversion failed", { error: e.message }); }
-    await w.close();
+    } catch (e) {
+      logStructured("error", "non-stream to stream conversion failed", { error: e.message });
+      try {
+        const fallbackId = "chatcmpl-" + Date.now();
+        await sse({ id: fallbackId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown", choices: [{ index: 0, delta: {}, finish_reason: "error" }] });
+        await w.write(enc.encode("data: [DONE]\n\n"));
+      } catch (e2) {}
+    }
+    try { await w.close(); } catch (e) { logStructured("warn", "closing non-stream writer failed", { error: e.message }); }
   })();
   return readable;
 }
@@ -621,21 +739,27 @@ async function handleModels(c) {
   const channels = await loadChannels(c.env);
   if (channels.length === 0) return c.json({ object: "list", data: [] });
   for (const channel of channels) {
+    if (isDegraded(channel.id)) continue;
     try {
       const url = channel.base_url.replace(/\/+$/, "") + "/models";
-      const headers = { Authorization: `Bearer ${channel.api_key}` };
+      const headers = new Headers({ Authorization: `Bearer ${channel.api_key}` });
       if (channel.headers) {
         try {
           const ch = typeof channel.headers === "string" ? JSON.parse(channel.headers) : channel.headers;
-          if (Array.isArray(ch)) for (const h of ch) { if (h.key && h.key.trim()) headers[h.key.trim()] = h.value || ""; }
+          if (Array.isArray(ch)) for (const h of ch) { if (h.key && h.key.trim() && !BLOCKED_CUSTOM_HEADERS.has(h.key.trim().toLowerCase())) headers.set(h.key.trim(), h.value || ""); }
         } catch (e) {}
       }
       const res = await fetch(url, {
         headers,
         signal: AbortSignal.timeout(5000),
       });
-      if (res.ok) return c.json(await res.json());
+      if (res.ok) {
+        markHealthy(channel.id, c.env);
+        return c.json(await res.json());
+      }
+      if (res.status >= 500 || res.status === 429) markDegraded(channel.id, c.env);
     } catch (e) {
+      markDegraded(channel.id, c.env);
       logStructured("warn", "models fetch failed, trying next", { channel: channel.name, error: e.message });
     }
   }
@@ -659,6 +783,15 @@ async function handleGenericProxy(c) {
   const { response: upstream } = result;
   const resHeaders = cleanResponseHeaders(upstream.headers);
   resHeaders.set("X-Request-Id", rid);
+  const ct = upstream.headers.get("Content-Type") || "";
+  if (ct.includes("text/event-stream")) {
+    let sseBody = createIdleTimeoutStream(upstream.body, STREAM_IDLE_TIMEOUT_MS);
+    const filters = await loadFilters(c.env);
+    if (filters.length > 0) sseBody = sseBody.pipeThrough(createFilterTransform(filters));
+    resHeaders.set("Cache-Control", "no-cache");
+    resHeaders.set("X-Accel-Buffering", "no");
+    return new Response(sseBody, { status: upstream.status, headers: resHeaders });
+  }
   return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
 }
 
@@ -684,6 +817,7 @@ function registerGateway(app) {
   for (const p of API_PREFIXES) {
     app.use(p + "/*", authMiddleware);
     app.post(p + "/chat/completions", handleChatCompletions);
+    app.post(p + "/completions", handleChatCompletions);
     app.get(p + "/models", handleModels);
     app.all(p + "/*", handleGenericProxy);
   }
@@ -756,8 +890,16 @@ function createDashboardApi() {
     }
     const inputToken = c.req.header("X-Admin-Token");
     if (!inputToken) return c.json({ error: "Unauthorized" }, 401);
-    if (!(await verifyPassword(inputToken, storedHash))) return c.json({ error: "Unauthorized" }, 401);
-    await next();
+    // fast path: session token (無 PBKDF2)
+    maybePruneSessions();
+    if (isValidSession(inputToken)) return await next();
+    // slow path: legacy token (密碼), 驗證後回寫 session token
+    if (await verifyPassword(inputToken, storedHash)) {
+      const sessionToken = generateSessionToken();
+      c.header("X-Session-Token", sessionToken);
+      return await next();
+    }
+    return c.json({ error: "Unauthorized" }, 401);
   });
 
   api.get("/init", async (c) => {
@@ -779,14 +921,22 @@ function createDashboardApi() {
     if (!Array.isArray(body)) return c.json({ ok: false, error: "Expected array" }, 400);
     const errs = validateChannelData(body);
     if (errs.length > 0) return c.json({ ok: false, error: "Validation failed", details: errs }, 400);
+    // D1 batch transactions have a 100-statement limit (D1_BATCH_LIMIT = 99).
+    // DELETE occupies 1 slot, so we can atomically save at most D1_BATCH_LIMIT-1 channels.
+    // Beyond that, sequential batches risk interleaving with concurrent requests.
+    const maxChannels = D1_BATCH_LIMIT - 1;
+    if (body.length > maxChannels) {
+      return c.json({ ok: false, error: `Too many channels (${body.length}), max ${maxChannels}. Save in smaller batches.` }, 400);
+    }
     const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
+    const isMasked = (key) => typeof key === "string" && key.includes("***");
     const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers";
     const ph = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
-      const apiKey = ch.api_key || (allKeys[ch.id] || "");
+      const apiKey = (!ch.api_key || isMasked(ch.api_key)) ? (allKeys[ch.id] || "") : ch.api_key;
       batch.push(
         c.env.DB.prepare(`INSERT INTO channels (${cols}) VALUES (${ph})`).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0,
@@ -832,6 +982,20 @@ function createDashboardApi() {
     clearGatewayCache();
 
     return c.json({ ok: true });
+  });
+
+  api.post("/verify-token", async (c) => {
+    const { token } = await c.req.json();
+    if (!token) return c.json({ valid: false }, 400);
+    // fast path: session token
+    if (isValidSession(token)) return c.json({ valid: true });
+    // slow path: 相容舊版 password token → 升級為 session token
+    const storedHash = await getAdminPass(c);
+    if (!storedHash) return c.json({ valid: false }, 403);
+    if (await verifyPassword(token, storedHash)) {
+      return c.json({ valid: true, sessionToken: generateSessionToken() });
+    }
+    return c.json({ valid: false });
   });
 
   api.post("/admin-pass", async (c) => {
@@ -895,14 +1059,6 @@ function createDashboardApi() {
     } catch (e) { return c.json({ needsSetup: true }); }
   });
 
-  api.post("/verify-token", async (c) => {
-    const { token } = await c.req.json();
-    if (!token) return c.json({ valid: false }, 400);
-    const storedHash = await getAdminPass(c);
-    if (!storedHash) return c.json({ valid: false }, 403);
-    return c.json({ valid: await verifyPassword(token, storedHash) });
-  });
-
   return api;
 }
 
@@ -934,7 +1090,10 @@ function createDashboardApp() {
     if (!password) return c.json({ error: "密碼 required" }, 400);
     const storedHash = await getAdminPass(c);
     if (!storedHash) return c.json({ error: "尚未設定密碼" }, 403);
-    if (await verifyPassword(password, storedHash)) { loginState.delete(ip); return c.json({ ok: true }); }
+    if (await verifyPassword(password, storedHash)) {
+      loginState.delete(ip);
+      return c.json({ ok: true, sessionToken: generateSessionToken() });
+    }
     const newCount = state.count + 1;
     if (newCount >= LOGIN_MAX_FAILURES) {
       loginState.set(ip, { count: 0, banUntil: Date.now() + LOGIN_BAN_MS });

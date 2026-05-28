@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **相容代理** — 完整 `/v1/chat/completions`、`/v1/models` 轉發
+- **相容代理** — 完整 OpenAI API 所有標準路徑轉發
 - **負載平衡** — 依 weight 權重隨機選取通道
 - **故障冷卻** — HTTP 5xx/429/網路錯誤自動標記 degraded，120 秒後自動恢復
 - **串流過濾** — RollingFilter 關鍵字刪除/截斷（TransformStream）

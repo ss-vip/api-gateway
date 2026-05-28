@@ -267,6 +267,10 @@
                 <option value="assistant">assistant</option>
                 <option value="fine_tune">fine_tune</option>
                 <option value="file">file</option>
+                <option value="responses">responses</option>
+                <option value="batches">batches</option>
+                <option value="models">models</option>
+                <option value="realtime">realtime</option>
               </select>
             </div>
             <div class="col-3 d-flex flex-column align-items-center justify-content-center">
@@ -357,6 +361,9 @@
           signal: ac.signal,
         });
         clearTimeout(to);
+        // 收到 session token 升級 header 時存入 storage
+        const st = r.headers.get('X-Session-Token');
+        if (st) sessionStorage.setItem('adminToken', st);
         if (r.status === 401) {
           dismissAllModals();
           toast('登入階段已過期，請重新登入', 'warning');
@@ -464,7 +471,7 @@
         const data = await r.json();
         loading(false);
         if (r.ok) {
-          sessionStorage.setItem('adminToken', p);
+          sessionStorage.setItem('adminToken', data.sessionToken || p);
           sessionStorage.setItem('adminLoggedIn', '1');
           await showAdmin();
         } else {
@@ -501,7 +508,8 @@
         });
         loading(false);
         if (loginRes.ok) {
-          sessionStorage.setItem('adminToken', p);
+          const loginData = await loginRes.json();
+          sessionStorage.setItem('adminToken', loginData.sessionToken || p);
           sessionStorage.setItem('adminLoggedIn', '1');
           await showAdmin();
         } else {
@@ -600,17 +608,16 @@
 
       document.getElementById('channel-list').innerHTML = filtered.map((c) => {
         const realIdx = channels.indexOf(c);
-        const modelName = esc(c.model || "");
         const displayName = esc(c.model || "-");
 
         let row = '<tr>';
         row += '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>';
         row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>';
         row += '<td class="fw-bold align-middle">' + esc(c.name) + '</td>';
-        row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code></td>';
-        row += '<td class="d-none d-lg-table-cell align-middle">' + c.weight + '</td>';
-        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' bg-opacity-25 text-dark small">' + esc(c.stream_type || 'both') + '</span></td>';
-        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-primary bg-opacity-10 text-dark small">' + esc(c.channel_type || 'chat') + '</span></td>';
+        row += '<td class="align-middle"><code class="small copy-model" style="cursor:pointer" data-model="' + esc(c.model || '') + '" title="點擊複製">' + displayName + '</code></td>';
+        row += '<td class="d-none d-lg-table-cell align-middle">' + esc(String(c.weight)) + '</td>';
+        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' bg-opacity-10 text-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' small">' + esc(c.stream_type || 'both') + '</span></td>';
+        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-primary bg-opacity-10 text-primary small">' + esc(c.channel_type || 'chat') + '</span></td>';
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
@@ -701,15 +708,15 @@
 
     const saveEverything = async () => {
       const cfgEl = document.getElementById('cfg-token');
-      if (cfgEl) await api('/admin/api/config', 'POST', { token: cfgEl.value });
+      if (cfgEl) { const cfgOk = await api('/admin/api/config', 'POST', { token: cfgEl.value }); if (!cfgOk) { toast('Token 儲存失敗', 'danger'); return; } }
       const channelsOk = await api('/admin/api/batch-channels', 'POST', channels);
       if (!channelsOk) { toast('渠道儲存失敗，請檢查連線', 'danger'); return; }
-      const invalid = filters.filter(f => !f.text || f.text.trim().length === 0 || f.text.length > 30);
-      if (invalid.length === 0) {
-        await api('/admin/api/filters', 'POST', filters);
-      } else {
-        toast(invalid.length + ' 個過濾器關鍵字無效（1-30字），已跳過', 'warning');
+      const validFilters = filters.filter(f => f.text && f.text.trim().length > 0 && f.text.length <= 30);
+      if (validFilters.length !== filters.length) {
+        toast(`${filters.length - validFilters.length} 個過濾器關鍵字無效（1-30字），已跳過`, 'warning');
       }
+      const filterOk = await api('/admin/api/filters', 'POST', validFilters);
+      if (!filterOk) { toast('過濾器儲存失敗', 'danger'); return; }
       toast('全部已儲存', 'success');
       await init();
     };
@@ -824,6 +831,7 @@
         weight: c.weight,
         is_enabled: c.is_enabled,
         stream_type: c.stream_type || 'both',
+        channel_type: c.channel_type || 'chat',
         headers: Array.isArray(c.headers) ? c.headers.filter(h => h.key) : [],
       }));
       const blob = new Blob([JSON.stringify({ version: 1, channels: data }, null, 2)], { type: 'application/json' });
@@ -853,19 +861,18 @@
           }
           const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
           let nextId = 1; while (existingIds.includes(nextId)) nextId++;
-          channels.length = 0;
-          for (const ch of arr) {
-            channels.push({
-              id: nextId++,
-              name: ch.name,
-              base_url: ch.base_url,
-              model: ch.model,
-              weight: ch.weight || 50,
-              is_enabled: ch.is_enabled != null ? (ch.is_enabled ? 1 : 0) : 1,
-              stream_type: ch.stream_type || 'both',
-              headers: Array.isArray(ch.headers) ? ch.headers.filter(h => h.key) : [],
-            });
-          }
+          const newChannels = arr.map(ch => ({
+            id: nextId++,
+            name: ch.name,
+            base_url: ch.base_url,
+            model: ch.model,
+            weight: ch.weight || 50,
+            is_enabled: ch.is_enabled != null ? (ch.is_enabled ? 1 : 0) : 1,
+            stream_type: ch.stream_type || 'both',
+            channel_type: ch.channel_type || 'chat',
+            headers: Array.isArray(ch.headers) ? ch.headers.filter(h => h.key) : [],
+          }));
+          channels.splice(0, channels.length, ...newChannels);
           renderChannels();
           renderStats();
           toast('已匯入 ' + channels.length + ' 個渠道, 請留意 API Key 需手動補填', 'success');
@@ -945,7 +952,9 @@
           const data = await r.json();
           if (data.valid) {
             sessionStorage.setItem('adminLoggedIn', '1');
+            if (data.sessionToken) sessionStorage.setItem('adminToken', data.sessionToken);
             await showAdmin();
+            loading(false);
           } else {
             sessionStorage.removeItem('adminToken');
             sessionStorage.removeItem('adminLoggedIn');
@@ -989,6 +998,11 @@
           };
           window.addEventListener('scroll', updateGoTop);
         }
+        // 點擊 model 名稱複製（event delegation，避免 inline onclick XSS）
+        document.getElementById('channel-list')?.addEventListener('click', (e) => {
+          const code = e.target.closest('.copy-model');
+          if (code) { const m = code.dataset.model; if (m) copyModelName(m); }
+        });
       } catch (e) { console.error('[init]', e); }
       checkAuth();
     };
