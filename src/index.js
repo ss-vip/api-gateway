@@ -110,7 +110,8 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   model       TEXT    NOT NULL DEFAULT '',
   weight      INTEGER NOT NULL DEFAULT 50,
   is_enabled  INTEGER NOT NULL DEFAULT 1,
-  stream_type TEXT    NOT NULL DEFAULT 'both'
+  stream_type TEXT    NOT NULL DEFAULT 'both',
+  headers     TEXT    NOT NULL DEFAULT '[]'
 )`;
 
 const FILTERS_DDL = `CREATE TABLE IF NOT EXISTS filters (
@@ -156,6 +157,7 @@ async function ensureSchema(env) {
   }
   if (ok > 0) console.log(`[schema] ${ok}/${ALL_DDLS.length} tables ready`);
   try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'both'`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE channels ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'`).run(); } catch (e) {}
   schemaReady = true;
 }
 
@@ -212,7 +214,7 @@ async function loadChannels(env) {
   loadPromise = (async () => {
     try {
       const { results } = await env.DB.prepare(
-        "SELECT id, name, base_url, api_key, weight, stream_type FROM channels WHERE is_enabled = 1 ORDER BY weight DESC"
+        "SELECT id, name, base_url, api_key, weight, stream_type, headers FROM channels WHERE is_enabled = 1 ORDER BY weight DESC"
       ).all();
       cachedChannels = results || [];
     } catch (e) {
@@ -363,7 +365,7 @@ function createIdleTimeoutStream(readable, idleMs) {
   return out;
 }
 
-async function tryForward(env, path, method, baseHeaders, body, rid, streamType) {
+async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
   const channels = await loadChannels(env);
   if (channels.length === 0) return { error: { message: "No upstream channels available", status: 503 } };
   let eligible = streamType ? channels.filter(c => c.stream_type === "both" || c.stream_type === streamType) : channels;
@@ -372,6 +374,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType)
   const suffix = matched ? path.slice(matched.length) : path;
   const attempted = new Set();
   for (let i = 0; i < Math.min(3, eligible.length); i++) {
+    if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
     const channel = selectChannel(eligible, attempted);
     if (!channel) break;
     attempted.add(channel.id);
@@ -379,11 +382,22 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType)
     const url = channel.base_url.replace(/\/+$/, "") + upstreamPath;
     const headers = new Headers(baseHeaders);
     headers.set("Authorization", `Bearer ${channel.api_key}`);
+    if (channel.headers) {
+      try {
+        const customHeaders = typeof channel.headers === "string" ? JSON.parse(channel.headers) : channel.headers;
+        if (Array.isArray(customHeaders)) {
+          for (const h of customHeaders) {
+            if (h.key && h.key.trim()) headers.set(h.key.trim(), h.value || "");
+          }
+        }
+      } catch (e) {}
+    }
     try {
       let reqBody = body;
       if (method === "POST" && body && channel.stream_type === "nonstream") {
         try {
-          const parsed = JSON.parse(body);
+          const bodyStr = body instanceof ArrayBuffer ? new TextDecoder().decode(body) : body;
+          const parsed = JSON.parse(bodyStr);
           if (parsed.stream === true) {
             const { stream, ...rest } = parsed;
             reqBody = JSON.stringify(rest);
@@ -391,9 +405,15 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType)
         } catch (e) {}
       }
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+      const onAbort = () => controller.abort();
+      if (clientSignal) {
+        if (clientSignal.aborted) { controller.abort(); }
+        else clientSignal.addEventListener("abort", onAbort, { once: true });
+      }
+      const timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
       const res = await fetch(url, { method, headers, body: reqBody, signal: controller.signal });
       clearTimeout(timer);
+      if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
       if (res.ok) { markHealthy(channel.id); return { response: res, channel }; }
       if (res.status >= 500 || res.status === 429) {
         markDegraded(channel.id);
@@ -402,6 +422,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType)
       }
       return { response: res };
     } catch (err) {
+      if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
       markDegraded(channel.id);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
       continue;
@@ -422,7 +443,7 @@ async function handleChatCompletions(c) {
   }
   logStructured("info", "chat completion", { model: body?.model || "unknown", stream: isStream, rid });
   const baseHeaders = buildBaseHeaders(c.req.raw.headers, rid);
-  const result = await tryForward(c.env, c.req.path, "POST", baseHeaders, rawBody, rid, isStream ? "stream" : "nonstream");
+  const result = await tryForward(c.env, c.req.path, "POST", baseHeaders, rawBody, rid, isStream ? "stream" : "nonstream", c.req.raw.signal);
   if (result.error) {
     return c.json({ error: { message: result.error.message, type: "upstream_error", param: null, code: "upstream_error" } }, result.error.status);
   }
@@ -495,8 +516,15 @@ async function handleModels(c) {
   for (const channel of channels) {
     try {
       const url = channel.base_url.replace(/\/+$/, "") + "/models";
+      const headers = { Authorization: `Bearer ${channel.api_key}` };
+      if (channel.headers) {
+        try {
+          const ch = typeof channel.headers === "string" ? JSON.parse(channel.headers) : channel.headers;
+          if (Array.isArray(ch)) for (const h of ch) { if (h.key && h.key.trim()) headers[h.key.trim()] = h.value || ""; }
+        } catch (e) {}
+      }
       const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${channel.api_key}` },
+        headers,
         signal: AbortSignal.timeout(5000),
       });
       if (res.ok) return c.json(await res.json());
@@ -512,12 +540,12 @@ async function handleGenericProxy(c) {
   const path = c.req.path;
   const baseHeaders = buildBaseHeaders(c.req.raw.headers, rid);
   const rawBody = c.req.method !== "GET" && c.req.method !== "HEAD"
-    ? await c.req.raw.clone().text() : undefined;
+    ? await c.req.raw.clone().arrayBuffer() : undefined;
   let streamType;
   if (rawBody) {
-    try { const b = JSON.parse(rawBody); streamType = b?.stream === true ? "stream" : "nonstream"; } catch (e) {}
+    try { const b = JSON.parse(new TextDecoder().decode(rawBody)); streamType = b?.stream === true ? "stream" : "nonstream"; } catch (e) {}
   }
-  const result = await tryForward(c.env, path, c.req.method, baseHeaders, rawBody, rid, streamType);
+  const result = await tryForward(c.env, path, c.req.method, baseHeaders, rawBody, rid, streamType, c.req.raw.signal);
   if (result.error) {
     return c.json({ error: { message: result.error.message, type: "upstream_error", param: null, code: "upstream_error" } }, result.error.status);
   }
@@ -554,9 +582,6 @@ function registerGateway(app) {
   }
 }
 
-let resCacheGen = 0;
-
-function clearResCache() { resCacheGen++; }
 
 const setupRateLimit = new Map();
 
@@ -592,6 +617,18 @@ function validateChannelData(channels) {
     }
     if (ch.stream_type && !STREAM_TYPES.includes(ch.stream_type))
       errors.push(`[${i}] Invalid stream_type "${ch.stream_type}", must be one of: ${STREAM_TYPES.join(", ")}`);
+    if (ch.headers !== undefined) {
+      if (!Array.isArray(ch.headers)) errors.push(`[${i}] headers must be an array`);
+      else {
+        for (let j = 0; j < ch.headers.length; j++) {
+          const h = ch.headers[j];
+          if (!h || typeof h !== "object" || !h.key || typeof h.key !== "string" || h.key.trim().length === 0)
+            errors.push(`[${i}] headers[${j}]: key is required`);
+          else if (/[^a-zA-Z0-9\-\_]/.test(h.key.trim()))
+            errors.push(`[${i}] headers[${j}]: invalid key "${h.key}"`);
+        }
+      }
+    }
   }
   return errors;
 }
@@ -632,15 +669,15 @@ function createDashboardApi() {
     const allKeyRows = await c.env.DB.prepare("SELECT id, api_key FROM channels").all();
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type";
-    const ph = "?, ?, ?, ?, ?, ?, ?, ?";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, headers";
+    const ph = "?, ?, ?, ?, ?, ?, ?, ?, ?";
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
       const apiKey = ch.api_key || (allKeys[ch.id] || "");
       batch.push(
         c.env.DB.prepare(`INSERT INTO channels (${cols}) VALUES (${ph})`).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0,
-          ch.stream_type || "both"
+          ch.stream_type || "both", JSON.stringify(ch.headers || [])
         )
       );
     }
@@ -649,7 +686,7 @@ function createDashboardApi() {
       if (chunk.length > 0) await retry(() => c.env.DB.batch(chunk));
     }
     clearGatewayCache();
-    clearResCache();
+
     return c.json({ ok: true });
   });
 
@@ -666,7 +703,7 @@ function createDashboardApi() {
       if (chunk.length > 0) await retry(() => c.env.DB.batch(chunk));
     }
     clearGatewayCache();
-    clearResCache();
+
     return c.json({ ok: true });
   });
 
@@ -680,7 +717,7 @@ function createDashboardApi() {
       else await c.env.DB.prepare("INSERT INTO config (id, client_token, admin_password) VALUES (1, ?, '')").bind(token).run();
     } catch (e) { return c.json({ error: e.message }, 500); }
     clearGatewayCache();
-    clearResCache();
+
     return c.json({ ok: true });
   });
 
@@ -695,7 +732,7 @@ function createDashboardApi() {
     if (ex) await c.env.DB.prepare("UPDATE config SET admin_password=? WHERE id=1").bind(hashedPass).run();
     else await c.env.DB.prepare("INSERT INTO config (id, client_token, admin_password) VALUES (1, ?, ?)").bind(generateToken(), hashedPass).run();
     clearGatewayCache();
-    clearResCache();
+
     return c.json({ ok: true });
   });
 
@@ -734,7 +771,7 @@ function createDashboardApi() {
       c.env.DB.prepare("UPDATE config SET client_token=? WHERE id=1").bind(freshToken),
     ]));
     clearGatewayCache();
-    clearResCache();
+
     return c.json({ ok: true, new_token: freshToken });
   });
 
