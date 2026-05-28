@@ -90,6 +90,9 @@
           <div class="dropdown">
             <button class="btn btn-sm btn-outline-secondary dropdown-toggle fw-bold" data-bs-toggle="dropdown">TOOLS</button>
             <ul class="dropdown-menu dropdown-menu-end shadow border-0">
+              <li><button class="dropdown-item py-2 small" onclick="exportChannels()"><i class="bi bi-download me-2"></i>Export JSON</button></li>
+              <li><button class="dropdown-item py-2 small" onclick="importChannels()"><i class="bi bi-upload me-2"></i>Import JSON</button></li>
+              <li><hr class="dropdown-divider"></li>
               <li><button class="dropdown-item py-2 small" onclick="if(passModal)passModal.show()"><i class="bi bi-shield-lock me-2"></i>Change PW</button></li>
               <li><hr class="dropdown-divider"></li>
               <li><button class="dropdown-item py-2 small text-danger" onclick="resetSystem()"><i class="bi bi-arrow-counterclockwise me-2"></i>System Reset</button></li>
@@ -135,6 +138,7 @@
                 <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-arrow-down-up opacity-25"></i></th>
+                <th style="width: 90px" class="d-none d-lg-table-cell border-0">Type</th>
                 <th style="width: 150px" class="text-center border-0">Actions</th>
               </tr>
             </thead>
@@ -215,7 +219,7 @@
         </div>
       </div>
       <div class="mb-1">
-        <label class="form-label mini-label fw-bold">Base URL *</label>
+        <label class="form-label mini-label fw-bold">Base URL * <span class="text-muted" style="font-weight:400">（包含 /v1）</span></label>
         <input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" required />
       </div>
       <div class="mb-1">
@@ -223,11 +227,19 @@
         <input type="text" id="ch-model" class="form-control form-control-sm" required />
       </div>
       <div class="row g-2 mb-1">
-        <div class="col-6">
+        <div class="col-4 d-flex flex-column justify-content-center">
           <label class="form-label mini-label fw-bold">Weight</label>
           <input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required />
         </div>
-        <div class="col-6 d-flex flex-column align-items-center justify-content-center">
+        <div class="col-4 d-flex flex-column justify-content-center">
+          <label class="form-label mini-label fw-bold">Stream Type</label>
+          <select id="ch-stream" class="form-select form-select-sm">
+            <option value="both">both</option>
+            <option value="stream">stream</option>
+            <option value="nonstream">nonstream</option>
+          </select>
+        </div>
+        <div class="col-4 d-flex flex-column align-items-center justify-content-center">
           <div class="form-check form-switch d-inline-block mb-0">
             <input class="form-check-input" type="checkbox" id="ch-enabled" checked>
           </div>
@@ -536,6 +548,7 @@
         row += '<td class="fw-bold align-middle">' + esc(c.name) + '</td>';
         row += '<td class="align-middle"><code class="small" style="cursor:pointer" onclick="copyModelName(\'' + modelName + '\')" title="點擊複製">' + displayName + '</code></td>';
         row += '<td class="d-none d-lg-table-cell align-middle">' + c.weight + '</td>';
+        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' bg-opacity-25 text-dark small">' + esc(c.stream_type || 'both') + '</span></td>';
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
@@ -556,7 +569,7 @@
         row += '</td>';
         row += '</tr>';
         return row;
-      }).join('') || '<tr><td colspan="6" class="py-4 text-muted">No channels.</td></tr>';
+      }).join('') || '<tr><td colspan="7" class="py-4 text-muted">No channels.</td></tr>';
       initTooltips();
     };
 
@@ -652,6 +665,7 @@
       ['ch-name','ch-key','ch-url','ch-model'].forEach(i => document.getElementById(i).value = '');
       document.getElementById('ch-weight').value = 50;
       document.getElementById('ch-enabled').checked = true;
+      document.getElementById('ch-stream').value = 'both';
       chModal.show();
     };
 
@@ -669,6 +683,7 @@
       document.getElementById('ch-model').value = c.model || '';
       document.getElementById('ch-weight').value = c.weight || 50;
       document.getElementById('ch-enabled').checked = c.is_enabled == 1;
+      document.getElementById('ch-stream').value = c.stream_type || 'both';
       chModal.show();
     };
 
@@ -691,6 +706,7 @@
         model: document.getElementById('ch-model').value,
         weight,
         is_enabled: document.getElementById('ch-enabled').checked ? 1 : 0,
+        stream_type: document.getElementById('ch-stream').value,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -719,6 +735,64 @@
       });
       renderChannels();
       renderStats();
+    };
+
+    const exportChannels = () => {
+      const data = channels.map(c => ({
+        name: c.name,
+        base_url: c.base_url,
+        model: c.model,
+        weight: c.weight,
+        is_enabled: c.is_enabled,
+        stream_type: c.stream_type || 'both',
+      }));
+      const blob = new Blob([JSON.stringify({ version: 1, channels: data }, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'channels-export.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      toast('已匯出 ' + data.length + ' 個渠道', 'success');
+    };
+
+    const importChannels = () => {
+      const input = document.createElement('input');
+      input.type = 'file'; input.accept = '.json';
+      input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const data = JSON.parse(text);
+          const arr = data?.channels || data;
+          if (!Array.isArray(arr)) throw new Error('格式錯誤：缺少 channels 陣列');
+          const validTypes = ['both', 'stream', 'nonstream'];
+          for (const ch of arr) {
+            if (!ch.name || !ch.base_url || !ch.model) throw new Error('缺少必要欄位 (name, base_url, model)');
+            if (ch.stream_type && !validTypes.includes(ch.stream_type)) throw new Error('無效的 stream_type: ' + ch.stream_type);
+          }
+          const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
+          let nextId = 1; while (existingIds.includes(nextId)) nextId++;
+          channels.length = 0;
+          for (const ch of arr) {
+            channels.push({
+              id: nextId++,
+              name: ch.name,
+              base_url: ch.base_url,
+              model: ch.model,
+              weight: ch.weight || 50,
+              is_enabled: ch.is_enabled != null ? (ch.is_enabled ? 1 : 0) : 1,
+              stream_type: ch.stream_type || 'both',
+            });
+          }
+          renderChannels();
+          renderStats();
+          toast('已匯入 ' + channels.length + ' 個渠道, 請留意 API Key 需手動補填', 'success');
+        } catch (err) {
+          toast('匯入失敗: ' + err.message, 'danger');
+        }
+      };
+      input.click();
     };
 
     const toggleKeyVis = () => {
