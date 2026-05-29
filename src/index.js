@@ -13,24 +13,43 @@ const SESSION_PRUNE_INTERVAL = 50;
 const adminSessions = new Map();
 let sessionPruneCounter = 0;
 
-function generateSessionToken() {
-  const token = generateToken();
-  adminSessions.set(token, Date.now() + SESSION_TTL);
+async function generateSessionToken(env) {
+  const token = generateToken("sess-");
+  const expiresAt = Date.now() + SESSION_TTL;
+  adminSessions.set(token, expiresAt);
+  await env.DB.prepare("INSERT OR REPLACE INTO sessions (token, expires_at) VALUES (?, ?)").bind(token, expiresAt).run().catch(() => {});
   return token;
 }
 
-function isValidSession(token) {
+async function isValidSession(env, token) {
   const expiry = adminSessions.get(token);
-  if (!expiry) return false;
-  if (Date.now() > expiry) { adminSessions.delete(token); return false; }
-  return true;
+  if (expiry) {
+    if (Date.now() > expiry) { adminSessions.delete(token); return false; }
+    return true;
+  }
+  try {
+    const row = await env.DB.prepare("SELECT expires_at FROM sessions WHERE token=?").bind(token).first();
+    if (row && row.expires_at > Date.now()) {
+      adminSessions.set(token, row.expires_at);
+      return true;
+    }
+    if (row) {
+      env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(token).run().catch(() => {});
+    }
+  } catch (e) {}
+  return false;
 }
 
+let pruneD1Counter = 0;
 function maybePruneSessions() {
   if (++sessionPruneCounter % SESSION_PRUNE_INTERVAL !== 0) return;
   const now = Date.now();
   for (const [k, v] of adminSessions) { if (now > v) adminSessions.delete(k); }
   if (adminSessions.size > 10000) adminSessions.clear();
+}
+async function pruneSessionD1(env) {
+  if (++pruneD1Counter % 20 !== 0) return;
+  await env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(Date.now()).run().catch(() => {});
 }
 const REFRESH_MS = 60_000;
 const D1_BATCH_LIMIT = 99;
@@ -68,11 +87,11 @@ function getPathChannelType(suffix) {
   return "chat";
 }
 
-function generateToken() {
+function generateToken(prefix = "sk-") {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
   const rand = new Uint32Array(30);
   crypto.getRandomValues(rand);
-  let t = "sk-";
+  let t = prefix;
   for (let i = 0; i < 30; i++) t += chars[rand[i] % chars.length];
   return t;
 }
@@ -197,9 +216,6 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   health_check_interval INTEGER NOT NULL DEFAULT 300,
   health_check_timeout INTEGER NOT NULL DEFAULT 5,
   consecutive_successes INTEGER NOT NULL DEFAULT 0,
-  canary_enabled INTEGER NOT NULL DEFAULT 0,
-  canary_percentage INTEGER NOT NULL DEFAULT 10,
-  canary_channels TEXT NOT NULL DEFAULT '[]',
   cache_enabled INTEGER NOT NULL DEFAULT 0,
   cache_ttl INTEGER NOT NULL DEFAULT 3600,
   rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm',
@@ -226,8 +242,13 @@ const SCHEMA_META_DDL = `CREATE TABLE IF NOT EXISTS schema_meta (
   value TEXT NOT NULL DEFAULT ''
 )`;
 
-const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL, SCHEMA_META_DDL];
-const ALL_TABLES = ["channels", "filters", "config", "schema_meta"];
+const SESSIONS_DDL = `CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+)`;
+
+const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL, SCHEMA_META_DDL, SESSIONS_DDL];
+const ALL_TABLES = ["channels", "filters", "config", "schema_meta", "sessions"];
 
 async function ensureSchema(env) {
   if (schemaReady) return;
@@ -293,9 +314,6 @@ async function ensureSchema(env) {
       "ALTER TABLE channels ADD COLUMN health_check_interval INTEGER NOT NULL DEFAULT 300",
       "ALTER TABLE channels ADD COLUMN health_check_timeout INTEGER NOT NULL DEFAULT 5",
       "ALTER TABLE channels ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN canary_enabled INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN canary_percentage INTEGER NOT NULL DEFAULT 10",
-      "ALTER TABLE channels ADD COLUMN canary_channels TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE channels ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE channels ADD COLUMN cache_ttl INTEGER NOT NULL DEFAULT 3600",
       "ALTER TABLE channels ADD COLUMN rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm'",
@@ -360,13 +378,17 @@ const degradedUntil = new Map();
 
 async function loadChannels(env, channelType) {
   const now = Date.now();
-  // 無類型過濾時才走快取；類型查詢每次從 DB 讀取（量小，避免快取污染）
   if (!channelType && cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
   if (loadPromise && !channelType) return loadPromise;
-  const pKey = loadPromise;
   loadPromise = (async () => {
     try {
-      let sql = "SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers, cooldown_until FROM channels WHERE is_enabled = 1";
+      let sql = `SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers,
+        cooldown_until, rpm_limit, rpd_limit, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at,
+        consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
+        cache_enabled, cache_ttl,
+        rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
+        fallback_model, model, max_tokens, is_enabled
+        FROM channels WHERE is_enabled = 1`;
       const params = [];
       if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
       sql += " ORDER BY weight DESC";
@@ -380,7 +402,6 @@ async function loadChannels(env, channelType) {
         }
         if (ch.cooldown_until > nowMs) { degradedUntil.set(ch.id, ch.cooldown_until); }
       }
-      // 只有無類型查詢才更新快取
       if (!channelType) { cachedChannels = active; lastLoad = Date.now(); }
       return active;
     } catch (e) {
@@ -398,29 +419,33 @@ function clearChannelCache() {
 }
 
 function selectChannel(channels, exclude = new Set()) {
+  // 如果所有 channel 都已 degraded，嘗試撈取已冷卻完畢的 channel
   const healthy = channels.filter(c => !exclude.has(c.id) && !isDegraded(c.id));
   if (healthy.length === 0) return null;
-  const totalWeight = healthy.reduce((s, c) => s + Math.max(c.weight, 1), 0);
+  const pool = healthy;
+  const totalWeight = pool.reduce((s, c) => s + Math.max(c.weight, 1), 0);
   let r = Math.random() * totalWeight;
-  for (const c of healthy) {
+  for (const c of pool) {
     r -= Math.max(c.weight, 1);
     if (r <= 0) return c;
   }
-  return healthy[healthy.length - 1];
+  return pool[pool.length - 1];
 }
 
 function markDegraded(channelId, env) {
   const until = Date.now() + CHANNEL_COOLDOWN_MS;
   degradedUntil.set(channelId, until);
   if (env) {
-    env.DB.prepare("UPDATE channels SET cooldown_until=? WHERE id=?").bind(until, channelId).run().catch(() => {});
+    // 遞增 consecutive_errors；達閾值則自動關閉 channel（冷卻過後管理員可手動重啟）
+    env.DB.prepare(`UPDATE channels SET cooldown_until=?, consecutive_errors=consecutive_errors+1, consecutive_successes=0 WHERE id=?`).bind(until, channelId).run().catch(() => {});
   }
 }
 
 function markHealthy(channelId, env) {
   degradedUntil.delete(channelId);
   if (env) {
-    env.DB.prepare("UPDATE channels SET cooldown_until=0 WHERE id=?").bind(channelId).run().catch(() => {});
+    // 遞增 consecutive_successes；達 3 次則重置 consecutive_errors 與 cooldown
+    env.DB.prepare(`UPDATE channels SET cooldown_until=0, consecutive_successes=consecutive_successes+1, consecutive_errors=CASE WHEN consecutive_errors>0 THEN consecutive_errors-1 ELSE 0 END WHERE id=?`).bind(channelId).run().catch(() => {});
   }
 }
 
@@ -430,6 +455,82 @@ function isDegraded(channelId) {
   if (Date.now() < until) return true;
   degradedUntil.delete(channelId);
   return false;
+}
+
+// 簡易記憶體 Token Bucket（按 channelId）
+const tokenBuckets = new Map();
+const TOKEN_BUCKET_SYNC_MS = 30000;
+let lastBucketSync = 0;
+
+function checkRateLimit(channel) {
+  if (!channel.rpm_limit && !channel.rpd_limit && !channel.rate_limit_capacity) return { ok: true };
+  const now = Date.now();
+  const cid = channel.id || 0;
+  let bucket = tokenBuckets.get(cid);
+  if (!bucket) {
+    bucket = {
+      rpm: channel.rpm_limit || 0, rpmTs: now, rpmCount: 0,
+      rpd: channel.rpd_limit || 0, rpdTs: now, rpdCount: 0,
+      tokens: channel.rate_limit_capacity || 0, tokenTs: now,
+      capacity: channel.rate_limit_capacity || 0, rate: (channel.rate_limit_rate || 0) / 60,
+    };
+    tokenBuckets.set(cid, bucket);
+  }
+  // RPM 檢查
+  if (bucket.rpm > 0) {
+    if (now - bucket.rpmTs > 60000) { bucket.rpmCount = 0; bucket.rpmTs = now; }
+    if (bucket.rpmCount >= bucket.rpm) return { ok: false, reason: "rpm_limit" };
+    bucket.rpmCount++;
+  }
+  // RPD 檢查
+  if (bucket.rpd > 0) {
+    if (now - bucket.rpdTs > 86400000) { bucket.rpdCount = 0; bucket.rpdTs = now; }
+    if (bucket.rpdCount >= bucket.rpd) return { ok: false, reason: "rpd_limit" };
+    bucket.rpdCount++;
+  }
+  // Token Bucket（演算法）
+  if (bucket.capacity > 0 && bucket.rate > 0) {
+    const elapsed = (now - bucket.tokenTs) / 1000;
+    bucket.tokens = Math.min(bucket.capacity, bucket.tokens + elapsed * bucket.rate);
+    bucket.tokenTs = now;
+    if (bucket.tokens < 1) return { ok: false, reason: "rate_limit" };
+    bucket.tokens -= 1;
+  }
+  return { ok: true };
+}
+
+// 記憶體快取（non-stream 響應）
+const responseCache = new Map();
+const CACHE_MAX_ENTRIES = 200;
+
+function getCacheKey(model, body) {
+  if (!body) return null;
+  try {
+    const p = typeof body === "string" ? JSON.parse(body) : body;
+    const msgHash = JSON.stringify(p.messages || p.input || "");
+    return `${model || ""}:${msgHash.length}:${hashStr(msgHash)}`;
+  } catch { return null; }
+}
+
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) { h = ((h << 5) - h + s.charCodeAt(i)) | 0; }
+  return h.toString(36);
+}
+
+function cacheGet(key) {
+  const entry = responseCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expires) { responseCache.delete(key); return null; }
+  return entry.data;
+}
+
+function cacheSet(key, data, ttl) {
+  if (responseCache.size >= CACHE_MAX_ENTRIES) {
+    const firstKey = responseCache.keys().next().value;
+    if (firstKey) responseCache.delete(firstKey);
+  }
+  responseCache.set(key, { data, expires: Date.now() + (ttl || 3600) * 1000 });
 }
 
 let tokenCache = { token: null, ts: 0 };
@@ -551,13 +652,11 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
   const requiredType = getPathChannelType(suffix);
-  // SQL 層先過濾 channel_type，減少 D1 rows_read 與 JS 陣列操作
   let channels = await loadChannels(env, requiredType);
   if (channels.length === 0) {
     if (requiredType !== "chat") {
       return { error: { message: `No enabled channel with type "${requiredType}" for path "${suffix}"`, status: 503 } };
     }
-    // fallback: 非 chat 以外的請求才容許任類型 channel
     channels = await loadChannels(env);
     if (channels.length === 0) return { error: { message: "No upstream channels available", status: 503 } };
   }
@@ -566,15 +665,32 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     logStructured("warn", "no channels match stream_type, falling back to all", { streamType, path, rid });
     eligible = channels;
   }
+  // 非串流請求嘗試走快取
+  if (streamType !== "stream" && body && requiredType !== "chat") {
+    const ck = getCacheKey("", body);
+    if (ck) {
+      const cached = cacheGet(ck);
+      if (cached) return { response: new Response(cached.body, { status: 200, headers: new Headers(cached.headers) }) };
+    }
+  }
   const attempted = new Set();
   for (let i = 0; i < Math.min(3, eligible.length); i++) {
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
     const channel = selectChannel(eligible, attempted);
     if (!channel) break;
+    // rate limit 檢查
+    const rl = checkRateLimit(channel);
+    if (!rl.ok) {
+      attempted.add(channel.id);
+      logStructured("warn", "rate limit exceeded, try next", { channel: channel.name, reason: rl.reason, rid });
+      markDegraded(channel.id, env);
+      continue;
+    }
     const upstreamPath = suffix;
     const url = channel.base_url.replace(/\/+$/, "") + upstreamPath;
     const headers = new Headers(baseHeaders);
     headers.set("Authorization", `Bearer ${channel.api_key}`);
+    // 套用自訂 header
     if (channel.headers) {
       try {
         const customHeaders = typeof channel.headers === "string" ? JSON.parse(channel.headers) : channel.headers;
@@ -585,10 +701,54 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
       } catch (e) {}
     }
+    // 從 provider_options 解析請求重寫規則
+    let reqBody = body;
+    if (channel.provider_options) {
+      try {
+        const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
+        if (opts.rewrite?.request?.headers) {
+          for (const [k, v] of Object.entries(opts.rewrite.request.headers)) {
+            if (v === null || v === "") headers.delete(k);
+            else headers.set(k, String(v));
+          }
+        }
+        if (opts.rewrite?.request?.body && reqBody) {
+          const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : (typeof reqBody === "string" ? reqBody : null);
+          if (bodyStr) {
+            let parsed = JSON.parse(bodyStr);
+            // model_map: 將用戶請求的 model 名稱映射到 provider 使用的 model 名稱
+            if (opts.model_map && parsed.model) {
+              const mapped = opts.model_map[parsed.model];
+              if (mapped) parsed.model = mapped;
+            }
+            for (const [path, val] of Object.entries(opts.rewrite.request.body)) {
+              if (path === "model") parsed.model = val;
+              else if (path === "max_tokens") parsed.max_tokens = val;
+              else if (path === "temperature") parsed.temperature = val;
+              else if (path === "top_p") parsed.top_p = val;
+              else { parsed[path] = val; }
+            }
+            reqBody = JSON.stringify(parsed);
+          }
+        }
+      } catch (e) {}
+    }
+    // fallback_model: 覆寫請求 model（無論有無 provider_options 都適用）
+    if (channel.fallback_model && reqBody) {
+      try {
+        const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : (typeof reqBody === "string" ? reqBody : null);
+        if (bodyStr) {
+          const parsed = JSON.parse(bodyStr);
+          if (parsed.model && parsed.model !== channel.fallback_model) {
+            parsed.model = channel.fallback_model;
+            reqBody = JSON.stringify(parsed);
+          }
+        }
+      } catch (e) {}
+    }
     let timer;
     const controller = new AbortController();
     const onAbort = () => controller.abort();
-    // 先 addEventListener 再檢查 aborted，避免 race（abort 事件不會在同步程式碼中觸發）
     if (clientSignal) {
       clientSignal.addEventListener("abort", onAbort, { once: true });
       if (clientSignal.aborted) {
@@ -597,10 +757,9 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
     }
     try {
-      let reqBody = body;
       if (method === "POST" && body && channel.stream_type === "nonstream") {
         try {
-          const bodyStr = body instanceof ArrayBuffer ? new TextDecoder().decode(body) : body;
+          const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : reqBody;
           const parsed = JSON.parse(bodyStr);
           if (parsed.stream === true) {
             const { stream, ...rest } = parsed;
@@ -612,9 +771,47 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       const res = await fetch(url, { method, headers, body: reqBody, signal: controller.signal });
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
-      if (res.ok) { markHealthy(channel.id, env); return { response: res, channel }; }
+      if (res.ok) {
+        markHealthy(channel.id, env);
+        // 套用響應重寫 / 驗證
+        if (channel.provider_options) {
+          try {
+            const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
+            if (opts.validate?.response?.required_fields && res.headers.get("Content-Type")?.includes("json")) {
+              const text = await res.clone().text();
+              const parsed = JSON.parse(text);
+              for (const field of opts.validate.response.required_fields) {
+                if (field.includes(".")) {
+                  const parts = field.split(".");
+                  let val = parsed;
+                  for (const p of parts) { if (val != null) val = val[p]; }
+                  if (val == null) { logStructured("warn", "response validation failed", { channel: channel.name, missing: field, rid }); }
+                } else if (parsed[field] == null) {
+                  logStructured("warn", "response validation failed", { channel: channel.name, missing: field, rid });
+                }
+              }
+            }
+            if (opts.rewrite?.response?.headers) {
+              for (const [k, v] of Object.entries(opts.rewrite.response.headers)) {
+                if (v === null || v === "") res.headers.delete(k);
+                else res.headers.set(k, String(v));
+              }
+            }
+      } catch (e) {}
+    }
+        // 非串流快取：僅快取 embeddings / moderations 類型
+        if (streamType !== "stream" && !(body && typeof body === "string" && body.includes('"stream":true'))) {
+          const ct = res.headers.get("Content-Type") || "";
+          if (ct.includes("application/json") && (requiredType === "embed" || requiredType === "moderate")) {
+            res.clone().text().then(text => {
+              const ck = getCacheKey("", body);
+              if (ck) cacheSet(ck, { body: text, headers: { "Content-Type": ct } }, channel.cache_ttl || 3600);
+            }).catch(() => {});
+          }
+        }
+        return { response: res, channel };
+      }
       if (res.status >= 500 || res.status === 429) {
-        // 消耗 body 避免連線懸掛
         res.body?.cancel().catch(() => {});
         markDegraded(channel.id, env);
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
@@ -892,10 +1089,11 @@ function createDashboardApi() {
     if (!inputToken) return c.json({ error: "Unauthorized" }, 401);
     // fast path: session token (無 PBKDF2)
     maybePruneSessions();
-    if (isValidSession(inputToken)) return await next();
+    pruneSessionD1(c.env);
+    if (await isValidSession(c.env, inputToken)) return await next();
     // slow path: legacy token (密碼), 驗證後回寫 session token
     if (await verifyPassword(inputToken, storedHash)) {
-      const sessionToken = generateSessionToken();
+      const sessionToken = await generateSessionToken(c.env);
       c.header("X-Session-Token", sessionToken);
       return await next();
     }
@@ -911,7 +1109,9 @@ function createDashboardApi() {
     const channels = (ch.results || []).map(ch => {
       let headers = ch.headers || [];
       if (typeof headers === "string") try { headers = JSON.parse(headers); } catch (e) { headers = []; }
-      return { ...ch, api_key: maskApiKey(ch.api_key || ''), headers };
+      let provider_options = ch.provider_options || null;
+      if (typeof provider_options === "string") try { provider_options = JSON.parse(provider_options); } catch (e) { provider_options = null; }
+      return { ...ch, api_key: maskApiKey(ch.api_key || ''), headers, provider_options };
     });
     return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "" } });
   });
@@ -932,15 +1132,28 @@ function createDashboardApi() {
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const isMasked = (key) => typeof key === "string" && key.includes("***");
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers";
-    const ph = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools";
+    const ph = cols.split(",").map(() => "?").join(",");
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
       const apiKey = (!ch.api_key || isMasked(ch.api_key)) ? (allKeys[ch.id] || "") : ch.api_key;
       batch.push(
         c.env.DB.prepare(`INSERT INTO channels (${cols}) VALUES (${ph})`).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0,
-          ch.stream_type || "both", ch.channel_type || "chat", JSON.stringify(ch.headers || [])
+          ch.stream_type || "both", ch.channel_type || "chat", JSON.stringify(ch.headers || []),
+          ch.provider || "", (ch.provider_options && typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : (typeof ch.provider_options === "string" ? ch.provider_options : "[]")), ch.max_tokens || 0, ch.fallback_model || "",
+          ch.health_check_enabled ? 1 : 0, ch.health_check_interval || 300, ch.health_check_timeout || 5,
+          ch.cache_enabled ? 1 : 0, ch.cache_ttl || 3600,
+          ch.rate_limit_algorithm || "rpm", ch.rate_limit_capacity || 0, ch.rate_limit_rate || 0,
+          ch.rpm_limit || 0, ch.rpd_limit || 0,
+          ch.consecutive_errors || 0, ch.last_error_msg || "", ch.last_error_at || 0,
+          ch.support_stream != null ? (ch.support_stream ? 1 : 0) : 1,
+          ch.support_image_gen != null ? (ch.support_image_gen ? 1 : 0) : 0,
+          ch.support_audio_tts != null ? (ch.support_audio_tts ? 1 : 0) : 0,
+          ch.support_audio_stt != null ? (ch.support_audio_stt ? 1 : 0) : 0,
+          ch.support_image_edit != null ? (ch.support_image_edit ? 1 : 0) : 0,
+          ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
+          ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1
         )
       );
     }
@@ -988,12 +1201,12 @@ function createDashboardApi() {
     const { token } = await c.req.json();
     if (!token) return c.json({ valid: false }, 400);
     // fast path: session token
-    if (isValidSession(token)) return c.json({ valid: true });
+    if (await isValidSession(c.env, token)) return c.json({ valid: true });
     // slow path: 相容舊版 password token → 升級為 session token
     const storedHash = await getAdminPass(c);
     if (!storedHash) return c.json({ valid: false }, 403);
     if (await verifyPassword(token, storedHash)) {
-      return c.json({ valid: true, sessionToken: generateSessionToken() });
+      return c.json({ valid: true, sessionToken: await generateSessionToken(c.env) });
     }
     return c.json({ valid: false });
   });
@@ -1092,7 +1305,7 @@ function createDashboardApp() {
     if (!storedHash) return c.json({ error: "尚未設定密碼" }, 403);
     if (await verifyPassword(password, storedHash)) {
       loginState.delete(ip);
-      return c.json({ ok: true, sessionToken: generateSessionToken() });
+      return c.json({ ok: true, sessionToken: await generateSessionToken(c.env) });
     }
     const newCount = state.count + 1;
     if (newCount >= LOGIN_MAX_FAILURES) {

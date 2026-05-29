@@ -283,6 +283,25 @@
           <p class="text-muted small mb-2">自訂 Header 會在轉發請求時附加到上游。</p>
           <div id="header-list" class="mb-2"></div>
           <button type="button" class="btn btn-outline-secondary btn-sm w-100 mt-1 fw-bold" onclick="addHeaderRow()"><i class="bi bi-plus-lg me-1"></i>ADD HEADER</button>
+          <hr class="my-2">
+          <div class="row g-1 mb-1">
+            <div class="col-6">
+              <label class="form-label mini-label fw-bold">RPM</label>
+              <input type="number" id="ch-rpm" class="form-control form-control-sm" value="0" min="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label mini-label fw-bold">RPD</label>
+              <input type="number" id="ch-rpd" class="form-control form-control-sm" value="0" min="0">
+            </div>
+          </div>
+          <div class="mb-1">
+            <label class="form-label mini-label fw-bold">Override Model <span class="text-muted" style="font-weight:400">（留空 = 不覆寫）</span></label>
+            <input type="text" id="ch-override-model" class="form-control form-control-sm" placeholder="gpt-4-turbo">
+          </div>
+          <div class="mb-1">
+            <label class="form-label mini-label fw-bold">Provider Options (JSON)</label>
+            <textarea id="ch-provider-options" class="form-control form-control-sm" rows="3" placeholder='{"rewrite":{"request":{"body":{"model":"gpt-4-turbo"}}},"validate":{"response":{"required_fields":["choices"]}}}' style="font-family:monospace;font-size:0.7rem"></textarea>
+          </div>
         </div>
       </div>
     </div>
@@ -742,6 +761,10 @@
       updateEnabledBtn();
       document.getElementById('ch-stream').value = 'both';
       document.getElementById('ch-type').value = 'chat';
+      document.getElementById('ch-rpm').value = '0';
+      document.getElementById('ch-rpd').value = '0';
+      document.getElementById('ch-override-model').value = '';
+      document.getElementById('ch-provider-options').value = '';
       chHeaders = [];
       renderHeaders();
       switchTab('basic');
@@ -765,6 +788,12 @@
       updateEnabledBtn();
       document.getElementById('ch-stream').value = c.stream_type || 'both';
       document.getElementById('ch-type').value = c.channel_type || 'chat';
+      document.getElementById('ch-rpm').value = c.rpm_limit || 0;
+      document.getElementById('ch-rpd').value = c.rpd_limit || 0;
+      document.getElementById('ch-override-model').value = c.fallback_model || '';
+      let popts = {};
+      if (c.provider_options) { try { popts = typeof c.provider_options === "string" ? JSON.parse(c.provider_options) : c.provider_options; } catch (e) {} }
+      document.getElementById('ch-provider-options').value = Object.keys(popts).length ? JSON.stringify(popts, null, 2) : '';
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
       switchTab('basic');
@@ -782,6 +811,12 @@
       if (!url) return toast('請輸入 Base URL', 'warning');
 
       const idVal = document.getElementById('ch-id').value;
+      const rpmLimit = parseInt(document.getElementById('ch-rpm')?.value) || 0;
+      const rpdLimit = parseInt(document.getElementById('ch-rpd')?.value) || 0;
+      const overrideModel = document.getElementById('ch-override-model')?.value?.trim() || '';
+      let providerOptions = null;
+      const poText = document.getElementById('ch-provider-options')?.value?.trim();
+      if (poText) { try { providerOptions = JSON.parse(poText); } catch (e) { toast('Provider Options JSON 格式錯誤', 'warning'); return; } }
       const ch = {
         id: idVal ? parseInt(idVal) : undefined,
         name,
@@ -793,6 +828,10 @@
         stream_type: document.getElementById('ch-stream').value,
         channel_type: document.getElementById('ch-type').value,
         headers: chHeaders.filter(h => h.key && h.key.trim()),
+        rpm_limit: rpmLimit,
+        rpd_limit: rpdLimit,
+        fallback_model: overrideModel,
+        provider_options: providerOptions,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -833,6 +872,10 @@
         stream_type: c.stream_type || 'both',
         channel_type: c.channel_type || 'chat',
         headers: Array.isArray(c.headers) ? c.headers.filter(h => h.key) : [],
+        rpm_limit: c.rpm_limit || 0,
+        rpd_limit: c.rpd_limit || 0,
+        fallback_model: c.fallback_model || '',
+        provider_options: c.provider_options,
       }));
       const blob = new Blob([JSON.stringify({ version: 1, channels: data }, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -871,6 +914,10 @@
             stream_type: ch.stream_type || 'both',
             channel_type: ch.channel_type || 'chat',
             headers: Array.isArray(ch.headers) ? ch.headers.filter(h => h.key) : [],
+            rpm_limit: ch.rpm_limit || 0,
+            rpd_limit: ch.rpd_limit || 0,
+            fallback_model: ch.fallback_model || '',
+            provider_options: ch.provider_options || null,
           }));
           channels.splice(0, channels.length, ...newChannels);
           renderChannels();
