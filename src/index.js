@@ -5,7 +5,7 @@ import portalHtml from "./dashboard/portal.html";
 
 const UPSTREAM_TIMEOUT_MS = 120_000;
 const CHANNEL_COOLDOWN_MS = UPSTREAM_TIMEOUT_MS;
-const STREAM_IDLE_TIMEOUT_MS = 60_000;
+const STREAM_IDLE_TIMEOUT_MS = 180_000;
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
 const SESSION_TTL = 86400000;
@@ -374,48 +374,74 @@ class RollingFilter {
 let cachedChannels = null;
 let lastLoad = 0;
 let loadPromise = null;
+const typeChannelCache = new Map(); // "type" => { data, ts }
+const TYPE_CACHE_TTL = 30000;
 const degradedUntil = new Map();
 
 async function loadChannels(env, channelType) {
   const now = Date.now();
-  if (!channelType && cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
+  // type-specific 快取（短 TTL 30s）
+  if (channelType) {
+    const cached = typeChannelCache.get(channelType);
+    if (cached && now - cached.ts < TYPE_CACHE_TTL) return cached.data;
+  } else {
+    // 通用快取（REFRESH_MS = 60s）
+    if (cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
+  }
+  // 只有通用查詢才共享 loadPromise，避免 type 查詢阻塞
   if (loadPromise && !channelType) return loadPromise;
-  loadPromise = (async () => {
-    try {
-      let sql = `SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers,
-        cooldown_until, rpm_limit, rpd_limit, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at,
-        consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
-        cache_enabled, cache_ttl,
-        rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
-        fallback_model, model, max_tokens, is_enabled
-        FROM channels WHERE is_enabled = 1`;
-      const params = [];
-      if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
-      sql += " ORDER BY weight DESC";
-      const { results } = await env.DB.prepare(sql).bind(...params).all();
-      const rows = results || [];
-      const nowMs = Date.now();
-      const active = rows.filter(ch => !ch.cooldown_until || ch.cooldown_until <= nowMs);
-      for (const ch of rows) {
-        if (ch.cooldown_until > 0 && ch.cooldown_until <= nowMs) {
-          env.DB.prepare("UPDATE channels SET cooldown_until=0 WHERE id=?").bind(ch.id).run().catch(() => {});
-        }
-        if (ch.cooldown_until > nowMs) { degradedUntil.set(ch.id, ch.cooldown_until); }
+  if (!channelType) {
+    loadPromise = (async () => {
+      try {
+        const rows = await dbLoadChannels(env, null);
+        cachedChannels = rows; lastLoad = Date.now();
+        return rows;
+      } catch (e) {
+        console.error("[channel] load error:", e.message);
+        cachedChannels = cachedChannels || [];
+        return cachedChannels;
       }
-      if (!channelType) { cachedChannels = active; lastLoad = Date.now(); }
-      return active;
-    } catch (e) {
-      console.error("[channel] load error:", e.message);
-      if (!channelType) cachedChannels = cachedChannels || [];
-      return cachedChannels || [];
+    })();
+    return loadPromise;
+  }
+  return dbLoadChannels(env, channelType);
+}
+
+async function dbLoadChannels(env, channelType) {
+  try {
+    let sql = `SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers,
+      cooldown_until, rpm_limit, rpd_limit, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at,
+      consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
+      cache_enabled, cache_ttl,
+      rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
+      fallback_model, model, max_tokens, is_enabled
+      FROM channels WHERE is_enabled = 1`;
+    const params = [];
+    if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
+    sql += " ORDER BY weight DESC";
+    const { results } = await env.DB.prepare(sql).bind(...params).all();
+    const rows = results || [];
+    const nowMs = Date.now();
+    const active = rows.filter(ch => !ch.cooldown_until || ch.cooldown_until <= nowMs);
+    for (const ch of rows) {
+      if (ch.cooldown_until > 0 && ch.cooldown_until <= nowMs) {
+        env.DB.prepare("UPDATE channels SET cooldown_until=0 WHERE id=?").bind(ch.id).run().catch(() => {});
+      }
+      if (ch.cooldown_until > nowMs) { degradedUntil.set(ch.id, ch.cooldown_until); }
     }
-  })();
-  return loadPromise;
+    if (channelType) { typeChannelCache.set(channelType, { data: active, ts: Date.now() }); }
+    return active;
+  } catch (e) {
+    console.error("[channel] load error:", e.message);
+    const fallback = channelType ? (typeChannelCache.get(channelType)?.data || []) : (cachedChannels || []);
+    return fallback;
+  }
 }
 
 function clearChannelCache() {
   cachedChannels = null;
   lastLoad = 0;
+  typeChannelCache.clear();
 }
 
 function selectChannel(channels, exclude = new Set()) {
@@ -642,9 +668,9 @@ function createIdleTimeoutStream(readable, idleMs) {
         if (result.done) { await writer.close(); return; }
         await writer.write(result.value);
       }
-    } catch (e) { await writer.close(); }
+    } catch (e) { /* idle timeout or client disconnect — safe to close */ try { await writer.close(); } catch (_) {} }
     finally { clearTimeout(idleTimer); reader.releaseLock(); }
-  })();
+  })().catch(e => logStructured("error", "idle-timeout-stream internal error", { error: e.message }));
   return out;
 }
 
@@ -674,7 +700,10 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     }
   }
   const attempted = new Set();
-  for (let i = 0; i < Math.min(3, eligible.length); i++) {
+  const maxAttempts = Math.min(eligible.length, 10);
+  let attempts = 0;
+  while (attempts < maxAttempts && attempted.size < eligible.length) {
+    attempts++;
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
     const channel = selectChannel(eligible, attempted);
     if (!channel) break;
@@ -777,6 +806,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         if (channel.provider_options) {
           try {
             const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
+            // 驗證僅 log 不阻斷請求：log-only, 無論驗證成功與否都不影響回傳內容
             if (opts.validate?.response?.required_fields && res.headers.get("Content-Type")?.includes("json")) {
               const text = await res.clone().text();
               const parsed = JSON.parse(text);
@@ -797,8 +827,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
                 else res.headers.set(k, String(v));
               }
             }
-      } catch (e) {}
-    }
+          } catch (e) {}
+        }
         // 非串流快取：僅快取 embeddings / moderations 類型
         if (streamType !== "stream" && !(body && typeof body === "string" && body.includes('"stream":true'))) {
           const ct = res.headers.get("Content-Type") || "";
@@ -928,7 +958,7 @@ function nonStreamToStream(bodyText, filters) {
       } catch (e2) {}
     }
     try { await w.close(); } catch (e) { logStructured("warn", "closing non-stream writer failed", { error: e.message }); }
-  })();
+  })().catch(e => logStructured("error", "non-stream-to-stream internal error", { error: e.message }));
   return readable;
 }
 
@@ -1066,6 +1096,8 @@ function validateChannelData(channels) {
             errors.push(`[${i}] headers[${j}]: key is required`);
           else if (/[^a-zA-Z0-9\-\_]/.test(h.key.trim()))
             errors.push(`[${i}] headers[${j}]: invalid key "${h.key}"`);
+          if (h.value === undefined || h.value === null || (typeof h.value === "string" && h.value.trim().length === 0))
+            errors.push(`[${i}] headers[${j}]: value is required`);
         }
       }
     }
