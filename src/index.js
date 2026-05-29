@@ -445,7 +445,7 @@ function markHealthy(channelId, env) {
   degradedUntil.delete(channelId);
   if (env) {
     // 遞增 consecutive_successes；達 3 次則重置 consecutive_errors 與 cooldown
-    env.DB.prepare(`UPDATE channels SET cooldown_until=0, consecutive_successes=consecutive_successes+1, consecutive_errors=CASE WHEN consecutive_errors>0 THEN consecutive_errors-1 ELSE 0 END WHERE id=?`).bind(channelId).run().catch(() => {});
+    env.DB.prepare(`UPDATE channels SET cooldown_until=0, consecutive_successes=consecutive_successes+1, consecutive_errors=0 WHERE id=?`).bind(channelId).run().catch(() => {});
   }
 }
 
@@ -683,7 +683,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     if (!rl.ok) {
       attempted.add(channel.id);
       logStructured("warn", "rate limit exceeded, try next", { channel: channel.name, reason: rl.reason, rid });
-      markDegraded(channel.id, env);
       continue;
     }
     const upstreamPath = suffix;
@@ -733,14 +732,15 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
       } catch (e) {}
     }
-    // fallback_model: 覆寫請求 model（無論有無 provider_options 都適用）
-    if (channel.fallback_model && reqBody) {
+    // model override: fallback_model 優先，無則用 channel.model
+    const overrideModel = channel.fallback_model || channel.model;
+    if (overrideModel && reqBody) {
       try {
         const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : (typeof reqBody === "string" ? reqBody : null);
         if (bodyStr) {
           const parsed = JSON.parse(bodyStr);
-          if (parsed.model && parsed.model !== channel.fallback_model) {
-            parsed.model = channel.fallback_model;
+          if (parsed.model && parsed.model !== overrideModel) {
+            parsed.model = overrideModel;
             reqBody = JSON.stringify(parsed);
           }
         }
