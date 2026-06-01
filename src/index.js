@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
-import portalHtml from "./dashboard/portal.html";
+import portalHtml from "./dashboard.html";
 
 const UPSTREAM_TIMEOUT_MS = 120_000;
 const CHANNEL_COOLDOWN_MS = UPSTREAM_TIMEOUT_MS;
@@ -106,6 +106,12 @@ function maskApiKey(str) {
   });
 }
 
+function maskApiKeyValue(key) {
+  // 遮罩純 API key 值（非 JSON 字串內嵌 key），保留前 8 末 4 供識別
+  if (typeof key !== "string" || key.length < 12) return key;
+  return key.slice(0, 8) + "***" + key.slice(-4);
+}
+
 function getDefaults() {
   return { token: generateToken() };
 }
@@ -194,6 +200,7 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   created_at  INTEGER NOT NULL DEFAULT unixepoch(),
   updated_at  INTEGER NOT NULL DEFAULT unixepoch(),
   support_tools INTEGER NOT NULL DEFAULT 1,
+  support_vision INTEGER NOT NULL DEFAULT 0,
   response_time INTEGER NOT NULL DEFAULT 0,
   fallback_model TEXT NOT NULL DEFAULT '',
   max_tokens INTEGER NOT NULL DEFAULT 0,
@@ -282,51 +289,56 @@ async function ensureSchema(env) {
     const meta = await env.DB.prepare("SELECT value FROM schema_meta WHERE key='schema_ver'").first();
     schemaVer = meta?.value || "0";
   } catch (e) { /* schema_meta 表格尚未就緒 */ }
-  if (schemaVer < "2") {
-    const migrations = [
-      "ALTER TABLE channels ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'both'",
-      "ALTER TABLE channels ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'",
-      "ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'chat'",
-      "ALTER TABLE channels ADD COLUMN provider_options TEXT NOT NULL DEFAULT '[]'",
-      "ALTER TABLE channels ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE channels ADD COLUMN absolute_url INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN support_tools INTEGER NOT NULL DEFAULT 1",
-      "ALTER TABLE channels ADD COLUMN response_time INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN fallback_model TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE channels ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rpd_limit INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rpm_count INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rpm_reset_at INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rpd_count INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rpd_reset_at INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN last_error_msg TEXT NOT NULL DEFAULT ''",
-      "ALTER TABLE channels ADD COLUMN last_error_at INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1",
-      "ALTER TABLE channels ADD COLUMN support_image_gen INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN support_audio_tts INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN support_audio_stt INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN support_image_edit INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN support_embeddings INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN health_check_enabled INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN health_check_interval INTEGER NOT NULL DEFAULT 300",
-      "ALTER TABLE channels ADD COLUMN health_check_timeout INTEGER NOT NULL DEFAULT 5",
-      "ALTER TABLE channels ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN cache_ttl INTEGER NOT NULL DEFAULT 3600",
-      "ALTER TABLE channels ADD COLUMN rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm'",
-      "ALTER TABLE channels ADD COLUMN rate_limit_capacity INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rate_limit_rate INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE channels ADD COLUMN rate_limit_key TEXT NOT NULL DEFAULT ''",
-    ];
+  if (parseInt(schemaVer, 10) < 3) {
+    const migrations = [];
+    if (parseInt(schemaVer, 10) < 2) {
+      migrations.push(
+        "ALTER TABLE channels ADD COLUMN stream_type TEXT NOT NULL DEFAULT 'both'",
+        "ALTER TABLE channels ADD COLUMN headers TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'chat'",
+        "ALTER TABLE channels ADD COLUMN provider_options TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE channels ADD COLUMN provider TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE channels ADD COLUMN absolute_url INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN cooldown_until INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN support_tools INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE channels ADD COLUMN response_time INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN fallback_model TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE channels ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rpm_limit INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rpd_limit INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rpm_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rpm_reset_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rpd_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rpd_reset_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN last_error_msg TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE channels ADD COLUMN last_error_at INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN support_stream INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE channels ADD COLUMN support_image_gen INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN support_audio_tts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN support_audio_stt INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN support_image_edit INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN support_embeddings INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN health_check_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN health_check_interval INTEGER NOT NULL DEFAULT 300",
+        "ALTER TABLE channels ADD COLUMN health_check_timeout INTEGER NOT NULL DEFAULT 5",
+        "ALTER TABLE channels ADD COLUMN consecutive_successes INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN cache_ttl INTEGER NOT NULL DEFAULT 3600",
+        "ALTER TABLE channels ADD COLUMN rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm'",
+        "ALTER TABLE channels ADD COLUMN rate_limit_capacity INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rate_limit_rate INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE channels ADD COLUMN rate_limit_key TEXT NOT NULL DEFAULT ''"
+      );
+    }
+    // v3 migration: support_vision
+    migrations.push("ALTER TABLE channels ADD COLUMN support_vision INTEGER NOT NULL DEFAULT 0");
     for (const sql of migrations) {
       try { await env.DB.prepare(sql).run(); } catch (e) { /* 欄位已存在則略過 */ }
     }
   }
   // migration 完成後寫入 DB flag，下次冷啟動直接跳過
-  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '2')").run();
+  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '3')").run();
   schemaReady = true;
 }
 
@@ -384,27 +396,26 @@ async function loadChannels(env, channelType) {
   if (channelType) {
     const cached = typeChannelCache.get(channelType);
     if (cached && now - cached.ts < TYPE_CACHE_TTL) return cached.data;
-  } else {
-    // 通用快取（REFRESH_MS = 60s）
-    if (cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
+    return dbLoadChannels(env, channelType);
   }
-  // 只有通用查詢才共享 loadPromise，避免 type 查詢阻塞
-  if (loadPromise && !channelType) return loadPromise;
-  if (!channelType) {
-    loadPromise = (async () => {
-      try {
-        const rows = await dbLoadChannels(env, null);
-        cachedChannels = rows; lastLoad = Date.now();
-        return rows;
-      } catch (e) {
-        console.error("[channel] load error:", e.message);
-        cachedChannels = cachedChannels || [];
-        return cachedChannels;
-      }
-    })();
-    return loadPromise;
-  }
-  return dbLoadChannels(env, channelType);
+  // 通用快取（REFRESH_MS = 60s）
+  if (cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
+  // 共享 loadPromise 避免並發重複查詢；resolve 後自動重置
+  if (loadPromise) return loadPromise;
+  loadPromise = (async () => {
+    try {
+      const rows = await dbLoadChannels(env, null);
+      cachedChannels = rows; lastLoad = Date.now();
+      return rows;
+    } catch (e) {
+      console.error("[channel] load error:", e.message);
+      cachedChannels = cachedChannels || [];
+      return cachedChannels;
+    } finally {
+      loadPromise = null; // 確保 REFRESH_MS 過後能重新查詢
+    }
+  })();
+  return loadPromise;
 }
 
 async function dbLoadChannels(env, channelType) {
@@ -414,7 +425,8 @@ async function dbLoadChannels(env, channelType) {
       consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
       cache_enabled, cache_ttl,
       rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
-      fallback_model, model, max_tokens, is_enabled
+      fallback_model, model, max_tokens, is_enabled,
+      support_tools, support_vision
       FROM channels WHERE is_enabled = 1`;
     const params = [];
     if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
@@ -675,6 +687,90 @@ function createIdleTimeoutStream(readable, idleMs) {
   return out;
 }
 
+// ---- Relay Plugin（HTTP 轉發代理）----
+// 解析 relay 回應格式：第一行為 {"_relay":{"status":200,"headers":{...}}} metadata
+// 其餘為實際 upstream body（以 ReadableStream 回傳）
+async function parseRelayResponse(relayRes) {
+  // Relay 本身錯誤（503 配額滿、連線失敗等）
+  if (!relayRes.ok || !relayRes.body) {
+    const text = await relayRes.text().catch(() => "relay unavailable");
+    const fake = new Response(text, { status: relayRes.status || 502, headers: relayRes.headers });
+    fake.headers.set("X-Relay-Error", "1");
+    return { relayError: true, response: fake };
+  }
+  const reader = relayRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const MAX_META = 65536; // 64KB metadata line upper bound
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      const fake = new Response(JSON.stringify({ error: "relay response truncated" }), { status: 502, headers: { "content-type": "application/json" } });
+      fake.headers.set("X-Relay-Error", "1");
+      return { relayError: true, response: fake };
+    }
+    buf += decoder.decode(value, { stream: true });
+    if (buf.length > MAX_META) {
+      const fake = new Response(JSON.stringify({ error: "relay metadata too large" }), { status: 502, headers: { "content-type": "application/json" } });
+      fake.headers.set("X-Relay-Error", "1");
+      return { relayError: true, response: fake };
+    }
+    const nl = buf.indexOf("\n");
+    if (nl === -1) continue;
+    const metaLine = buf.slice(0, nl);
+    const remainder = buf.slice(nl + 1);
+    let meta;
+    try { meta = JSON.parse(metaLine); } catch {
+      const fake = new Response(JSON.stringify({ error: "invalid relay metadata" }), { status: 502, headers: { "content-type": "application/json" } });
+      fake.headers.set("X-Relay-Error", "1");
+      return { relayError: true, response: fake };
+    }
+    // Relay-level error（upstream 連線失敗、逾時等）
+    if (meta._relay?.error) {
+      const fake = new Response(JSON.stringify({ error: meta._relay.error }), { status: 502, headers: { "content-type": "application/json" } });
+      fake.headers.set("X-Relay-Error", "1");
+      return { relayError: true, response: fake };
+    }
+    // 成功 relay：取出 upstream status / headers，剩餘 body 串流回傳
+    const upstreamStatus = meta._relay?.status || 502;
+    const upstreamHeaders = new Headers(meta._relay?.headers || {});
+    const bodyStream = new ReadableStream({
+      start(controller) {
+        if (remainder) controller.enqueue(new TextEncoder().encode(remainder));
+        (async () => {
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) { controller.close(); return; }
+              controller.enqueue(value);
+            }
+          } catch (e) { controller.error(e); }
+        })();
+      },
+    });
+    return { response: new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders }) };
+  }
+}
+
+// relay 感知的 upstream fetch — 無 relay 設定時直接 fetch，有設定時透過 relay 轉發
+async function upstreamFetch(url, { method, headers, body, signal }, env, rid) {
+  if (!env.RELAY_BASE_URL) {
+    return fetch(url, { method, headers, body, signal });
+  }
+  const relayHeaders = new Headers(headers);
+  relayHeaders.set("x-target-url", url);
+  if (env.RELAY_SECRET) relayHeaders.set("x-relay-token", env.RELAY_SECRET);
+  const relayRes = await fetch(env.RELAY_BASE_URL, {
+    method, headers: relayHeaders, body, signal,
+  });
+  const parsed = await parseRelayResponse(relayRes);
+  if (parsed.relayError) {
+    logStructured("warn", "relay error", { relay: env.RELAY_BASE_URL, status: parsed.response.status, rid });
+    return parsed.response; // 含 X-Relay-Error header
+  }
+  return parsed.response; // upstream 原始 Response（status/headers/body 已還原）
+}
+
 async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
@@ -693,11 +789,47 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     eligible = channels;
   }
   // 非串流請求嘗試走快取
-  if (streamType !== "stream" && body && requiredType !== "chat") {
+  // 僅快取 embed / moderate 類型（與 cacheSet 邏輯一致）
+  if (streamType !== "stream" && body && (requiredType === "embed" || requiredType === "moderate")) {
     const ck = getCacheKey("", body);
     if (ck) {
       const cached = cacheGet(ck);
       if (cached) return { response: new Response(cached.body, { status: 200, headers: new Headers(cached.headers) }) };
+    }
+  }
+  // 統一 body 為字串（避免下游重複 ArrayBuffer 解碼），同時判斷 vision/tools 需求
+  let bodyStr = null;
+  if (body) {
+    bodyStr = body instanceof ArrayBuffer ? new TextDecoder().decode(body) : (typeof body === "string" ? body : null);
+  }
+  let needsVision = false, needsTools = false;
+  if (bodyStr && requiredType === "chat") {
+    try {
+      const parsed = JSON.parse(bodyStr);
+      if (Array.isArray(parsed.messages)) {
+        for (const msg of parsed.messages) {
+          if (Array.isArray(msg.content)) {
+            if (msg.content.some(part => part.type === "image_url")) needsVision = true;
+          } else if (typeof msg.content === "string" && /data:image\//.test(msg.content)) {
+            needsVision = true;
+          }
+          if (msg.tool_calls || msg.tool_call_id) needsTools = true;
+        }
+      }
+      if (parsed.tools || parsed.tool_choice) needsTools = true;
+    } catch (e) {}
+  }
+  // 依能力過濾渠道
+  if (needsVision) eligible = eligible.filter(c => c.support_vision);
+  if (needsTools) eligible = eligible.filter(c => c.support_tools);
+  if (eligible.length === 0) {
+    logStructured("warn", "no channels match capability", { vision: needsVision, tools: needsTools, path, rid });
+    // 用原始 channels 清單重試（已有資料，不重查 DB）
+    eligible = channels;
+    if (needsVision) eligible = eligible.filter(c => c.support_vision);
+    if (needsTools) eligible = eligible.filter(c => c.support_tools);
+    if (eligible.length === 0) {
+      return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools})`, status: 503 } };
     }
   }
   const attempted = new Set();
@@ -730,8 +862,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
       } catch (e) {}
     }
-    // 從 provider_options 解析請求重寫規則
-    let reqBody = body;
+    // 使用已在外面統一解析的 body 字串
+    let reqBody = bodyStr;
     if (channel.provider_options) {
       try {
         const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
@@ -742,47 +874,41 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           }
         }
         if (opts.rewrite?.request?.body && reqBody) {
-          const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : (typeof reqBody === "string" ? reqBody : null);
-          if (bodyStr) {
-            let parsed = JSON.parse(bodyStr);
-            // 前置提示訊息：強制插入到最前面，但檢查所有 system message 避免重複
-            const pms = opts.rewrite.request.body._prepend_messages;
-            if (pms && Array.isArray(pms) && pms.length > 0 && Array.isArray(parsed.messages)) {
-              const pmContent = pms[0]?.content;
-              const exists = pmContent && parsed.messages.some(m => m.role === "system" && m.content === pmContent);
-              if (!exists) {
-                parsed.messages.unshift(...pms);
-              }
+          let parsed = JSON.parse(reqBody);
+          // 前置提示訊息：強制插入到最前面，但檢查所有 system message 避免重複
+          const pms = opts.rewrite.request.body._prepend_messages;
+          if (pms && Array.isArray(pms) && pms.length > 0 && Array.isArray(parsed.messages)) {
+            const pmContent = pms[0]?.content;
+            const exists = pmContent && parsed.messages.some(m => m.role === "system" && m.content === pmContent);
+            if (!exists) {
+              parsed.messages.unshift(...pms);
             }
-            // model_map: 將用戶請求的 model 名稱映射到 provider 使用的 model 名稱
-            if (opts.model_map && parsed.model) {
-              const mapped = opts.model_map[parsed.model];
-              if (mapped) parsed.model = mapped;
-            }
-            for (const [path, val] of Object.entries(opts.rewrite.request.body)) {
-              if (path === "_prepend_messages") continue;
-              if (path === "model") parsed.model = val;
-              else if (path === "max_tokens") parsed.max_tokens = val;
-              else if (path === "temperature") parsed.temperature = val;
-              else if (path === "top_p") parsed.top_p = val;
-              else { parsed[path] = val; }
-            }
-            reqBody = JSON.stringify(parsed);
           }
+          // model_map: 將用戶請求的 model 名稱映射到 provider 使用的 model 名稱
+          if (opts.model_map && parsed.model) {
+            const mapped = opts.model_map[parsed.model];
+            if (mapped) parsed.model = mapped;
+          }
+          for (const [path, val] of Object.entries(opts.rewrite.request.body)) {
+            if (path === "_prepend_messages") continue;
+            if (path === "model") parsed.model = val;
+            else if (path === "max_tokens") parsed.max_tokens = val;
+            else if (path === "temperature") parsed.temperature = val;
+            else if (path === "top_p") parsed.top_p = val;
+            else { parsed[path] = val; }
+          }
+          reqBody = JSON.stringify(parsed);
         }
       } catch (e) {}
     }
-    // model override: fallback_model 優先，無則用 channel.model
-    const overrideModel = channel.fallback_model || channel.model;
+    // model override: 僅對 chat 類型有效，其他類型（embed / image_gen 等）跳過
+    const overrideModel = (requiredType === "chat") ? (channel.fallback_model || channel.model) : "";
     if (overrideModel && reqBody) {
       try {
-        const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : (typeof reqBody === "string" ? reqBody : null);
-        if (bodyStr) {
-          const parsed = JSON.parse(bodyStr);
-          if (parsed.model && parsed.model !== overrideModel) {
-            parsed.model = overrideModel;
-            reqBody = JSON.stringify(parsed);
-          }
+        const parsed = JSON.parse(reqBody);
+        if (parsed.model && parsed.model !== overrideModel) {
+          parsed.model = overrideModel;
+          reqBody = JSON.stringify(parsed);
         }
       } catch (e) {}
     }
@@ -790,17 +916,14 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     if (clientSignal) {
+      // 先檢查再註冊 listener，消除註冊與檢查間的 race
+      if (clientSignal.aborted) return { error: { message: "Client disconnected", status: 499 } };
       clientSignal.addEventListener("abort", onAbort, { once: true });
-      if (clientSignal.aborted) {
-        clientSignal.removeEventListener("abort", onAbort);
-        controller.abort();
-      }
     }
     try {
       if (method === "POST" && body && channel.stream_type === "nonstream") {
         try {
-          const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : reqBody;
-          const parsed = JSON.parse(bodyStr);
+          const parsed = JSON.parse(reqBody);
           if (parsed.stream === true) {
             const { stream, ...rest } = parsed;
             reqBody = JSON.stringify(rest);
@@ -808,9 +931,15 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         } catch (e) {}
       }
       timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
-      const res = await fetch(url, { method, headers, body: reqBody, signal: controller.signal });
+      const res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid);
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
+      // relay 本身錯誤（配額滿、斷線等）→ 不標記 channel degraded，直接重試
+      if (res.headers.get("X-Relay-Error") === "1") {
+        res.body?.cancel().catch(() => {});
+        logStructured("warn", "relay error, retrying", { relay: env.RELAY_BASE_URL, status: res.status, rid });
+        continue;
+      }
       if (res.ok) {
         markHealthy(channel.id, env);
         // 套用響應重寫 / 驗證
@@ -1154,9 +1283,27 @@ function createDashboardApi() {
       if (typeof headers === "string") try { headers = JSON.parse(headers); } catch (e) { headers = []; }
       let provider_options = ch.provider_options || null;
       if (typeof provider_options === "string") try { provider_options = JSON.parse(provider_options); } catch (e) { provider_options = null; }
-      return { ...ch, api_key: maskApiKey(ch.api_key || ''), headers, provider_options };
+      return { ...ch, api_key: ch.api_key || '', headers, provider_options };
     });
     return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "" } });
+  });
+
+  // 完整匯出（含 unmasked API Key），用作全設定手動備份
+  api.get("/export", async (c) => {
+    const [ch, fl] = await Promise.all([
+      c.env.DB.prepare("SELECT * FROM channels ORDER BY id").all(),
+      c.env.DB.prepare("SELECT id, text, mode, is_enabled FROM filters ORDER BY id").all(),
+    ]);
+    const cf = await c.env.DB.prepare("SELECT * FROM config WHERE id=1").first();
+    const channels = (ch.results || []).map(ch => {
+      let headers = ch.headers || [];
+      if (typeof headers === "string") try { headers = JSON.parse(headers); } catch (e) { headers = []; }
+      let provider_options = ch.provider_options || null;
+      if (typeof provider_options === "string") try { provider_options = JSON.parse(provider_options); } catch (e) { provider_options = null; }
+      // 匯出不遮罩 api_key
+      return { ...ch, headers, provider_options };
+    });
+    return c.json({ version: 1, channels, filters: fl.results || [], config: { token: cf?.client_token || "" } });
   });
 
   api.post("/batch-channels", async (c) => {
@@ -1175,7 +1322,7 @@ function createDashboardApi() {
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const isMasked = (key) => typeof key === "string" && key.includes("***");
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision";
     const ph = cols.split(",").map(() => "?").join(",");
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
@@ -1196,7 +1343,8 @@ function createDashboardApi() {
           ch.support_audio_stt != null ? (ch.support_audio_stt ? 1 : 0) : 0,
           ch.support_image_edit != null ? (ch.support_image_edit ? 1 : 0) : 0,
           ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
-          ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1
+          ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1,
+          ch.support_vision != null ? (ch.support_vision ? 1 : 0) : 0
         )
       );
     }

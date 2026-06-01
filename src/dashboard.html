@@ -298,6 +298,23 @@
             <label class="form-label mini-label fw-bold">Override Model <span class="text-muted" style="font-weight:400">（留空 = 使用渠道 Model）</span></label>
             <input type="text" id="ch-override-model" class="form-control form-control-sm" placeholder="gpt-4-turbo">
           </div>
+          <div class="row g-1 mb-1">
+            <div class="col-12">
+              <label class="form-label mini-label fw-bold">Capabilities</label>
+            </div>
+            <div class="col-6 text-center">
+              <div class="form-check form-switch mb-0 d-inline-block">
+                <input class="form-check-input" type="checkbox" id="ch-support-tools" checked>
+                <label class="form-check-label small" for="ch-support-tools">Tools（工具調用）</label>
+              </div>
+            </div>
+            <div class="col-6 text-center">
+              <div class="form-check form-switch mb-0 d-inline-block">
+                <input class="form-check-input" type="checkbox" id="ch-support-vision">
+                <label class="form-check-label small" for="ch-support-vision">Vision（圖片辨識）</label>
+              </div>
+            </div>
+          </div>
           <div class="mb-1">
             <label class="form-label mini-label fw-bold">前置提示訊息 <span class="text-muted" style="font-weight:400">（強制插入到最前面，內容相同時自動去重）</span></label>
             <textarea id="ch-prepend-prompt" class="form-control form-control-sm" rows="4" placeholder="請輸入 system prompt，例如：&#10;你是一個專業的程式設計助手，請全程用繁體中文回答。"></textarea>
@@ -765,6 +782,8 @@
       document.getElementById('ch-rpd').value = '0';
       document.getElementById('ch-override-model').value = '';
       document.getElementById('ch-prepend-prompt').value = '';
+      document.getElementById('ch-support-tools').checked = true;
+      document.getElementById('ch-support-vision').checked = false;
       chHeaders = [];
       renderHeaders();
       switchTab('basic');
@@ -800,6 +819,8 @@
         } catch (e) {}
       }
       document.getElementById('ch-prepend-prompt').value = prependText;
+      document.getElementById('ch-support-tools').checked = c.support_tools == 1;
+      document.getElementById('ch-support-vision').checked = c.support_vision == 1;
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
       switchTab('basic');
@@ -855,6 +876,8 @@
         rpd_limit: rpdLimit,
         fallback_model: overrideModel,
         provider_options: providerOptions,
+        support_tools: document.getElementById('ch-support-tools').checked ? 1 : 0,
+        support_vision: document.getElementById('ch-support-vision').checked ? 1 : 0,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -885,28 +908,17 @@
       renderStats();
     };
 
-    const exportChannels = () => {
-      const data = channels.map(c => ({
-        name: c.name,
-        base_url: c.base_url,
-        model: c.model,
-        weight: c.weight,
-        is_enabled: c.is_enabled,
-        stream_type: c.stream_type || 'both',
-        channel_type: c.channel_type || 'chat',
-        headers: Array.isArray(c.headers) ? c.headers.filter(h => h.key) : [],
-        rpm_limit: c.rpm_limit || 0,
-        rpd_limit: c.rpd_limit || 0,
-        fallback_model: c.fallback_model || '',
-        provider_options: c.provider_options,
-      }));
-      const blob = new Blob([JSON.stringify({ version: 1, channels: data }, null, 2)], { type: 'application/json' });
+    const exportChannels = async () => {
+      const full = await api('/admin/api/export', 'GET', null, true);
+      if (!full) return toast('匯出失敗', 'danger');
+      const data = { version: 1, channels: full.channels, filters: full.filters, config: full.config };
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = 'channels-export.json';
+      a.href = url; a.download = 'api-gateway-full-backup.json';
       a.click();
       URL.revokeObjectURL(url);
-      toast('已匯出 ' + data.length + ' 個渠道', 'success');
+      toast('已匯出 ' + (full.channels?.length || 0) + ' 個渠道（含 API Key）', 'success');
     };
 
     const importChannels = () => {
@@ -932,6 +944,7 @@
             name: ch.name,
             base_url: ch.base_url,
             model: ch.model,
+            api_key: ch.api_key || '',     // 保留備份中的 API Key
             weight: ch.weight || 50,
             is_enabled: ch.is_enabled != null ? (ch.is_enabled ? 1 : 0) : 1,
             stream_type: ch.stream_type || 'both',
@@ -941,11 +954,19 @@
             rpd_limit: ch.rpd_limit || 0,
             fallback_model: ch.fallback_model || '',
             provider_options: ch.provider_options || null,
+            support_tools: ch.support_tools != null ? ch.support_tools : 1,
+            support_vision: ch.support_vision != null ? ch.support_vision : 0,
           }));
           channels.splice(0, channels.length, ...newChannels);
+          // 若備份檔包含 filters 也一併匯入
+          if (Array.isArray(data.filters)) {
+            filters.splice(0, filters.length, ...data.filters.map(f => ({
+              id: f.id, text: f.text, mode: f.mode != null ? f.mode : 1, is_enabled: f.is_enabled != null ? f.is_enabled : 1,
+            })));
+          }
           renderChannels();
           renderStats();
-          toast('已匯入 ' + channels.length + ' 個渠道, 請留意 API Key 需手動補填', 'success');
+          toast('已匯入 ' + channels.length + ' 個渠道' + (data.filters ? ' + ' + data.filters.length + ' 過濾器' : ''), 'success');
         } catch (err) {
           toast('匯入失敗: ' + err.message, 'danger');
         }
