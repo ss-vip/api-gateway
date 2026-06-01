@@ -299,8 +299,8 @@
             <input type="text" id="ch-override-model" class="form-control form-control-sm" placeholder="gpt-4-turbo">
           </div>
           <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Provider Options (JSON)</label>
-            <textarea id="ch-provider-options" class="form-control form-control-sm" rows="3" placeholder='{"rewrite":{"request":{"body":{"model":"gpt-4-turbo"}}},"validate":{"response":{"required_fields":["choices"]}}}' style="font-family:monospace;font-size:0.7rem"></textarea>
+            <label class="form-label mini-label fw-bold">前置提示訊息 <span class="text-muted" style="font-weight:400">（強制插入到最前面，內容相同時自動去重）</span></label>
+            <textarea id="ch-prepend-prompt" class="form-control form-control-sm" rows="4" placeholder="請輸入 system prompt，例如：&#10;你是一個專業的程式設計助手，請全程用繁體中文回答。"></textarea>
           </div>
         </div>
       </div>
@@ -764,7 +764,7 @@
       document.getElementById('ch-rpm').value = '0';
       document.getElementById('ch-rpd').value = '0';
       document.getElementById('ch-override-model').value = '';
-      document.getElementById('ch-provider-options').value = '';
+      document.getElementById('ch-prepend-prompt').value = '';
       chHeaders = [];
       renderHeaders();
       switchTab('basic');
@@ -791,9 +791,15 @@
       document.getElementById('ch-rpm').value = c.rpm_limit || 0;
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
       document.getElementById('ch-override-model').value = c.fallback_model || '';
-      let popts = {};
-      if (c.provider_options) { try { popts = typeof c.provider_options === "string" ? JSON.parse(c.provider_options) : c.provider_options; } catch (e) {} }
-      document.getElementById('ch-provider-options').value = Object.keys(popts).length ? JSON.stringify(popts, null, 2) : '';
+      let prependText = '';
+      if (c.provider_options) {
+        try {
+          const popts = typeof c.provider_options === "string" ? JSON.parse(c.provider_options) : c.provider_options;
+          const pms = popts?.rewrite?.request?.body?._prepend_messages;
+          if (Array.isArray(pms) && pms.length > 0 && pms[0].content) prependText = pms[0].content;
+        } catch (e) {}
+      }
+      document.getElementById('ch-prepend-prompt').value = prependText;
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
       switchTab('basic');
@@ -815,8 +821,25 @@
       const rpdLimit = parseInt(document.getElementById('ch-rpd')?.value) || 0;
       const overrideModel = document.getElementById('ch-override-model')?.value?.trim() || '';
       let providerOptions = null;
-      const poText = document.getElementById('ch-provider-options')?.value?.trim();
-      if (poText) { try { providerOptions = JSON.parse(poText); } catch (e) { toast('Provider Options JSON 格式錯誤', 'warning'); return; } }
+      const prependText = document.getElementById('ch-prepend-prompt')?.value?.trim();
+      // 保留現有 provider_options 中非 _prepend_messages 的欄位（如 model_map）
+      const existingPO = (idx !== '' && channels[parseInt(idx)]?.provider_options) || null;
+      if (existingPO || prependText) {
+        const merged = existingPO ? (typeof existingPO === "string" ? JSON.parse(existingPO) : JSON.parse(JSON.stringify(existingPO))) : {};
+        if (!merged.rewrite) merged.rewrite = {};
+        if (!merged.rewrite.request) merged.rewrite.request = {};
+        if (!merged.rewrite.request.body) merged.rewrite.request.body = {};
+        if (prependText) {
+          merged.rewrite.request.body._prepend_messages = [{ role: "system", content: prependText }];
+        } else {
+          delete merged.rewrite.request.body._prepend_messages;
+        }
+        // 清理空物件
+        if (Object.keys(merged.rewrite.request.body).length === 0) delete merged.rewrite.request.body;
+        if (Object.keys(merged.rewrite.request).length === 0) delete merged.rewrite.request;
+        if (Object.keys(merged.rewrite).length === 0) delete merged.rewrite;
+        providerOptions = Object.keys(merged).length ? merged : null;
+      }
       const ch = {
         id: idVal ? parseInt(idVal) : undefined,
         name,

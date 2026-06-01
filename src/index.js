@@ -637,6 +637,7 @@ function createFilterTransform(filters) {
                 const delta = choice?.delta || {};
                 if (delta.content) delta.content = RollingFilter.applyStatic(delta.content, filters);
                 if (delta.refusal) delta.refusal = RollingFilter.applyStatic(delta.refusal, filters);
+                if (delta.reasoning_content) delta.reasoning_content = RollingFilter.applyStatic(delta.reasoning_content, filters);
                 if (delta.tool_calls) {
                   for (const tc of delta.tool_calls) {
                     if (tc.function?.arguments) tc.function.arguments = RollingFilter.applyStatic(tc.function.arguments, filters);
@@ -744,12 +745,22 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           const bodyStr = reqBody instanceof ArrayBuffer ? new TextDecoder().decode(reqBody) : (typeof reqBody === "string" ? reqBody : null);
           if (bodyStr) {
             let parsed = JSON.parse(bodyStr);
+            // 前置提示訊息：強制插入到最前面，但檢查所有 system message 避免重複
+            const pms = opts.rewrite.request.body._prepend_messages;
+            if (pms && Array.isArray(pms) && pms.length > 0 && Array.isArray(parsed.messages)) {
+              const pmContent = pms[0]?.content;
+              const exists = pmContent && parsed.messages.some(m => m.role === "system" && m.content === pmContent);
+              if (!exists) {
+                parsed.messages.unshift(...pms);
+              }
+            }
             // model_map: 將用戶請求的 model 名稱映射到 provider 使用的 model 名稱
             if (opts.model_map && parsed.model) {
               const mapped = opts.model_map[parsed.model];
               if (mapped) parsed.model = mapped;
             }
             for (const [path, val] of Object.entries(opts.rewrite.request.body)) {
+              if (path === "_prepend_messages") continue;
               if (path === "model") parsed.model = val;
               else if (path === "max_tokens") parsed.max_tokens = val;
               else if (path === "temperature") parsed.temperature = val;
