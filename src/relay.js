@@ -7,16 +7,30 @@
  *   3. MAX_BODY 上限 — 防止惡意大 body 撐爆記憶體
  *   4. Client 斷線自動 abort upstream — 不浪費 upstream 處理
  *   5. Reasoning Cache (response-only) — 截取 SSE 串流，累積 reasoning_content + tool_call_ids
- *   6. PM2 記憶體自癒 — 超過 150MB 自動重啟
+ *   6. 自動記憶體監控 — 超過 MEMORY_LIMIT_MB 自動重啟程序
+ *   7. 健康檢查端點 GET /health — 供外部監控
  *
  * Request injection（補回 reasoning_content）由 CF Worker 端處理。
  *
- * 部署方式:
- *   npm install pm2 -g
- *   pm2 start src/relay.js --name relay --watch --max-memory-restart 150M --kill-timeout 10000
- *   pm2 save
- *   Server 開啟 TCP port 3000（或自訂 PORT 環境變數）
+ * 部署方式（擇一）:
+ *   PM2（建議）:
+ *     npm install pm2 -g
+ *     pm2 start src/relay.js --name relay --watch --max-memory-restart 150M --kill-timeout 10000
+ *     pm2 save
+ *
+ *   背景執行:
+ *     nohup node src/relay.js > relay.log 2>&1 &
+ *
+ *  環境變數:
+ *    PORT             預設 3000
+ *    RELAY_TIMEOUT    預設 300000（5 分）
+ *    MAX_CONCURRENT   預設 15
+ *    MEMORY_LIMIT_MB  預設 150（超過自動 exit，由監控重啟）
+ *    RELAY_TOKEN      非空時啟用 x-relay-token 驗證（避免被濫用）
  */
+// crontab watchdog（每 5 分鐘檢查，不在背景就重啟）:
+//   crontab -e
+//   */5 * * * * pgrep -f "node.*relay" || nohup node ${HOME}/relay.js > relay.log 2>&1 &
 
 const http = require('http');
 const https = require('https');
@@ -25,8 +39,33 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const TIMEOUT = parseInt(process.env.RELAY_TIMEOUT || '300000', 10);   // 5 min
 const MAX_REQS = parseInt(process.env.MAX_CONCURRENT || '15', 10);     // 並行上限
 const MAX_BODY = 31_457_280;  // 30MB（多模態多圖約 5-15MB，30MB 安全緩衝）
+const MEMORY_LIMIT_MB = parseInt(process.env.MEMORY_LIMIT_MB || '150', 10);
+const RELAY_TOKEN = process.env.RELAY_TOKEN || '';
 
 let active = 0;
+let startedAt = Date.now();
+let totalRequests = 0;
+
+// ---- 記憶體監控：超過上限自動 exit（由外部 watchdog/cron 重啟）----
+function checkMemory() {
+  const usage = process.memoryUsage();
+  const rssMB = Math.round(usage.rss / 1024 / 1024);
+  const heapMB = Math.round(usage.heapUsed / 1024 / 1024);
+  if (rssMB > MEMORY_LIMIT_MB) {
+    console.error(`[relay] MEMORY LIMIT EXCEEDED: RSS=${rssMB}MB > ${MEMORY_LIMIT_MB}MB, exiting`);
+    process.exit(1);
+  }
+  return { rssMB, heapMB };
+}
+setInterval(checkMemory, 30000).unref();
+
+// ---- 全域錯誤兜底，避免未捕捉錯誤導致程序 crash ----
+process.on('uncaughtException', (err) => {
+  console.error('[relay] UNCAUGHT EXCEPTION:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[relay] UNHANDLED REJECTION:', reason);
+});
 
 // ---- Reasoning Replay Cache（in-memory，僅 response side capture）----
 const reasonCache = new Map();
@@ -48,7 +87,7 @@ function cacheSet(key, content) {
 function cacheGet(key) {
   return key ? reasonCache.get(key) : undefined;
 }
-// 公開讓 CF Worker 可查
+// 開放外部存取 reasoning cache（供 PM2 介面、除錯工具等使用）
 function getReasoningCache() { return { get: cacheGet, keys: () => [...reasonCache.keys()] }; }
 
 // ---- 截取 SSE 串流：累積 reasoning_content + tool_call_ids ----
@@ -94,6 +133,24 @@ function attachSseCapture(proxyRes, res, rid) {
 
 // ---- 核心轉發（純事件驅動，無 async/await）----
 function handleRequest(req, res) {
+  totalRequests++;
+
+  // 健康檢查端點（供外部監控工具定期檢查）
+  if (req.url === '/health') {
+    const mem = checkMemory();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      ok: true, uptime: Math.floor((Date.now() - startedAt) / 1000),
+      active, total: totalRequests, rssMB: mem.rssMB, heapMB: mem.heapMB,
+    }));
+  }
+
+  // RELAY_TOKEN 驗證（非空時啟用，避免共用網路下被濫用）
+  if (RELAY_TOKEN && req.headers['x-relay-token'] !== RELAY_TOKEN) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'invalid or missing x-relay-token' }));
+  }
+
   // 連線配額檢查
   if (active >= MAX_REQS) {
     res.writeHead(503, { 'Content-Type': 'application/json' });
@@ -147,7 +204,7 @@ function handleRequest(req, res) {
     headers: {},
   };
   for (const [k, v] of Object.entries(req.headers)) {
-    if (!['host', 'x-target-url', 'connection', 'transfer-encoding', 'accept-encoding'].includes(k)) {
+    if (!['host', 'x-target-url', 'connection', 'transfer-encoding', 'accept-encoding', 'x-relay-token'].includes(k)) {
       opts.headers[k] = v;
     }
   }
@@ -155,10 +212,11 @@ function handleRequest(req, res) {
   // 若原始請求沒 content-length （少見）則由 Node.js 自動 chunked
 
   let aborted = false;
+  let proxyReq;  // 提前宣告，避免 abort() 在 const TDZ 中拋 ReferenceError
   const abort = () => {
     if (aborted) return;
     aborted = true;
-    proxyReq.destroy();
+    if (proxyReq) proxyReq.destroy();
     try { res.end(); } catch {}
   };
 
@@ -171,7 +229,7 @@ function handleRequest(req, res) {
   });
 
   const proto = isHttps ? https : http;
-  const proxyReq = proto.request(opts, (proxyRes) => {
+  proxyReq = proto.request(opts, (proxyRes) => {
     if (aborted) return;
     const sc = proxyRes.statusCode;
     console.log(`[${rid}] upstream -> ${sc}`);
@@ -259,3 +317,5 @@ process.on('SIGTERM', () => {
     process.exit(1);
   }, 30000).unref();
 });
+
+module.exports = { getReasoningCache, handleRequest };

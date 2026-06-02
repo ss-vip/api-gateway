@@ -229,7 +229,7 @@
             <label class="form-label mini-label fw-bold">API Key *</label>
             <input type="password" style="position:absolute;width:0;height:0;padding:0;border:0;opacity:0" tabindex="-1" aria-hidden="true" readonly />
             <div class="input-group input-group-sm">
-              <input type="text" id="ch-key" class="form-control form-control-sm" autocomplete="off" style="-webkit-text-security:disc" required />
+              <input type="password" id="ch-key" class="form-control form-control-sm" autocomplete="off" required />
               <button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button>
             </div>
           </div>
@@ -238,15 +238,15 @@
             <input type="url" id="ch-url" class="form-control form-control-sm" placeholder="https://api.example.com/v1" required />
           </div>
           <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Model *</label>
+            <label for="ch-model" class="form-label mini-label fw-bold">Model *</label>
             <input type="text" id="ch-model" class="form-control form-control-sm" required />
           </div>
           <div class="row g-2 mb-1">
-            <div class="col-3 d-flex flex-column justify-content-center">
+            <div class="col-4 d-flex flex-column justify-content-center">
               <label class="form-label mini-label fw-bold">Weight</label>
               <input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required />
             </div>
-            <div class="col-3 d-flex flex-column justify-content-center">
+            <div class="col-4 d-flex flex-column justify-content-center">
               <label class="form-label mini-label fw-bold">Channel Type</label>
               <select id="ch-type" class="form-select form-select-sm" onchange="updateCapabilities()">
                 <option value="chat">chat</option>
@@ -265,17 +265,7 @@
                 <option value="realtime">realtime</option>
               </select>
             </div>
-            <div class="col-3 d-flex flex-column align-items-center justify-content-center">
-              <div class="form-check mb-0">
-                <input class="form-check-input" type="checkbox" id="ch-support-tools">
-                <label class="form-check-label" for="ch-support-tools">Tools</label>
-              </div>
-              <div class="form-check mb-0">
-                <input class="form-check-input" type="checkbox" id="ch-support-vision">
-                <label class="form-check-label" for="ch-support-vision">Vision</label>
-              </div>
-            </div>
-            <div class="col-3 d-flex flex-column align-items-center justify-content-center">
+            <div class="col-4 d-flex flex-column align-items-center justify-content-center">
               <label class="form-label mini-label fw-bold text-center">Enabled</label>
               <button type="button" id="ch-enabled-btn" class="btn btn-sm btn-outline-success px-3 fw-bold" onclick="chEnabled=!chEnabled;updateEnabledBtn()">已啟用</button>
             </div>
@@ -285,6 +275,25 @@
           <p class="text-muted small mb-2">自訂 Header 會在轉發請求時附加到上游。</p>
           <div id="header-list" class="mb-2"></div>
           <button type="button" class="btn btn-outline-secondary btn-sm w-100 mt-1 fw-bold" onclick="addHeaderRow()"><i class="bi bi-plus-lg me-1"></i>ADD HEADER</button>
+          <hr class="my-2">
+          <div class="row g-2 mb-1">
+            <div class="col-6 d-flex flex-column align-items-center justify-content-center">
+              <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="ch-support-tools">
+                <label class="form-check-label" for="ch-support-tools">Tools</label>
+              </div>
+            </div>
+            <div class="col-6 d-flex flex-column align-items-center justify-content-center">
+              <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="ch-support-vision">
+                <label class="form-check-label" for="ch-support-vision">Vision</label>
+              </div>
+            </div>
+          </div>
+          <div class="mb-1">
+            <label class="form-label mini-label fw-bold">Relay URL <span class="text-muted" style="font-weight:400">（留空 = 使用全域設定）</span></label>
+            <input type="url" id="ch-relay-url" class="form-control form-control-sm" placeholder="https://your-relay-server:3000">
+          </div>
           <hr class="my-2">
           <div class="row g-1 mb-1">
             <div class="col-3">
@@ -350,17 +359,22 @@
       document.getElementById(name + '-panel')?.classList.add('active');
     };
 
+    let loadingTimeout = null;
     const loading = (show) => {
       const el = document.getElementById('loading-overlay');
       if (show) {
         pendingRequests++;
         el.classList.remove('hide');
-        setTimeout(() => {
+        if (loadingTimeout) clearTimeout(loadingTimeout);
+        loadingTimeout = setTimeout(() => {
           if (pendingRequests > 0) { pendingRequests = 0; el.classList.add('hide'); }
         }, 15000);
       } else {
         pendingRequests = Math.max(0, pendingRequests - 1);
-        if (pendingRequests === 0) el.classList.add('hide');
+        if (pendingRequests === 0) {
+          el.classList.add('hide');
+          if (loadingTimeout) { clearTimeout(loadingTimeout); loadingTimeout = null; }
+        }
       }
     };
 
@@ -746,7 +760,7 @@
         let row = '<tr>';
         row += '<td class="text-muted small align-middle">' + (f.id || '-') + '</td>';
         row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (f.is_enabled ? 'checked' : '') + ' onchange="filters[' + realIdx + '].is_enabled=this.checked;renderFilters()"></div></td>';
-        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="filters[' + realIdx + '].text=this.value"></td>';
+        row += '<td class="align-middle"><input type="text" class="form-control form-control-sm" minLength="1" maxLength="30" placeholder="關鍵字（1-30 字）" value="' + esc(f.text) + '" oninput="if(this.value.length<=30)filters[' + realIdx + '].text=this.value"></td>';
         row += '<td class="d-none d-md-table-cell align-middle"><select class="form-select form-select-sm" onchange="filters[' + realIdx + '].mode=parseInt(this.value)"><option value="1" ' + (f.mode == 1 ? 'selected' : '') + '>Truncate</option><option value="0" ' + (f.mode == 0 ? 'selected' : '') + '>Delete</option></select></td>';
         row += '<td class="align-middle"><button onclick="filters.splice(' + realIdx + ',1);renderFilters()" class="btn btn-sm btn-outline-danger py-1 px-2"><i class="bi bi-trash"></i></button></td>';
         row += '</tr>';
@@ -783,11 +797,15 @@
       renderHeaders();
     };
 
+    const nextChannelId = () => {
+      const ids = new Set(channels.map(c => c.id).filter(i => i !== undefined));
+      let id = 1; while (ids.has(id)) id++; return id;
+    };
+
     const openChannelModal = () => {
       if (!chModal) { toast('Modal 尚未準備好，請稍候再試', 'danger'); return; }
       document.getElementById('ch-idx').value = '';
-      const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
-      let nextId = 1; while (existingIds.includes(nextId)) nextId++;
+      const nextId = nextChannelId();
       document.getElementById('ch-id').value = nextId;
       const badge = document.getElementById('ch-id-badge');
       badge.textContent = 'NEW #' + nextId; badge.style.display = '';
@@ -800,7 +818,7 @@
       document.getElementById('ch-rpd').value = '0';
       document.getElementById('ch-override-model').value = '';
       document.getElementById('ch-prepend-prompt').value = '';
-      document.getElementById('ch-support-tools').checked = false;
+      document.getElementById('ch-support-tools').checked = true;
       document.getElementById('ch-support-vision').checked = false;
       document.getElementById('ch-relay-url').value = '';
       document.getElementById('ch-max-ctx').value = '0';
@@ -843,6 +861,7 @@
       document.getElementById('ch-support-vision').checked = c.support_vision == 1;
 
       document.getElementById('ch-max-ctx').value = c.max_context_length || 0;
+      document.getElementById('ch-relay-url').value = c.relay_url || '';
       updateCapabilities();
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
@@ -857,6 +876,8 @@
       if (!name) return toast('請輸入名稱', 'warning');
       const weight = parseInt(document.getElementById('ch-weight').value);
       if (isNaN(weight) || weight < 1 || weight > 1000) return toast('Weight 需介於 1-1000', 'warning');
+      const model = document.getElementById('ch-model').value.trim();
+      if (!model) return toast('請輸入 Model', 'warning');
       const url = document.getElementById('ch-url').value.trim().replace(/\/+$/, '');
       if (!url) return toast('請輸入 Base URL', 'warning');
 
@@ -891,7 +912,7 @@
         name,
         api_key: document.getElementById('ch-key').value,
         base_url: url,
-        model: document.getElementById('ch-model').value,
+        model,
         weight,
         is_enabled: chEnabled ? 1 : 0,
         stream_type: 'both',
@@ -905,6 +926,7 @@
         support_vision: document.getElementById('ch-support-vision').checked ? 1 : 0,
 
         max_context_length: parseInt(document.getElementById('ch-max-ctx')?.value) || 0,
+        relay_url: document.getElementById('ch-relay-url')?.value?.trim() || '',
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -924,8 +946,7 @@
 
     const copyChannel = (idx) => {
       const src = channels[idx];
-      const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
-      let nextId = 1; while (existingIds.includes(nextId)) nextId++;
+      const nextId = nextChannelId();
       channels.push({
         ...src,
         name: src.name + ' (copy)',
@@ -954,19 +975,23 @@
       input.onchange = async (e) => {
         const file = e.target.files[0];
         if (!file) return;
+        if (file.size > 5 * 1024 * 1024) return toast('檔案過大（最大 5MB）', 'danger');
         try {
           const text = await file.text();
           const data = JSON.parse(text);
           const arr = data?.channels || data;
           if (!Array.isArray(arr)) throw new Error('格式錯誤：缺少 channels 陣列');
-          const validTypes = ['both', 'stream', 'nonstream'];
+          const validStreamTypes = ['both', 'stream', 'nonstream'];
+          const validChannelTypes = ['chat','image_gen','image_edit','tts','stt','embed','moderate','assistant','fine_tune','file','responses','batches','models','realtime'];
           for (const ch of arr) {
             if (!ch.name || !ch.base_url || !ch.model) throw new Error('缺少必要欄位 (name, base_url, model)');
-            if (ch.stream_type && !validTypes.includes(ch.stream_type)) throw new Error('無效的 stream_type: ' + ch.stream_type);
+            if (ch.stream_type && !validStreamTypes.includes(ch.stream_type)) throw new Error('無效的 stream_type: ' + ch.stream_type);
+            if (ch.channel_type && !validChannelTypes.includes(ch.channel_type)) throw new Error('無效的 channel_type: ' + ch.channel_type);
           }
-          let nextId = 1;
+          const maxExistingId = arr.reduce((max, ch) => ch.id != null ? Math.max(max, ch.id) : max, 0);
+          let nextId = maxExistingId + 1;
           const newChannels = arr.map(ch => ({
-            id: (ch.id != null) ? ch.id : nextId++,
+            id: (ch.id != null && ch.id !== 0) ? ch.id : nextId++,
             api_key: ch.api_key || '',
             name: ch.name,
             base_url: ch.base_url,
@@ -983,6 +1008,7 @@
             support_tools: ch.support_tools != null ? ch.support_tools : 1,
             support_vision: ch.support_vision != null ? ch.support_vision : 0,
             provider: ch.provider || '',
+            relay_url: ch.relay_url || '',
             max_tokens: ch.max_tokens || 0,
             support_stream: ch.support_stream != null ? (ch.support_stream ? 1 : 0) : 1,
             support_image_gen: ch.support_image_gen != null ? (ch.support_image_gen ? 1 : 0) : 0,
@@ -1019,10 +1045,10 @@
 
     const toggleKeyVis = () => {
       const i = document.getElementById('ch-key');
-      if (i.style.webkitTextSecurity === 'disc') {
-        i.style.webkitTextSecurity = 'none';
+      if (i.type === 'password') {
+        i.type = 'text';
       } else {
-        i.style.webkitTextSecurity = 'disc';
+        i.type = 'password';
       }
     };
 
@@ -1046,7 +1072,7 @@
       target.forEach(c => c.is_enabled = val);
       renderChannels();
       renderStats();
-      toast('已更新，請存檔生效', 'info');
+      toast((query ? '搜尋範圍 ' : '全部 ') + target.length + ' 個渠道已' + (val ? '啟用' : '停用') + '，請存檔生效', 'info');
     };
     const toggleAllFilters = (val) => {
       const query = document.getElementById('fl-search')?.value?.toLowerCase() || '';
@@ -1056,7 +1082,7 @@
       if (target.length === 0) return toast('沒有符合的過濾器', 'warning');
       target.forEach(f => f.is_enabled = val);
       renderFilters();
-      toast('已更新，請存檔生效', 'info');
+      toast((query ? '搜尋範圍 ' : '全部 ') + target.length + ' 個過濾器已' + (val ? '啟用' : '停用') + '，請存檔生效', 'info');
     };
 
     const resetSystem = async () => {

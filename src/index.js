@@ -53,7 +53,7 @@ async function pruneSessionD1(env) {
   await env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(Date.now()).run().catch(() => {});
 }
 const REFRESH_MS = 60_000;
-const D1_BATCH_LIMIT = 99;
+const D1_BATCH_LIMIT = 100;
 const LOGIN_MAX_FAILURES = 10;
 const LOGIN_BAN_MS = 15 * 60 * 1000;
 const SETUP_MAX_ATTEMPTS = 5;
@@ -95,21 +95,6 @@ function generateToken(prefix = "sk-") {
   let t = prefix;
   for (let i = 0; i < 30; i++) t += chars[rand[i] % chars.length];
   return t;
-}
-
-const API_KEY_REGEX = /(["']?api_key["']?\s*[:=]\s*["']?)([^"'\s,}\]">]+)/gi;
-
-function maskApiKey(str) {
-  if (typeof str !== "string") return str;
-  return str.replace(API_KEY_REGEX, (m, pre, key) => {
-    if (key.length > 8) return pre + key.slice(0, 8) + "***";
-    return pre + "***";
-  });
-}
-
-function maskApiKeyValue(key) {
-  if (typeof key !== "string" || key.length < 12) return key;
-  return key.slice(0, 8) + "***" + key.slice(-4);
 }
 
 function getDefaults() {
@@ -228,9 +213,9 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm',
   rate_limit_capacity INTEGER NOT NULL DEFAULT 0,
   rate_limit_rate INTEGER NOT NULL DEFAULT 0,
-   rate_limit_key TEXT NOT NULL DEFAULT '',
-    relay_url TEXT NOT NULL DEFAULT '',
-    max_context_length INTEGER NOT NULL DEFAULT 0
+  rate_limit_key TEXT NOT NULL DEFAULT '',
+  relay_url TEXT NOT NULL DEFAULT '',
+  max_context_length INTEGER NOT NULL DEFAULT 0
 )`;
 
 
@@ -342,7 +327,7 @@ async function ensureSchema(env) {
     }
   }
   if (parseInt(schemaVer, 10) < 5) {
-    try { await env.DB.prepare("ALTER TABLE channels ADD COLUMN support_vision INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* 欄位已存在則略過 */ }
+    // support_vision 已在 v3 中追加，此處僅追加 relay_url
     try { await env.DB.prepare("ALTER TABLE channels ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* 欄位已存在則略過 */ }
   }
   if (parseInt(schemaVer, 10) < 6) {
@@ -357,34 +342,7 @@ async function ensureSchema(env) {
 }
 
 class RollingFilter {
-  constructor(filters) {
-    this.filters = (filters || []).filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
-    this.buf = "";
-    this.safe = this.filters.reduce((m, f) => Math.max(m, f.text.length - 1), 0);
-    this.truncated = false;
-  }
-  transform(chunk) {
-    if (this.filters.length === 0) return chunk;
-    if (this.truncated) return "";
-    this.buf += chunk;
-    for (const f of this.filters) {
-      if (f.mode === 1) {
-        const idx = this.buf.indexOf(f.text);
-        if (idx !== -1) { this.buf = this.buf.substring(0, idx); this.truncated = true; break; }
-      } else {
-        this.buf = this.buf.split(f.text).join("");
-      }
-    }
-    if (this.truncated) { const out = this.buf; this.buf = ""; return out; }
-    const flush = Math.max(0, this.buf.length - this.safe);
-    const out = this.buf.slice(0, flush);
-    this.buf = this.buf.slice(flush);
-    return out;
-  }
-  flush() {
-    if (this.truncated) return "";
-    const out = this.buf; this.buf = ""; return out;
-  }
+  // 僅使用靜態 applyStatic 方法；實例方法（constructor / transform / flush）已移除
   static applyStatic(text, filters) {
     if (!text || !filters || filters.length === 0) return text;
     const enabled = filters.filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
@@ -528,8 +486,6 @@ function isDegraded(channelId) {
 
 // 簡易記憶體 Token Bucket（按 channelId）
 const tokenBuckets = new Map();
-const TOKEN_BUCKET_SYNC_MS = 30000;
-let lastBucketSync = 0;
 
 // 純檢查，不消耗配額
 function checkRateLimit(channel) {
@@ -653,6 +609,7 @@ async function loadFilters(env) {
 function clearGatewayCache() {
   globalConfigCache = { token: null, relay_url: null, ts: 0 };
   filterCache = { data: null, ts: 0 };
+  tokenBuckets.clear();
   clearChannelCache();
 }
 
@@ -756,6 +713,11 @@ function createFilterTransform(filters) {
               // 非串流格式（message）自動轉為串流（delta）
               const isNonStreaming = parsed.choices.some(ch => ch.message && !ch.delta);
               if (isNonStreaming) {
+                // 若 Smart Split 正在偵測中，先 flush 緩衝內容避免遺失
+                if (ssHeld.length > 0) {
+                  for (const hl of ssHeld) controller.enqueue(encoder.encode(hl + "\n\n"));
+                  ssHeld = []; ssHeldParsed = []; ssDetectBuf = ""; ssMode = "normal";
+                }
                 for (const ch of parsed.choices) {
                   const msg = ch.message || {};
                   const idx = ch.index || 0;
@@ -906,12 +868,14 @@ async function parseRelayResponse(relayRes) {
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
+      reader.cancel().catch(() => {});
       const fake = new Response(JSON.stringify({ error: "relay response truncated" }), { status: 502, headers: { "content-type": "application/json" } });
       fake.headers.set("X-Relay-Error", "1");
       return { relayError: true, response: fake };
     }
     buf += decoder.decode(value, { stream: true });
     if (buf.length > MAX_META) {
+      reader.cancel().catch(() => {});
       const fake = new Response(JSON.stringify({ error: "relay metadata too large" }), { status: 502, headers: { "content-type": "application/json" } });
       fake.headers.set("X-Relay-Error", "1");
       return { relayError: true, response: fake };
@@ -922,11 +886,13 @@ async function parseRelayResponse(relayRes) {
     const remainder = buf.slice(nl + 1);
     let meta;
     try { meta = JSON.parse(metaLine); } catch {
+      reader.cancel().catch(() => {});
       const fake = new Response(JSON.stringify({ error: "invalid relay metadata" }), { status: 502, headers: { "content-type": "application/json" } });
       fake.headers.set("X-Relay-Error", "1");
       return { relayError: true, response: fake };
     }
     if (meta._relay?.error) {
+      reader.cancel().catch(() => {});
       const fake = new Response(JSON.stringify({ error: meta._relay.error }), { status: 502, headers: { "content-type": "application/json" } });
       fake.headers.set("X-Relay-Error", "1");
       return { relayError: true, response: fake };
@@ -946,6 +912,7 @@ async function parseRelayResponse(relayRes) {
           } catch (e) { controller.error(e); }
         })();
       },
+      cancel() { reader.cancel(); },
     });
     return { response: new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders }) };
   }
@@ -971,18 +938,24 @@ async function upstreamFetch(url, opts, env, rid, noRelay) {
 }
 
 // Per-channel relay: 使用 channel.relay_url 逐一設定
-async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, signal) {
+async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, signal, relaySecret) {
   const h = new Headers(baseHeaders);
   h.set("x-target-url", targetUrl);
+  if (relaySecret) h.set("x-relay-token", relaySecret);
   const relayRes = await fetch(relayBase, { method, headers: h, body, signal });
   if (relayRes.headers.get("x-relay") !== "1") return relayRes;
   const reader = relayRes.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  const MAX_META = 65536;
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += decoder.decode(value, { stream: true });
+    if (buf.length > MAX_META) {
+      reader.cancel();
+      return new Response(JSON.stringify({ error: "relay metadata too large" }), { status: 502, headers: { "content-type": "application/json", "x-relay-error": "1" } });
+    }
     const nl = buf.indexOf("\n");
     if (nl >= 0) {
       const metaLine = buf.slice(0, nl);
@@ -1064,7 +1037,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   // 非串流請求嘗試走快取
   // 僅快取 embed / moderate 類型（與 cacheSet 邏輯一致）
   if (streamType !== "stream" && body && (requiredType === "embed" || requiredType === "moderate")) {
-    const ck = getCacheKey("", body);
+    const ck = getCacheKey(requiredType, body);
     if (ck) {
       const cached = cacheGet(ck);
       if (cached) return { response: new Response(cached.body, { status: 200, headers: new Headers(cached.headers) }) };
@@ -1171,11 +1144,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
               parsed.messages.unshift(...pms);
             }
           }
-          // model_map: 將用戶請求的 model 名稱映射到 provider 使用的 model 名稱
-          if (opts.model_map && parsed.model) {
-            const mapped = opts.model_map[parsed.model];
-            if (mapped) parsed.model = mapped;
-          }
           for (const [path, val] of Object.entries(opts.rewrite.request.body)) {
             if (path === "_prepend_messages") continue;
             if (path === "model") parsed.model = val;
@@ -1185,6 +1153,14 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             else { parsed[path] = val; }
           }
           reqBody = JSON.stringify(parsed);
+        }
+        // model_map 獨立於 rewrite.request.body 之外，即使無 body rewrite 仍可生效
+        if (opts.model_map && reqBody) {
+          let parsed = JSON.parse(reqBody);
+          if (parsed.model && opts.model_map[parsed.model]) {
+            parsed.model = opts.model_map[parsed.model];
+            reqBody = JSON.stringify(parsed);
+          }
         }
       } catch (e) {}
     }
@@ -1214,7 +1190,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       const isChat = requiredType === "chat";
       if (isChat && globalRelayUrl?.trim()) {
         const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
-        res = await fetchViaRelay(relayBase + upstreamPath, url, method, headers, reqBody, controller.signal);
+        // relay server 讀 x-target-url header 決定轉發目標，不依賴請求路徑
+        res = await fetchViaRelay(relayBase, url, method, headers, reqBody, controller.signal, env.RELAY_SECRET);
       } else if (isChat) {
         res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false);
       } else {
@@ -1259,11 +1236,11 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           } catch (e) {}
         }
         // 非串流快取：僅快取 embeddings / moderations 類型
-        if (streamType !== "stream" && !(body && typeof body === "string" && body.includes('"stream":true'))) {
+        if (streamType !== "stream" && !(bodyStr && bodyStr.includes('"stream":true'))) {
           const ct = res.headers.get("Content-Type") || "";
           if (ct.includes("application/json") && (requiredType === "embed" || requiredType === "moderate")) {
             res.clone().text().then(text => {
-              const ck = getCacheKey("", body);
+              const ck = getCacheKey(channel.model || requiredType, bodyStr);
               if (ck) cacheSet(ck, { body: text, headers: { "Content-Type": ct } }, channel.cache_ttl || 3600);
             }).catch(() => {});
           }
@@ -1284,6 +1261,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             parsed.stream = false;
             reqBody = JSON.stringify(parsed);
             retryAsNonStream = true;
+            refundRateLimit(channel);  // 退還 rate limit 配額，避免重試同一渠道時雙重計算
             logStructured("warn", "4xx with stream=true, retrying same channel with stream=false", { channel: channel.name, status: res.status, rid });
             continue;
           }
@@ -1432,6 +1410,7 @@ async function wrapNonStreamToStream(c, upstream, headers) {
   headers.set("X-Accel-Buffering", "no");
 
   // 每 5 秒送 keepalive，避免 client timeout
+  // keepAlive 由下游非同步任務設為 false 終止迴圈；JS 單執行緒保證可見性
   const keepTask = (async () => {
     while (keepAlive) {
       try { await writer.write(enc.encode(": keepalive\n\n")); } catch { break; }
@@ -1484,6 +1463,7 @@ async function wrapNonStreamToStream(c, upstream, headers) {
 }
 
 async function handleModels(c) {
+  const { relay_url: globalRelayUrl } = await resolveGlobalConfig(c.env);
   const channels = await loadChannels(c.env);
   if (channels.length === 0) return c.json({ object: "list", data: [] });
   for (const channel of channels) {
@@ -1497,10 +1477,28 @@ async function handleModels(c) {
           if (Array.isArray(ch)) for (const h of ch) { if (h.key && h.key.trim() && !BLOCKED_CUSTOM_HEADERS.has(h.key.trim().toLowerCase())) headers.set(h.key.trim(), h.value || ""); }
         } catch (e) {}
       }
-      const res = await fetch(url, {
-        headers,
-        signal: AbortSignal.timeout(5000),
-      });
+      let res;
+      const channelRelay = channel.relay_url?.trim();
+      const globalRelay = globalRelayUrl?.trim();
+      if (channelRelay) {
+        // 使用 per-channel relay
+        res = await fetchViaRelay(channelRelay.replace(/\/+$/, ""), url, "GET", headers, undefined, AbortSignal.timeout(5000), c.env.RELAY_SECRET);
+      } else if (globalRelay) {
+        // 使用 config 表中的全域 relay
+        const relayHeaders = new Headers(headers);
+        relayHeaders.set("x-target-url", url);
+        if (c.env.RELAY_SECRET) relayHeaders.set("x-relay-token", c.env.RELAY_SECRET);
+        const relayRes = await fetch(globalRelay.replace(/\/+$/, ""), { method: "GET", headers: relayHeaders, signal: AbortSignal.timeout(5000) });
+        if (relayRes.headers.get("x-relay") === "1") {
+          const parsed = await parseRelayResponse(relayRes);
+          if (parsed.relayError) { markDegraded(channel.id, c.env); continue; }
+          res = parsed.response;
+        } else {
+          res = relayRes;
+        }
+      } else {
+        res = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
+      }
       if (res.ok) {
         markHealthy(channel.id, c.env);
         return c.json(await res.json());
@@ -1700,7 +1698,7 @@ function createDashboardApi() {
     if (!Array.isArray(body)) return c.json({ ok: false, error: "Expected array" }, 400);
     const errs = validateChannelData(body);
     if (errs.length > 0) return c.json({ ok: false, error: "Validation failed", details: errs }, 400);
-    // D1 batch transactions have a 100-statement limit (D1_BATCH_LIMIT = 99).
+    // D1 batch transactions have a 100-statement limit (D1_BATCH_LIMIT = 100).
     // DELETE occupies 1 slot, so we can atomically save at most D1_BATCH_LIMIT-1 channels.
     // Beyond that, sequential batches risk interleaving with concurrent requests.
     const maxChannels = D1_BATCH_LIMIT - 1;
@@ -1840,7 +1838,7 @@ function createDashboardApi() {
       let res;
       if (relayUrl) {
         // fetchViaRelay 的 body 讀取不在初始 signal 範圍內，用 race 強制總 timeout
-        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST", testHeaders, testBody, AbortSignal.timeout(TEST_TIMEOUT_MS));
+        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST", testHeaders, testBody, AbortSignal.timeout(TEST_TIMEOUT_MS), c.env.RELAY_SECRET);
         const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error("relay test timeout")), TEST_TIMEOUT_MS)
         );
@@ -1947,7 +1945,7 @@ app.use("*", cors({
   origin: "*",
   allowHeaders: ["Content-Type", "Authorization", "X-Admin-Token"],
   allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  exposeHeaders: ["Content-Length"],
+  exposeHeaders: ["Content-Length", "X-Session-Token"],
   maxAge: 600,
   credentials: false,
 }));
