@@ -245,7 +245,8 @@ const FILTERS_DDL = `CREATE TABLE IF NOT EXISTS filters (
 const CONFIG_DDL = `CREATE TABLE IF NOT EXISTS config (
   id              INTEGER PRIMARY KEY CHECK (id = 1),
   client_token    TEXT    NOT NULL DEFAULT '',
-  admin_password  TEXT    NOT NULL DEFAULT ''
+  admin_password  TEXT    NOT NULL DEFAULT '',
+  relay_url       TEXT    NOT NULL DEFAULT ''
 )`;
 
 const SCHEMA_META_DDL = `CREATE TABLE IF NOT EXISTS schema_meta (
@@ -347,8 +348,11 @@ async function ensureSchema(env) {
   if (parseInt(schemaVer, 10) < 6) {
     try { await env.DB.prepare("ALTER TABLE channels ADD COLUMN max_context_length INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* 欄位已存在則略過 */ }
   }
+  if (parseInt(schemaVer, 10) < 7) {
+    try { await env.DB.prepare("ALTER TABLE config ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* 欄位已存在則略過 */ }
+  }
   // migration 完成後寫入 DB flag，下次冷啟動直接跳過
-  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '6')").run();
+  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '7')").run();
   schemaReady = true;
 }
 
@@ -471,16 +475,28 @@ function clearChannelCache() {
   typeChannelCache.clear();
 }
 
-function selectChannel(channels, exclude = new Set()) {
-  // 如果所有 channel 都已 degraded，嘗試撈取已冷卻完畢的 channel
+function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0) {
   const healthy = channels.filter(c => !exclude.has(c.id) && !isDegraded(c.id));
   if (healthy.length === 0) return null;
   const pool = healthy;
-  const totalWeight = pool.reduce((s, c) => s + Math.max(c.weight, 1), 0);
+  // 動態權重：僅懲罰接近 context limit 的渠道，不對無限渠道加成（避免覆蓋管理員設定的 weight）
+  const weights = pool.map(c => {
+    let weight = Math.max(c.weight, 1);
+    if (c.max_context_length > 0 && estimatedContextTokens > 0) {
+      const ratio = estimatedContextTokens / c.max_context_length;
+      if (ratio >= 0.9) {
+        weight *= 0.7;
+      } else if (ratio >= 0.7) {
+        weight *= 0.85;
+      }
+    }
+    return weight;
+  });
+  const totalWeight = weights.reduce((s, w) => s + w, 0);
   let r = Math.random() * totalWeight;
-  for (const c of pool) {
-    r -= Math.max(c.weight, 1);
-    if (r <= 0) return c;
+  for (let i = 0; i < pool.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return pool[i];
   }
   return pool[pool.length - 1];
 }
@@ -515,6 +531,7 @@ const tokenBuckets = new Map();
 const TOKEN_BUCKET_SYNC_MS = 30000;
 let lastBucketSync = 0;
 
+// 純檢查，不消耗配額
 function checkRateLimit(channel) {
   if (!channel.rpm_limit && !channel.rpd_limit && !channel.rate_limit_capacity) return { ok: true };
   const now = Date.now();
@@ -529,27 +546,41 @@ function checkRateLimit(channel) {
     };
     tokenBuckets.set(cid, bucket);
   }
-  // RPM 檢查
   if (bucket.rpm > 0) {
     if (now - bucket.rpmTs > 60000) { bucket.rpmCount = 0; bucket.rpmTs = now; }
     if (bucket.rpmCount >= bucket.rpm) return { ok: false, reason: "rpm_limit" };
-    bucket.rpmCount++;
   }
-  // RPD 檢查
   if (bucket.rpd > 0) {
     if (now - bucket.rpdTs > 86400000) { bucket.rpdCount = 0; bucket.rpdTs = now; }
     if (bucket.rpdCount >= bucket.rpd) return { ok: false, reason: "rpd_limit" };
-    bucket.rpdCount++;
   }
-  // Token Bucket（演算法）
   if (bucket.capacity > 0 && bucket.rate > 0) {
     const elapsed = (now - bucket.tokenTs) / 1000;
     bucket.tokens = Math.min(bucket.capacity, bucket.tokens + elapsed * bucket.rate);
     bucket.tokenTs = now;
     if (bucket.tokens < 1) return { ok: false, reason: "rate_limit" };
-    bucket.tokens -= 1;
   }
   return { ok: true };
+}
+
+// 通過檢查後、實際發送請求前消耗配額
+function consumeRateLimit(channel) {
+  const cid = channel.id || 0;
+  const bucket = tokenBuckets.get(cid);
+  if (!bucket) return;
+  if (bucket.rpm > 0) bucket.rpmCount++;
+  if (bucket.rpd > 0) bucket.rpdCount++;
+  if (bucket.capacity > 0 && bucket.rate > 0) bucket.tokens -= 1;
+}
+
+// 請求未到達上游時退還配額（連線失敗等）
+function refundRateLimit(channel) {
+  const cid = channel.id || 0;
+  const bucket = tokenBuckets.get(cid);
+  if (!bucket) return;
+  if (bucket.rpm > 0 && bucket.rpmCount > 0) bucket.rpmCount--;
+  if (bucket.rpd > 0 && bucket.rpdCount > 0) bucket.rpdCount--;
+  if (bucket.capacity > 0 && bucket.rate > 0) bucket.tokens = Math.min(bucket.capacity, bucket.tokens + 1);
 }
 
 // 記憶體快取（non-stream 響應）
@@ -586,17 +617,22 @@ function cacheSet(key, data, ttl) {
   responseCache.set(key, { data, expires: Date.now() + (ttl || 3600) * 1000 });
 }
 
-let tokenCache = { token: null, ts: 0 };
+let globalConfigCache = { token: null, relay_url: null, ts: 0 };
+
+async function resolveGlobalConfig(env) {
+  if (globalConfigCache.ts > 0 && Date.now() - globalConfigCache.ts < TOKEN_TTL) return globalConfigCache;
+  try {
+    const cf = await env.DB.prepare("SELECT client_token, relay_url FROM config WHERE id=1").first();
+    globalConfigCache = { token: cf?.client_token || null, relay_url: cf?.relay_url || null, ts: Date.now() };
+  } catch {
+    globalConfigCache = { token: null, relay_url: null, ts: Date.now() };
+  }
+  return globalConfigCache;
+}
 
 async function resolveClientToken(env) {
-  if (tokenCache.token && Date.now() - tokenCache.ts < TOKEN_TTL) return tokenCache.token;
-  try {
-    const cf = await env.DB.prepare("SELECT client_token FROM config WHERE id=1").first();
-    tokenCache = { token: cf?.client_token || null, ts: Date.now() };
-  } catch {
-    tokenCache = { token: null, ts: Date.now() };
-  }
-  return tokenCache.token;
+  const cfg = await resolveGlobalConfig(env);
+  return cfg.token;
 }
 
 let filterCache = { data: null, ts: 0 };
@@ -615,7 +651,7 @@ async function loadFilters(env) {
 }
 
 function clearGatewayCache() {
-  tokenCache = { token: null, ts: 0 };
+  globalConfigCache = { token: null, relay_url: null, ts: 0 };
   filterCache = { data: null, ts: 0 };
   clearChannelCache();
 }
@@ -989,7 +1025,7 @@ function createForwardStream(initial, reader) {
 async function patchReasoningToContent(res) {
   try {
     const ct = (res.headers.get("Content-Type") || "").toLowerCase();
-    if (!ct.includes("application/json") && !ct.includes("text/event-stream")) return res;
+    if (!ct.includes("application/json")) return res;
     const cloned = res.clone();
     const text = await cloned.text();
     const parsed = JSON.parse(text);
@@ -1012,6 +1048,7 @@ async function patchReasoningToContent(res) {
 }
 
 async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
+  const { relay_url: globalRelayUrl } = await resolveGlobalConfig(env);
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
   const requiredType = getPathChannelType(suffix);
@@ -1033,40 +1070,49 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       if (cached) return { response: new Response(cached.body, { status: 200, headers: new Headers(cached.headers) }) };
     }
   }
-  // 統一 body 為字串（避免下游重複 ArrayBuffer 解碼），同時判斷 vision/tools 需求
+  // 統一 body 為字串（避免下游重複 ArrayBuffer 解碼），同時判斷 vision/tools 需求、計算 token 並過濾非標準欄位
   let bodyStr = null;
+  let needsVision = false, needsTools = false;
+  let estimatedContextTokens = 0;
   if (body) {
     bodyStr = body instanceof ArrayBuffer ? new TextDecoder().decode(body) : (typeof body === "string" ? body : null);
   }
-  let needsVision = false, needsTools = false;
   if (bodyStr && requiredType === "chat") {
     try {
       const parsed = JSON.parse(bodyStr);
+      let sanitized = false;
       if (Array.isArray(parsed.messages)) {
         for (const msg of parsed.messages) {
+          // 清除非標準欄位避免上游報錯
+          if (msg.reasoning_content !== undefined) { delete msg.reasoning_content; sanitized = true; }
+          // 計算 token 與判定 vision/tools
           if (Array.isArray(msg.content)) {
-            if (msg.content.some(part => part.type === "image_url")) needsVision = true;
-          } else if (typeof msg.content === "string" && /data:image\//.test(msg.content)) {
-            needsVision = true;
+            for (const part of msg.content) {
+              if (part.type === "image_url") needsVision = true;
+              if (part.type === "text" && typeof part.text === "string") estimatedContextTokens += part.text.length / 4;
+            }
+          } else if (typeof msg.content === "string") {
+            if (/data:image\//.test(msg.content)) needsVision = true;
+            estimatedContextTokens += msg.content.length / 4;
           }
           if (msg.tool_calls || msg.tool_call_id) needsTools = true;
         }
       }
       if (parsed.tools || parsed.tool_choice) needsTools = true;
+      if (sanitized) bodyStr = JSON.stringify(parsed);
     } catch (e) {}
   }
+  
+  if (estimatedContextTokens > 0) {
+    eligible = eligible.filter(c => c.max_context_length === 0 || estimatedContextTokens <= c.max_context_length);
+  }
+  
   // 依能力過濾渠道
   if (needsVision) eligible = eligible.filter(c => c.support_vision);
   if (needsTools) eligible = eligible.filter(c => c.support_tools);
   if (eligible.length === 0) {
-    logStructured("warn", "no channels match capability", { vision: needsVision, tools: needsTools, path, rid });
-    // 用原始 channels 清單重試（已有資料，不重查 DB）
-    eligible = channels;
-    if (needsVision) eligible = eligible.filter(c => c.support_vision);
-    if (needsTools) eligible = eligible.filter(c => c.support_tools);
-    if (eligible.length === 0) {
-      return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools})`, status: 503 } };
-    }
+    logStructured("warn", "no channels match capability or context length", { vision: needsVision, tools: needsTools, tokens: estimatedContextTokens, path, rid });
+    return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools}, tokens=${estimatedContextTokens})`, status: 503 } };
   }
   const attempted = new Set();
   const maxAttempts = Math.min(Math.max(eligible.length, 1) * 3, 15);
@@ -1076,7 +1122,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   while (attempts < maxAttempts && attempted.size < eligible.length) {
     attempts++;
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
-    const channel = selectChannel(eligible, attempted);
+    const channel = selectChannel(eligible, attempted, estimatedContextTokens);
     if (!channel) break;
     // 非重試時重置 reqBody 為原始值，重試時保留修改後的 reqBody（stream: false）
     if (!retryAsNonStream) reqBody = bodyStr;
@@ -1088,6 +1134,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       logStructured("warn", "rate limit exceeded, try next", { channel: channel.name, reason: rl.reason, rid });
       continue;
     }
+    consumeRateLimit(channel);
     const upstreamPath = suffix;
     const url = channel.base_url.replace(/\/+$/, "") + upstreamPath;
     const headers = new Headers(baseHeaders);
@@ -1152,24 +1199,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
       } catch (e) {}
     }
-    // max_context_length 檢查：超過則跳過此渠道，留給下一渠道處理
-    if (channel.max_context_length > 0 && requiredType === "chat" && reqBody) {
-      let ctxOverLimit = false;
-      try {
-        const parsed = JSON.parse(reqBody);
-        if (Array.isArray(parsed.messages)) {
-          const estTokens = (text) => Math.ceil((typeof text === "string" ? text : JSON.stringify(text)).length / 2);
-          let total = 0;
-          for (const m of parsed.messages) total += estTokens(m.content || "");
-          if (total > channel.max_context_length) ctxOverLimit = true;
-        }
-      } catch (e) { /* skip check */ }
-      if (ctxOverLimit) {
-        attempted.add(channel.id);
-        logStructured("info", "context too long for channel, trying next", { channel: channel.name, maxCtx: channel.max_context_length, rid });
-        continue;
-      }
-    }
+
     let timer;
     const controller = new AbortController();
     const onAbort = () => controller.abort();
@@ -1182,8 +1212,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
       let res;
       const isChat = requiredType === "chat";
-      if (isChat && channel.relay_url?.trim()) {
-        const relayBase = channel.relay_url.trim().replace(/\/+$/, '');
+      if (isChat && globalRelayUrl?.trim()) {
+        const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
         res = await fetchViaRelay(relayBase + upstreamPath, url, method, headers, reqBody, controller.signal);
       } else if (isChat) {
         res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false);
@@ -1192,10 +1222,11 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
-      // relay 本身錯誤（配額滿、斷線等）→ 不標記 channel degraded，直接重試
+      // relay 本身錯誤（配額滿、斷線等）→ 標記 attempted 避免空轉同一渠道
       if (res.headers.get("X-Relay-Error") === "1") {
         res.body?.cancel().catch(() => {});
-        logStructured("warn", "relay error, retrying", { relay: env.RELAY_BASE_URL, status: res.status, rid });
+        attempted.add(channel.id);
+        logStructured("warn", "relay error, retrying", { relay: globalRelayUrl, status: res.status, rid });
         continue;
       }
       if (res.ok) {
@@ -1245,7 +1276,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
         continue;
       }
-      // 4xx + 原始請求為串流 → 上游可能不支援串流，改用非串流重試同一渠道
+      // 4xx + 原始請求為串流 → 上游可能不支援串流，改用非串流重試同一渠道 (安全性：限定 reqBody 有 stream 屬性時)
       if (res.status >= 400 && res.status < 500 && streamType === "stream" && reqBody) {
         try {
           const parsed = JSON.parse(reqBody);
@@ -1262,6 +1293,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     } catch (err) {
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
+      refundRateLimit(channel);
       if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
       markDegraded(channel.id, env);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
@@ -1642,7 +1674,7 @@ function createDashboardApi() {
       if (typeof provider_options === "string") try { provider_options = JSON.parse(provider_options); } catch (e) { provider_options = null; }
       return { ...ch, api_key: ch.api_key || '', headers, provider_options };
     });
-    return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "" } });
+    return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "", relay_url: cf?.relay_url || "" } });
   });
 
   // 完整匯出（含 unmasked API Key），用作全設定手動備份
@@ -1660,7 +1692,7 @@ function createDashboardApi() {
       // 匯出不遮罩 api_key
       return { ...ch, headers, provider_options };
     });
-    return c.json({ version: 1, channels, filters: fl.results || [], config: { token: cf?.client_token || "" } });
+    return c.json({ version: 1, channels, filters: fl.results || [], config: { token: cf?.client_token || "", relay_url: cf?.relay_url || "" } });
   });
 
   api.post("/batch-channels", async (c) => {
@@ -1737,12 +1769,22 @@ function createDashboardApi() {
 
   api.post("/config", async (c) => {
     const b = await c.req.json();
-    const ex = await c.env.DB.prepare("SELECT client_token FROM config WHERE id=1").first();
+    const ex = await c.env.DB.prepare("SELECT client_token, relay_url FROM config WHERE id=1").first();
     const existingToken = ex?.client_token || "";
     try {
-      const token = b.token || existingToken || getDefaults().token;
-      if (ex) await c.env.DB.prepare("UPDATE config SET client_token=? WHERE id=1").bind(token).run();
-      else await c.env.DB.prepare("INSERT INTO config (id, client_token, admin_password) VALUES (1, ?, '')").bind(token).run();
+      const token = b.token !== undefined ? b.token : (existingToken || getDefaults().token);
+      let updates = [];
+      let bindings = [];
+      updates.push("client_token=?"); bindings.push(token);
+      if (b.relay_url !== undefined) {
+        updates.push("relay_url=?"); bindings.push(b.relay_url);
+      }
+      if (ex) {
+        await c.env.DB.prepare(`UPDATE config SET ${updates.join(",")} WHERE id=1`).bind(...bindings).run();
+      } else {
+        const rUrl = b.relay_url || "";
+        await c.env.DB.prepare("INSERT INTO config (id, client_token, admin_password, relay_url) VALUES (1, ?, '', ?)").bind(token, rUrl).run();
+      }
     } catch (e) { return c.json({ error: e.message }, 500); }
     clearGatewayCache();
 

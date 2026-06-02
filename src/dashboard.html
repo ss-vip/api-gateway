@@ -141,9 +141,9 @@
                 </th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('name')">Name <i id="sort-name" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 90px" class="d-none d-lg-table-cell border-0">Stream</th>
-                <th style="width: 80px" class="d-none d-lg-table-cell border-0">Ch Type</th>
+                <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
+                <th style="width: 90px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('channel_type')">Type <i id="sort-channel_type" class="bi bi-arrow-down-up opacity-25"></i></th>
+                <th style="width: 110px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('max_context_length')">Max Ctx <i id="sort-max_context_length" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 150px" class="text-center border-0">Actions</th>
               </tr>
             </thead>
@@ -287,13 +287,17 @@
           <button type="button" class="btn btn-outline-secondary btn-sm w-100 mt-1 fw-bold" onclick="addHeaderRow()"><i class="bi bi-plus-lg me-1"></i>ADD HEADER</button>
           <hr class="my-2">
           <div class="row g-1 mb-1">
-            <div class="col-6">
+            <div class="col-3">
               <label class="form-label mini-label fw-bold">RPM</label>
               <input type="number" id="ch-rpm" class="form-control form-control-sm" value="0" min="0">
             </div>
-            <div class="col-6">
+            <div class="col-3">
               <label class="form-label mini-label fw-bold">RPD</label>
               <input type="number" id="ch-rpd" class="form-control form-control-sm" value="0" min="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label mini-label fw-bold">Max Context (est. tokens) <span class="text-muted" style="font-weight:400">（0=不限）</span></label>
+              <input type="number" id="ch-max-ctx" class="form-control form-control-sm" value="0" min="0" placeholder="12000">
             </div>
           </div>
           <div class="mb-1">
@@ -303,14 +307,6 @@
           <div class="mb-1">
             <label class="form-label mini-label fw-bold">前置提示訊息 <span class="text-muted" style="font-weight:400">（強制插入到最前面，內容相同時自動去重）</span></label>
             <textarea id="ch-prepend-prompt" class="form-control form-control-sm" rows="4" placeholder="請輸入 system prompt，例如：&#10;你是一個專業的程式設計助手，請全程用繁體中文回答。"></textarea>
-          </div>
-          <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Relay URL <span class="text-muted" style="font-weight:400">（選用，佈署 relay.js 的服務）</span></label>
-            <input type="url" id="ch-relay-url" class="form-control form-control-sm" placeholder="https://your-server:3000">
-          </div>
-          <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Max Context (est. tokens) <span class="text-muted" style="font-weight:400">（0=不限，超過則截斷中間歷史）</span></label>
-            <input type="number" id="ch-max-ctx" class="form-control form-control-sm" value="0" min="0" placeholder="12000">
           </div>
         </div>
       </div>
@@ -565,9 +561,12 @@
         if (batch) {
           channels = batch.channels || [];
           filters = batch.filters || [];
-          renderStats();
           const el = document.getElementById('cfg-token');
           if (el) el.value = batch.config?.token || '';
+          const rl = document.getElementById('cfg-relay-url');
+          if (rl) rl.value = batch.config?.relay_url || '';
+          // We must render stats AFTER setting the values so it picks them up, or pass them in
+          renderStats(batch.config?.token || '', batch.config?.relay_url || '');
           renderChannels();
           renderFilters();
           return true;
@@ -577,13 +576,14 @@
       return false;
     };
 
-    const renderStats = () => {
+    const renderStats = (initToken, initRelay) => {
       const total = channels.length;
       const enabled = channels.filter(c => c.is_enabled).length;
-      const tokenVal = esc(document.getElementById('cfg-token')?.value || '');
+      const tokenVal = esc(initToken !== undefined ? initToken : (document.getElementById('cfg-token')?.value || ''));
+      const relayVal = esc(initRelay !== undefined ? initRelay : (document.getElementById('cfg-relay-url')?.value || ''));
       document.getElementById('stat-content').innerHTML =
         '<div class="row g-2 g-md-3 mb-3">' +
-          '<div class="col-6 col-md-3">' +
+          '<div class="col-6 col-md-2">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-0 mb-md-1">Total</div>' +
@@ -591,7 +591,7 @@
               '</div>' +
             '</div>' +
           '</div>' +
-          '<div class="col-6 col-md-3">' +
+          '<div class="col-6 col-md-2">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-0 mb-md-1">Enabled</div>' +
@@ -599,13 +599,24 @@
               '</div>' +
             '</div>' +
           '</div>' +
-          '<div class="col-12 col-md-6">' +
+          '<div class="col-12 col-md-4">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-1">Token</div>' +
                 '<div class="input-group input-group-sm mt-1">' +
                   '<input type="text" id="cfg-token" class="form-control" value="' + tokenVal + '" />' +
                   '<button class="btn btn-outline-secondary" onclick="copyToken()" title="Copy Token"><i class="bi bi-copy"></i></button>' +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="col-12 col-md-4">' +
+            '<div class="card border-0 shadow-sm h-100">' +
+              '<div class="card-body p-2 p-md-3">' +
+                '<div class="small text-muted text-uppercase fw-bold mb-1">Relay URL (Global)</div>' +
+                '<div class="input-group input-group-sm mt-1">' +
+                  '<input type="url" id="cfg-relay-url" class="form-control" placeholder="https://your-server:3000" value="' + relayVal + '" />' +
+                  '<button class="btn btn-outline-secondary" onclick="document.getElementById(\'cfg-relay-url\').value=\'\'" title="Clear"><i class="bi bi-x-lg"></i></button>' +
                 '</div>' +
               '</div>' +
             '</div>' +
@@ -633,7 +644,7 @@
         (c.model || '').toLowerCase().includes(query)
       );
 
-      ['id','name','model','weight'].forEach(k => {
+      ['id','name','model','weight','channel_type','max_context_length'].forEach(k => {
         const icon = document.getElementById('sort-' + k);
         if (!icon) return;
         icon.className = 'bi bi-arrow-down-up opacity-25';
@@ -655,6 +666,7 @@
         row += '<td class="align-middle"><span style="display:inline-flex;align-items:center;gap:2px"><code class="small copy-model mb-0" style="cursor:pointer" data-model="' + esc(c.model || '') + '" title="點擊複製">' + displayName + '</code>' + (c.channel_type === 'chat' && c.support_tools ? '<span style="font-size:0.7rem;line-height:1">🔧</span>' : '') + (c.channel_type === 'chat' && c.support_vision ? '<span style="font-size:0.7rem;line-height:1">👁️</span>' : '') + '</span></td>';
         row += '<td class="d-none d-lg-table-cell align-middle">' + esc(String(c.weight)) + '</td>';
         row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-primary bg-opacity-10 text-primary small">' + esc(c.channel_type || 'chat') + '</span></td>';
+        row += '<td class="d-none d-lg-table-cell align-middle">' + (c.max_context_length > 0 ? esc(String(c.max_context_length)) : '<span class="text-muted">∞</span>') + '</td>';
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
@@ -675,7 +687,7 @@
         row += '</td>';
         row += '</tr>';
         return row;
-      }).join('') || '<tr><td colspan="7" class="py-4 text-muted">No channels.</td></tr>';
+      }).join('') || '<tr><td colspan="8" class="py-4 text-muted">No channels.</td></tr>';
       initTooltips();
     };
 
@@ -703,7 +715,6 @@
         base_url: ch.base_url,
         api_key: ch.api_key,
         model: ch.model,
-        relay_url: ch.relay_url || '',
       }, false);
       btns.forEach(b => { b.innerHTML = b._orig || '<i class="bi bi-play-fill"></i>'; b.disabled = false; });
       if (r) {
@@ -746,7 +757,11 @@
 
     const saveEverything = async () => {
       const cfgEl = document.getElementById('cfg-token');
-      if (cfgEl) { const cfgOk = await api('/admin/api/config', 'POST', { token: cfgEl.value }); if (!cfgOk) { toast('Token 儲存失敗', 'danger'); return; } }
+      const relayEl = document.getElementById('cfg-relay-url');
+      const configPayload = { token: cfgEl ? cfgEl.value : undefined };
+      if (relayEl) configPayload.relay_url = relayEl.value;
+      const cfgOk = await api('/admin/api/config', 'POST', configPayload);
+      if (!cfgOk) { toast('Config 儲存失敗', 'danger'); return; }
       const channelsOk = await api('/admin/api/batch-channels', 'POST', channels);
       if (!channelsOk) { toast('渠道儲存失敗，請檢查連線', 'danger'); return; }
       const validFilters = filters.filter(f => f.text && f.text.trim().length > 0 && f.text.length <= 30);
@@ -826,7 +841,7 @@
       document.getElementById('ch-prepend-prompt').value = prependText;
       document.getElementById('ch-support-tools').checked = c.support_tools == 1;
       document.getElementById('ch-support-vision').checked = c.support_vision == 1;
-      document.getElementById('ch-relay-url').value = c.relay_url || '';
+
       document.getElementById('ch-max-ctx').value = c.max_context_length || 0;
       updateCapabilities();
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
@@ -888,7 +903,7 @@
         provider_options: providerOptions,
         support_tools: document.getElementById('ch-support-tools').checked ? 1 : 0,
         support_vision: document.getElementById('ch-support-vision').checked ? 1 : 0,
-        relay_url: (document.getElementById('ch-relay-url')?.value?.trim() || '').replace(/\/+$/, ''),
+
         max_context_length: parseInt(document.getElementById('ch-max-ctx')?.value) || 0,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
@@ -977,7 +992,8 @@
             support_embeddings: ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
             absolute_url: ch.absolute_url ? 1 : 0,
             response_time: ch.response_time || 0,
-            relay_url: ch.relay_url || '',
+            max_context_length: ch.max_context_length || 0,
+
           }));
           channels.splice(0, channels.length, ...newChannels);
           // 若備份檔包含 filters 也一併匯入
@@ -985,6 +1001,11 @@
             filters.splice(0, filters.length, ...data.filters.map(f => ({
               id: f.id, text: f.text, mode: f.mode != null ? f.mode : 1, is_enabled: f.is_enabled != null ? f.is_enabled : 1,
             })));
+          }
+          // 匯入全域 relay_url（若備份檔有包含）
+          if (data.config?.relay_url != null) {
+            const rl = document.getElementById('cfg-relay-url');
+            if (rl) rl.value = data.config.relay_url;
           }
           renderChannels();
           renderStats();
