@@ -319,6 +319,10 @@
             <label class="form-label mini-label fw-bold">前置提示訊息 <span class="text-muted" style="font-weight:400">（強制插入到最前面，內容相同時自動去重）</span></label>
             <textarea id="ch-prepend-prompt" class="form-control form-control-sm" rows="4" placeholder="請輸入 system prompt，例如：&#10;你是一個專業的程式設計助手，請全程用繁體中文回答。"></textarea>
           </div>
+          <div class="mb-1">
+            <label class="form-label mini-label fw-bold">Relay URL <span class="text-muted" style="font-weight:400">（選用，繞過 CF 30s 限制，填 serv00 relay 位址）</span></label>
+            <input type="url" id="ch-relay-url" class="form-control form-control-sm" placeholder="https://your-server:3000">
+          </div>
         </div>
       </div>
     </div>
@@ -702,6 +706,7 @@
         base_url: ch.base_url,
         api_key: ch.api_key,
         model: ch.model,
+        relay_url: ch.relay_url || '',
       }, false);
       btns.forEach(b => { b.innerHTML = b._orig || '<i class="bi bi-play-fill"></i>'; b.disabled = false; });
       if (r) {
@@ -754,7 +759,9 @@
       const filterOk = await api('/admin/api/filters', 'POST', validFilters);
       if (!filterOk) { toast('過濾器儲存失敗', 'danger'); return; }
       toast('全部已儲存', 'success');
-      await init();
+      // 不呼叫 init() 以免 D1 eventual consistency 覆蓋前端已儲存的最新資料
+      renderChannels();
+      renderStats();
     };
 
     const addFilter = () => { filters.push({ text: '', mode: 1, is_enabled: true }); renderFilters(); };
@@ -784,6 +791,7 @@
       document.getElementById('ch-prepend-prompt').value = '';
       document.getElementById('ch-support-tools').checked = true;
       document.getElementById('ch-support-vision').checked = false;
+      document.getElementById('ch-relay-url').value = '';
       chHeaders = [];
       renderHeaders();
       switchTab('basic');
@@ -821,6 +829,7 @@
       document.getElementById('ch-prepend-prompt').value = prependText;
       document.getElementById('ch-support-tools').checked = c.support_tools == 1;
       document.getElementById('ch-support-vision').checked = c.support_vision == 1;
+      document.getElementById('ch-relay-url').value = c.relay_url || '';
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
       switchTab('basic');
@@ -844,7 +853,9 @@
       let providerOptions = null;
       const prependText = document.getElementById('ch-prepend-prompt')?.value?.trim();
       // 保留現有 provider_options 中非 _prepend_messages 的欄位（如 model_map）
-      const existingPO = (idx !== '' && channels[parseInt(idx)]?.provider_options) || null;
+      // 注意：D1 預設值 '[]' 經 JSON.parse 後變空陣列，物件 key 會因 JSON.stringify 遺失
+      const rawPO = (idx !== '' && channels[parseInt(idx)]?.provider_options) || null;
+      const existingPO = (rawPO && Array.isArray(rawPO) && rawPO.length === 0) ? null : rawPO;
       if (existingPO || prependText) {
         const merged = existingPO ? (typeof existingPO === "string" ? JSON.parse(existingPO) : JSON.parse(JSON.stringify(existingPO))) : {};
         if (!merged.rewrite) merged.rewrite = {};
@@ -878,6 +889,7 @@
         provider_options: providerOptions,
         support_tools: document.getElementById('ch-support-tools').checked ? 1 : 0,
         support_vision: document.getElementById('ch-support-vision').checked ? 1 : 0,
+        relay_url: (document.getElementById('ch-relay-url')?.value?.trim() || '').replace(/\/+$/, ''),
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -937,14 +949,13 @@
             if (!ch.name || !ch.base_url || !ch.model) throw new Error('缺少必要欄位 (name, base_url, model)');
             if (ch.stream_type && !validTypes.includes(ch.stream_type)) throw new Error('無效的 stream_type: ' + ch.stream_type);
           }
-          const existingIds = channels.map(c => c.id).filter(i => i !== undefined);
-          let nextId = 1; while (existingIds.includes(nextId)) nextId++;
+          let nextId = 1;
           const newChannels = arr.map(ch => ({
-            id: nextId++,
+            id: (ch.id != null) ? ch.id : nextId++,
+            api_key: ch.api_key || '',
             name: ch.name,
             base_url: ch.base_url,
             model: ch.model,
-            api_key: ch.api_key || '',     // 保留備份中的 API Key
             weight: ch.weight || 50,
             is_enabled: ch.is_enabled != null ? (ch.is_enabled ? 1 : 0) : 1,
             stream_type: ch.stream_type || 'both',
@@ -956,6 +967,17 @@
             provider_options: ch.provider_options || null,
             support_tools: ch.support_tools != null ? ch.support_tools : 1,
             support_vision: ch.support_vision != null ? ch.support_vision : 0,
+            provider: ch.provider || '',
+            max_tokens: ch.max_tokens || 0,
+            support_stream: ch.support_stream != null ? (ch.support_stream ? 1 : 0) : 1,
+            support_image_gen: ch.support_image_gen != null ? (ch.support_image_gen ? 1 : 0) : 0,
+            support_audio_tts: ch.support_audio_tts != null ? (ch.support_audio_tts ? 1 : 0) : 0,
+            support_audio_stt: ch.support_audio_stt != null ? (ch.support_audio_stt ? 1 : 0) : 0,
+            support_image_edit: ch.support_image_edit != null ? (ch.support_image_edit ? 1 : 0) : 0,
+            support_embeddings: ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
+            absolute_url: ch.absolute_url ? 1 : 0,
+            response_time: ch.response_time || 0,
+            relay_url: ch.relay_url || '',
           }));
           channels.splice(0, channels.length, ...newChannels);
           // 若備份檔包含 filters 也一併匯入

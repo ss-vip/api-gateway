@@ -10,6 +10,7 @@ const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
 const SESSION_TTL = 86400000;
 const SESSION_PRUNE_INTERVAL = 50;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const adminSessions = new Map();
 let sessionPruneCounter = 0;
 
@@ -107,7 +108,6 @@ function maskApiKey(str) {
 }
 
 function maskApiKeyValue(key) {
-  // 遮罩純 API key 值（非 JSON 字串內嵌 key），保留前 8 末 4 供識別
   if (typeof key !== "string" || key.length < 12) return key;
   return key.slice(0, 8) + "***" + key.slice(-4);
 }
@@ -228,8 +228,10 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   rate_limit_algorithm TEXT NOT NULL DEFAULT 'rpm',
   rate_limit_capacity INTEGER NOT NULL DEFAULT 0,
   rate_limit_rate INTEGER NOT NULL DEFAULT 0,
-  rate_limit_key TEXT NOT NULL DEFAULT ''
+   rate_limit_key TEXT NOT NULL DEFAULT '',
+   relay_url TEXT NOT NULL DEFAULT ''
 )`;
+
 
 const FILTERS_DDL = `CREATE TABLE IF NOT EXISTS filters (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -331,8 +333,8 @@ async function ensureSchema(env) {
         "ALTER TABLE channels ADD COLUMN rate_limit_key TEXT NOT NULL DEFAULT ''"
       );
     }
-    // v3 migration: support_vision
     migrations.push("ALTER TABLE channels ADD COLUMN support_vision INTEGER NOT NULL DEFAULT 0");
+    migrations.push("ALTER TABLE channels ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''");
     for (const sql of migrations) {
       try { await env.DB.prepare(sql).run(); } catch (e) { /* 欄位已存在則略過 */ }
     }
@@ -425,14 +427,18 @@ async function dbLoadChannels(env, channelType) {
       consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
       cache_enabled, cache_ttl,
       rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
-      fallback_model, model, max_tokens, is_enabled,
+      fallback_model, model, max_tokens, is_enabled, provider_options, relay_url,
       support_tools, support_vision
       FROM channels WHERE is_enabled = 1`;
     const params = [];
     if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
     sql += " ORDER BY weight DESC";
     const { results } = await env.DB.prepare(sql).bind(...params).all();
-    const rows = results || [];
+    const rows = (results || []).map(ch => {
+      if (typeof ch.provider_options === "string") try { ch.provider_options = JSON.parse(ch.provider_options); } catch (e) { ch.provider_options = null; }
+      if (ch.provider_options && Array.isArray(ch.provider_options) && ch.provider_options.length === 0) ch.provider_options = null;
+      return ch;
+    });
     const nowMs = Date.now();
     const active = rows.filter(ch => !ch.cooldown_until || ch.cooldown_until <= nowMs);
     for (const ch of rows) {
@@ -453,6 +459,7 @@ async function dbLoadChannels(env, channelType) {
 function clearChannelCache() {
   cachedChannels = null;
   lastLoad = 0;
+  loadPromise = null;
   typeChannelCache.clear();
 }
 
@@ -647,6 +654,9 @@ function createFilterTransform(filters) {
             if (parsed.choices) {
               for (const choice of parsed.choices) {
                 const delta = choice?.delta || {};
+                if (!delta.content) {
+                  delta.content = delta.reasoning_content || delta.reasoning || "";
+                }
                 if (delta.content) delta.content = RollingFilter.applyStatic(delta.content, filters);
                 if (delta.refusal) delta.refusal = RollingFilter.applyStatic(delta.refusal, filters);
                 if (delta.reasoning_content) delta.reasoning_content = RollingFilter.applyStatic(delta.reasoning_content, filters);
@@ -688,10 +698,10 @@ function createIdleTimeoutStream(readable, idleMs) {
 }
 
 // ---- Relay Plugin（HTTP 轉發代理）----
+
 // 解析 relay 回應格式：第一行為 {"_relay":{"status":200,"headers":{...}}} metadata
 // 其餘為實際 upstream body（以 ReadableStream 回傳）
 async function parseRelayResponse(relayRes) {
-  // Relay 本身錯誤（503 配額滿、連線失敗等）
   if (!relayRes.ok || !relayRes.body) {
     const text = await relayRes.text().catch(() => "relay unavailable");
     const fake = new Response(text, { status: relayRes.status || 502, headers: relayRes.headers });
@@ -701,7 +711,7 @@ async function parseRelayResponse(relayRes) {
   const reader = relayRes.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
-  const MAX_META = 65536; // 64KB metadata line upper bound
+  const MAX_META = 65536;
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
@@ -725,13 +735,11 @@ async function parseRelayResponse(relayRes) {
       fake.headers.set("X-Relay-Error", "1");
       return { relayError: true, response: fake };
     }
-    // Relay-level error（upstream 連線失敗、逾時等）
     if (meta._relay?.error) {
       const fake = new Response(JSON.stringify({ error: meta._relay.error }), { status: 502, headers: { "content-type": "application/json" } });
       fake.headers.set("X-Relay-Error", "1");
       return { relayError: true, response: fake };
     }
-    // 成功 relay：取出 upstream status / headers，剩餘 body 串流回傳
     const upstreamStatus = meta._relay?.status || 502;
     const upstreamHeaders = new Headers(meta._relay?.headers || {});
     const bodyStream = new ReadableStream({
@@ -752,23 +760,100 @@ async function parseRelayResponse(relayRes) {
   }
 }
 
-// relay 感知的 upstream fetch — 無 relay 設定時直接 fetch，有設定時透過 relay 轉發
-async function upstreamFetch(url, { method, headers, body, signal }, env, rid) {
+// Global relay: 使用 env.RELAY_BASE_URL 全局設定
+async function upstreamFetch(url, opts, env, rid) {
   if (!env.RELAY_BASE_URL) {
-    return fetch(url, { method, headers, body, signal });
+    return fetch(url, opts);
   }
-  const relayHeaders = new Headers(headers);
+  const relayHeaders = new Headers(opts.headers);
   relayHeaders.set("x-target-url", url);
   if (env.RELAY_SECRET) relayHeaders.set("x-relay-token", env.RELAY_SECRET);
   const relayRes = await fetch(env.RELAY_BASE_URL, {
-    method, headers: relayHeaders, body, signal,
+    method: opts.method, headers: relayHeaders, body: opts.body, signal: opts.signal,
   });
   const parsed = await parseRelayResponse(relayRes);
   if (parsed.relayError) {
     logStructured("warn", "relay error", { relay: env.RELAY_BASE_URL, status: parsed.response.status, rid });
-    return parsed.response; // 含 X-Relay-Error header
+    return parsed.response;
   }
-  return parsed.response; // upstream 原始 Response（status/headers/body 已還原）
+  return parsed.response;
+}
+
+// Per-channel relay: 使用 channel.relay_url 逐一設定
+async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, signal) {
+  const h = new Headers(baseHeaders);
+  h.set("x-target-url", targetUrl);
+  const relayRes = await fetch(relayBase, { method, headers: h, body, signal });
+  if (relayRes.headers.get("x-relay") !== "1") return relayRes;
+  const reader = relayRes.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const nl = buf.indexOf("\n");
+    if (nl >= 0) {
+      const metaLine = buf.slice(0, nl);
+      const rest = buf.slice(nl + 1);
+      try {
+        const meta = JSON.parse(metaLine);
+        if (meta._relay) {
+          const upstreamStatus = meta._relay.status || relayRes.status;
+          const upstreamHeaders = new Headers(meta._relay.headers || {});
+          const fwd = createForwardStream(rest, reader);
+          return new Response(fwd, { status: upstreamStatus, headers: upstreamHeaders });
+        }
+      } catch (e) { /* invalid metadata — passthrough */ }
+      const fallback = createForwardStream(buf, reader);
+      return new Response(fallback, { status: relayRes.status, headers: relayRes.headers });
+    }
+  }
+  return new Response("", { status: relayRes.status, headers: relayRes.headers });
+}
+
+function createForwardStream(initial, reader) {
+  return new ReadableStream({
+    start(controller) {
+      (async () => {
+        try {
+          if (initial) controller.enqueue(new TextEncoder().encode(initial));
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) { controller.close(); return; }
+            controller.enqueue(value);
+          }
+        } catch (e) { controller.error(e); }
+      })();
+    },
+    cancel() { reader.cancel(); },
+  });
+}
+
+// ---- Reasoning → Content fallback ----
+async function patchReasoningToContent(res) {
+  try {
+    const ct = (res.headers.get("Content-Type") || "").toLowerCase();
+    if (!ct.includes("application/json") && !ct.includes("text/event-stream")) return res;
+    const cloned = res.clone();
+    const text = await cloned.text();
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed?.choices)) {
+      let changed = false;
+      for (const ch of parsed.choices) {
+        const msg = ch.message || ch.delta || {};
+        if (!msg.content) {
+          const fallback = msg.reasoning_content || msg.reasoning || "";
+          if (fallback) { msg.content = fallback; changed = true; }
+        }
+      }
+      if (changed) {
+        logStructured("info", "patched reasoning→content fallback");
+        return new Response(JSON.stringify(parsed), { status: res.status, statusText: res.statusText, headers: res.headers });
+      }
+    }
+  } catch (e) { /* not JSON or no reasoning fields — pass through */ }
+  return res;
 }
 
 async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
@@ -931,7 +1016,13 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         } catch (e) {}
       }
       timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
-      const res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid);
+      let res;
+      if (channel.relay_url?.trim()) {
+        const relayBase = channel.relay_url.trim().replace(/\/+$/, '');
+        res = await fetchViaRelay(relayBase + upstreamPath, url, method, headers, reqBody, controller.signal);
+      } else {
+        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid);
+      }
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
       // relay 本身錯誤（配額滿、斷線等）→ 不標記 channel degraded，直接重試
@@ -979,7 +1070,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             }).catch(() => {});
           }
         }
-        return { response: res, channel };
+        return { response: await patchReasoningToContent(res), channel };
       }
       if (res.status >= 500 || res.status === 429) {
         res.body?.cancel().catch(() => {});
@@ -1022,16 +1113,7 @@ async function handleChatCompletions(c) {
   if (isStream) {
     const ct = upstream.headers.get("Content-Type") || "";
     if (!ct.includes("text/event-stream")) {
-      const text = await upstream.text();
-      if (upstream.status !== 200) {
-        try { return c.json(JSON.parse(text), upstream.status); } catch (e) { return c.text(text, upstream.status); }
-      }
-      const filters = await loadFilters(c.env);
-      const sseHeaders = new Headers(resHeaders);
-      sseHeaders.set("Content-Type", "text/event-stream");
-      sseHeaders.set("Cache-Control", "no-cache");
-      sseHeaders.set("X-Accel-Buffering", "no");
-      return new Response(nonStreamToStream(text, filters), { status: 200, headers: sseHeaders });
+      return wrapNonStreamToStream(c, upstream, resHeaders);
     }
     let sseBody = createIdleTimeoutStream(upstream.body, STREAM_IDLE_TIMEOUT_MS);
     const filters = await loadFilters(c.env);
@@ -1070,8 +1152,9 @@ function nonStreamToStream(bodyText, filters) {
         if (msg.role) {
           await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { role: msg.role }, finish_reason: null }] });
         }
-        if (msg.content) {
-          const content = filters?.length > 0 ? RollingFilter.applyStatic(msg.content, filters) : msg.content;
+        const msgContent = msg.content || msg.reasoning_content || msg.reasoning || "";
+        if (msgContent) {
+          const content = filters?.length > 0 ? RollingFilter.applyStatic(msgContent, filters) : msgContent;
           await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { content }, finish_reason: null }] });
         }
         if (msg.tool_calls) {
@@ -1100,6 +1183,68 @@ function nonStreamToStream(bodyText, filters) {
     try { await w.close(); } catch (e) { logStructured("warn", "closing non-stream writer failed", { error: e.message }); }
   })().catch(e => logStructured("error", "non-stream-to-stream internal error", { error: e.message }));
   return readable;
+}
+
+async function wrapNonStreamToStream(c, upstream, headers) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const enc = new TextEncoder();
+  let keepAlive = true;
+
+  headers.set("Content-Type", "text/event-stream");
+  headers.set("Cache-Control", "no-cache");
+  headers.set("X-Accel-Buffering", "no");
+
+  // 每 5 秒送 keepalive，避免 client timeout
+  const keepTask = (async () => {
+    while (keepAlive) {
+      try { await writer.write(enc.encode(": keepalive\n\n")); } catch { break; }
+      await sleep(5000);
+    }
+  })();
+
+  // 非同步等待 upstream 回應，轉 SSE
+  (async () => {
+    try {
+      const text = await upstream.text();
+      keepAlive = false;
+      if (upstream.status !== 200) {
+        // 非 200 → 送 error chunk 再關閉
+        try {
+          const errObj = JSON.parse(text);
+          await writer.write(enc.encode("data: " + JSON.stringify({
+            id: "error", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown",
+            choices: [{ index: 0, delta: {}, finish_reason: "error" }],
+            error: errObj.error || { message: text }
+          }) + "\n\n"));
+        } catch { /* non-JSON error body — skip */ }
+        await writer.write(enc.encode("data: [DONE]\n\n"));
+        await writer.close();
+        return;
+      }
+      const filters = await loadFilters(c.env);
+      const sseStream = nonStreamToStream(text, filters);
+      const reader = sseStream.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        await writer.write(value);
+      }
+      reader.releaseLock();
+    } catch (e) {
+      logStructured("error", "wrapNonStreamToStream failed", { error: e.message });
+      try {
+        await writer.write(enc.encode("data: " + JSON.stringify({
+          id: "error", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "unknown",
+          choices: [{ index: 0, delta: {}, finish_reason: "error" }]
+        }) + "\n\n"));
+        await writer.write(enc.encode("data: [DONE]\n\n"));
+      } catch {}
+    }
+    try { await writer.close(); } catch {}
+  })();
+
+  return new Response(readable, { status: 200, headers });
 }
 
 async function handleModels(c) {
@@ -1163,6 +1308,9 @@ async function handleGenericProxy(c) {
 }
 
 async function authMiddleware(c, next) {
+  // 跳過非 API 路由（admin portal、login 等）
+  const path = c.req.path;
+  if (path.startsWith("/admin") || path === "/login" || path === "/" || path === "/api") return next();
   if (c.req.method === "OPTIONS") return next();
   const auth = c.req.header("Authorization");
   if (!auth || !auth.startsWith("Bearer ")) {
@@ -1181,6 +1329,7 @@ async function authMiddleware(c, next) {
 }
 
 function registerGateway(app) {
+  // 有前綴路徑 /v1, /v1beta, /v2, /v3, /v4
   for (const p of API_PREFIXES) {
     app.use(p + "/*", authMiddleware);
     app.post(p + "/chat/completions", handleChatCompletions);
@@ -1188,6 +1337,10 @@ function registerGateway(app) {
     app.get(p + "/models", handleModels);
     app.all(p + "/*", handleGenericProxy);
   }
+  // 無前綴路徑（相容 OpenCode/Claude Code 等不含 /v1 的 client）
+  app.post("/chat/completions", authMiddleware, handleChatCompletions);
+  app.post("/completions", authMiddleware, handleChatCompletions);
+  app.get("/models", authMiddleware, handleModels);
 }
 
 
@@ -1322,7 +1475,7 @@ function createDashboardApi() {
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const isMasked = (key) => typeof key === "string" && key.includes("***");
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision, relay_url";
     const ph = cols.split(",").map(() => "?").join(",");
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
@@ -1331,7 +1484,7 @@ function createDashboardApi() {
         c.env.DB.prepare(`INSERT INTO channels (${cols}) VALUES (${ph})`).bind(
           ch.id || null, ch.name || "", ch.base_url || "", apiKey, ch.model || "", ch.weight || 50, ch.is_enabled ? 1 : 0,
           ch.stream_type || "both", ch.channel_type || "chat", JSON.stringify(ch.headers || []),
-          ch.provider || "", (ch.provider_options && typeof ch.provider_options === "object" ? JSON.stringify(ch.provider_options) : (typeof ch.provider_options === "string" ? ch.provider_options : "[]")), ch.max_tokens || 0, ch.fallback_model || "",
+          ch.provider || "", (ch.provider_options && typeof ch.provider_options === "object" && !Array.isArray(ch.provider_options) ? JSON.stringify(ch.provider_options) : (typeof ch.provider_options === "string" ? ch.provider_options : "[]")), ch.max_tokens || 0, ch.fallback_model || "",
           ch.health_check_enabled ? 1 : 0, ch.health_check_interval || 300, ch.health_check_timeout || 5,
           ch.cache_enabled ? 1 : 0, ch.cache_ttl || 3600,
           ch.rate_limit_algorithm || "rpm", ch.rate_limit_capacity || 0, ch.rate_limit_rate || 0,
@@ -1344,7 +1497,8 @@ function createDashboardApi() {
           ch.support_image_edit != null ? (ch.support_image_edit ? 1 : 0) : 0,
           ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
           ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1,
-          ch.support_vision != null ? (ch.support_vision ? 1 : 0) : 0
+          ch.support_vision != null ? (ch.support_vision ? 1 : 0) : 0,
+          ch.relay_url || ""
         )
       );
     }
@@ -1353,7 +1507,9 @@ function createDashboardApi() {
       if (chunk.length > 0) await retry(() => c.env.DB.batch(chunk));
     }
     clearGatewayCache();
-
+    // 在後台預熱常用快取，降低 D1 eventual consistency 影響
+    loadChannels(c.env).catch(() => {});
+    loadChannels(c.env, "chat").catch(() => {});
     return c.json({ ok: true });
   });
 
@@ -1427,14 +1583,29 @@ function createDashboardApi() {
     if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
     const baseUrl = ch.base_url || "";
     const testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+    const relayUrl = ch.relay_url?.trim();
     const start = Date.now();
     try {
-      const res = await fetch(testUrl, {
-        method: "POST",
-        headers: { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" },
-        body: JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "hi" }], max_tokens: 1 }),
-        signal: AbortSignal.timeout(10000),
-      });
+      const testHeaders = { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" };
+      const testBody = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "hi" }], max_tokens: 1 });
+      const TEST_TIMEOUT_MS = 10000;
+      const startFetch = Date.now();
+      let res;
+      if (relayUrl) {
+        // fetchViaRelay 的 body 讀取不在初始 signal 範圍內，用 race 強制總 timeout
+        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST", testHeaders, testBody, AbortSignal.timeout(TEST_TIMEOUT_MS));
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("relay test timeout")), TEST_TIMEOUT_MS)
+        );
+        res = await Promise.race([fetchPromise, timeoutPromise]);
+      } else {
+        res = await fetch(testUrl, {
+          method: "POST",
+          headers: testHeaders,
+          body: testBody,
+          signal: AbortSignal.timeout(TEST_TIMEOUT_MS),
+        });
+      }
       const ms = Date.now() - start;
       const ok = res.status === 200 || res.status === 400;
       return c.json({ ok, status: res.status, ms, diagnosis: ok ? "連線正常" : `HTTP ${res.status}` });
