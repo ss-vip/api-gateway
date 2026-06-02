@@ -229,8 +229,10 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   rate_limit_capacity INTEGER NOT NULL DEFAULT 0,
   rate_limit_rate INTEGER NOT NULL DEFAULT 0,
    rate_limit_key TEXT NOT NULL DEFAULT '',
-   relay_url TEXT NOT NULL DEFAULT ''
+    relay_url TEXT NOT NULL DEFAULT '',
+    max_context_length INTEGER NOT NULL DEFAULT 0
 )`;
+
 
 
 const FILTERS_DDL = `CREATE TABLE IF NOT EXISTS filters (
@@ -334,13 +336,19 @@ async function ensureSchema(env) {
       );
     }
     migrations.push("ALTER TABLE channels ADD COLUMN support_vision INTEGER NOT NULL DEFAULT 0");
-    migrations.push("ALTER TABLE channels ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''");
     for (const sql of migrations) {
       try { await env.DB.prepare(sql).run(); } catch (e) { /* 欄位已存在則略過 */ }
     }
   }
+  if (parseInt(schemaVer, 10) < 5) {
+    try { await env.DB.prepare("ALTER TABLE channels ADD COLUMN support_vision INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* 欄位已存在則略過 */ }
+    try { await env.DB.prepare("ALTER TABLE channels ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* 欄位已存在則略過 */ }
+  }
+  if (parseInt(schemaVer, 10) < 6) {
+    try { await env.DB.prepare("ALTER TABLE channels ADD COLUMN max_context_length INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* 欄位已存在則略過 */ }
+  }
   // migration 完成後寫入 DB flag，下次冷啟動直接跳過
-  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '3')").run();
+  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '6')").run();
   schemaReady = true;
 }
 
@@ -428,7 +436,7 @@ async function dbLoadChannels(env, channelType) {
       cache_enabled, cache_ttl,
       rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
       fallback_model, model, max_tokens, is_enabled, provider_options, relay_url,
-      support_tools, support_vision
+      support_tools, support_vision, max_context_length
       FROM channels WHERE is_enabled = 1`;
     const params = [];
     if (channelType) { sql += " AND channel_type = ?"; params.push(channelType); }
@@ -640,39 +648,186 @@ function createFilterTransform(filters) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buf = "";
+  // Smart Split 狀態機：偵測上游把思考塞進 content 時，搬移到 reasoning_content
+  let ssMode = "normal";     // normal | detecting | thinking | answering
+  let ssDetectBuf = "";      // 累積開頭字元來偵測 Thought: 前綴
+  let ssHeld = [];           // 偵測期間緩衝的完整 SSE 行（原始文字）
+  let ssHeldParsed = [];     // 偵測期間緩衝的 parsed 深拷貝（flush 時需改寫）
+
+  function ssFlushAsThinking(controller) {
+    let splitIdx = -1;
+    for (let i = 0; i < ssHeldParsed.length; i++) {
+      const c = ssHeldParsed[i].choices?.[0]?.delta?.content || "";
+      if (c.indexOf("\n\n") >= 0) { splitIdx = i; break; }
+    }
+    if (splitIdx >= 0) {
+      // 分界點之前的行：全部當作 reasoning_content
+      for (let i = 0; i < splitIdx; i++) {
+        const p = JSON.parse(JSON.stringify(ssHeldParsed[i]));
+        const raw = p.choices[0].delta.content;
+        p.choices[0].delta.reasoning_content = i === 0 ? raw.replace(/^[Tt]hought[:：]\s*/, '') : raw;
+        delete p.choices[0].delta.content;
+        controller.enqueue(encoder.encode("data: " + JSON.stringify(p) + "\n\n"));
+      }
+      // 分界行：拆分 \n\n 前後
+      const p = JSON.parse(JSON.stringify(ssHeldParsed[splitIdx]));
+      const raw = p.choices[0].delta.content;
+      const ci = raw.indexOf("\n\n");
+      const thought = (splitIdx === 0 ? raw.slice(0, ci).replace(/^[Tt]hought[:：]\s*/, '') : raw.slice(0, ci));
+      const answer = raw.slice(ci + 2);
+      p.choices[0].delta.reasoning_content = thought;
+      p.choices[0].delta.content = answer || undefined;
+      if (!p.choices[0].delta.content) delete p.choices[0].delta.content;
+      controller.enqueue(encoder.encode("data: " + JSON.stringify(p) + "\n\n"));
+      // 分界點之後的行：當作一般 content 放出
+      for (let i = splitIdx + 1; i < ssHeld.length; i++) {
+        controller.enqueue(encoder.encode(ssHeld[i] + "\n\n"));
+      }
+    } else {
+      // 完全沒有 \n\n：全部都是思考內容
+      for (let i = 0; i < ssHeldParsed.length; i++) {
+        const p = JSON.parse(JSON.stringify(ssHeldParsed[i]));
+        const raw = p.choices[0].delta.content;
+        p.choices[0].delta.reasoning_content = i === 0 ? raw.replace(/^[Tt]hought[:：]\s*/, '') : raw;
+        delete p.choices[0].delta.content;
+        controller.enqueue(encoder.encode("data: " + JSON.stringify(p) + "\n\n"));
+      }
+    }
+  }
+
   return new TransformStream({
     transform(chunk, controller) {
       buf += decoder.decode(chunk, { stream: true });
       const parts = buf.split("\n");
       buf = parts.pop() || "";
       for (const line of parts) {
+        if (!line.trim()) continue;
         if (line.startsWith("data: ")) {
           const payload = line.slice(6);
-          if (payload === "[DONE]") { controller.enqueue(encoder.encode(line + "\n")); continue; }
+          if (payload === "[DONE]") {
+            // 在 [DONE] 前 flush Smart Split 緩衝內容，避免內容遺失
+            if (ssHeld.length > 0 && ssMode !== "normal") {
+              for (const hl of ssHeld) controller.enqueue(encoder.encode(hl + "\n\n"));
+              ssHeld = []; ssHeldParsed = []; ssDetectBuf = ""; ssMode = "normal";
+            }
+            controller.enqueue(encoder.encode(line + "\n\n"));
+            continue;
+          }
           try {
             const parsed = JSON.parse(payload);
+            let ssSkipped = false; // Smart Split 暫緩主 emit 的旗標
             if (parsed.choices) {
+              // 非串流格式（message）自動轉為串流（delta）
+              const isNonStreaming = parsed.choices.some(ch => ch.message && !ch.delta);
+              if (isNonStreaming) {
+                for (const ch of parsed.choices) {
+                  const msg = ch.message || {};
+                  const idx = ch.index || 0;
+                  const baseEvent = { id: parsed.id, object: "chat.completion.chunk", created: parsed.created || Math.floor(Date.now() / 1000), model: parsed.model || "unknown" };
+                  const emit = (data) => controller.enqueue(encoder.encode("data: " + JSON.stringify({ ...baseEvent, choices: [data] }) + "\n\n"));
+                  // role chunk
+                  if (msg.role) emit({ index: idx, delta: { role: msg.role }, finish_reason: null });
+                  // content chunk
+                  if (msg.content) {
+                    const content = filters?.length > 0 ? RollingFilter.applyStatic(msg.content, filters) : msg.content;
+                    emit({ index: idx, delta: { content }, finish_reason: null });
+                  }
+                  // tool_calls
+                  if (msg.tool_calls) {
+                    for (const tc of msg.tool_calls) {
+                      emit({ index: idx, delta: { tool_calls: [{ index: tc.index || 0, id: tc.id, type: tc.type || "function", function: { name: tc.function?.name || "", arguments: "" } }] }, finish_reason: null });
+                      if (tc.function?.arguments) {
+                        const filteredArgs = filters?.length > 0 ? RollingFilter.applyStatic(tc.function.arguments, filters) : tc.function.arguments;
+                        emit({ index: idx, delta: { tool_calls: [{ index: tc.index || 0, function: { arguments: filteredArgs } }] }, finish_reason: null });
+                      }
+                    }
+                  }
+                  // finish chunk
+                  emit({ index: idx, delta: {}, finish_reason: ch.finish_reason || "stop" });
+                }
+                // usage
+                if (parsed.usage) {
+                  const baseEvent = { id: parsed.id, object: "chat.completion.chunk", created: parsed.created || Math.floor(Date.now() / 1000), model: parsed.model || "unknown" };
+                  controller.enqueue(encoder.encode("data: " + JSON.stringify({ ...baseEvent, choices: [], usage: parsed.usage }) + "\n\n"));
+                }
+                ssSkipped = true;
+              } else {
               for (const choice of parsed.choices) {
                 const delta = choice?.delta || {};
-                if (!delta.content) {
-                  delta.content = delta.reasoning_content || delta.reasoning || "";
-                }
+                // 套用 filter（空陣列時無作用）
                 if (delta.content) delta.content = RollingFilter.applyStatic(delta.content, filters);
                 if (delta.refusal) delta.refusal = RollingFilter.applyStatic(delta.refusal, filters);
-                if (delta.reasoning_content) delta.reasoning_content = RollingFilter.applyStatic(delta.reasoning_content, filters);
                 if (delta.tool_calls) {
                   for (const tc of delta.tool_calls) {
                     if (tc.function?.arguments) tc.function.arguments = RollingFilter.applyStatic(tc.function.arguments, filters);
                   }
                 }
+                // Smart Split：僅在 upstream 未給 reasoning_content 時啟用
+                if (delta.content && !delta.reasoning_content) {
+                  if (ssMode === "normal") {
+                    ssMode = "detecting";
+                    ssDetectBuf = delta.content;
+                    ssHeld = [line];
+                    ssHeldParsed = [JSON.parse(JSON.stringify(parsed))];
+                    ssSkipped = true;
+                    continue;
+                  }
+                  if (ssMode === "detecting") {
+                    ssDetectBuf += delta.content;
+                    ssHeld.push(line);
+                    ssHeldParsed.push(JSON.parse(JSON.stringify(parsed)));
+                    if (/^[Tt]hought[:：]/.test(ssDetectBuf)) {
+                      ssMode = "thinking";
+                      ssFlushAsThinking(controller);
+                      ssHeld = []; ssHeldParsed = []; ssDetectBuf = "";
+                      ssSkipped = true;
+                      continue;
+                    }
+                    if (ssDetectBuf.length >= 25) {
+                      ssMode = "answering";
+                      for (const hl of ssHeld) controller.enqueue(encoder.encode(hl + "\n\n"));
+                      ssHeld = []; ssHeldParsed = []; ssDetectBuf = "";
+                      ssSkipped = true; // held 已 flush，不重複 emit
+                      continue;
+                    }
+                    ssSkipped = true;
+                    continue; // 繼續偵測
+                  }
+                  if (ssMode === "thinking") {
+                    const idx = delta.content.indexOf("\n\n");
+                    if (idx >= 0) {
+                      if (idx > 0) delta.reasoning_content = delta.content.slice(0, idx);
+                      delta.content = delta.content.slice(idx + 2) || undefined;
+                      if (!delta.content) delete delta.content;
+                      ssMode = "answering";
+                    } else {
+                      delta.reasoning_content = delta.content;
+                      delete delta.content;
+                    }
+                  }
+                }
+              }
               }
             }
-            controller.enqueue(encoder.encode("data: " + JSON.stringify(parsed) + "\n"));
-          } catch { controller.enqueue(encoder.encode(line + "\n")); }
-        } else { controller.enqueue(encoder.encode(line + "\n")); }
+            if (!ssSkipped) controller.enqueue(encoder.encode("data: " + JSON.stringify(parsed) + "\n\n"));
+          } catch { controller.enqueue(encoder.encode(line + "\n\n")); }
+        } else if (/^\{/.test(line)) {
+          // 裸 JSON（無 data: 前綴）→ 補上 data: 前綴
+          controller.enqueue(encoder.encode("data: " + line + "\n\n"));
+        } else if (/^\[DONE\]/.test(line) || /^\[ERROR\]/.test(line)) {
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } else {
+          controller.enqueue(encoder.encode(line + "\n"));
+        }
       }
     },
-    flush(controller) { if (buf) controller.enqueue(encoder.encode(buf + "\n")); },
+    flush(controller) {
+      // 若串流結束時仍在偵測 mode，放出緩衝內容
+      if (ssHeld.length > 0) {
+        for (const hl of ssHeld) controller.enqueue(encoder.encode(hl + "\n\n"));
+      }
+      if (buf) controller.enqueue(encoder.encode(buf + "\n\n"));
+    },
   });
 }
 
@@ -760,9 +915,9 @@ async function parseRelayResponse(relayRes) {
   }
 }
 
-// Global relay: 使用 env.RELAY_BASE_URL 全局設定
-async function upstreamFetch(url, opts, env, rid) {
-  if (!env.RELAY_BASE_URL) {
+// Global relay: 使用 env.RELAY_BASE_URL 全局設定（僅 chat 類型使用）
+async function upstreamFetch(url, opts, env, rid, noRelay) {
+  if (noRelay || !env.RELAY_BASE_URL) {
     return fetch(url, opts);
   }
   const relayHeaders = new Headers(opts.headers);
@@ -868,11 +1023,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     channels = await loadChannels(env);
     if (channels.length === 0) return { error: { message: "No upstream channels available", status: 503 } };
   }
-  let eligible = streamType ? channels.filter(c => c.stream_type === "both" || c.stream_type === streamType) : channels;
-  if (eligible.length === 0) {
-    logStructured("warn", "no channels match stream_type, falling back to all", { streamType, path, rid });
-    eligible = channels;
-  }
+  let eligible = channels;
   // 非串流請求嘗試走快取
   // 僅快取 embed / moderate 類型（與 cacheSet 邏輯一致）
   if (streamType !== "stream" && body && (requiredType === "embed" || requiredType === "moderate")) {
@@ -918,13 +1069,18 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     }
   }
   const attempted = new Set();
-  const maxAttempts = Math.min(eligible.length, 10);
+  const maxAttempts = Math.min(Math.max(eligible.length, 1) * 3, 15);
   let attempts = 0;
+  let reqBody = bodyStr;
+  let retryAsNonStream = false;
   while (attempts < maxAttempts && attempted.size < eligible.length) {
     attempts++;
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
     const channel = selectChannel(eligible, attempted);
     if (!channel) break;
+    // 非重試時重置 reqBody 為原始值，重試時保留修改後的 reqBody（stream: false）
+    if (!retryAsNonStream) reqBody = bodyStr;
+    retryAsNonStream = false;
     // rate limit 檢查
     const rl = checkRateLimit(channel);
     if (!rl.ok) {
@@ -948,7 +1104,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       } catch (e) {}
     }
     // 使用已在外面統一解析的 body 字串
-    let reqBody = bodyStr;
     if (channel.provider_options) {
       try {
         const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
@@ -997,6 +1152,24 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
       } catch (e) {}
     }
+    // max_context_length 檢查：超過則跳過此渠道，留給下一渠道處理
+    if (channel.max_context_length > 0 && requiredType === "chat" && reqBody) {
+      let ctxOverLimit = false;
+      try {
+        const parsed = JSON.parse(reqBody);
+        if (Array.isArray(parsed.messages)) {
+          const estTokens = (text) => Math.ceil((typeof text === "string" ? text : JSON.stringify(text)).length / 2);
+          let total = 0;
+          for (const m of parsed.messages) total += estTokens(m.content || "");
+          if (total > channel.max_context_length) ctxOverLimit = true;
+        }
+      } catch (e) { /* skip check */ }
+      if (ctxOverLimit) {
+        attempted.add(channel.id);
+        logStructured("info", "context too long for channel, trying next", { channel: channel.name, maxCtx: channel.max_context_length, rid });
+        continue;
+      }
+    }
     let timer;
     const controller = new AbortController();
     const onAbort = () => controller.abort();
@@ -1006,22 +1179,16 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       clientSignal.addEventListener("abort", onAbort, { once: true });
     }
     try {
-      if (method === "POST" && body && channel.stream_type === "nonstream") {
-        try {
-          const parsed = JSON.parse(reqBody);
-          if (parsed.stream === true) {
-            const { stream, ...rest } = parsed;
-            reqBody = JSON.stringify(rest);
-          }
-        } catch (e) {}
-      }
       timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
       let res;
-      if (channel.relay_url?.trim()) {
+      const isChat = requiredType === "chat";
+      if (isChat && channel.relay_url?.trim()) {
         const relayBase = channel.relay_url.trim().replace(/\/+$/, '');
         res = await fetchViaRelay(relayBase + upstreamPath, url, method, headers, reqBody, controller.signal);
+      } else if (isChat) {
+        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false);
       } else {
-        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid);
+        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, true);
       }
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
@@ -1078,6 +1245,19 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
         continue;
       }
+      // 4xx + 原始請求為串流 → 上游可能不支援串流，改用非串流重試同一渠道
+      if (res.status >= 400 && res.status < 500 && streamType === "stream" && reqBody) {
+        try {
+          const parsed = JSON.parse(reqBody);
+          if (parsed.stream === true) {
+            parsed.stream = false;
+            reqBody = JSON.stringify(parsed);
+            retryAsNonStream = true;
+            logStructured("warn", "4xx with stream=true, retrying same channel with stream=false", { channel: channel.name, status: res.status, rid });
+            continue;
+          }
+        } catch (e) {}
+      }
       return { response: res };
     } catch (err) {
       clearTimeout(timer);
@@ -1112,12 +1292,18 @@ async function handleChatCompletions(c) {
   resHeaders.set("X-Request-Id", rid);
   if (isStream) {
     const ct = upstream.headers.get("Content-Type") || "";
+    resHeaders.set("X-Debug-Ct", ct);
     if (!ct.includes("text/event-stream")) {
+      resHeaders.set("X-Debug-Route", "wrap");
+      // 診斷：複製 body 看前 300 chars
+      const preview = await upstream.clone().text().catch(() => "(clone failed)");
+      resHeaders.set("X-Debug-Body-Preview", preview.slice(0, 300).replace(/[\r\n]/g, '↵'));
       return wrapNonStreamToStream(c, upstream, resHeaders);
     }
+    resHeaders.set("X-Debug-Route", "filter");
     let sseBody = createIdleTimeoutStream(upstream.body, STREAM_IDLE_TIMEOUT_MS);
     const filters = await loadFilters(c.env);
-    if (filters.length > 0) sseBody = sseBody.pipeThrough(createFilterTransform(filters));
+    sseBody = sseBody.pipeThrough(createFilterTransform(filters));
     resHeaders.set("Cache-Control", "no-cache");
     resHeaders.set("X-Accel-Buffering", "no");
     return new Response(sseBody, { status: upstream.status, headers: resHeaders });
@@ -1132,7 +1318,25 @@ function nonStreamToStream(bodyText, filters) {
   const sse = (data) => w.write(enc.encode("data: " + JSON.stringify(data) + "\n\n"));
   (async () => {
     try {
-      const p = JSON.parse(bodyText);
+      let p;
+      try {
+        p = JSON.parse(bodyText);
+      } catch (e) {
+        // 非標準 SSE（多行裸 JSON，無 data: 前綴）→ 逐行加上前綴
+        for (const line of bodyText.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          if (/^\[DONE\]/.test(trimmed) || /^\[ERROR\]/.test(trimmed)) {
+            await w.write(enc.encode("data: [DONE]\n\n"));
+          } else if (trimmed.startsWith('{')) {
+            await w.write(enc.encode("data: " + trimmed + "\n\n"));
+          } else if (trimmed.startsWith('data: ')) {
+            await w.write(enc.encode(trimmed + "\n\n"));
+          }
+        }
+        await w.close();
+        return;
+      }
       const id = p.id || "chatcmpl-" + Date.now();
       const created = p.created || Math.floor(Date.now() / 1000);
       const model = p.model || "unknown";
@@ -1152,7 +1356,7 @@ function nonStreamToStream(bodyText, filters) {
         if (msg.role) {
           await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { role: msg.role }, finish_reason: null }] });
         }
-        const msgContent = msg.content || msg.reasoning_content || msg.reasoning || "";
+        const msgContent = msg.content || "";
         if (msgContent) {
           const content = filters?.length > 0 ? RollingFilter.applyStatic(msgContent, filters) : msgContent;
           await sse({ id, object: "chat.completion.chunk", created, model, choices: [{ index: idx, delta: { content }, finish_reason: null }] });
@@ -1299,7 +1503,7 @@ async function handleGenericProxy(c) {
   if (ct.includes("text/event-stream")) {
     let sseBody = createIdleTimeoutStream(upstream.body, STREAM_IDLE_TIMEOUT_MS);
     const filters = await loadFilters(c.env);
-    if (filters.length > 0) sseBody = sseBody.pipeThrough(createFilterTransform(filters));
+    sseBody = sseBody.pipeThrough(createFilterTransform(filters));
     resHeaders.set("Cache-Control", "no-cache");
     resHeaders.set("X-Accel-Buffering", "no");
     return new Response(sseBody, { status: upstream.status, headers: resHeaders });
@@ -1475,7 +1679,7 @@ function createDashboardApi() {
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const isMasked = (key) => typeof key === "string" && key.includes("***");
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision, relay_url";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision, relay_url, max_context_length";
     const ph = cols.split(",").map(() => "?").join(",");
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
@@ -1498,7 +1702,8 @@ function createDashboardApi() {
           ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
           ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1,
           ch.support_vision != null ? (ch.support_vision ? 1 : 0) : 0,
-          ch.relay_url || ""
+          ch.relay_url || "",
+          ch.max_context_length || 0
         )
       );
     }

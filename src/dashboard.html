@@ -247,16 +247,8 @@
               <input type="number" id="ch-weight" class="form-control form-control-sm" min="1" max="1000" value="50" required />
             </div>
             <div class="col-3 d-flex flex-column justify-content-center">
-              <label class="form-label mini-label fw-bold">Stream Type</label>
-              <select id="ch-stream" class="form-select form-select-sm">
-                <option value="both">both</option>
-                <option value="stream">stream</option>
-                <option value="nonstream">nonstream</option>
-              </select>
-            </div>
-            <div class="col-3 d-flex flex-column justify-content-center">
               <label class="form-label mini-label fw-bold">Channel Type</label>
-              <select id="ch-type" class="form-select form-select-sm">
+              <select id="ch-type" class="form-select form-select-sm" onchange="updateCapabilities()">
                 <option value="chat">chat</option>
                 <option value="image_gen">image_gen</option>
                 <option value="image_edit">image_edit</option>
@@ -272,6 +264,16 @@
                 <option value="models">models</option>
                 <option value="realtime">realtime</option>
               </select>
+            </div>
+            <div class="col-3 d-flex flex-column align-items-center justify-content-center">
+              <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="ch-support-tools">
+                <label class="form-check-label" for="ch-support-tools">Tools</label>
+              </div>
+              <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="ch-support-vision">
+                <label class="form-check-label" for="ch-support-vision">Vision</label>
+              </div>
             </div>
             <div class="col-3 d-flex flex-column align-items-center justify-content-center">
               <label class="form-label mini-label fw-bold text-center">Enabled</label>
@@ -298,30 +300,17 @@
             <label class="form-label mini-label fw-bold">Override Model <span class="text-muted" style="font-weight:400">（留空 = 使用渠道 Model）</span></label>
             <input type="text" id="ch-override-model" class="form-control form-control-sm" placeholder="gpt-4-turbo">
           </div>
-          <div class="row g-1 mb-1">
-            <div class="col-12">
-              <label class="form-label mini-label fw-bold">Capabilities</label>
-            </div>
-            <div class="col-6 text-center">
-              <div class="form-check form-switch mb-0 d-inline-block">
-                <input class="form-check-input" type="checkbox" id="ch-support-tools" checked>
-                <label class="form-check-label small" for="ch-support-tools">Tools（工具調用）</label>
-              </div>
-            </div>
-            <div class="col-6 text-center">
-              <div class="form-check form-switch mb-0 d-inline-block">
-                <input class="form-check-input" type="checkbox" id="ch-support-vision">
-                <label class="form-check-label small" for="ch-support-vision">Vision（圖片辨識）</label>
-              </div>
-            </div>
-          </div>
           <div class="mb-1">
             <label class="form-label mini-label fw-bold">前置提示訊息 <span class="text-muted" style="font-weight:400">（強制插入到最前面，內容相同時自動去重）</span></label>
             <textarea id="ch-prepend-prompt" class="form-control form-control-sm" rows="4" placeholder="請輸入 system prompt，例如：&#10;你是一個專業的程式設計助手，請全程用繁體中文回答。"></textarea>
           </div>
           <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Relay URL <span class="text-muted" style="font-weight:400">（選用，繞過 CF 30s 限制，填 serv00 relay 位址）</span></label>
+            <label class="form-label mini-label fw-bold">Relay URL <span class="text-muted" style="font-weight:400">（選用，佈署 relay.js 的服務）</span></label>
             <input type="url" id="ch-relay-url" class="form-control form-control-sm" placeholder="https://your-server:3000">
+          </div>
+          <div class="mb-1">
+            <label class="form-label mini-label fw-bold">Max Context (est. tokens) <span class="text-muted" style="font-weight:400">（0=不限，超過則截斷中間歷史）</span></label>
+            <input type="number" id="ch-max-ctx" class="form-control form-control-sm" value="0" min="0" placeholder="12000">
           </div>
         </div>
       </div>
@@ -384,6 +373,15 @@
       if (!btn) return;
       btn.className = 'btn btn-sm px-3 fw-bold ' + (chEnabled ? 'btn-outline-success' : 'btn-outline-danger');
       btn.textContent = chEnabled ? '已啟用' : '已停用';
+    };
+
+    const updateCapabilities = () => {
+      const isChat = document.getElementById('ch-type').value === 'chat';
+      ['ch-support-tools', 'ch-support-vision'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!isChat) { el.checked = false; el.disabled = true; }
+        else { el.disabled = false; }
+      });
     };
 
     const api = async (u, m='GET', b=null, showLoader=true, opts={}) => {
@@ -654,9 +652,8 @@
         row += '<td class="text-muted small align-middle">' + (c.id || '-') + '</td>';
         row += '<td class="align-middle"><div class="form-check form-switch d-inline-block mb-0" style="font-size:0.7rem"><input class="form-check-input" type="checkbox" ' + (c.is_enabled ? 'checked' : '') + ' onchange="channels[' + realIdx + '].is_enabled=this.checked;renderStats()"></div></td>';
         row += '<td class="fw-bold align-middle">' + esc(c.name) + '</td>';
-        row += '<td class="align-middle"><code class="small copy-model" style="cursor:pointer" data-model="' + esc(c.model || '') + '" title="點擊複製">' + displayName + '</code></td>';
+        row += '<td class="align-middle"><span style="display:inline-flex;align-items:center;gap:2px"><code class="small copy-model mb-0" style="cursor:pointer" data-model="' + esc(c.model || '') + '" title="點擊複製">' + displayName + '</code>' + (c.channel_type === 'chat' && c.support_tools ? '<span style="font-size:0.7rem;line-height:1">🔧</span>' : '') + (c.channel_type === 'chat' && c.support_vision ? '<span style="font-size:0.7rem;line-height:1">👁️</span>' : '') + '</span></td>';
         row += '<td class="d-none d-lg-table-cell align-middle">' + esc(String(c.weight)) + '</td>';
-        row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' bg-opacity-10 text-' + (c.stream_type === 'stream' ? 'info' : c.stream_type === 'nonstream' ? 'secondary' : 'success') + ' small">' + esc(c.stream_type || 'both') + '</span></td>';
         row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-primary bg-opacity-10 text-primary small">' + esc(c.channel_type || 'chat') + '</span></td>';
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
@@ -783,15 +780,16 @@
       document.getElementById('ch-weight').value = 50;
       chEnabled = true;
       updateEnabledBtn();
-      document.getElementById('ch-stream').value = 'both';
       document.getElementById('ch-type').value = 'chat';
       document.getElementById('ch-rpm').value = '0';
       document.getElementById('ch-rpd').value = '0';
       document.getElementById('ch-override-model').value = '';
       document.getElementById('ch-prepend-prompt').value = '';
-      document.getElementById('ch-support-tools').checked = true;
+      document.getElementById('ch-support-tools').checked = false;
       document.getElementById('ch-support-vision').checked = false;
       document.getElementById('ch-relay-url').value = '';
+      document.getElementById('ch-max-ctx').value = '0';
+      updateCapabilities();
       chHeaders = [];
       renderHeaders();
       switchTab('basic');
@@ -813,7 +811,6 @@
       document.getElementById('ch-weight').value = c.weight || 50;
       chEnabled = c.is_enabled == 1;
       updateEnabledBtn();
-      document.getElementById('ch-stream').value = c.stream_type || 'both';
       document.getElementById('ch-type').value = c.channel_type || 'chat';
       document.getElementById('ch-rpm').value = c.rpm_limit || 0;
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
@@ -830,6 +827,8 @@
       document.getElementById('ch-support-tools').checked = c.support_tools == 1;
       document.getElementById('ch-support-vision').checked = c.support_vision == 1;
       document.getElementById('ch-relay-url').value = c.relay_url || '';
+      document.getElementById('ch-max-ctx').value = c.max_context_length || 0;
+      updateCapabilities();
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
       switchTab('basic');
@@ -880,7 +879,7 @@
         model: document.getElementById('ch-model').value,
         weight,
         is_enabled: chEnabled ? 1 : 0,
-        stream_type: document.getElementById('ch-stream').value,
+        stream_type: 'both',
         channel_type: document.getElementById('ch-type').value,
         headers: chHeaders.filter(h => h.key && h.key.trim()),
         rpm_limit: rpmLimit,
@@ -890,6 +889,7 @@
         support_tools: document.getElementById('ch-support-tools').checked ? 1 : 0,
         support_vision: document.getElementById('ch-support-vision').checked ? 1 : 0,
         relay_url: (document.getElementById('ch-relay-url')?.value?.trim() || '').replace(/\/+$/, ''),
+        max_context_length: parseInt(document.getElementById('ch-max-ctx')?.value) || 0,
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
