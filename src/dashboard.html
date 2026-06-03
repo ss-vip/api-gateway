@@ -41,6 +41,7 @@
     .tab-pane-wrap { border: 1px solid var(--bs-border-color); border-top: none; border-radius: 0 0 0.375rem 0.375rem; padding: 0.75rem; height: 320px; overflow-y: auto; overflow-x: hidden; }
     .tab-pane-wrap .tab-pane { display: none; }
     .tab-pane-wrap .tab-pane.active { display: block; }
+    .pwd-mask { -webkit-text-security: disc; }
   </style>
 </head>
 <body>
@@ -221,15 +222,28 @@
       </ul>
       <div class="tab-pane-wrap">
         <div class="tab-pane active" id="basic-panel" role="tabpanel" aria-labelledby="basic-tab">
-          <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Name *</label>
-            <input type="text" id="ch-name" class="form-control form-control-sm" required />
+          <div class="row g-2 mb-1">
+            <div class="col-6">
+              <label class="form-label mini-label fw-bold">Name *</label>
+              <input type="text" id="ch-name" class="form-control form-control-sm" required />
+            </div>
+            <div class="col-3 d-flex flex-column align-items-center justify-content-center">
+              <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="ch-support-tools">
+                <label class="form-check-label" for="ch-support-tools">Tools</label>
+              </div>
+            </div>
+            <div class="col-3 d-flex flex-column align-items-center justify-content-center">
+              <div class="form-check mb-0">
+                <input class="form-check-input" type="checkbox" id="ch-support-vision">
+                <label class="form-check-label" for="ch-support-vision">Vision</label>
+              </div>
+            </div>
           </div>
           <div class="mb-1" style="position:relative">
             <label class="form-label mini-label fw-bold">API Key *</label>
-            <input type="password" style="position:absolute;width:0;height:0;padding:0;border:0;opacity:0" tabindex="-1" aria-hidden="true" readonly />
             <div class="input-group input-group-sm">
-              <input type="password" id="ch-key" class="form-control form-control-sm" autocomplete="off" required />
+              <input type="text" id="ch-key" class="form-control form-control-sm pwd-mask" autocomplete="off" required />
               <button class="btn btn-outline-secondary" type="button" onclick="toggleKeyVis()" title="Toggle visibility">&#128065;</button>
             </div>
           </div>
@@ -240,6 +254,24 @@
           <div class="mb-1">
             <label for="ch-model" class="form-label mini-label fw-bold">Model *</label>
             <input type="text" id="ch-model" class="form-control form-control-sm" required />
+          </div>
+          <div class="mb-1">
+            <label class="form-label mini-label fw-bold">Fallback Model <span class="text-muted" style="font-weight:400">（留空 = 不備用）</span></label>
+            <input type="text" id="ch-fallback-model" class="form-control form-control-sm" placeholder="gpt-4-turbo">
+          </div>
+          <div class="row g-2 mb-1">
+            <div class="col-3">
+              <label class="form-label mini-label fw-bold">RPM</label>
+              <input type="number" id="ch-rpm" class="form-control form-control-sm" value="0" min="0">
+            </div>
+            <div class="col-3">
+              <label class="form-label mini-label fw-bold">RPD</label>
+              <input type="number" id="ch-rpd" class="form-control form-control-sm" value="0" min="0">
+            </div>
+            <div class="col-6">
+              <label class="form-label mini-label fw-bold">Max Context (est. tokens) <span class="text-muted" style="font-weight:400">（0=不限）</span></label>
+              <input type="number" id="ch-max-ctx" class="form-control form-control-sm" value="0" min="0" placeholder="12000">
+            </div>
           </div>
           <div class="row g-2 mb-1">
             <div class="col-4 d-flex flex-column justify-content-center">
@@ -276,43 +308,6 @@
           <div id="header-list" class="mb-2"></div>
           <button type="button" class="btn btn-outline-secondary btn-sm w-100 mt-1 fw-bold" onclick="addHeaderRow()"><i class="bi bi-plus-lg me-1"></i>ADD HEADER</button>
           <hr class="my-2">
-          <div class="row g-2 mb-1">
-            <div class="col-6 d-flex flex-column align-items-center justify-content-center">
-              <div class="form-check mb-0">
-                <input class="form-check-input" type="checkbox" id="ch-support-tools">
-                <label class="form-check-label" for="ch-support-tools">Tools</label>
-              </div>
-            </div>
-            <div class="col-6 d-flex flex-column align-items-center justify-content-center">
-              <div class="form-check mb-0">
-                <input class="form-check-input" type="checkbox" id="ch-support-vision">
-                <label class="form-check-label" for="ch-support-vision">Vision</label>
-              </div>
-            </div>
-          </div>
-          <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Relay URL <span class="text-muted" style="font-weight:400">（留空 = 使用全域設定）</span></label>
-            <input type="url" id="ch-relay-url" class="form-control form-control-sm" placeholder="https://your-relay-server:3000">
-          </div>
-          <hr class="my-2">
-          <div class="row g-1 mb-1">
-            <div class="col-3">
-              <label class="form-label mini-label fw-bold">RPM</label>
-              <input type="number" id="ch-rpm" class="form-control form-control-sm" value="0" min="0">
-            </div>
-            <div class="col-3">
-              <label class="form-label mini-label fw-bold">RPD</label>
-              <input type="number" id="ch-rpd" class="form-control form-control-sm" value="0" min="0">
-            </div>
-            <div class="col-6">
-              <label class="form-label mini-label fw-bold">Max Context (est. tokens) <span class="text-muted" style="font-weight:400">（0=不限）</span></label>
-              <input type="number" id="ch-max-ctx" class="form-control form-control-sm" value="0" min="0" placeholder="12000">
-            </div>
-          </div>
-          <div class="mb-1">
-            <label class="form-label mini-label fw-bold">Override Model <span class="text-muted" style="font-weight:400">（留空 = 使用渠道 Model）</span></label>
-            <input type="text" id="ch-override-model" class="form-control form-control-sm" placeholder="gpt-4-turbo">
-          </div>
           <div class="mb-1">
             <label class="form-label mini-label fw-bold">前置提示訊息 <span class="text-muted" style="font-weight:400">（強制插入到最前面，內容相同時自動去重）</span></label>
             <textarea id="ch-prepend-prompt" class="form-control form-control-sm" rows="4" placeholder="請輸入 system prompt，例如：&#10;你是一個專業的程式設計助手，請全程用繁體中文回答。"></textarea>
@@ -414,8 +409,8 @@
         if (st) sessionStorage.setItem('adminToken', st);
         if (r.status === 401) {
           dismissAllModals();
-          toast('登入階段已過期，請重新登入', 'warning');
-          showLogin();
+          toast('登入階段已過期，請先按右上角 LOGOUT 重新登入，再繼續操作', 'warning');
+          // 不立即跳轉到登入頁面，避免操作中的資料遺失（如編輯中的渠道、未存檔設定）
           return null;
         }
         if (!r.ok) {
@@ -579,25 +574,31 @@
           if (el) el.value = batch.config?.token || '';
           const rl = document.getElementById('cfg-relay-url');
           if (rl) rl.value = batch.config?.relay_url || '';
+          const rt = document.getElementById('cfg-relay-token');
+          if (rt) rt.value = batch.config?.relay_token || '';
           // We must render stats AFTER setting the values so it picks them up, or pass them in
-          renderStats(batch.config?.token || '', batch.config?.relay_url || '');
+          renderStats(batch.config?.token || '', batch.config?.relay_url || '', batch.config?.relay_token || '');
           renderChannels();
           renderFilters();
           return true;
         }
         if (i < retries) await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
       }
+      // 所有重試失敗 → 導向登入頁面（防止卡在空白畫面）
+      showLogin();
       return false;
     };
 
-    const renderStats = (initToken, initRelay) => {
+    const renderStats = (initToken, initRelay, initRelayToken) => {
       const total = channels.length;
       const enabled = channels.filter(c => c.is_enabled).length;
       const tokenVal = esc(initToken !== undefined ? initToken : (document.getElementById('cfg-token')?.value || ''));
       const relayVal = esc(initRelay !== undefined ? initRelay : (document.getElementById('cfg-relay-url')?.value || ''));
+      const relayTokenVal = esc(initRelayToken !== undefined ? initRelayToken : (document.getElementById('cfg-relay-token')?.value || ''));
       document.getElementById('stat-content').innerHTML =
+        // Row 1: Total(3) + Enabled(3) + Token(6)
         '<div class="row g-2 g-md-3 mb-3">' +
-          '<div class="col-6 col-md-2">' +
+          '<div class="col-6 col-md-3">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-0 mb-md-1">Total</div>' +
@@ -605,7 +606,7 @@
               '</div>' +
             '</div>' +
           '</div>' +
-          '<div class="col-6 col-md-2">' +
+          '<div class="col-6 col-md-3">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-0 mb-md-1">Enabled</div>' +
@@ -613,7 +614,7 @@
               '</div>' +
             '</div>' +
           '</div>' +
-          '<div class="col-12 col-md-4">' +
+          '<div class="col-12 col-md-6">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-1">Token</div>' +
@@ -624,13 +625,27 @@
               '</div>' +
             '</div>' +
           '</div>' +
-          '<div class="col-12 col-md-4">' +
+        '</div>' +
+        // Row 2: Relay URL(6) + Relay Token(6)
+        '<div class="row g-2 g-md-3">' +
+          '<div class="col-12 col-md-6">' +
             '<div class="card border-0 shadow-sm h-100">' +
               '<div class="card-body p-2 p-md-3">' +
                 '<div class="small text-muted text-uppercase fw-bold mb-1">Relay URL (Global)</div>' +
                 '<div class="input-group input-group-sm mt-1">' +
                   '<input type="url" id="cfg-relay-url" class="form-control" placeholder="https://your-server:3000" value="' + relayVal + '" />' +
                   '<button class="btn btn-outline-secondary" onclick="document.getElementById(\'cfg-relay-url\').value=\'\'" title="Clear"><i class="bi bi-x-lg"></i></button>' +
+                '</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="col-12 col-md-6">' +
+            '<div class="card border-0 shadow-sm h-100">' +
+              '<div class="card-body p-2 p-md-3">' +
+                '<div class="small text-muted text-uppercase fw-bold mb-1">Relay Token</div>' +
+                '<div class="input-group input-group-sm mt-1">' +
+                  '<input type="text" id="cfg-relay-token" class="form-control pwd-mask" placeholder="x-relay-token" value="' + relayTokenVal + '" />' +
+                  '<button class="btn btn-outline-secondary" onclick="document.getElementById(\'cfg-relay-token\').value=\'\'" title="Clear"><i class="bi bi-x-lg"></i></button>' +
                 '</div>' +
               '</div>' +
             '</div>' +
@@ -772,8 +787,10 @@
     const saveEverything = async () => {
       const cfgEl = document.getElementById('cfg-token');
       const relayEl = document.getElementById('cfg-relay-url');
+      const relayTokenEl = document.getElementById('cfg-relay-token');
       const configPayload = { token: cfgEl ? cfgEl.value : undefined };
       if (relayEl) configPayload.relay_url = relayEl.value;
+      if (relayTokenEl) configPayload.relay_token = relayTokenEl.value;
       const cfgOk = await api('/admin/api/config', 'POST', configPayload);
       if (!cfgOk) { toast('Config 儲存失敗', 'danger'); return; }
       const channelsOk = await api('/admin/api/batch-channels', 'POST', channels);
@@ -816,11 +833,10 @@
       document.getElementById('ch-type').value = 'chat';
       document.getElementById('ch-rpm').value = '0';
       document.getElementById('ch-rpd').value = '0';
-      document.getElementById('ch-override-model').value = '';
+      document.getElementById('ch-fallback-model').value = '';
       document.getElementById('ch-prepend-prompt').value = '';
       document.getElementById('ch-support-tools').checked = true;
       document.getElementById('ch-support-vision').checked = false;
-      document.getElementById('ch-relay-url').value = '';
       document.getElementById('ch-max-ctx').value = '0';
       updateCapabilities();
       chHeaders = [];
@@ -847,7 +863,7 @@
       document.getElementById('ch-type').value = c.channel_type || 'chat';
       document.getElementById('ch-rpm').value = c.rpm_limit || 0;
       document.getElementById('ch-rpd').value = c.rpd_limit || 0;
-      document.getElementById('ch-override-model').value = c.fallback_model || '';
+      document.getElementById('ch-fallback-model').value = c.fallback_model || '';
       let prependText = '';
       if (c.provider_options) {
         try {
@@ -861,7 +877,6 @@
       document.getElementById('ch-support-vision').checked = c.support_vision == 1;
 
       document.getElementById('ch-max-ctx').value = c.max_context_length || 0;
-      document.getElementById('ch-relay-url').value = c.relay_url || '';
       updateCapabilities();
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
@@ -884,7 +899,7 @@
       const idVal = document.getElementById('ch-id').value;
       const rpmLimit = parseInt(document.getElementById('ch-rpm')?.value) || 0;
       const rpdLimit = parseInt(document.getElementById('ch-rpd')?.value) || 0;
-      const overrideModel = document.getElementById('ch-override-model')?.value?.trim() || '';
+      const fallbackModel = document.getElementById('ch-fallback-model')?.value?.trim() || '';
       let providerOptions = null;
       const prependText = document.getElementById('ch-prepend-prompt')?.value?.trim();
       // 保留現有 provider_options 中非 _prepend_messages 的欄位（如 model_map）
@@ -920,13 +935,12 @@
         headers: chHeaders.filter(h => h.key && h.key.trim()),
         rpm_limit: rpmLimit,
         rpd_limit: rpdLimit,
-        fallback_model: overrideModel,
+        fallback_model: fallbackModel,
         provider_options: providerOptions,
         support_tools: document.getElementById('ch-support-tools').checked ? 1 : 0,
         support_vision: document.getElementById('ch-support-vision').checked ? 1 : 0,
 
         max_context_length: parseInt(document.getElementById('ch-max-ctx')?.value) || 0,
-        relay_url: document.getElementById('ch-relay-url')?.value?.trim() || '',
       };
       if (idx !== '') channels[parseInt(idx)] = ch;
       else channels.push(ch);
@@ -1008,7 +1022,6 @@
             support_tools: ch.support_tools != null ? ch.support_tools : 1,
             support_vision: ch.support_vision != null ? ch.support_vision : 0,
             provider: ch.provider || '',
-            relay_url: ch.relay_url || '',
             max_tokens: ch.max_tokens || 0,
             support_stream: ch.support_stream != null ? (ch.support_stream ? 1 : 0) : 1,
             support_image_gen: ch.support_image_gen != null ? (ch.support_image_gen ? 1 : 0) : 0,
@@ -1022,20 +1035,44 @@
 
           }));
           channels.splice(0, channels.length, ...newChannels);
-          // 若備份檔包含 filters 也一併匯入
+          let importedFilters = false;
           if (Array.isArray(data.filters)) {
             filters.splice(0, filters.length, ...data.filters.map(f => ({
               id: f.id, text: f.text, mode: f.mode != null ? f.mode : 1, is_enabled: f.is_enabled != null ? f.is_enabled : 1,
             })));
+            importedFilters = true;
           }
-          // 匯入全域 relay_url（若備份檔有包含）
-          if (data.config?.relay_url != null) {
-            const rl = document.getElementById('cfg-relay-url');
-            if (rl) rl.value = data.config.relay_url;
+          // 自動存檔到 D1（避免重整頁面後資料遺失）
+          loading(true);
+          try {
+            const chOk = await api('/admin/api/batch-channels', 'POST', channels, false);
+            if (!chOk) { toast('渠道儲存失敗', 'danger'); return; }
+            if (importedFilters) {
+              const validFilters = filters.filter(f => f.text && f.text.trim().length > 0 && f.text.length <= 30);
+              const flOk = await api('/admin/api/filters', 'POST', validFilters, false);
+              if (!flOk) { toast('過濾器儲存失敗', 'danger'); return; }
+            }
+            const cfgPayload = {};
+            if (data.config?.relay_url != null) {
+              const rl = document.getElementById('cfg-relay-url');
+              if (rl) rl.value = data.config.relay_url;
+              cfgPayload.relay_url = data.config.relay_url;
+            }
+            if (data.config?.relay_token != null) {
+              const rt = document.getElementById('cfg-relay-token');
+              if (rt) rt.value = data.config.relay_token;
+              cfgPayload.relay_token = data.config.relay_token;
+            }
+            if (Object.keys(cfgPayload).length > 0) {
+              await api('/admin/api/config', 'POST', cfgPayload, false);
+            }
+          } finally {
+            loading(false);
           }
           renderChannels();
+          renderFilters();
           renderStats();
-          toast('已匯入 ' + channels.length + ' 個渠道' + (data.filters ? ' + ' + data.filters.length + ' 過濾器' : ''), 'success');
+          toast('已匯入 ' + channels.length + ' 個渠道' + (importedFilters ? ' + ' + filters.length + ' 過濾器' : '') + '，已自動存檔', 'success');
         } catch (err) {
           toast('匯入失敗: ' + err.message, 'danger');
         }
@@ -1045,11 +1082,7 @@
 
     const toggleKeyVis = () => {
       const i = document.getElementById('ch-key');
-      if (i.type === 'password') {
-        i.type = 'text';
-      } else {
-        i.type = 'password';
-      }
+      i.classList.toggle('pwd-mask');
     };
 
     const toggleSort = (key) => {

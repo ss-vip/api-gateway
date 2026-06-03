@@ -28,6 +28,7 @@
  *    MEMORY_LIMIT_MB  預設 150（超過自動 exit，由監控重啟）
  *    RELAY_TOKEN      非空時啟用 x-relay-token 驗證（避免被濫用）
  */
+
 // crontab watchdog（每 5 分鐘檢查，不在背景就重啟）:
 //   crontab -e
 //   */5 * * * * pgrep -f "node.*relay" || nohup node ${HOME}/relay.js > relay.log 2>&1 &

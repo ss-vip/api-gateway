@@ -3,16 +3,33 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import portalHtml from "./dashboard.html";
 
-const UPSTREAM_TIMEOUT_MS = 120_000;
+const UPSTREAM_TIMEOUT_MS = 120_000;    // chat 請求總 timeout
+const LONG_TIMEOUT_MS = 600_000;        // 非 chat（文生圖等）總 timeout, 配合 relay 即回 meta 架構
 const CHANNEL_COOLDOWN_MS = UPSTREAM_TIMEOUT_MS;
 const STREAM_IDLE_TIMEOUT_MS = 180_000;
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
-const SESSION_TTL = 86400000;
+const SESSION_TTL = 604800000; // 7 天
 const SESSION_PRUNE_INTERVAL = 50;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const adminSessions = new Map();
 let sessionPruneCounter = 0;
+
+// 自動學習：渠道實際能承載的 context 上限（從 runtime 錯誤回饋）
+const contextOverflowAt = new Map(); // channelId -> lowest estimatedTokens that failed
+function isContextLengthError(text) {
+  return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit/i.test(text);
+}
+function learnContextLimit(channelId, tokens) {
+  const prev = contextOverflowAt.get(channelId);
+  contextOverflowAt.set(channelId, prev !== undefined ? Math.min(prev, tokens) : tokens);
+}
+function successContextObserved(channelId, tokens) {
+  const overflow = contextOverflowAt.get(channelId);
+  if (overflow !== undefined && tokens >= overflow - 500) {
+    contextOverflowAt.delete(channelId);
+  }
+}
 
 async function generateSessionToken(env) {
   const token = generateToken("sess-");
@@ -336,8 +353,11 @@ async function ensureSchema(env) {
   if (parseInt(schemaVer, 10) < 7) {
     try { await env.DB.prepare("ALTER TABLE config ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* 欄位已存在則略過 */ }
   }
+  if (parseInt(schemaVer, 10) < 8) {
+    try { await env.DB.prepare("ALTER TABLE config ADD COLUMN relay_token TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* 欄位已存在則略過 */ }
+  }
   // migration 完成後寫入 DB flag，下次冷啟動直接跳過
-  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '7')").run();
+  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '8')").run();
   schemaReady = true;
 }
 
@@ -397,7 +417,7 @@ async function dbLoadChannels(env, channelType) {
       consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
       cache_enabled, cache_ttl,
       rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
-      fallback_model, model, max_tokens, is_enabled, provider_options, relay_url,
+      fallback_model, model, max_tokens, is_enabled, provider_options,
       support_tools, support_vision, max_context_length
       FROM channels WHERE is_enabled = 1`;
     const params = [];
@@ -437,7 +457,7 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
   const healthy = channels.filter(c => !exclude.has(c.id) && !isDegraded(c.id));
   if (healthy.length === 0) return null;
   const pool = healthy;
-  // 動態權重：僅懲罰接近 context limit 的渠道，不對無限渠道加成（避免覆蓋管理員設定的 weight）
+  // 動態權重：接近 limit 的渠道降權、小請求優先選有限 context 渠道（保留無限渠道給大請求）
   const weights = pool.map(c => {
     let weight = Math.max(c.weight, 1);
     if (c.max_context_length > 0 && estimatedContextTokens > 0) {
@@ -446,6 +466,10 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
         weight *= 0.7;
       } else if (ratio >= 0.7) {
         weight *= 0.85;
+      } else if (ratio < 0.5) {
+        // 請求遠小於限制 → 加成，保留無限渠道給真正需要的大請求
+        const boost = 1 + (1 - ratio * 2) * 0.5; // ratio 0 → *1.5, ratio 0.25 → *1.25, ratio 0.5 → 無加成
+        weight *= boost;
       }
     }
     return weight;
@@ -573,15 +597,15 @@ function cacheSet(key, data, ttl) {
   responseCache.set(key, { data, expires: Date.now() + (ttl || 3600) * 1000 });
 }
 
-let globalConfigCache = { token: null, relay_url: null, ts: 0 };
+let globalConfigCache = { token: null, relay_url: null, relay_token: null, ts: 0 };
 
 async function resolveGlobalConfig(env) {
   if (globalConfigCache.ts > 0 && Date.now() - globalConfigCache.ts < TOKEN_TTL) return globalConfigCache;
   try {
-    const cf = await env.DB.prepare("SELECT client_token, relay_url FROM config WHERE id=1").first();
-    globalConfigCache = { token: cf?.client_token || null, relay_url: cf?.relay_url || null, ts: Date.now() };
+    const cf = await env.DB.prepare("SELECT client_token, relay_url, relay_token FROM config WHERE id=1").first();
+    globalConfigCache = { token: cf?.client_token || null, relay_url: cf?.relay_url || null, relay_token: cf?.relay_token || null, ts: Date.now() };
   } catch {
-    globalConfigCache = { token: null, relay_url: null, ts: Date.now() };
+    globalConfigCache = { token: null, relay_url: null, relay_token: null, ts: Date.now() };
   }
   return globalConfigCache;
 }
@@ -607,7 +631,7 @@ async function loadFilters(env) {
 }
 
 function clearGatewayCache() {
-  globalConfigCache = { token: null, relay_url: null, ts: 0 };
+  globalConfigCache = { token: null, relay_url: null, relay_token: null, ts: 0 };
   filterCache = { data: null, ts: 0 };
   tokenBuckets.clear();
   clearChannelCache();
@@ -918,14 +942,16 @@ async function parseRelayResponse(relayRes) {
   }
 }
 
-// Global relay: 使用 env.RELAY_BASE_URL 全局設定（僅 chat 類型使用）
+// Global relay: 使用 env.RELAY_BASE_URL 全局設定（所有類型皆可使用）
 async function upstreamFetch(url, opts, env, rid, noRelay) {
   if (noRelay || !env.RELAY_BASE_URL) {
     return fetch(url, opts);
   }
+  const { relay_token: dbRelayToken } = await resolveGlobalConfig(env);
+  const relayToken = dbRelayToken || env.RELAY_SECRET || "";
   const relayHeaders = new Headers(opts.headers);
   relayHeaders.set("x-target-url", url);
-  if (env.RELAY_SECRET) relayHeaders.set("x-relay-token", env.RELAY_SECRET);
+  if (relayToken) relayHeaders.set("x-relay-token", relayToken);
   const relayRes = await fetch(env.RELAY_BASE_URL, {
     method: opts.method, headers: relayHeaders, body: opts.body, signal: opts.signal,
   });
@@ -1021,7 +1047,7 @@ async function patchReasoningToContent(res) {
 }
 
 async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
-  const { relay_url: globalRelayUrl } = await resolveGlobalConfig(env);
+  const { relay_url: globalRelayUrl, relay_token: dbRelayToken } = await resolveGlobalConfig(env);
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
   const requiredType = getPathChannelType(suffix);
@@ -1077,7 +1103,14 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   }
   
   if (estimatedContextTokens > 0) {
-    eligible = eligible.filter(c => c.max_context_length === 0 || estimatedContextTokens <= c.max_context_length);
+    eligible = eligible.filter(c => {
+      const configured = c.max_context_length;
+      const overflow = contextOverflowAt.get(c.id);
+      const effectiveMax = configured > 0
+        ? (overflow !== undefined ? Math.min(configured, overflow) : configured)
+        : (overflow !== undefined ? overflow : Infinity);
+      return estimatedContextTokens < effectiveMax;
+    });
   }
   
   // 依能力過濾渠道
@@ -1088,6 +1121,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools}, tokens=${estimatedContextTokens})`, status: 503 } };
   }
   const attempted = new Set();
+  const fallbackModelsTried = new Set(); // 追蹤已嘗試過 fallback model 的渠道
   const maxAttempts = Math.min(Math.max(eligible.length, 1) * 3, 15);
   let attempts = 0;
   let reqBody = bodyStr;
@@ -1164,13 +1198,21 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
       } catch (e) {}
     }
-    // model override: 僅對 chat 類型有效，其他類型（embed / image_gen 等）跳過
-    const overrideModel = (requiredType === "chat") ? (channel.fallback_model || channel.model) : "";
-    if (overrideModel && reqBody) {
+    // 使用渠道 model 取代請求中的 model（若渠道 model 有設定）
+    // 若已嘗試過 fallback，則改用 fallback_model
+    let effectiveModel = "";
+    if (requiredType === "chat") {
+      if (fallbackModelsTried.has(channel.id)) {
+        effectiveModel = channel.fallback_model || "";
+      } else {
+        effectiveModel = channel.model || "";
+      }
+    }
+    if (effectiveModel && reqBody) {
       try {
         const parsed = JSON.parse(reqBody);
-        if (parsed.model && parsed.model !== overrideModel) {
-          parsed.model = overrideModel;
+        if (parsed.model && parsed.model !== effectiveModel) {
+          parsed.model = effectiveModel;
           reqBody = JSON.stringify(parsed);
         }
       } catch (e) {}
@@ -1185,17 +1227,18 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       clientSignal.addEventListener("abort", onAbort, { once: true });
     }
     try {
-      timer = setTimeout(onAbort, UPSTREAM_TIMEOUT_MS);
-      let res;
       const isChat = requiredType === "chat";
-      if (isChat && globalRelayUrl?.trim()) {
-        const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
-        // relay server 讀 x-target-url header 決定轉發目標，不依賴請求路徑
-        res = await fetchViaRelay(relayBase, url, method, headers, reqBody, controller.signal, env.RELAY_SECRET);
-      } else if (isChat) {
-        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false);
-      } else {
+      timer = setTimeout(onAbort, isChat ? UPSTREAM_TIMEOUT_MS : LONG_TIMEOUT_MS);
+      let res;
+      if (requiredType === "realtime") {
+        // WebSocket upgrade 無法透過 HTTP relay，必須直連
         res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, true);
+      } else if (globalRelayUrl?.trim()) {
+        const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
+        // relay server 即回 meta 架構，避免 CF 邊緣網路 100s 無回應觸發 524
+        res = await fetchViaRelay(relayBase, url, method, headers, reqBody, controller.signal, dbRelayToken || env.RELAY_SECRET);
+      } else {
+        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false);
       }
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
@@ -1245,6 +1288,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             }).catch(() => {});
           }
         }
+        // 成功回饋：清除該渠道的 overflow 記憶（若此次超過先前的失敗點）
+        if (estimatedContextTokens > 0) successContextObserved(channel.id, estimatedContextTokens);
         return { response: await patchReasoningToContent(res), channel };
       }
       if (res.status >= 500 || res.status === 429) {
@@ -1252,6 +1297,17 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         markDegraded(channel.id, env);
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
         continue;
+      }
+      // 偵測 context overflow → 學習該渠道實際上限，跳過 model fallback
+      if ((res.status === 400 || res.status === 413) && estimatedContextTokens > 0) {
+        const text = await res.clone().text().catch(() => "");
+        if (isContextLengthError(text)) {
+          res.body?.cancel().catch(() => {});
+          learnContextLimit(channel.id, estimatedContextTokens);
+          attempted.add(channel.id);
+          logStructured("warn", "context length exceeded, learned limit", { channel: channel.name, tokens: estimatedContextTokens, overflow: contextOverflowAt.get(channel.id), rid });
+          continue;
+        }
       }
       // 4xx + 原始請求為串流 → 上游可能不支援串流，改用非串流重試同一渠道 (安全性：限定 reqBody 有 stream 屬性時)
       if (res.status >= 400 && res.status < 500 && streamType === "stream" && reqBody) {
@@ -1266,6 +1322,18 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             continue;
           }
         } catch (e) {}
+      }
+      // 所有非 2xx → 先嘗試備用 model，再換下一個渠道
+      if (!res.ok) {
+        res.body?.cancel().catch(() => {});
+        if (channel.fallback_model && !fallbackModelsTried.has(channel.id)) {
+          fallbackModelsTried.add(channel.id);
+          logStructured("warn", "non-2xx, retrying with fallback model", { channel: channel.name, model: channel.fallback_model, status: res.status, rid });
+          continue;
+        }
+        attempted.add(channel.id);
+        logStructured("warn", "non-2xx upstream, trying next channel", { channel: channel.name, status: res.status, rid });
+        continue;
       }
       return { response: res };
     } catch (err) {
@@ -1463,7 +1531,7 @@ async function wrapNonStreamToStream(c, upstream, headers) {
 }
 
 async function handleModels(c) {
-  const { relay_url: globalRelayUrl } = await resolveGlobalConfig(c.env);
+  const { relay_url: globalRelayUrl, relay_token: dbRelayToken } = await resolveGlobalConfig(c.env);
   const channels = await loadChannels(c.env);
   if (channels.length === 0) return c.json({ object: "list", data: [] });
   for (const channel of channels) {
@@ -1478,16 +1546,13 @@ async function handleModels(c) {
         } catch (e) {}
       }
       let res;
-      const channelRelay = channel.relay_url?.trim();
       const globalRelay = globalRelayUrl?.trim();
-      if (channelRelay) {
-        // 使用 per-channel relay
-        res = await fetchViaRelay(channelRelay.replace(/\/+$/, ""), url, "GET", headers, undefined, AbortSignal.timeout(5000), c.env.RELAY_SECRET);
-      } else if (globalRelay) {
+      const relayToken = dbRelayToken || c.env.RELAY_SECRET;
+      if (globalRelay) {
         // 使用 config 表中的全域 relay
         const relayHeaders = new Headers(headers);
         relayHeaders.set("x-target-url", url);
-        if (c.env.RELAY_SECRET) relayHeaders.set("x-relay-token", c.env.RELAY_SECRET);
+        if (relayToken) relayHeaders.set("x-relay-token", relayToken);
         const relayRes = await fetch(globalRelay.replace(/\/+$/, ""), { method: "GET", headers: relayHeaders, signal: AbortSignal.timeout(5000) });
         if (relayRes.headers.get("x-relay") === "1") {
           const parsed = await parseRelayResponse(relayRes);
@@ -1670,9 +1735,10 @@ function createDashboardApi() {
       if (typeof headers === "string") try { headers = JSON.parse(headers); } catch (e) { headers = []; }
       let provider_options = ch.provider_options || null;
       if (typeof provider_options === "string") try { provider_options = JSON.parse(provider_options); } catch (e) { provider_options = null; }
-      return { ...ch, api_key: ch.api_key || '', headers, provider_options };
+      const { relay_url: _relay, ...chClean } = ch; // 移除已廢棄的 per-channel relay_url
+      return { ...chClean, api_key: chClean.api_key || '', headers, provider_options };
     });
-    return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "", relay_url: cf?.relay_url || "" } });
+    return c.json({ channels, filters: fl.results || [], config: { token: cf?.client_token || "", relay_url: cf?.relay_url || "", relay_token: cf?.relay_token || "" } });
   });
 
   // 完整匯出（含 unmasked API Key），用作全設定手動備份
@@ -1688,9 +1754,10 @@ function createDashboardApi() {
       let provider_options = ch.provider_options || null;
       if (typeof provider_options === "string") try { provider_options = JSON.parse(provider_options); } catch (e) { provider_options = null; }
       // 匯出不遮罩 api_key
-      return { ...ch, headers, provider_options };
+      const { relay_url: _relay, ...chClean } = ch; // 移除已廢棄的 per-channel relay_url
+      return { ...chClean, headers, provider_options };
     });
-    return c.json({ version: 1, channels, filters: fl.results || [], config: { token: cf?.client_token || "", relay_url: cf?.relay_url || "" } });
+    return c.json({ version: 1, channels, filters: fl.results || [], config: { token: cf?.client_token || "", relay_url: cf?.relay_url || "", relay_token: cf?.relay_token || "" } });
   });
 
   api.post("/batch-channels", async (c) => {
@@ -1709,7 +1776,7 @@ function createDashboardApi() {
     const allKeys = {};
     for (const row of allKeyRows.results || []) allKeys[row.id] = row.api_key;
     const isMasked = (key) => typeof key === "string" && key.includes("***");
-    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision, relay_url, max_context_length";
+    const cols = "id, name, base_url, api_key, model, weight, is_enabled, stream_type, channel_type, headers, provider, provider_options, max_tokens, fallback_model, health_check_enabled, health_check_interval, health_check_timeout, cache_enabled, cache_ttl, rate_limit_algorithm, rate_limit_capacity, rate_limit_rate, rpm_limit, rpd_limit, consecutive_errors, last_error_msg, last_error_at, support_stream, support_image_gen, support_audio_tts, support_audio_stt, support_image_edit, support_embeddings, absolute_url, response_time, support_tools, support_vision, max_context_length";
     const ph = cols.split(",").map(() => "?").join(",");
     const batch = [c.env.DB.prepare("DELETE FROM channels")];
     for (const ch of body) {
@@ -1732,7 +1799,6 @@ function createDashboardApi() {
           ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
           ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1,
           ch.support_vision != null ? (ch.support_vision ? 1 : 0) : 0,
-          ch.relay_url || "",
           ch.max_context_length || 0
         )
       );
@@ -1767,7 +1833,7 @@ function createDashboardApi() {
 
   api.post("/config", async (c) => {
     const b = await c.req.json();
-    const ex = await c.env.DB.prepare("SELECT client_token, relay_url FROM config WHERE id=1").first();
+    const ex = await c.env.DB.prepare("SELECT client_token, relay_url, relay_token FROM config WHERE id=1").first();
     const existingToken = ex?.client_token || "";
     try {
       const token = b.token !== undefined ? b.token : (existingToken || getDefaults().token);
@@ -1777,11 +1843,15 @@ function createDashboardApi() {
       if (b.relay_url !== undefined) {
         updates.push("relay_url=?"); bindings.push(b.relay_url);
       }
+      if (b.relay_token !== undefined) {
+        updates.push("relay_token=?"); bindings.push(b.relay_token);
+      }
       if (ex) {
         await c.env.DB.prepare(`UPDATE config SET ${updates.join(",")} WHERE id=1`).bind(...bindings).run();
       } else {
         const rUrl = b.relay_url || "";
-        await c.env.DB.prepare("INSERT INTO config (id, client_token, admin_password, relay_url) VALUES (1, ?, '', ?)").bind(token, rUrl).run();
+        const rToken = b.relay_token || "";
+        await c.env.DB.prepare("INSERT INTO config (id, client_token, admin_password, relay_url, relay_token) VALUES (1, ?, '', ?, ?)").bind(token, rUrl, rToken).run();
       }
     } catch (e) { return c.json({ error: e.message }, 500); }
     clearGatewayCache();
@@ -1829,6 +1899,8 @@ function createDashboardApi() {
     const baseUrl = ch.base_url || "";
     const testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
     const relayUrl = ch.relay_url?.trim();
+    const { relay_token: dbRelayToken } = await resolveGlobalConfig(c.env);
+    const relayToken = dbRelayToken || c.env.RELAY_SECRET;
     const start = Date.now();
     try {
       const testHeaders = { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" };
@@ -1838,7 +1910,7 @@ function createDashboardApi() {
       let res;
       if (relayUrl) {
         // fetchViaRelay 的 body 讀取不在初始 signal 範圍內，用 race 強制總 timeout
-        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST", testHeaders, testBody, AbortSignal.timeout(TEST_TIMEOUT_MS), c.env.RELAY_SECRET);
+        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST", testHeaders, testBody, AbortSignal.timeout(TEST_TIMEOUT_MS), relayToken);
         const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error("relay test timeout")), TEST_TIMEOUT_MS)
         );
