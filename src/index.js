@@ -16,7 +16,7 @@ const adminSessions = new Map();
 let sessionPruneCounter = 0;
 
 // 自動學習：渠道實際能承載的 context 上限（從 runtime 錯誤回饋）
-const contextOverflowAt = new Map(); // channelId -> lowest estimatedTokens that failed
+const contextOverflowAt = new Map();
 function isContextLengthError(text) {
   return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit/i.test(text);
 }
@@ -29,6 +29,18 @@ function successContextObserved(channelId, tokens) {
   if (overflow !== undefined && tokens >= overflow - 500) {
     contextOverflowAt.delete(channelId);
   }
+}
+
+// 自動學習：渠道實際上無法支援 tools / vision（從上游回空內容推斷）
+const channelNoTools = new Set();
+const channelNoVision = new Set();
+function learnChannelNoTools(channelId, env) {
+  channelNoTools.add(channelId);
+  env?.DB?.prepare("UPDATE channels SET support_tools=0 WHERE id=?").bind(channelId).run().catch(() => {});
+}
+function learnChannelNoVision(channelId, env) {
+  channelNoVision.add(channelId);
+  env?.DB?.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(channelId).run().catch(() => {});
 }
 
 async function generateSessionToken(env) {
@@ -362,7 +374,6 @@ async function ensureSchema(env) {
 }
 
 class RollingFilter {
-  // 僅使用靜態 applyStatic 方法；實例方法（constructor / transform / flush）已移除
   static applyStatic(text, filters) {
     if (!text || !filters || filters.length === 0) return text;
     const enabled = filters.filter(f => f.is_enabled && f.text && f.text.length >= 1 && f.text.length <= 30);
@@ -383,16 +394,13 @@ const TYPE_CACHE_TTL = 30000;
 const degradedUntil = new Map();
 
 async function loadChannels(env, channelType) {
-  const now = Date.now();
-  // type-specific 快取（短 TTL 30s）
+    const now = Date.now();
   if (channelType) {
     const cached = typeChannelCache.get(channelType);
     if (cached && now - cached.ts < TYPE_CACHE_TTL) return cached.data;
     return dbLoadChannels(env, channelType);
   }
-  // 通用快取（REFRESH_MS = 60s）
   if (cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
-  // 共享 loadPromise 避免並發重複查詢；resolve 後自動重置
   if (loadPromise) return loadPromise;
   loadPromise = (async () => {
     try {
@@ -404,7 +412,7 @@ async function loadChannels(env, channelType) {
       cachedChannels = cachedChannels || [];
       return cachedChannels;
     } finally {
-      loadPromise = null; // 確保 REFRESH_MS 過後能重新查詢
+      loadPromise = null;
     }
   })();
   return loadPromise;
@@ -508,10 +516,8 @@ function isDegraded(channelId) {
   return false;
 }
 
-// 簡易記憶體 Token Bucket（按 channelId）
 const tokenBuckets = new Map();
 
-// 純檢查，不消耗配額
 function checkRateLimit(channel) {
   if (!channel.rpm_limit && !channel.rpd_limit && !channel.rate_limit_capacity) return { ok: true };
   const now = Date.now();
@@ -668,8 +674,8 @@ function createFilterTransform(filters) {
   // Smart Split 狀態機：偵測上游把思考塞進 content 時，搬移到 reasoning_content
   let ssMode = "normal";     // normal | detecting | thinking | answering
   let ssDetectBuf = "";      // 累積開頭字元來偵測 Thought: 前綴
-  let ssHeld = [];           // 偵測期間緩衝的完整 SSE 行（原始文字）
-  let ssHeldParsed = [];     // 偵測期間緩衝的 parsed 深拷貝（flush 時需改寫）
+  let ssHeld = [];
+  let ssHeldParsed = [];
 
   function ssFlushAsThinking(controller) {
     let splitIdx = -1;
@@ -1060,8 +1066,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     if (channels.length === 0) return { error: { message: "No upstream channels available", status: 503 } };
   }
   let eligible = channels;
-  // 非串流請求嘗試走快取
-  // 僅快取 embed / moderate 類型（與 cacheSet 邏輯一致）
   if (streamType !== "stream" && body && (requiredType === "embed" || requiredType === "moderate")) {
     const ck = getCacheKey(requiredType, body);
     if (ck) {
@@ -1084,7 +1088,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         for (const msg of parsed.messages) {
           // 清除非標準欄位避免上游報錯
           if (msg.reasoning_content !== undefined) { delete msg.reasoning_content; sanitized = true; }
-          // 計算 token 與判定 vision/tools
           if (Array.isArray(msg.content)) {
             for (const part of msg.content) {
               if (part.type === "image_url") needsVision = true;
@@ -1113,15 +1116,14 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     });
   }
   
-  // 依能力過濾渠道
-  if (needsVision) eligible = eligible.filter(c => c.support_vision);
-  if (needsTools) eligible = eligible.filter(c => c.support_tools);
+  if (needsVision) eligible = eligible.filter(c => c.support_vision && !channelNoVision.has(c.id));
+  if (needsTools) eligible = eligible.filter(c => c.support_tools && !channelNoTools.has(c.id));
   if (eligible.length === 0) {
     logStructured("warn", "no channels match capability or context length", { vision: needsVision, tools: needsTools, tokens: estimatedContextTokens, path, rid });
     return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools}, tokens=${estimatedContextTokens})`, status: 503 } };
   }
   const attempted = new Set();
-  const fallbackModelsTried = new Set(); // 追蹤已嘗試過 fallback model 的渠道
+  const fallbackModelsTried = new Set();
   const maxAttempts = Math.min(Math.max(eligible.length, 1) * 3, 15);
   let attempts = 0;
   let reqBody = bodyStr;
@@ -1251,7 +1253,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
       if (res.ok) {
         markHealthy(channel.id, env);
-        // 套用響應重寫 / 驗證
         if (channel.provider_options) {
           try {
             const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
@@ -1278,7 +1279,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             }
           } catch (e) {}
         }
-        // 非串流快取：僅快取 embeddings / moderations 類型
         if (streamType !== "stream" && !(bodyStr && bodyStr.includes('"stream":true'))) {
           const ct = res.headers.get("Content-Type") || "";
           if (ct.includes("application/json") && (requiredType === "embed" || requiredType === "moderate")) {
@@ -1288,8 +1288,40 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             }).catch(() => {});
           }
         }
-        // 成功回饋：清除該渠道的 overflow 記憶（若此次超過先前的失敗點）
         if (estimatedContextTokens > 0) successContextObserved(channel.id, estimatedContextTokens);
+        // 空內容學習：串流回應且請求含 tools/vision → 監控是否有實際內容
+        if ((needsTools || needsVision) && res.body && (res.headers.get("Content-Type") || "").includes("text/event-stream")) {
+          const origBody = res.body;
+          let hasToolCalls = false, hasContent = false;
+          const monitoredBody = origBody.pipeThrough(new TransformStream({
+            transform(chunk, controller) {
+              const text = new TextDecoder().decode(chunk, { stream: true });
+              for (const line of text.split('\n')) {
+                if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                  try {
+                    const p = JSON.parse(line.slice(6));
+                    if (p.choices?.[0]) {
+                      if (p.choices[0].delta?.tool_calls) hasToolCalls = true;
+                      if (p.choices[0].delta?.content) hasContent = true;
+                    }
+                  } catch {}
+                }
+              }
+              controller.enqueue(chunk);
+            },
+            flush() {
+              if (needsTools && !hasToolCalls) {
+                learnChannelNoTools(channel.id, env);
+                logStructured("warn", "learned: channel does not support tools", { channel: channel.name, rid });
+              }
+              if (needsVision && !hasContent) {
+                learnChannelNoVision(channel.id, env);
+                logStructured("warn", "learned: channel does not support vision", { channel: channel.name, rid });
+              }
+            }
+          }));
+          res = new Response(monitoredBody, { status: res.status, statusText: res.statusText, headers: res.headers });
+        }
         return { response: await patchReasoningToContent(res), channel };
       }
       if (res.status >= 500 || res.status === 429) {
