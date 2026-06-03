@@ -1,5 +1,5 @@
 /**
- * HTTP 轉發代理 + SSE Reasoning Capture
+ * HTTP 轉發代理 + SSE Reasoning Capture + Function Calling Simulation
  *
  * 設計要點:
  *   1. 零緩存串流 — request body 邊收邊轉送 upstream，不佔 RAM
@@ -9,6 +9,8 @@
  *   5. Reasoning Cache (response-only) — 截取 SSE 串流，累積 reasoning_content + tool_call_ids
  *   6. 自動記憶體監控 — 超過 MEMORY_LIMIT_MB 自動重啟程序
  *   7. 健康檢查端點 GET /health — 供外部監控
+ *   8. Function Calling 模擬 — 對 /v1/chat/completions 請求，自動將 tools 參數
+ *      注入 system prompt，並從回應中解析 tool call 轉為標準 OpenAI tool_calls 格式
  *
  * Request injection（補回 reasoning_content）由 CF Worker 端處理。
  *
@@ -132,6 +134,127 @@ function attachSseCapture(proxyRes, res, rid) {
   });
 }
 
+// ============================================================
+//  Function Calling 模擬 — tools injection + response parsing
+// ============================================================
+
+/**
+ * 將 OpenAI tools 定義注入 system prompt，轉為文字描述。
+ * 上游模型收到後會以 JSON 格式回傳 tool call。
+ *
+ * 針對 8B 模型，使用具體函數名稱的完整範例（而非 <placeholder>），
+ * 讓模型能直接套用模式輸出。
+ */
+function injectToolDescriptions(messages, tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return messages;
+
+  // 用第一個 function 做 demo（讓模型有具體樣本可參考）
+  const firstFn = tools[0]?.function || {};
+  const firstName = firstFn.name || 'function_name';
+  const firstParams = firstFn.parameters?.properties || {};
+  const firstRequired = Array.isArray(firstFn.parameters?.required) ? firstFn.parameters.required : [];
+  const firstKeys = Object.keys(firstParams);
+  const demoArgs = firstKeys.length > 0
+    ? '{' + firstKeys.slice(0, 3).map(k => `"${k}": "${firstParams[k]?.type === 'number' ? '0' : '...'}"`).join(', ') + '}'
+    : '{}';
+
+  // 精簡工具描述（對 8B 模型，長描述反而干擾）
+  const desc = tools.map(t => {
+    const fn = t.function || {};
+    const p = fn.parameters?.properties || {};
+    const r = Array.isArray(fn.parameters?.required) ? fn.parameters.required : [];
+    const paramStr = Object.entries(p).map(([k, v]) =>
+      k + (r.includes(k) ? '*' : '') + ':' + (v.type || 'any')
+    ).join(', ');
+    return `  - ${fn.name}(${paramStr}): ${(fn.description || '').slice(0, 120)}`;
+  }).join('\n');
+
+  const prompt =
+    `\n\n## Available Functions\n${desc}\n\n` +
+    `## How to respond\n` +
+    `When user's request needs a function, answer with EXACTLY one JSON line (no other text):\n` +
+    `  {"tool": "${firstName}", "args": ${demoArgs}}\n` +
+    `(Replace function name and arguments as needed.)\n` +
+    `When no function is needed, answer normally in plain text.\n` +
+    `Never describe or list the available functions.`;
+
+  const msgs = Array.isArray(messages) ? [...messages] : [];
+  const sysIdx = msgs.findIndex(m => m && m.role === 'system');
+  if (sysIdx >= 0) {
+    msgs[sysIdx] = { ...msgs[sysIdx], content: (msgs[sysIdx].content || '') + prompt };
+  } else {
+    msgs.unshift({ role: 'system', content: prompt.trim() });
+  }
+  return msgs;
+}
+
+/**
+ * 從非串流 upstream 回應的 content 中，偵測 tool call JSON 格式。
+ * 比對成功則重構為標準 OpenAI tool_calls 格式。
+ *
+ * 回傳 { modifiedBody: string|null, toolCallId: string|null }
+ *  - modifiedBody: 若找到 tool call，回傳重構後的 JSON body
+ *  - toolCallId:   tool call id（做 reasoning cache key）
+ */
+function processToolCallResponse(rawBody, rid) {
+  if (!rawBody) return { modifiedBody: null, toolCallId: null };
+
+  let parsed;
+  try { parsed = JSON.parse(rawBody); } catch {
+    return { modifiedBody: null, toolCallId: null };
+  }
+
+  const choice = parsed?.choices?.[0];
+  if (!choice) return { modifiedBody: null, toolCallId: null };
+
+  // 只處理 finish_reason === "stop" 且 content 含 JSON tool call 的模式
+  if (choice.finish_reason !== 'stop') return { modifiedBody: null, toolCallId: null };
+
+  const content = choice.message?.content || '';
+  if (!content) return { modifiedBody: null, toolCallId: null };
+
+  // 用正則尋找 {"tool": "...", "args": {...}}
+  // 支援多行 JSON，使用 [\s\S] 匹配跨行
+  const re = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*?\})\s*\}/s;
+  const m = content.match(re);
+  if (!m) return { modifiedBody: null, toolCallId: null };
+
+  const toolName = m[1];
+  let toolArgs;
+  try { toolArgs = JSON.parse(m[2]); } catch {
+    console.log(`[${rid}] [fc] failed to parse tool args JSON: ${m[2].slice(0, 100)}`);
+    return { modifiedBody: null, toolCallId: null };
+  }
+
+  const toolCallId = 'call_' + Math.random().toString(36).slice(2, 12);
+  console.log(`[${rid}] [fc] DETECT tool=${toolName} args=${JSON.stringify(toolArgs)}`);
+
+  // 重構 response：移除 content 中的 JSON，改為標準 tool_calls 格式
+  const remainingContent = content.replace(re, '').trim();
+
+  const modified = {
+    ...parsed,
+    choices: [{
+      index: choice.index || 0,
+      message: {
+        role: 'assistant',
+        content: remainingContent || null,
+        tool_calls: [{
+          id: toolCallId,
+          type: 'function',
+          function: {
+            name: toolName,
+            arguments: JSON.stringify(toolArgs),
+          },
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  };
+
+  return { modifiedBody: JSON.stringify(modified), toolCallId };
+}
+
 // ---- 核心轉發（純事件驅動，無 async/await）----
 function handleRequest(req, res) {
   totalRequests++;
@@ -209,11 +332,9 @@ function handleRequest(req, res) {
       opts.headers[k] = v;
     }
   }
-  // 保留 content-length：多數上游需要明確長度而非 chunked
-  // 若原始請求沒 content-length （少見）則由 Node.js 自動 chunked
 
   let aborted = false;
-  let proxyReq;  // 提前宣告，避免 abort() 在 const TDZ 中拋 ReferenceError
+  let proxyReq;
   const abort = () => {
     if (aborted) return;
     aborted = true;
@@ -229,12 +350,17 @@ function handleRequest(req, res) {
     }
   });
 
+  // ---- Function Calling 旗標：工具注入後需處理回應 ----
+  let hasTools = false;
+  let fcToolCallId = null;  // 用於 reasoning cache
+
   const proto = isHttps ? https : http;
   proxyReq = proto.request(opts, (proxyRes) => {
     if (aborted) return;
     const sc = proxyRes.statusCode;
     console.log(`[${rid}] upstream -> ${sc}`);
 
+    // 先寫 meta 行（與 relay 協議相容）
     let sentMeta = false;
     try {
       const meta = JSON.stringify({
@@ -256,6 +382,28 @@ function handleRequest(req, res) {
         const body = Buffer.concat(chunks).toString();
         console.log(`[${rid}] upstream error body: ${body.slice(0, 800)}`);
         try { res.write(body); } catch {}
+        try { res.end(); } catch {}
+      });
+    } else if (hasTools && isChat && sc < 400) {
+      // === Function Calling 模式：緩衝非串流回應，偵測 tool call ===
+      const chunks = [];
+      proxyRes.on('data', (c) => chunks.push(c));
+      proxyRes.on('end', () => {
+        const body = Buffer.concat(chunks).toString();
+        const { modifiedBody, toolCallId } = processToolCallResponse(body, rid);
+        if (modifiedBody) {
+          console.log(`[${rid}] [fc] tool call reformatted, returning to client`);
+          fcToolCallId = toolCallId;
+          try { res.write(modifiedBody); } catch {}
+        } else {
+          // 無 tool call → 原樣寫回
+          try { res.write(body); } catch {}
+        }
+        try { res.end(); } catch {}
+      });
+      // 錯誤處理：upstream 串流中斷
+      proxyRes.on('error', (e) => {
+        console.log(`[${rid}] upstream stream error: ${e.message}`);
         try { res.end(); } catch {}
       });
     } else if (isChat && proxyRes.headers['content-type'] && proxyRes.headers['content-type'].includes('text/event-stream')) {
@@ -280,22 +428,70 @@ function handleRequest(req, res) {
     }
   });
 
-  // === Phase 3: 串流 request body（零緩衝，同原始 relay）===
-  let bodyBytes = 0;
-  req.on('data', (chunk) => {
-    bodyBytes += chunk.length;
-    if (bodyBytes > MAX_BODY) {
-      console.log(`[${rid}] body too large (${bodyBytes}), aborting`);
-      proxyReq.destroy(new Error('body too large'));
-      try { res.end(JSON.stringify({ error: { message: 'request body exceeds 30MB' } })); } catch {}
-      return;
-    }
-    proxyReq.write(chunk);
-  });
-  req.on('end', () => {
-    console.log(`[${rid}] body complete (${bodyBytes} bytes), forwarding to upstream`);
-    if (bodyBytes <= MAX_BODY) proxyReq.end();
-  });
+  // === Phase 3: 處理 request body ===
+  if (isChat) {
+    // 聊天請求：緩衝完整 body 以便檢測 tools 參數
+    const bodyChunks = [];
+    let bodyBytes = 0;
+
+    req.on('data', (chunk) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > MAX_BODY) {
+        console.log(`[${rid}] body too large (${bodyBytes}), aborting`);
+        proxyReq.destroy(new Error('body too large'));
+        try { res.end(JSON.stringify({ error: { message: 'request body exceeds 30MB' } })); } catch {}
+        return;
+      }
+      bodyChunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      if (aborted) return;
+      const rawBody = Buffer.concat(bodyChunks).toString();
+      console.log(`[${rid}] body complete (${rawBody.length} bytes)`);
+
+      let bodyToSend = rawBody;
+
+      try {
+        const parsed = JSON.parse(rawBody);
+        if (parsed.tools && Array.isArray(parsed.tools) && parsed.tools.length > 0) {
+          // 工具注入：強制 upstream 以非串流回應（stream=false）
+          // 避免 Gateway 的自動學習機制因 SSE 中無 delta.tool_calls
+          // 而誤判渠道不支援 tools
+          hasTools = true;
+          parsed.stream = false;
+          parsed.messages = injectToolDescriptions(parsed.messages, parsed.tools);
+          delete parsed.tools;
+          delete parsed.tool_choice;
+          bodyToSend = JSON.stringify(parsed);
+          console.log(`[${rid}] [fc] tools injected (stream forced=false, body=${bodyToSend.length} bytes)`);
+        }
+      } catch (e) {
+        // JSON 解析失敗 → 原樣轉發
+        console.log(`[${rid}] body parse error (non-json or empty): ${e.message}`);
+      }
+
+      proxyReq.write(bodyToSend);
+      if (bodyBytes <= MAX_BODY) proxyReq.end();
+    });
+  } else {
+    // 非聊天請求：串流轉送（原有行為）
+    let bodyBytes = 0;
+    req.on('data', (chunk) => {
+      bodyBytes += chunk.length;
+      if (bodyBytes > MAX_BODY) {
+        console.log(`[${rid}] body too large (${bodyBytes}), aborting`);
+        proxyReq.destroy(new Error('body too large'));
+        try { res.end(JSON.stringify({ error: { message: 'request body exceeds 30MB' } })); } catch {}
+        return;
+      }
+      proxyReq.write(chunk);
+    });
+    req.on('end', () => {
+      console.log(`[${rid}] body complete (${bodyBytes} bytes), forwarding to upstream`);
+      if (bodyBytes <= MAX_BODY) proxyReq.end();
+    });
+  }
 }
 
 // ---- Server ----

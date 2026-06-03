@@ -459,6 +459,9 @@ function clearChannelCache() {
   lastLoad = 0;
   loadPromise = null;
   typeChannelCache.clear();
+  // 清除自動學習標記，讓下次請求重新評估
+  channelNoTools.clear();
+  channelNoVision.clear();
 }
 
 function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0) {
@@ -1117,7 +1120,13 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   }
   
   if (needsVision) eligible = eligible.filter(c => c.support_vision && !channelNoVision.has(c.id));
-  if (needsTools) eligible = eligible.filter(c => c.support_tools && !channelNoTools.has(c.id));
+  // relay 全局模擬 function calling，不受自動學習標記影響
+  if (needsTools && !globalRelayUrl?.trim()) {
+    eligible = eligible.filter(c => c.support_tools && !channelNoTools.has(c.id));
+  } else if (needsTools) {
+    // relay 模式下只檢查 DB 標記（避開記憶體內的自動學習 Set）
+    eligible = eligible.filter(c => c.support_tools);
+  }
   if (eligible.length === 0) {
     logStructured("warn", "no channels match capability or context length", { vision: needsVision, tools: needsTools, tokens: estimatedContextTokens, path, rid });
     return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools}, tokens=${estimatedContextTokens})`, status: 503 } };
@@ -1290,7 +1299,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
         if (estimatedContextTokens > 0) successContextObserved(channel.id, estimatedContextTokens);
         // 空內容學習：串流回應且請求含 tools/vision → 監控是否有實際內容
-        if ((needsTools || needsVision) && res.body && (res.headers.get("Content-Type") || "").includes("text/event-stream")) {
+        // relay 模式跳過自動學習（relay 模擬 FC，SSE 不含 delta.tool_calls 為正常行為）
+        if ((needsTools || needsVision) && res.body && !globalRelayUrl?.trim() && (res.headers.get("Content-Type") || "").includes("text/event-stream")) {
           const origBody = res.body;
           let hasToolCalls = false, hasContent = false;
           const monitoredBody = origBody.pipeThrough(new TransformStream({
@@ -1563,50 +1573,25 @@ async function wrapNonStreamToStream(c, upstream, headers) {
 }
 
 async function handleModels(c) {
-  const { relay_url: globalRelayUrl, relay_token: dbRelayToken } = await resolveGlobalConfig(c.env);
+  // 從 channel config 直接聚合模型列表，不依賴各 upstream /v1/models
+  // 確保所有渠道類型（含 image_gen / tts / stt 等）都能正確顯示
   const channels = await loadChannels(c.env);
-  if (channels.length === 0) return c.json({ object: "list", data: [] });
+  const data = [];
+  const seen = new Set();
   for (const channel of channels) {
     if (isDegraded(channel.id)) continue;
-    try {
-      const url = channel.base_url.replace(/\/+$/, "") + "/models";
-      const headers = new Headers({ Authorization: `Bearer ${channel.api_key}` });
-      if (channel.headers) {
-        try {
-          const ch = typeof channel.headers === "string" ? JSON.parse(channel.headers) : channel.headers;
-          if (Array.isArray(ch)) for (const h of ch) { if (h.key && h.key.trim() && !BLOCKED_CUSTOM_HEADERS.has(h.key.trim().toLowerCase())) headers.set(h.key.trim(), h.value || ""); }
-        } catch (e) {}
-      }
-      let res;
-      const globalRelay = globalRelayUrl?.trim();
-      const relayToken = dbRelayToken || c.env.RELAY_SECRET;
-      if (globalRelay) {
-        // 使用 config 表中的全域 relay
-        const relayHeaders = new Headers(headers);
-        relayHeaders.set("x-target-url", url);
-        if (relayToken) relayHeaders.set("x-relay-token", relayToken);
-        const relayRes = await fetch(globalRelay.replace(/\/+$/, ""), { method: "GET", headers: relayHeaders, signal: AbortSignal.timeout(5000) });
-        if (relayRes.headers.get("x-relay") === "1") {
-          const parsed = await parseRelayResponse(relayRes);
-          if (parsed.relayError) { markDegraded(channel.id, c.env); continue; }
-          res = parsed.response;
-        } else {
-          res = relayRes;
-        }
-      } else {
-        res = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
-      }
-      if (res.ok) {
-        markHealthy(channel.id, c.env);
-        return c.json(await res.json());
-      }
-      if (res.status >= 500 || res.status === 429) markDegraded(channel.id, c.env);
-    } catch (e) {
-      markDegraded(channel.id, c.env);
-      logStructured("warn", "models fetch failed, trying next", { channel: channel.name, error: e.message });
-    }
+    if (!channel.model) continue;
+    const modelId = channel.model.trim();
+    if (!modelId || seen.has(modelId)) continue;
+    seen.add(modelId);
+    data.push({
+      id: modelId,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: channel.channel_type || "chat",
+    });
   }
-  return c.json({ object: "list", data: [] });
+  return c.json({ object: "list", data });
 }
 
 async function handleGenericProxy(c) {
