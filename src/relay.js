@@ -3,12 +3,13 @@
  *
  * 設計要點:
  *   1. 零緩衝串流 — request body 邊收邊轉送 upstream，不佔 RAM
- *   2. 連線上限 MAX_REQS — 超過回 503，避免 OS socket 耗盡
- *   3. 30MB body 上限 — 防止大 body 撐爆記憶體
- *   4. Client 斷線自動 abort upstream — 不浪費 upstream 處理
- *   5. 無 async/await — 純事件驅動，無 Promise 鏈開銷
- *   6. /health 自我健檢 — 回傳 uptime、記憶體、活躍連線數，供保活監控
- *   7. SIGTERM 緩衝關機 — 等待現有連線完成，最多 30s
+ *   2. 連線上限 + 佇列 — MAX_REQS 超過時自動排隊等待
+ *   3. Per-Channel 速率限制 — 單一行程精確計數（取代 D1 跨 isolate 版本）
+ *   4. Upstream 錯誤退避 — 自動記錄上游 502 頻率，暫時繞過問題上游
+ *   5. 30MB body 上限 — 防止大 body 撐爆記憶體
+ *   6. Client 斷線自動 abort upstream — 不浪費 upstream 處理
+ *   7. /health 自我健檢 — 回傳 uptime、記憶體、活躍連線數、佇列長度
+ *   8. SIGTERM 緩衝關機 — 等待現有連線完成，最多 30s
  *
  *  部署方式（擇一）:
  *   PM2（建議）:
@@ -29,7 +30,8 @@ const os    = require('os');
 
 const PORT     = parseInt(process.env.PORT            || '3000',   10);
 const TIMEOUT  = parseInt(process.env.RELAY_TIMEOUT   || '300000', 10); // 5 min
-const MAX_REQS = parseInt(process.env.MAX_CONCURRENT  || '100',    10); // 並行上限
+const MAX_REQS = parseInt(process.env.MAX_CONCURRENT  || '10',     10); // 並行上限 (預設 10)
+const QUEUE_MAX = parseInt(process.env.RELAY_QUEUE    || '20',     10); // 最大排隊數
 const MAX_BODY = 31_457_280; // 30MB
 
 const startTime = Date.now();
@@ -37,58 +39,146 @@ let active      = 0;
 let totalReqs   = 0;
 let totalErrors = 0;
 
-// ---- 自我健檢端點 (/health) ----
-// 回傳診斷資訊供監控讀取
+// ---- Per-Channel 速率限制 (in-memory，單一行程精確) ----
+const rpmCounters = new Map(); // key: "channel_{id}_{minute}" → count
+const rpdCounters = new Map(); // key: "channel_{id}_{day}" → count
+
+// 每分鐘清除過期計數器，防止記憶體洩漏
+setInterval(() => {
+  const now = Date.now();
+  const currMin = Math.floor(now / 60000);
+  const currDay = Math.floor(now / 86400000);
+  for (const key of rpmCounters.keys()) {
+    if (parseInt(key.split(':')[2]) < currMin - 1) rpmCounters.delete(key);
+  }
+  for (const key of rpdCounters.keys()) {
+    if (parseInt(key.split(':')[2]) < currDay - 1) rpdCounters.delete(key);
+  }
+  // 清除過期的 upstream error entries
+  for (const [host, entry] of upstreamErrors) {
+    if (now - entry.firstErrAt > 60000) upstreamErrors.delete(host);
+  }
+}, 60000);
+
+// 若總 entries 過多 (異常狀況)，強制清空
+function guardCounterMaps() {
+  if (rpmCounters.size > 10000 || rpdCounters.size > 10000) {
+    rpmCounters.clear();
+    rpdCounters.clear();
+  }
+}
+
+/**
+ * 檢查並消耗 rate limit 配額
+ * 回傳 { ok: boolean, reason?: string }
+ * 此函式同步執行，無 async/await，利用 Node.js 單執行緒避免 race condition
+ */
+function checkChannelRateLimit(channelId, rpmLimit, rpdLimit) {
+  if (!channelId || (!rpmLimit && !rpdLimit)) return { ok: true };
+  const now = Date.now();
+  guardCounterMaps();
+
+  if (rpmLimit > 0) {
+    const minute = Math.floor(now / 60000);
+    const key = channelId + ':rpm:' + minute;
+    const count = (rpmCounters.get(key) || 0) + 1;
+    rpmCounters.set(key, count);
+    if (count > rpmLimit) return { ok: false, reason: 'rpm_limit' };
+  }
+  if (rpdLimit > 0) {
+    const day = Math.floor(now / 86400000);
+    const key = channelId + ':rpd:' + day;
+    const count = (rpdCounters.get(key) || 0) + 1;
+    rpdCounters.set(key, count);
+    if (count > rpdLimit) return { ok: false, reason: 'rpd_limit' };
+  }
+  return { ok: true };
+}
+
+// ---- Upstream 錯誤退避 ----
+const upstreamErrors = new Map(); // key: hostname → { count, firstErrAt }
+
+function isUpstreamDegraded(hostname) {
+  if (!hostname) return false;
+  const entry = upstreamErrors.get(hostname);
+  if (!entry) return false;
+  // 60 秒內錯誤 >= 3 次 → 判定 degraded
+  if (Date.now() - entry.firstErrAt > 60000) {
+    upstreamErrors.delete(hostname);
+    return false;
+  }
+  if (entry.count >= 3) return true;
+  return false;
+}
+
+function recordUpstreamError(hostname) {
+  if (!hostname) return;
+  const now = Date.now();
+  const entry = upstreamErrors.get(hostname);
+  if (!entry) {
+    upstreamErrors.set(hostname, { count: 1, firstErrAt: now });
+  } else {
+    if (now - entry.firstErrAt > 60000) {
+      // 過期重置
+      upstreamErrors.set(hostname, { count: 1, firstErrAt: now });
+    } else {
+      entry.count++;
+    }
+  }
+}
+
+function recordUpstreamSuccess(hostname) {
+  // 連續成功可降低退避等級
+  if (!hostname) return;
+  const entry = upstreamErrors.get(hostname);
+  if (entry && Date.now() - entry.firstErrAt <= 60000 && entry.count > 0) {
+    entry.count = Math.max(0, entry.count - 1);
+    if (entry.count === 0) upstreamErrors.delete(hostname);
+  }
+}
+
+// ---- 請求佇列 ----
+const waitQueue = [];
+
+function tryDequeue() {
+  while (waitQueue.length > 0 && active < MAX_REQS) {
+    const entry = waitQueue.shift();
+    active++;
+    processRequest(entry.req, entry.res);
+  }
+}
+
+// ---- /health 端點 ----
 function handleHealth(res) {
   const mem = process.memoryUsage();
   const payload = JSON.stringify({
-    status:       'ok',
-    uptime_sec:   Math.floor((Date.now() - startTime) / 1000),
-    active_conns: active,
-    total_reqs:   totalReqs,
-    total_errors: totalErrors,
-    mem_rss_mb:   (mem.rss        / 1024 / 1024).toFixed(1),
-    mem_heap_mb:  (mem.heapUsed   / 1024 / 1024).toFixed(1),
-    load_avg:     os.loadavg().map(v => v.toFixed(2)),
-    node_version: process.version,
+    status:        'ok',
+    uptime_sec:    Math.floor((Date.now() - startTime) / 1000),
+    active_conns:  active,
+    queue_length:  waitQueue.length,
+    total_reqs:    totalReqs,
+    total_errors:  totalErrors,
+    rpm_entries:   rpmCounters.size,
+    rpd_entries:   rpdCounters.size,
+    degraded_hosts: upstreamErrors.size,
+    mem_rss_mb:    (mem.rss        / 1024 / 1024).toFixed(1),
+    mem_heap_mb:   (mem.heapUsed   / 1024 / 1024).toFixed(1),
+    load_avg:      os.loadavg().map(v => v.toFixed(2)),
+    node_version:  process.version,
   });
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(payload);
 }
 
-// ---- 核心轉發（無 async/await，純事件串流）----
-function handleRequest(req, res) {
-  totalReqs++;
+// ---- 核心轉發（純事件串流）----
+function processRequest(req, res) {
+  const targetUrlRaw = req.headers['x-target-url'];
+  const rid   = (Math.random() * 0xffffff | 0).toString(36);
+  const clientIp = req.socket?.remoteAddress || '?';
+  console.log(`[${rid}] <- ${req.method} ${targetUrlRaw} from ${clientIp}`);
 
-  // /health 保活端點
-  if (req.url === '/health' || req.url === '/health/') {
-    return handleHealth(res);
-  }
-
-  // 根路徑 GET 請求，回傳伺服器狀態
-  if (req.url === '/' && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    return res.end('api server is working');
-  }
-
-  // 連線配額檢查
-  if (active >= MAX_REQS) {
-    totalErrors++;
-    res.writeHead(503, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ error: { message: 'too many concurrent requests' } }));
-  }
-  active++;
-  const dec = () => { active = Math.max(0, active - 1); };
-  res.on('finish', dec);
-  res.on('close',  dec);
-
-  // 驗證 x-target-url
-  const targetUrl = req.headers['x-target-url'];
-  const rid       = (Math.random() * 0xffffff | 0).toString(36);
-  const clientIp  = req.socket?.remoteAddress || '?';
-  console.log(`[${rid}] <- ${req.method} ${targetUrl} from ${clientIp}`);
-
-  if (!targetUrl) {
+  // 驗證 target URL
+  if (!targetUrlRaw) {
     totalErrors++;
     console.log(`[${rid}] -> 400 missing x-target-url`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -96,7 +186,7 @@ function handleRequest(req, res) {
   }
 
   let upstreamUrl;
-  try   { upstreamUrl = new URL(targetUrl); }
+  try   { upstreamUrl = new URL(targetUrlRaw); }
   catch {
     totalErrors++;
     console.log(`[${rid}] -> 400 invalid x-target-url`);
@@ -109,7 +199,7 @@ function handleRequest(req, res) {
     return res.end(JSON.stringify({ error: 'unsupported protocol' }));
   }
 
-  // Phase 1: 立即回傳 headers，讓 CF Worker fetch() 快速 resolve，不佔 CF CPU Time
+  // Phase 1: 立即回傳 headers（讓 CF Worker fetch() 快速 resolve）
   res.writeHead(200, {
     'Content-Type':     'application/json',
     'Transfer-Encoding': 'chunked',
@@ -127,21 +217,23 @@ function handleRequest(req, res) {
     timeout:  TIMEOUT,
     headers:  {},
   };
-  // 過濾掉 hop-by-hop headers；保留 content-length 讓上游知道大小
-  const HOP_HEADERS = new Set(['host', 'x-target-url', 'connection', 'transfer-encoding']);
+  // 過濾 hop-by-hop headers；保留 content-length 讓上游知道大小
+  const HOP_HEADERS = new Set(['host', 'x-target-url', 'connection', 'transfer-encoding',
+    'x-channel-id', 'x-channel-rpm', 'x-channel-rpd']);
   for (const [k, v] of Object.entries(req.headers)) {
     if (!HOP_HEADERS.has(k)) opts.headers[k] = v;
   }
 
   let aborted = false;
+  let proxyReq = null; // 先宣告，讓 abort closure 可以引用；實際值在下方建立
   const abort = () => {
     if (aborted) return;
     aborted = true;
-    proxyReq.destroy();
+    if (proxyReq) try { proxyReq.destroy(); } catch {}
     try { res.end(); } catch {}
   };
 
-  // Client 斷線 → 放棄 upstream（避免浪費上游 token 用量）
+  // Client 斷線 → 放棄 upstream
   res.on('close', () => {
     if (!res.writableFinished) {
       console.log(`[${rid}] client disconnected early`);
@@ -150,20 +242,25 @@ function handleRequest(req, res) {
   });
 
   const proto    = isHttps ? https : http;
-  const proxyReq = proto.request(opts, (proxyRes) => {
+  proxyReq       = proto.request(opts, (proxyRes) => {
     if (aborted) return;
     const sc = proxyRes.statusCode;
     console.log(`[${rid}] upstream -> ${sc}`);
-    if (sc >= 400) totalErrors++;
+    if (sc >= 400) {
+      totalErrors++;
+      recordUpstreamError(upstreamUrl.hostname);
+    } else {
+      recordUpstreamSuccess(upstreamUrl.hostname);
+    }
 
-    // 先寫 metadata 行（CF Worker 端的 fetchViaRelay 讀取這一行取得真實 status / headers）
+    // 寫 metadata 行（CF Worker 端讀取這一行取得真實 status / headers）
     try {
       res.write(JSON.stringify({ _relay: { status: sc, headers: proxyRes.headers } }) + '\n');
     } catch { abort(); return; }
 
     if (aborted) return;
     if (sc >= 400) {
-      // 錯誤回應：緩衝完整 Body，印出 Log 以利排查，再回傳給客戶端
+      // 錯誤回應：緩衝 Body 後回傳
       const chunks = [];
       proxyRes.on('data', (c) => chunks.push(c));
       proxyRes.on('end', () => {
@@ -179,6 +276,10 @@ function handleRequest(req, res) {
     } else {
       // 正常回應：零緩衝直通
       proxyRes.pipe(res);
+      proxyRes.on('error', (e) => {
+        console.log(`[${rid}] upstream stream error: ${e.message}`);
+        if (!aborted) { try { res.end(); } catch {} }
+      });
     }
   });
 
@@ -186,6 +287,7 @@ function handleRequest(req, res) {
     totalErrors++;
     console.log(`[${rid}] upstream ERROR: ${e.message}`);
     if (aborted) return;
+    recordUpstreamError(upstreamUrl.hostname);
     try { res.write(JSON.stringify({ _relay: { error: 'upstream error: ' + e.message } }) + '\n'); } catch {}
     try { res.end(); } catch {}
   });
@@ -194,12 +296,13 @@ function handleRequest(req, res) {
     console.log(`[${rid}] upstream TIMEOUT after ${TIMEOUT}ms`);
     proxyReq.destroy(new Error('upstream timeout'));
     if (!aborted) {
+      recordUpstreamError(upstreamUrl.hostname);
       try { res.write(JSON.stringify({ _relay: { error: 'upstream timeout' } }) + '\n'); } catch {}
       try { res.end(); } catch {}
     }
   });
 
-  // Phase 3: 串流 request body（零緩衝，邊收邊轉，不佔 RAM）
+  // Phase 3: 串流 request body（零緩衝）
   let bodyBytes    = 0;
   let bodyLogTimer = Date.now();
   req.on('data', (chunk) => {
@@ -215,7 +318,10 @@ function handleRequest(req, res) {
       try { res.end(JSON.stringify({ error: { message: `request body exceeds ${MAX_BODY / 1024 / 1024}MB` } })); } catch {}
       return;
     }
-    proxyReq.write(chunk);
+    try { proxyReq.write(chunk); } catch (e) {
+      console.log(`[${rid}] write error: ${e.message}`);
+      abort();
+    }
   });
   req.on('end', () => {
     console.log(`[${rid}] body complete (${(bodyBytes / 1024).toFixed(0)} KB)`);
@@ -223,22 +329,111 @@ function handleRequest(req, res) {
   });
 }
 
+// ---- 請求入口（含速率限制 + 併發 + 佇列）----
+function handleRequest(req, res) {
+  totalReqs++;
+
+  // 保活 / 健檢端點
+  if (req.url === '/health' || req.url === '/health/') {
+    return handleHealth(res);
+  }
+  if (req.url === '/' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    return res.end('api server is working');
+  }
+
+  // Step 1: Per-Channel 速率限制（需在 writeHead 之前檢查）
+  const channelId  = req.headers['x-channel-id'];
+  const rpmLimit   = parseInt(req.headers['x-channel-rpm'] || '0', 10);
+  const rpdLimit   = parseInt(req.headers['x-channel-rpd'] || '0', 10);
+  const rlResult = checkChannelRateLimit(channelId, rpmLimit, rpdLimit);
+  if (!rlResult.ok) {
+    totalErrors++;
+    console.log(`[rate] channel ${channelId} ${rlResult.reason}`);
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'X-Relay': '1',
+      'Retry-After': '5',
+    });
+    return res.end(JSON.stringify({
+      error: { message: 'rate limit: ' + rlResult.reason },
+      _relay: { status: 429, headers: {} },
+    }));
+  }
+
+  // Step 2: Upstream 錯誤退避檢查
+  const targetUrl = req.headers['x-target-url'];
+  if (targetUrl) {
+    try {
+      const hostname = new URL(targetUrl).hostname;
+      if (isUpstreamDegraded(hostname)) {
+        totalErrors++;
+        console.log(`[degrade] upstream ${hostname} degraded, skipping`);
+        res.writeHead(502, {
+          'Content-Type': 'application/json',
+          'X-Relay': '1',
+        });
+        return res.end(JSON.stringify({
+          error: { message: 'upstream temporarily degraded' },
+          _relay: { status: 502, headers: {} },
+        }));
+      }
+    } catch {}
+  }
+
+  // Step 3: 併發 + 佇列
+  if (active >= MAX_REQS) {
+    if (waitQueue.length >= QUEUE_MAX) {
+      totalErrors++;
+      console.log(`[queue] queue full (${QUEUE_MAX}), rejecting`);
+      res.writeHead(503, {
+        'Content-Type': 'application/json',
+        'X-Relay': '1',
+      });
+      return res.end(JSON.stringify({
+        error: { message: 'too many concurrent requests' },
+        _relay: { status: 503, headers: {} },
+      }));
+    }
+    console.log(`[queue] enqueued (${waitQueue.length + 1}/${QUEUE_MAX})`);
+    waitQueue.push({ req, res });
+    return;
+  }
+  active++;
+  const dec = () => {
+    active = Math.max(0, active - 1);
+    tryDequeue(); // 有空位時從佇列取下一個
+  };
+  res.on('finish', dec);
+  res.on('close',  dec);
+
+  processRequest(req, res);
+}
+
+// ---- 全域例外捕捉（crash 前紀錄）----
+process.on('uncaughtException', (err) => {
+  console.error('[relay] UNCAUGHT EXCEPTION:', err.stack || err.message || err);
+  // 不 exit，讓 process 繼續（Node.js 預設會 exit，但我們希望 PM2 重啟時有 log）
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[relay] UNHANDLED REJECTION:', reason instanceof Error ? reason.stack : reason);
+});
+
 // ---- Server ----
 const server = http.createServer(handleRequest);
 server.timeout         = TIMEOUT;
 server.maxHeadersCount = 200;
 server.listen(PORT, () => {
-  console.log(`[relay] ready port=${PORT} timeout=${TIMEOUT}ms max_concurrent=${MAX_REQS} max_body=${MAX_BODY / 1024 / 1024}MB`);
+  console.log(`[relay] ready port=${PORT} timeout=${TIMEOUT}ms concurrent=${MAX_REQS} queue=${QUEUE_MAX}`);
 });
 
 // ---- SIGTERM 緩衝關機 ----
 process.on('SIGTERM', () => {
-  console.log(`[relay] SIGTERM — draining ${active} active connections...`);
+  console.log(`[relay] SIGTERM — draining ${active} active, ${waitQueue.length} queued...`);
   server.close(() => {
     console.log('[relay] all connections drained, exiting cleanly');
     process.exit(0);
   });
-  // 最多等 30s 強制退出
   setTimeout(() => {
     console.error('[relay] forced exit after 30s drain timeout');
     process.exit(1);

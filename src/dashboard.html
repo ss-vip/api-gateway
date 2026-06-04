@@ -329,10 +329,21 @@
       }
       return _notyf;
     };
-    const toast = (msg, type) => {
+    const toast = (msg, type, duration) => {
       const n = getNotyf();
       if (!n) { alert(msg); return; }
       if (type === 'danger') n.error(msg); else n.success(msg);
+    };
+    const toastHtml = (html, type, duration = 4000) => {
+      // 自定義 HTML toast（Notyf 原生不支援 HTML）
+      const n = getNotyf();
+      if (!n) { alert(html.replace(/<[^>]+>/g, '')); return; }
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;top:20px;right:20px;z-index:10001;padding:12px 16px;border-radius:8px;background:' + (type === 'danger' ? '#e74c3c' : '#2ecc71') + ';color:#fff;font-size:13px;line-height:1.5;max-width:420px;box-shadow:0 4px 12px rgba(0,0,0,.2);opacity:0;transition:opacity .3s';
+      el.innerHTML = html;
+      document.body.appendChild(el);
+      requestAnimationFrame(() => { el.style.opacity = '1'; });
+      setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, duration);
     };
     const confirmAction = (msg, onOk) => { if (window.confirm(msg)) onOk(); };
 
@@ -699,7 +710,15 @@
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
-        row += '    <button onclick="testChannel(' + c.id + ')" class="btn btn-sm btn-outline-info py-1 px-2" title="測試連線"><i class="bi bi-play-fill"></i></button>';
+        row += '    <div class="btn-group">';
+        row += '      <button onclick="testChannel(' + c.id + ',\'chat\')" class="btn btn-sm btn-outline-info py-1 px-2" title="Chat 測試"><i class="bi bi-play-fill"></i></button>';
+        row += '      <button type="button" class="btn btn-sm btn-outline-info dropdown-toggle dropdown-toggle-split py-1 px-1" data-bs-toggle="dropdown" title="更多測試"></button>';
+        row += '      <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
+        row += '        <li><button onclick="testChannel(' + c.id + ',\'vision\')" class="dropdown-item small py-2"><i class="bi bi-eye me-2"></i>Vision 測試</button></li>';
+        row += '        <li><button onclick="testChannel(' + c.id + ',\'tools\')" class="dropdown-item small py-2"><i class="bi bi-tools me-2"></i>Tools 測試</button></li>';
+        row += '        <li><button onclick="testChannel(' + c.id + ',\'all\')" class="dropdown-item small py-2"><i class="bi bi-grid-3x3-gap me-2"></i>全部測試</button></li>';
+        row += '      </ul>';
+        row += '    </div>';
         row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
         row += '    <button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>';
         row += '  </div>';
@@ -707,7 +726,11 @@
         row += '    <button class="btn btn-sm btn-outline-secondary py-1 px-2" data-bs-toggle="dropdown" title="Actions"><i class="bi bi-three-dots-vertical"></i></button>';
         row += '    <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
         row += '      <li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small py-2"><i class="bi bi-pencil me-2"></i>Edit</button></li>';
-        row += '      <li><button onclick="testChannel(' + c.id + ')" class="dropdown-item small py-2"><i class="bi bi-play-fill me-2"></i>Test</button></li>';
+        row += '      <li><button onclick="testChannel(' + c.id + ',\'chat\')" class="dropdown-item small py-2"><i class="bi bi-chat me-2"></i>Test Chat</button></li>';
+        row += '      <li><button onclick="testChannel(' + c.id + ',\'vision\')" class="dropdown-item small py-2"><i class="bi bi-eye me-2"></i>Test Vision</button></li>';
+        row += '      <li><button onclick="testChannel(' + c.id + ',\'tools\')" class="dropdown-item small py-2"><i class="bi bi-tools me-2"></i>Test Tools</button></li>';
+        row += '      <li><button onclick="testChannel(' + c.id + ',\'all\')" class="dropdown-item small py-2"><i class="bi bi-grid-3x3-gap me-2"></i>Test All</button></li>';
+        row += '      <li><hr class="dropdown-divider"></li>';
         row += '      <li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small py-2"><i class="bi bi-copy me-2"></i>Copy</button></li>';
         row += '      <li><hr class="dropdown-divider"></li>';
         row += '      <li><button onclick="delChannel(' + realIdx + ')" class="dropdown-item small py-2 text-danger"><i class="bi bi-trash me-2"></i>Delete</button></li>';
@@ -733,25 +756,48 @@
         });
     };
 
-    const testChannel = async (id) => {
+    const testChannel = async (id, type = 'chat') => {
       if (!id) return toast('請先儲存渠道', 'warning');
       const ch = channels.find(c => c.id === id);
       if (!ch) return toast('渠道不存在', 'warning');
       const btns = document.querySelectorAll('button[onclick*="testChannel(' + id + ')"]');
       btns.forEach(b => { b._orig = b.innerHTML; b.innerHTML = '<span class="spinner-border spinner-border-sm"></span>'; b.disabled = true; });
-      toast('連線測試中...', 'info');
+      toast('⏳ 正在測試 ' + type + ' ...', 'info');
       const r = await api('/admin/api/channels/' + id + '/test', 'POST', {
         base_url: ch.base_url,
         api_key: ch.api_key,
         model: ch.model,
+        type,
+        autoFix: true,
       }, false);
       btns.forEach(b => { b.innerHTML = b._orig || '<i class="bi bi-play-fill"></i>'; b.disabled = false; });
-      if (r) {
-        if (r.ok) {
-          toast('✅ 連線成功 ' + (r.ms || 0) + 'ms', 'success');
+      if (!r) return;
+      const results = r.results || {};
+      if (r.ok) {
+        let msg = '';
+        if (type === 'all') {
+          const parts = [];
+          for (const [t, rr] of Object.entries(results)) {
+            const icon = rr.capOk ? '✅' : '⚠️';
+            parts.push(`${icon} <b>${t}</b>: ${rr.diagnosis} (${rr.ms}ms)`);
+          }
+          msg = parts.join('<br>');
         } else {
-          toast('❌ 連線失敗: ' + (r.diagnosis || 'unknown'), 'danger');
+          const rr = results[type];
+          const icon = rr?.capOk ? '✅' : '⚠️';
+          msg = `${icon} <b>${type}</b> ${rr?.diagnosis || r.diagnosis} (${rr?.ms || 0}ms)`;
         }
+        // 如果有自動修正，顯示額外資訊
+        if (r.capabilities) {
+          const fixed = [];
+          if (r.capabilities.vision === false) fixed.push('Vision');
+          if (r.capabilities.tools === false) fixed.push('Tools');
+          if (fixed.length > 0) msg += '<br><span style="color:#f39c12">已自動關閉: ' + fixed.join(', ') + '</span>';
+        }
+        toastHtml(msg, 'success', 6000);
+      } else {
+        const diag = typeof r.diagnosis === 'string' ? r.diagnosis : 'unknown';
+        toast('❌ 測試失敗: ' + diag, 'danger');
       }
     };
 

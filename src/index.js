@@ -3,10 +3,11 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import portalHtml from "./dashboard.html";
 
-const UPSTREAM_TIMEOUT_MS = 120_000;    // chat 請求總 timeout
-const LONG_TIMEOUT_MS = 600_000;        // 非 chat（文生圖等）總 timeout, 配合 relay 即回 meta 架構
-const CHANNEL_COOLDOWN_MS = UPSTREAM_TIMEOUT_MS;
-const STREAM_IDLE_TIMEOUT_MS = 180_000;
+const UPSTREAM_TIMEOUT_MS = 25_000;     // chat 請求總 timeout（CF Free 平台限制 30s，保留 5s 緩衝）
+const LONG_TIMEOUT_MS = 25_000;         // 非 chat 同限制
+const CHANNEL_COOLDOWN_MS = 60_000;     // channel 冷卻 60 秒（獨立於 timeout）
+const STREAM_IDLE_TIMEOUT_MS = 60_000; // 60s 無新 chunk 視為斷流，比 180s 更快回應
+
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
 const SESSION_TTL = 604800000; // 7 天
@@ -18,7 +19,7 @@ let sessionPruneCounter = 0;
 // 自動學習：渠道實際能承載的 context 上限（從 runtime 錯誤回饋）
 const contextOverflowAt = new Map();
 function isContextLengthError(text) {
-  return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit|tokens per minute|tpm.*limit|rate_limit_exceeded/i.test(text);
+  return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit/i.test(text);
 }
 function learnContextLimit(channelId, tokens) {
   const prev = contextOverflowAt.get(channelId);
@@ -165,7 +166,7 @@ async function hashPassword(password) {
     "raw", new TextEncoder().encode(pepper + password), "PBKDF2", false, ["deriveBits"]
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256
+    { name: "PBKDF2", salt, iterations: 10000, hash: "SHA-256" }, key, 256
   );
   return bytesToHex(salt) + ":" + bytesToHex(new Uint8Array(bits));
 }
@@ -184,7 +185,7 @@ async function verifyPassword(password, storedHash) {
     "raw", new TextEncoder().encode(pepper + password), "PBKDF2", false, ["deriveBits"]
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256
+    { name: "PBKDF2", salt, iterations: 10000, hash: "SHA-256" }, key, 256
   );
   return bytesToHex(new Uint8Array(bits)) === hashHex;
 }
@@ -211,8 +212,8 @@ const CHANNELS_DDL = `CREATE TABLE IF NOT EXISTS channels (
   provider     TEXT    NOT NULL DEFAULT '',
   absolute_url INTEGER NOT NULL DEFAULT 0,
   cooldown_until INTEGER NOT NULL DEFAULT 0,
-  created_at  INTEGER NOT NULL DEFAULT unixepoch(),
-  updated_at  INTEGER NOT NULL DEFAULT unixepoch(),
+  created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at  INTEGER NOT NULL DEFAULT (unixepoch()),
   support_tools INTEGER NOT NULL DEFAULT 1,
   support_vision INTEGER NOT NULL DEFAULT 0,
   response_time INTEGER NOT NULL DEFAULT 0,
@@ -272,8 +273,17 @@ const SESSIONS_DDL = `CREATE TABLE IF NOT EXISTS sessions (
   token TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 )`;
+const SESSIONS_INDEX_DDL = `CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)`;
 
-const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL, SCHEMA_META_DDL, SESSIONS_DDL];
+const RATE_LIMITS_DDL = `CREATE TABLE IF NOT EXISTS rate_limits (
+  bucket_type  TEXT NOT NULL,
+  bucket_key   TEXT NOT NULL,
+  window_start INTEGER NOT NULL,
+  count        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket_type, bucket_key, window_start)
+)`;
+
+const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL, SCHEMA_META_DDL, SESSIONS_DDL, SESSIONS_INDEX_DDL, RATE_LIMITS_DDL];
 const ALL_TABLES = ["channels", "filters", "config", "schema_meta", "sessions"];
 
 async function ensureSchema(env) {
@@ -368,8 +378,14 @@ async function ensureSchema(env) {
   if (parseInt(schemaVer, 10) < 8) {
     try { await env.DB.prepare("ALTER TABLE config ADD COLUMN relay_token TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* 欄位已存在則略過 */ }
   }
+  if (parseInt(schemaVer, 10) < 9) {
+    try { await env.DB.prepare(SESSIONS_INDEX_DDL).run(); } catch (e) { /* 索引已存在則略過 */ }
+  }
+  if (parseInt(schemaVer, 10) < 10) {
+    try { await env.DB.prepare(RATE_LIMITS_DDL).run(); } catch (e) { /* 表格已存在則略過 */ }
+  }
   // migration 完成後寫入 DB flag，下次冷啟動直接跳過
-  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '8')").run();
+  await env.DB.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_ver', '10')").run();
   schemaReady = true;
 }
 
@@ -390,15 +406,32 @@ let cachedChannels = null;
 let lastLoad = 0;
 let loadPromise = null;
 const typeChannelCache = new Map(); // "type" => { data, ts }
+const typeLoadPromises = new Map(); // "type" => Promise (去重用)
 const TYPE_CACHE_TTL = 30000;
 const degradedUntil = new Map();
 
 async function loadChannels(env, channelType) {
-    const now = Date.now();
+  const now = Date.now();
   if (channelType) {
     const cached = typeChannelCache.get(channelType);
     if (cached && now - cached.ts < TYPE_CACHE_TTL) return cached.data;
-    return dbLoadChannels(env, channelType);
+    // 避免同一 type 的並發請求重複打 DB
+    if (typeLoadPromises.has(channelType)) return typeLoadPromises.get(channelType);
+    const p = (async () => {
+      try {
+        const rows = await dbLoadChannels(env, channelType);
+        typeChannelCache.set(channelType, { data: rows, ts: Date.now() });
+        return rows;
+      } catch (e) {
+        console.error(`[channel] load error for type ${channelType}:`, e.message);
+        const old = typeChannelCache.get(channelType);
+        return old?.data || [];
+      } finally {
+        typeLoadPromises.delete(channelType);
+      }
+    })();
+    typeLoadPromises.set(channelType, p);
+    return p;
   }
   if (cachedChannels && now - lastLoad < REFRESH_MS) return cachedChannels;
   if (loadPromise) return loadPromise;
@@ -471,16 +504,21 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
   // 動態權重：接近 limit 的渠道降權、小請求優先選有限 context 渠道（保留無限渠道給大請求）
   const weights = pool.map(c => {
     let weight = Math.max(c.weight, 1);
-    if (c.max_context_length > 0 && estimatedContextTokens > 0) {
-      const ratio = estimatedContextTokens / c.max_context_length;
-      if (ratio >= 0.9) {
+    if (estimatedContextTokens > 0) {
+      if (c.max_context_length > 0) {
+        const ratio = estimatedContextTokens / c.max_context_length;
+        if (ratio >= 0.9) {
+          weight *= 0.7;
+        } else if (ratio >= 0.7) {
+          weight *= 0.85;
+        } else if (ratio < 0.5) {
+          // 請求遠小於限制 → 加成，保留無限渠道給真正需要的大請求
+          const boost = 1 + (1 - ratio * 2) * 0.5; // ratio 0 → *1.5, ratio 0.25 → *1.25, ratio 0.5 → 無加成
+          weight *= boost;
+        }
+      } else if (estimatedContextTokens < 1000) {
+        // max_context_length=0（無限）但請求很小 → 降權，優先讓有限渠道承接
         weight *= 0.7;
-      } else if (ratio >= 0.7) {
-        weight *= 0.85;
-      } else if (ratio < 0.5) {
-        // 請求遠小於限制 → 加成，保留無限渠道給真正需要的大請求
-        const boost = 1 + (1 - ratio * 2) * 0.5; // ratio 0 → *1.5, ratio 0.25 → *1.25, ratio 0.5 → 無加成
-        weight *= boost;
       }
     }
     return weight;
@@ -519,57 +557,131 @@ function isDegraded(channelId) {
   return false;
 }
 
-const tokenBuckets = new Map();
+// ---- D1 共用速率限制（跨所有 Worker isolate） ----
 
-function checkRateLimit(channel) {
-  if (!channel.rpm_limit && !channel.rpd_limit && !channel.rate_limit_capacity) return { ok: true };
+const localTokenBuckets = new Map(); // D1 故障時 fallback
+
+async function checkRateLimitD1(env, channel) {
+  if (!channel.rpm_limit && !channel.rpd_limit) return { ok: true };
   const now = Date.now();
-  const cid = channel.id || 0;
-  let bucket = tokenBuckets.get(cid);
-  if (!bucket) {
-    bucket = {
-      rpm: channel.rpm_limit || 0, rpmTs: now, rpmCount: 0,
-      rpd: channel.rpd_limit || 0, rpdTs: now, rpdCount: 0,
-      tokens: channel.rate_limit_capacity || 0, tokenTs: now,
-      capacity: channel.rate_limit_capacity || 0, rate: (channel.rate_limit_rate || 0) / 60,
-    };
-    tokenBuckets.set(cid, bucket);
+  const stmts = [];
+
+  if (channel.rpm_limit > 0) {
+    const minute = Math.floor(now / 60000);
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO rate_limits (bucket_type, bucket_key, window_start, count)
+         VALUES ('rpm', ?, ?, 1)
+         ON CONFLICT(bucket_type, bucket_key, window_start)
+         DO UPDATE SET count = count + 1
+         RETURNING count`
+      ).bind(String(channel.id), minute)
+    );
   }
-  if (bucket.rpm > 0) {
-    if (now - bucket.rpmTs > 60000) { bucket.rpmCount = 0; bucket.rpmTs = now; }
-    if (bucket.rpmCount >= bucket.rpm) return { ok: false, reason: "rpm_limit" };
+  if (channel.rpd_limit > 0) {
+    const day = Math.floor(now / 86400000);
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO rate_limits (bucket_type, bucket_key, window_start, count)
+         VALUES ('rpd', ?, ?, 1)
+         ON CONFLICT(bucket_type, bucket_key, window_start)
+         DO UPDATE SET count = count + 1
+         RETURNING count`
+      ).bind(String(channel.id), day)
+    );
   }
-  if (bucket.rpd > 0) {
-    if (now - bucket.rpdTs > 86400000) { bucket.rpdCount = 0; bucket.rpdTs = now; }
-    if (bucket.rpdCount >= bucket.rpd) return { ok: false, reason: "rpd_limit" };
-  }
-  if (bucket.capacity > 0 && bucket.rate > 0) {
-    const elapsed = (now - bucket.tokenTs) / 1000;
-    bucket.tokens = Math.min(bucket.capacity, bucket.tokens + elapsed * bucket.rate);
-    bucket.tokenTs = now;
-    if (bucket.tokens < 1) return { ok: false, reason: "rate_limit" };
+
+  try {
+    const results = await env.DB.batch(stmts);
+    let idx = 0;
+    if (channel.rpm_limit > 0) {
+      const count = results[idx]?.results?.[0]?.count || 0;
+      if (count > channel.rpm_limit) return { ok: false, reason: 'rpm_limit' };
+      idx++;
+    }
+    if (channel.rpd_limit > 0) {
+      const count = results[idx]?.results?.[0]?.count || 0;
+      if (count > channel.rpd_limit) return { ok: false, reason: 'rpd_limit' };
+    }
+  } catch (e) {
+    // D1 失敗 → fallback 到本地記憶體
+    return localCheckAndConsume(channel);
   }
   return { ok: true };
 }
 
-// 通過檢查後、實際發送請求前消耗配額
-function consumeRateLimit(channel) {
-  const cid = channel.id || 0;
-  const bucket = tokenBuckets.get(cid);
-  if (!bucket) return;
-  if (bucket.rpm > 0) bucket.rpmCount++;
-  if (bucket.rpd > 0) bucket.rpdCount++;
-  if (bucket.capacity > 0 && bucket.rate > 0) bucket.tokens -= 1;
+// 退還 D1 rate limit 配額（fire-and-forget，不阻塞請求）
+function refundRateLimitD1(env, channel) {
+  if (!channel.rpm_limit && !channel.rpd_limit) return;
+  const now = Date.now();
+  const stmts = [];
+  if (channel.rpm_limit > 0) {
+    const minute = Math.floor(now / 60000);
+    stmts.push(
+      env.DB.prepare(
+        `UPDATE rate_limits SET count = MAX(0, count - 1)
+         WHERE bucket_type = 'rpm' AND bucket_key = ? AND window_start = ?`
+      ).bind(String(channel.id), minute)
+    );
+  }
+  if (channel.rpd_limit > 0) {
+    const day = Math.floor(now / 86400000);
+    stmts.push(
+      env.DB.prepare(
+        `UPDATE rate_limits SET count = MAX(0, count - 1)
+         WHERE bucket_type = 'rpd' AND bucket_key = ? AND window_start = ?`
+      ).bind(String(channel.id), day)
+    );
+  }
+  if (stmts.length > 0) {
+    env.DB.batch(stmts).catch(() => {});
+  }
 }
 
-// 請求未到達上游時退還配額（連線失敗等）
-function refundRateLimit(channel) {
+// D1 故障時的本地 fallback（check + consume 同步）
+function localCheckAndConsume(channel) {
+  if (!channel.rpm_limit && !channel.rpd_limit) return { ok: true };
+  const now = Date.now();
   const cid = channel.id || 0;
-  const bucket = tokenBuckets.get(cid);
-  if (!bucket) return;
-  if (bucket.rpm > 0 && bucket.rpmCount > 0) bucket.rpmCount--;
-  if (bucket.rpd > 0 && bucket.rpdCount > 0) bucket.rpdCount--;
-  if (bucket.capacity > 0 && bucket.rate > 0) bucket.tokens = Math.min(bucket.capacity, bucket.tokens + 1);
+  let bucket = localTokenBuckets.get(cid);
+  if (!bucket) {
+    bucket = { rpm: channel.rpm_limit || 0, rpmTs: now, rpmCount: 0, rpd: channel.rpd_limit || 0, rpdTs: now, rpdCount: 0 };
+    localTokenBuckets.set(cid, bucket);
+  }
+  if (bucket.rpm > 0) {
+    if (now - bucket.rpmTs > 60000) { bucket.rpmCount = 0; bucket.rpmTs = now; }
+    if (bucket.rpmCount >= bucket.rpm) return { ok: false, reason: 'rpm_limit' };
+  }
+  if (bucket.rpd > 0) {
+    if (now - bucket.rpdTs > 86400000) { bucket.rpdCount = 0; bucket.rpdTs = now; }
+    if (bucket.rpdCount >= bucket.rpd) return { ok: false, reason: 'rpd_limit' };
+  }
+  bucket.rpmCount++;
+  bucket.rpdCount++;
+  return { ok: true };
+}
+
+// Client IP 速率限制（D1 原子操作）
+const IP_LIMIT_PER_MIN = 60;
+
+async function checkClientIpRateLimit(env, clientIp) {
+  if (!clientIp || clientIp === 'unknown') return { ok: true };
+  const minute = Math.floor(Date.now() / 60000);
+  try {
+    const result = await env.DB.prepare(
+      `INSERT INTO rate_limits (bucket_type, bucket_key, window_start, count)
+       VALUES ('client_ip', ?, ?, 1)
+       ON CONFLICT(bucket_type, bucket_key, window_start)
+       DO UPDATE SET count = count + 1
+       RETURNING count`
+    ).bind(clientIp, minute).first();
+    if (result && result.count > IP_LIMIT_PER_MIN) {
+      return { ok: false, reason: 'client_ip_limit' };
+    }
+  } catch (e) {
+    // D1 故障時允許通過
+  }
+  return { ok: true };
 }
 
 // 記憶體快取（non-stream 響應）
@@ -642,8 +754,28 @@ async function loadFilters(env) {
 function clearGatewayCache() {
   globalConfigCache = { token: null, relay_url: null, relay_token: null, ts: 0 };
   filterCache = { data: null, ts: 0 };
-  tokenBuckets.clear();
+  localTokenBuckets.clear();
   clearChannelCache();
+}
+
+let pruneCounter = 0;
+function pruneRuntimeMaps() {
+  // 每 50 次請求清理一次 runtime Map/Set，防止記憶體洩漏
+  pruneCounter++;
+  if (pruneCounter % 50 !== 0) return;
+  if (contextOverflowAt.size > 100) {
+    // 只保留最近 100 筆
+    const entries = [...contextOverflowAt.entries()].sort((a, b) => b[1] - a[1]);
+    contextOverflowAt.clear();
+    for (let i = 0; i < Math.min(100, entries.length); i++) {
+      contextOverflowAt.set(entries[i][0], entries[i][1]);
+    }
+  }
+  if (localTokenBuckets.size > 500) {
+    const entries = [...localTokenBuckets.entries()].slice(0, 500);
+    localTokenBuckets.clear();
+    for (const [k, v] of entries) localTokenBuckets.set(k, v);
+  }
 }
 
 function buildBaseHeaders(reqHeaders, rid) {
@@ -691,6 +823,11 @@ function createModelRewriteTransform(clientModel) {
             continue;
           } catch {}
         }
+        // [DONE] 需要完整 \n\n 才算完整 SSE 事件，否則 client 會無限期等待下一個 chunk
+        if (line.startsWith("data: ") && line.includes("[DONE]")) {
+          controller.enqueue(encoder.encode(line + "\n\n"));
+          continue;
+        }
         if (line) controller.enqueue(encoder.encode(line + "\n"));
       }
     },
@@ -711,6 +848,35 @@ function rewriteModelInJson(text, clientModel) {
     }
   } catch {}
   return text;
+}
+
+// 從串流 body 偷看第一 chunk 而不消耗整個串流
+async function peekFirstChunk(body) {
+  if (!body) return { done: true, value: null, tail: null };
+  const reader = body.getReader();
+  const { done, value } = await reader.read();
+  if (done) { reader.releaseLock(); return { done: true, value: null, tail: null }; }
+  // 將已讀取的 chunk 放回新的 ReadableStream，串接後續資料
+  let readerCancelled = false;
+  const tail = new ReadableStream({
+    start(controller) { controller.enqueue(value); },
+    pull(controller) {
+      if (readerCancelled) { controller.close(); return; }
+      return reader.read().then(({ done, value }) => {
+        if (done) controller.close();
+        else controller.enqueue(value);
+      });
+    },
+    cancel() { readerCancelled = true; reader.cancel().catch(() => {}); },
+  });
+  return { done: false, value, tail };
+}
+
+function isValidSseChunk(chunk) {
+  if (!chunk || chunk.byteLength === 0) return false;
+  const text = new TextDecoder().decode(chunk, { stream: true });
+  const trimmed = text.trimStart();
+  return trimmed.startsWith('data:') || trimmed.startsWith(':');
 }
 
 function createFilterTransform(filters) {
@@ -909,6 +1075,7 @@ function createIdleTimeoutStream(readable, idleMs) {
   const reader = readable.getReader();
   const { readable: out, writable } = new TransformStream();
   const writer = writable.getWriter();
+  const enc = new TextEncoder();
   let idleTimer;
   (async () => {
     try {
@@ -920,7 +1087,16 @@ function createIdleTimeoutStream(readable, idleMs) {
         if (result.done) { await writer.close(); return; }
         await writer.write(result.value);
       }
-    } catch (e) { /* idle timeout or client disconnect — safe to close */ try { await writer.close(); } catch (_) {} }
+    } catch (e) {
+      // 閒置逾時 → 送錯誤 chunk 讓 client 知道串流不完整
+      try {
+        await writer.write(enc.encode("data: " + JSON.stringify({
+          id: "timeout", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "",
+          choices: [{ index: 0, delta: {}, finish_reason: "error" }]
+        }) + "\n\ndata: [DONE]\n\n"));
+      } catch (_) {}
+      try { await writer.close(); } catch (_) {}
+    }
     finally { clearTimeout(idleTimer); reader.releaseLock(); }
   })().catch(e => logStructured("error", "idle-timeout-stream internal error", { error: e.message }));
   return out;
@@ -995,7 +1171,7 @@ async function parseRelayResponse(relayRes) {
 }
 
 // Global relay: 使用 env.RELAY_BASE_URL 全局設定（所有類型皆可使用）
-async function upstreamFetch(url, opts, env, rid, noRelay) {
+async function upstreamFetch(url, opts, env, rid, noRelay, channel) {
   if (noRelay || !env.RELAY_BASE_URL) {
     return fetch(url, opts);
   }
@@ -1004,6 +1180,12 @@ async function upstreamFetch(url, opts, env, rid, noRelay) {
   const relayHeaders = new Headers(opts.headers);
   relayHeaders.set("x-target-url", url);
   if (relayToken) relayHeaders.set("x-relay-token", relayToken);
+  // 傳遞 channel 速率限制資訊給 relay
+  if (channel) {
+    relayHeaders.set("x-channel-id", String(channel.id));
+    if (channel.rpm_limit) relayHeaders.set("x-channel-rpm", String(channel.rpm_limit));
+    if (channel.rpd_limit) relayHeaders.set("x-channel-rpd", String(channel.rpd_limit));
+  }
   const relayRes = await fetch(env.RELAY_BASE_URL, {
     method: opts.method, headers: relayHeaders, body: opts.body, signal: opts.signal,
   });
@@ -1072,102 +1254,6 @@ function createForwardStream(initial, reader) {
   });
 }
 
-// ---- Function Calling Simulation ----
-function injectToolDescriptions(messages, tools) {
-  const msgs = Array.isArray(messages) ? [...messages] : [];
-  let prompt = "You are a helpful assistant. You have access to the following tools:\n";
-  for (const t of tools) {
-    if (t.type === 'function' && t.function) {
-      prompt += `- ${t.function.name}: ${t.function.description || ''}\n  Parameters: ${JSON.stringify(t.function.parameters || {})}\n`;
-    }
-  }
-  prompt += "\nIf you decide to use a tool, you MUST respond ONLY with a JSON object matching this exact format:\n";
-  prompt += `{"tool": "tool_name", "args": {"arg1": "value1"}}\n`;
-  prompt += "Do not include any other text, markdown, or explanations before or after the JSON.\n";
-
-  if (msgs.length > 0 && msgs[0].role === 'system') {
-    msgs[0].content = prompt + "\n" + (msgs[0].content || "");
-  } else {
-    msgs.unshift({ role: 'system', content: prompt.trim() });
-  }
-  return msgs;
-}
-
-function processToolCallResponse(rawBody) {
-  if (!rawBody) return { modifiedBody: null };
-  let parsed;
-  try { parsed = JSON.parse(rawBody); } catch { return { modifiedBody: null }; }
-  const choice = parsed?.choices?.[0];
-  if (!choice) return { modifiedBody: null };
-  if (choice.finish_reason !== 'stop') return { modifiedBody: null };
-
-  const content = choice.message?.content || '';
-  if (!content) return { modifiedBody: null };
-
-  const re = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*?\})\s*\}/s;
-  const m = content.match(re);
-  if (!m) return { modifiedBody: null };
-
-  const toolName = m[1];
-  let toolArgs;
-  try { toolArgs = JSON.parse(m[2]); } catch { return { modifiedBody: null }; }
-
-  const toolCallId = 'call_' + Math.random().toString(36).slice(2, 12);
-  const remainingContent = content.replace(re, '').trim();
-
-  const modified = {
-    ...parsed,
-    choices: [{
-      index: choice.index || 0,
-      message: {
-        role: 'assistant',
-        content: remainingContent || null,
-        tool_calls: [{
-          id: toolCallId,
-          type: 'function',
-          function: { name: toolName, arguments: JSON.stringify(toolArgs) }
-        }],
-      },
-      finish_reason: 'tool_calls',
-    }],
-  };
-  return { modifiedBody: JSON.stringify(modified) };
-}
-
-function fakeSseStream(modifiedBodyStr) {
-  const parsed = JSON.parse(modifiedBodyStr);
-  const choice = parsed.choices[0];
-  const tc = choice.message.tool_calls[0];
-  
-  const chunk1 = {
-    id: parsed.id || 'chatcmpl-' + Date.now(),
-    object: 'chat.completion.chunk',
-    created: parsed.created || Math.floor(Date.now() / 1000),
-    model: parsed.model || 'unknown',
-    choices: [{ index: choice.index || 0, delta: { role: 'assistant' }, finish_reason: null }]
-  };
-  const chunk2 = {
-    id: chunk1.id, object: 'chat.completion.chunk', created: chunk1.created, model: chunk1.model,
-    choices: [{ index: choice.index || 0, delta: { tool_calls: [{ index: 0, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }]
-  };
-  const chunk3 = {
-    id: chunk1.id, object: 'chat.completion.chunk', created: chunk1.created, model: chunk1.model,
-    choices: [{ index: choice.index || 0, delta: {}, finish_reason: 'tool_calls' }]
-  };
-  
-  const stream = new ReadableStream({
-    start(controller) {
-      const enc = new TextEncoder();
-      controller.enqueue(enc.encode('data: ' + JSON.stringify(chunk1) + '\n\n'));
-      controller.enqueue(enc.encode('data: ' + JSON.stringify(chunk2) + '\n\n'));
-      controller.enqueue(enc.encode('data: ' + JSON.stringify(chunk3) + '\n\n'));
-      controller.enqueue(enc.encode('data: [DONE]\n\n'));
-      controller.close();
-    }
-  });
-  return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
-}
-
 // ---- Reasoning → Content fallback ----
 async function patchReasoningToContent(res) {
   try {
@@ -1194,7 +1280,8 @@ async function patchReasoningToContent(res) {
   return res;
 }
 
-async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal) {
+async function tryForward(env, path, method, baseHeaders, body, rid, streamType, clientSignal, clientIp) {
+  pruneRuntimeMaps();
   const { relay_url: globalRelayUrl, relay_token: dbRelayToken } = await resolveGlobalConfig(env);
   const matched = API_PREFIXES.find(p => path === p || path.startsWith(p + "/"));
   const suffix = matched ? path.slice(matched.length) : path;
@@ -1236,8 +1323,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     }
     // 否則保持全部渠道（不限制模型名稱）
   }
-  let originalStreamType = streamType;
-  let forceNonStream = false;
   if (bodyStr && requiredType === "chat") {
     try {
       const parsed = JSON.parse(bodyStr);
@@ -1262,17 +1347,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
       if (parsed.tools || parsed.tool_choice) needsTools = true;
 
-      // Function Calling 模擬攔截
-      if (parsed.tools && Array.isArray(parsed.tools) && parsed.tools.length > 0) {
-        parsed.messages = injectToolDescriptions(parsed.messages, parsed.tools);
-        delete parsed.tools;
-        delete parsed.tool_choice;
-        parsed.stream = false;
-        forceNonStream = true;
-        sanitized = true;
-        logStructured("info", "tools injected, forcing non-stream", { rid });
-      }
-
       if (sanitized) {
         bodyStr = JSON.stringify(parsed);
         estimatedContextTokens = Math.ceil(bodyStr.length / 3);
@@ -1292,16 +1366,23 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   }
   
   if (needsVision) eligible = eligible.filter(c => c.support_vision && !channelNoVision.has(c.id));
-  // relay 全局模擬 function calling，不受自動學習標記影響
   if (needsTools && !globalRelayUrl?.trim()) {
     eligible = eligible.filter(c => c.support_tools && !channelNoTools.has(c.id));
   } else if (needsTools) {
-    // relay 模式下只檢查 DB 標記（避開記憶體內的自動學習 Set）
+    // relay 模式只檢查 DB 標記（無自動學習）
     eligible = eligible.filter(c => c.support_tools);
   }
   if (eligible.length === 0) {
     logStructured("warn", "no channels match capability or context length", { vision: needsVision, tools: needsTools, tokens: estimatedContextTokens, path, rid });
     return { error: { message: `No enabled channels support the requested capabilities (vision=${needsVision}, tools=${needsTools}, tokens=${estimatedContextTokens})`, status: 503 } };
+  }
+  // Client IP 速率限制
+  if (clientIp) {
+    const ipCheck = await checkClientIpRateLimit(env, clientIp);
+    if (!ipCheck.ok) {
+      logStructured("warn", "client IP rate limit exceeded", { clientIp, rid });
+      return { error: { message: "Too many requests from this IP. Please slow down.", status: 429 } };
+    }
   }
   const attempted = new Set();
   const fallbackModelsTried = new Set();
@@ -1317,14 +1398,16 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     // 非重試時重置 reqBody 為原始值，重試時保留修改後的 reqBody（stream: false）
     if (!retryAsNonStream) reqBody = bodyStr;
     retryAsNonStream = false;
-    // rate limit 檢查
-    const rl = checkRateLimit(channel);
-    if (!rl.ok) {
-      attempted.add(channel.id);
-      logStructured("warn", "rate limit exceeded, try next", { channel: channel.name, reason: rl.reason, rid });
-      continue;
+    // rate limit 檢查：Relay 啟用時由 Relay 處理（in-memory 更精確），否則走 D1
+    const relayActive = !!(globalRelayUrl?.trim() || env.RELAY_BASE_URL);
+    if (!relayActive) {
+      const rl = await checkRateLimitD1(env, channel);
+      if (!rl.ok) {
+        attempted.add(channel.id);
+        logStructured("warn", "rate limit exceeded, try next", { channel: channel.name, reason: rl.reason, rid });
+        continue;
+      }
     }
-    consumeRateLimit(channel);
     const upstreamPath = suffix;
     const url = channel.base_url.replace(/\/+$/, "") + upstreamPath;
     const headers = new Headers(baseHeaders);
@@ -1430,9 +1513,15 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       } else if (globalRelayUrl?.trim()) {
         const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
         // relay server 即回 meta 架構，避免 CF 邊緣網路 100s 無回應觸發 524
+        // 傳遞 channel 速率限制資訊給 relay，讓 relay 做精確的 in-memory 計數
+        if (channel) {
+          headers.set("x-channel-id", String(channel.id));
+          if (channel.rpm_limit) headers.set("x-channel-rpm", String(channel.rpm_limit));
+          if (channel.rpd_limit) headers.set("x-channel-rpd", String(channel.rpd_limit));
+        }
         res = await fetchViaRelay(relayBase, url, method, headers, reqBody, controller.signal, dbRelayToken || env.RELAY_SECRET);
       } else {
-        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false);
+        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false, channel);
       }
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
@@ -1445,6 +1534,29 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
       if (res.ok) {
         markHealthy(channel.id, env);
+        // 驗證 SSE 回應：若上游 stream:true 回傳非 SSE 內容，改用非串流重試
+        if (streamType === "stream" && reqBody && (res.headers.get("Content-Type") || "").includes("text/event-stream")) {
+          const peek = await peekFirstChunk(res.body);
+          if (peek.done || !isValidSseChunk(peek.value)) {
+            // 未收到 chunk 或內容不是有效 SSE → 取消並以非串流重試
+            res.body?.cancel().catch(() => {});
+            try {
+              const parsed = JSON.parse(reqBody);
+              if (parsed.stream === true) {
+                parsed.stream = false;
+                reqBody = JSON.stringify(parsed);
+                retryAsNonStream = true;
+                refundRateLimitD1(env, channel);
+                markDegraded(channel.id, env);
+                logStructured("warn", "invalid SSE body, retrying with stream=false", { channel: channel.name, rid });
+                continue;
+              }
+            } catch (e) {}
+          } else {
+            // 有效 SSE → 用剩餘串流取代 body 繼續處理
+            res = new Response(peek.tail, { status: res.status, statusText: res.statusText, headers: new Headers(res.headers) });
+          }
+        }
         if (channel.provider_options) {
           try {
             const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
@@ -1482,7 +1594,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
         if (estimatedContextTokens > 0) successContextObserved(channel.id, estimatedContextTokens);
         // 空內容學習：串流回應且請求含 tools/vision → 監控是否有實際內容
-        // relay 模式跳過自動學習（relay 模擬 FC，SSE 不含 delta.tool_calls 為正常行為）
+        // relay 模式跳過自動學習（上游原生處理 tools）
         if ((needsTools || needsVision) && res.body && !globalRelayUrl?.trim() && (res.headers.get("Content-Type") || "").includes("text/event-stream")) {
           const origBody = res.body;
           let hasToolCalls = false, hasContent = false;
@@ -1515,18 +1627,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           }));
           res = new Response(monitoredBody, { status: res.status, statusText: res.statusText, headers: res.headers });
         }
-        if (forceNonStream && res.headers.get("Content-Type")?.includes("application/json")) {
-          const rawText = await res.clone().text().catch(() => "");
-          const { modifiedBody } = processToolCallResponse(rawText);
-          if (modifiedBody) {
-            logStructured("info", "tool calls reformatted via CF", { rid });
-            if (originalStreamType === "stream") {
-              res = fakeSseStream(modifiedBody);
-            } else {
-              res = new Response(modifiedBody, { status: res.status, statusText: res.statusText, headers: res.headers });
-            }
-          }
-        }
         return { response: await patchReasoningToContent(res), channel, clientRequestModel };
       }
       if (res.status >= 500 || res.status === 429) {
@@ -1554,7 +1654,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             parsed.stream = false;
             reqBody = JSON.stringify(parsed);
             retryAsNonStream = true;
-            refundRateLimit(channel);  // 退還 rate limit 配額，避免重試同一渠道時雙重計算
+            refundRateLimitD1(env, channel);  // 退還 rate limit 配額，避免重試同一渠道時雙重計算
             logStructured("warn", "4xx with stream=true, retrying same channel with stream=false", { channel: channel.name, status: res.status, rid });
             continue;
           }
@@ -1576,7 +1676,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     } catch (err) {
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
-      refundRateLimit(channel);
+      refundRateLimitD1(env, channel);
       if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
       markDegraded(channel.id, env);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
@@ -1599,7 +1699,8 @@ async function handleChatCompletions(c) {
   }
   logStructured("info", "chat completion", { model: body?.model || "unknown", stream: isStream, rid });
   const baseHeaders = buildBaseHeaders(c.req.raw.headers, rid);
-  const result = await tryForward(c.env, c.req.path, "POST", baseHeaders, rawBody, rid, isStream ? "stream" : "nonstream", c.req.raw.signal);
+  const clientIp = c.req.raw.headers.get("cf-connecting-ip") || "";
+  const result = await tryForward(c.env, c.req.path, "POST", baseHeaders, rawBody, rid, isStream ? "stream" : "nonstream", c.req.raw.signal, clientIp);
   if (result.error) {
     return c.json({ error: { message: result.error.message, type: "upstream_error", param: null, code: "upstream_error" } }, result.error.status);
   }
@@ -1611,9 +1712,6 @@ async function handleChatCompletions(c) {
     resHeaders.set("X-Debug-Ct", ct);
     if (!ct.includes("text/event-stream")) {
       resHeaders.set("X-Debug-Route", "wrap");
-      // 診斷：複製 body 看前 300 chars
-      const preview = await upstream.clone().text().catch(() => "(clone failed)");
-      resHeaders.set("X-Debug-Body-Preview", preview.slice(0, 300).replace(/[\r\n]/g, '↵'));
       return wrapNonStreamToStream(c, upstream, resHeaders);
     }
     resHeaders.set("X-Debug-Route", "filter");
@@ -1810,7 +1908,8 @@ async function handleGenericProxy(c) {
   if (rawBody) {
     try { const b = JSON.parse(new TextDecoder().decode(rawBody)); streamType = b?.stream === true ? "stream" : "nonstream"; } catch (e) {}
   }
-  const result = await tryForward(c.env, path, c.req.method, baseHeaders, rawBody, rid, streamType, c.req.raw.signal);
+  const clientIp = c.req.raw.headers.get("cf-connecting-ip") || "";
+  const result = await tryForward(c.env, path, c.req.method, baseHeaders, rawBody, rid, streamType, c.req.raw.signal, clientIp);
   if (result.error) {
     return c.json({ error: { message: result.error.message, type: "upstream_error", param: null, code: "upstream_error" } }, result.error.status);
   }
@@ -2111,48 +2210,222 @@ function createDashboardApi() {
     return c.json({ ok: true });
   });
 
+  // 產生最小有效 WAV 檔案（44 bytes header + 8000 samples silence）
+  function createMinimalWav() {
+    const sr = 8000, ch = 1, bps = 8, dataSz = sr * ch * (bps / 8);
+    const buf = new ArrayBuffer(44 + dataSz);
+    const dv = new DataView(buf);
+    const w = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); dv.setUint32(4, 36 + dataSz, true); w(8, "WAVE");
+    w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, ch, true);
+    dv.setUint32(24, sr, true); dv.setUint32(28, sr * ch * (bps / 8), true);
+    dv.setUint16(32, ch * (bps / 8), true); dv.setUint16(34, bps, true);
+    w(36, "data"); dv.setUint32(40, dataSz, true);
+    return new Uint8Array(buf);
+  }
+  // 從回應中偵測上游的 max context 限制
+  function detectMaxContextFromResult(json, headers, text) {
+    if (json?.max_context) return json.max_context;
+    if (json?.max_input_tokens) return json.max_input_tokens;
+    if (json?.max_total_tokens) return json.max_total_tokens;
+    if (headers) {
+      for (const h of ["X-Max-Tokens", "X-Context-Length", "X-Model-Max-Tokens"]) {
+        const v = headers.get(h);
+        if (v) { const n = parseInt(v, 10); if (n > 0) return n; }
+      }
+    }
+    // 從錯誤/中繼訊息中擷取（如果上游在正常回應中夾帶這類資訊）
+    if (text && typeof text === "string") {
+      const m = text.match(/(?:max[-_\s]*(?:context|tokens)|context[-_\s]*length).{0,30}[:：]?\s*(\d{3,6})/i);
+      if (m) { const n = parseInt(m[1], 10); if (n > 0) return n; }
+    }
+    return 0;
+  }
+
+  async function runSingleTest(ch, testType, env) {
+    const relayUrl = ch.relay_url?.trim();
+    const { relay_token: dbRelayToken } = await resolveGlobalConfig(env);
+    const relayToken = dbRelayToken || env.RELAY_SECRET;
+    const baseUrl = ch.base_url || "";
+    const headers = { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" };
+    const TEST_TIMEOUT_MS = 10000;
+    let testUrl, body, useFormData = false, isAudioTest = false;
+
+    // 根據 testType 設定 url、body 與 Content-Type
+    switch (testType) {
+      case "chat":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Say hi" }], max_tokens: 5, temperature: 0 });
+        break;
+      case "vision":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: [{ type: "text", text: "Describe" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }], max_tokens: 10, temperature: 0 });
+        break;
+      case "tools":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Weather in Tokyo" }], tools: [{ type: "function", function: { name: "get_weather", description: "Get weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }], tool_choice: "auto", max_tokens: 50, temperature: 0 });
+        break;
+      case "tts":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/audio/speech";
+        body = JSON.stringify({ model: ch.model || "tts-1", input: "Hello world", voice: "alloy" });
+        isAudioTest = true;
+        break;
+      case "stt":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/audio/transcriptions";
+        // 使用 multipart/form-data 傳送最小 WAV
+        delete headers["Content-Type"]; // fetch 自動設 boundary
+        if (!relayUrl) { // relay 不支援 FormData，改用 endpoint 存在性檢查
+          const wav = createMinimalWav();
+          const fd = new FormData();
+          fd.append("file", new Blob([wav], { type: "audio/wav" }), "test.wav");
+          fd.append("model", ch.model || "whisper-1");
+          body = fd;
+          useFormData = true;
+        } else {
+          // relay 模式：送一個空的 POST 看端點是否回應
+          body = "{}";
+        }
+        isAudioTest = true;
+        break;
+      case "image_gen":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/images/generations";
+        body = JSON.stringify({ model: ch.model || "dall-e-3", prompt: "a cat", n: 1, size: "256x256" });
+        break;
+      case "embed":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/embeddings";
+        body = JSON.stringify({ model: ch.model || "text-embedding-ada-002", input: "test" });
+        break;
+      case "moderate":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/moderations";
+        body = JSON.stringify({ model: ch.model || "text-moderation-latest", input: "test content" });
+        break;
+      default:
+        return { ok: false, status: 0, ms: 0, capOk: false, diagnosis: "未知測試類型", maxContextDetected: 0 };
+    }
+
+    const start = Date.now();
+    try {
+      let res;
+      if (relayUrl) {
+        const fetchBody = typeof body === "string" ? body : JSON.stringify({});
+        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST",
+          { Authorization: headers.Authorization, "Content-Type": headers["Content-Type"] || "application/json" },
+          fetchBody, AbortSignal.timeout(TEST_TIMEOUT_MS), relayToken);
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("relay test timeout")), TEST_TIMEOUT_MS));
+        res = await Promise.race([fetchPromise, timeoutPromise]);
+      } else {
+        const fetchOpts = { method: "POST", headers, body, signal: AbortSignal.timeout(TEST_TIMEOUT_MS) };
+        if (useFormData) { delete fetchOpts.headers["Content-Type"]; }
+        res = await fetch(testUrl, fetchOpts);
+      }
+      const ms = Date.now() - start;
+      const text = await res.text().catch(() => "");
+
+      // 非 200 → 若端點存在（4xx）則 capOk 仍標 true，表示能力通道存在
+      if (res.status !== 200) {
+        const isEndpointLive = res.status < 500;
+        return { ok: false, status: res.status, ms, capOk: isEndpointLive, diagnosis: `HTTP ${res.status}${text ? ": " + text.slice(0, 80) : ""}`, maxContextDetected: 0 };
+      }
+
+      let json;
+      try { json = JSON.parse(text); } catch { json = null; }
+
+      let capOk = false, capMsg = "無法驗證", maxCtx = 0;
+
+      if (testType === "tts") {
+        const ct = res.headers.get("Content-Type") || "";
+        capOk = ct.includes("audio/") || text.length > 100;
+        capMsg = capOk ? "語音生成正常" : "非 audio content-type 或內容過短";
+      } else if (testType === "stt") {
+        capOk = !!json?.text || text.length > 0;
+        capMsg = capOk ? "語音辨識正常" : "無文字回傳";
+      } else if (testType === "image_gen") {
+        capOk = Array.isArray(json?.data) && json.data.length > 0;
+        capMsg = capOk ? "圖片生成正常" : "無 data 陣列";
+      } else if (testType === "embed") {
+        capOk = Array.isArray(json?.data) && json.data.length > 0;
+        capMsg = capOk ? "嵌入向量正常" : "無 data 陣列";
+      } else if (testType === "moderate") {
+        capOk = Array.isArray(json?.results);
+        capMsg = capOk ? "審核正常" : "無 results 陣列";
+      } else {
+        // chat / vision / tools
+        const choice = json?.choices?.[0];
+        if (!choice) {
+          capOk = false; capMsg = "無 choices 陣列";
+        } else if (testType === "tools") {
+          capOk = !!choice.message?.tool_calls;
+          capMsg = capOk ? "工具呼叫正常" : "無 tool_calls 回應";
+        } else if (testType === "vision") {
+          capOk = !!choice.message?.content;
+          capMsg = capOk ? "圖片辨識正常" : "無內容回應";
+        } else {
+          capOk = !!choice.message?.content;
+          capMsg = capOk ? "連線正常" : "無內容回應";
+        }
+      }
+
+      // 偵測 max context
+      maxCtx = detectMaxContextFromResult(json, res.headers, text);
+
+      return { ok: true, status: 200, ms, capOk, diagnosis: capMsg, maxContextDetected: maxCtx };
+    } catch (e) {
+      const ms = Date.now() - start;
+      return { ok: false, status: 0, ms, capOk: false, diagnosis: "連線失敗: " + (e.message?.slice(0, 60) || "unknown"), maxContextDetected: 0 };
+    }
+  }
+
   api.post("/channels/:id/test", async (c) => {
     const chId = parseInt(c.req.param("id"), 10);
     const reqBody = await c.req.json().catch(() => ({}));
+    const { type: testType = "chat", autoFix = false } = reqBody;
     const fromBody = !!reqBody.base_url;
     let ch;
     if (fromBody) { ch = { id: chId, ...reqBody }; }
     else { const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || []; ch = rows[0]; }
     if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
-    const baseUrl = ch.base_url || "";
-    const testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-    const relayUrl = ch.relay_url?.trim();
-    const { relay_token: dbRelayToken } = await resolveGlobalConfig(c.env);
-    const relayToken = dbRelayToken || c.env.RELAY_SECRET;
-    const start = Date.now();
-    try {
-      const testHeaders = { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" };
-      const testBody = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "hi" }], max_tokens: 1 });
-      const TEST_TIMEOUT_MS = 10000;
-      const startFetch = Date.now();
-      let res;
-      if (relayUrl) {
-        // fetchViaRelay 的 body 讀取不在初始 signal 範圍內，用 race 強制總 timeout
-        const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST", testHeaders, testBody, AbortSignal.timeout(TEST_TIMEOUT_MS), relayToken);
-        const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("relay test timeout")), TEST_TIMEOUT_MS)
-        );
-        res = await Promise.race([fetchPromise, timeoutPromise]);
-      } else {
-        res = await fetch(testUrl, {
-          method: "POST",
-          headers: testHeaders,
-          body: testBody,
-          signal: AbortSignal.timeout(TEST_TIMEOUT_MS),
-        });
-      }
-      const ms = Date.now() - start;
-      const ok = res.status === 200 || res.status === 400;
-      return c.json({ ok, status: res.status, ms, diagnosis: ok ? "連線正常" : `HTTP ${res.status}` });
-    } catch (e) {
-      const ms = Date.now() - start;
-      return c.json({ ok: false, status: 0, ms, diagnosis: "連線失敗: " + (e.message?.slice(0, 60) || "unknown") });
+
+    // 根據渠道類型決定 "all" 要跑哪些測試
+    const chType = ch.channel_type || "chat";
+    const allTypes = chType === "chat"
+      ? ["chat", "vision", "tools"]
+      : [chType];
+
+    const typesToRun = testType === "all" ? allTypes : [testType];
+    const results = {};
+    let anyOk = false;
+    for (const t of typesToRun) {
+      const r = await runSingleTest(ch, t, c.env);
+      results[t] = r;
+      if (r.ok) anyOk = true;
     }
+
+    // auto-fix: 更新 DB
+    if (autoFix && !fromBody) {
+      const updates = [];
+      if (results.vision && !results.vision.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(chId));
+      if (results.tools && !results.tools.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_tools=0 WHERE id=?").bind(chId));
+      // 從測試結果自動學習 max_context
+      for (const [, r] of Object.entries(results)) {
+        if (r.maxContextDetected && r.maxContextDetected > (ch.max_context_length || 0)) {
+          updates.push(c.env.DB.prepare("UPDATE channels SET max_context_length=? WHERE id=?").bind(r.maxContextDetected, chId));
+        }
+      }
+      if (updates.length > 0) await c.env.DB.batch(updates);
+    }
+
+    const capabilities = {};
+    if (results.vision) capabilities.vision = results.vision.capOk;
+    if (results.tools) capabilities.tools = results.tools.capOk;
+
+    return c.json({
+      ok: anyOk,
+      type: testType,
+      results,
+      capabilities: Object.keys(capabilities).length ? capabilities : undefined,
+      diagnosis: typesToRun.map(t => `${t}: ${results[t].diagnosis}`).join("; "),
+    });
   });
 
   api.post("/reset", async (c) => {
@@ -2267,8 +2540,11 @@ app.notFound((c) => c.json({
 }, 404));
 
 app.onError((err, c) => {
-  console.error("[error]", err.message);
-  return c.json({ error: { message: "The server had an error processing your request", type: "server_error", param: null, code: "api_error" } }, 500);
+  console.error("[error]", err.message, err.stack?.slice(0, 500));
+  return c.json({
+    error: { message: "The server had an error processing your request", type: "server_error", param: null, code: "api_error" },
+    _debug: err.message,
+  }, 500);
 });
 
 export { pruneLoginState };
