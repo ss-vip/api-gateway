@@ -18,7 +18,7 @@ let sessionPruneCounter = 0;
 // 自動學習：渠道實際能承載的 context 上限（從 runtime 錯誤回饋）
 const contextOverflowAt = new Map();
 function isContextLengthError(text) {
-  return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit/i.test(text);
+  return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit|tokens per minute|tpm.*limit|rate_limit_exceeded/i.test(text);
 }
 function learnContextLimit(channelId, tokens) {
   const prev = contextOverflowAt.get(channelId);
@@ -670,6 +670,49 @@ function cleanResponseHeaders(headers) {
   return h;
 }
 
+// ---- Model 名稱回射工具 ----
+// 將 SSE 串流中每個 data chunk 的 model 欄位覆寫為客戶端原始請求的 model 名稱
+function createModelRewriteTransform(clientModel) {
+  if (!clientModel) return new TransformStream(); // no-op
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buf = "";
+  return new TransformStream({
+    transform(chunk, controller) {
+      buf += decoder.decode(chunk, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.startsWith("data: ") && !line.includes("[DONE]")) {
+          try {
+            const obj = JSON.parse(line.slice(6));
+            if (obj.model !== undefined) obj.model = clientModel;
+            controller.enqueue(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
+            continue;
+          } catch {}
+        }
+        if (line) controller.enqueue(encoder.encode(line + "\n"));
+      }
+    },
+    flush(controller) {
+      if (buf) controller.enqueue(encoder.encode(buf));
+    }
+  });
+}
+
+// 將 JSON 字串中的 model 欄位覆寫為客戶端原始請求的 model 名稱（非串流用）
+function rewriteModelInJson(text, clientModel) {
+  if (!clientModel || !text) return text;
+  try {
+    const obj = JSON.parse(text);
+    if (obj.model !== undefined) {
+      obj.model = clientModel;
+      return JSON.stringify(obj);
+    }
+  } catch {}
+  return text;
+}
+
 function createFilterTransform(filters) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -1029,6 +1072,102 @@ function createForwardStream(initial, reader) {
   });
 }
 
+// ---- Function Calling Simulation ----
+function injectToolDescriptions(messages, tools) {
+  const msgs = Array.isArray(messages) ? [...messages] : [];
+  let prompt = "You are a helpful assistant. You have access to the following tools:\n";
+  for (const t of tools) {
+    if (t.type === 'function' && t.function) {
+      prompt += `- ${t.function.name}: ${t.function.description || ''}\n  Parameters: ${JSON.stringify(t.function.parameters || {})}\n`;
+    }
+  }
+  prompt += "\nIf you decide to use a tool, you MUST respond ONLY with a JSON object matching this exact format:\n";
+  prompt += `{"tool": "tool_name", "args": {"arg1": "value1"}}\n`;
+  prompt += "Do not include any other text, markdown, or explanations before or after the JSON.\n";
+
+  if (msgs.length > 0 && msgs[0].role === 'system') {
+    msgs[0].content = prompt + "\n" + (msgs[0].content || "");
+  } else {
+    msgs.unshift({ role: 'system', content: prompt.trim() });
+  }
+  return msgs;
+}
+
+function processToolCallResponse(rawBody) {
+  if (!rawBody) return { modifiedBody: null };
+  let parsed;
+  try { parsed = JSON.parse(rawBody); } catch { return { modifiedBody: null }; }
+  const choice = parsed?.choices?.[0];
+  if (!choice) return { modifiedBody: null };
+  if (choice.finish_reason !== 'stop') return { modifiedBody: null };
+
+  const content = choice.message?.content || '';
+  if (!content) return { modifiedBody: null };
+
+  const re = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*?\})\s*\}/s;
+  const m = content.match(re);
+  if (!m) return { modifiedBody: null };
+
+  const toolName = m[1];
+  let toolArgs;
+  try { toolArgs = JSON.parse(m[2]); } catch { return { modifiedBody: null }; }
+
+  const toolCallId = 'call_' + Math.random().toString(36).slice(2, 12);
+  const remainingContent = content.replace(re, '').trim();
+
+  const modified = {
+    ...parsed,
+    choices: [{
+      index: choice.index || 0,
+      message: {
+        role: 'assistant',
+        content: remainingContent || null,
+        tool_calls: [{
+          id: toolCallId,
+          type: 'function',
+          function: { name: toolName, arguments: JSON.stringify(toolArgs) }
+        }],
+      },
+      finish_reason: 'tool_calls',
+    }],
+  };
+  return { modifiedBody: JSON.stringify(modified) };
+}
+
+function fakeSseStream(modifiedBodyStr) {
+  const parsed = JSON.parse(modifiedBodyStr);
+  const choice = parsed.choices[0];
+  const tc = choice.message.tool_calls[0];
+  
+  const chunk1 = {
+    id: parsed.id || 'chatcmpl-' + Date.now(),
+    object: 'chat.completion.chunk',
+    created: parsed.created || Math.floor(Date.now() / 1000),
+    model: parsed.model || 'unknown',
+    choices: [{ index: choice.index || 0, delta: { role: 'assistant' }, finish_reason: null }]
+  };
+  const chunk2 = {
+    id: chunk1.id, object: 'chat.completion.chunk', created: chunk1.created, model: chunk1.model,
+    choices: [{ index: choice.index || 0, delta: { tool_calls: [{ index: 0, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } }] }, finish_reason: null }]
+  };
+  const chunk3 = {
+    id: chunk1.id, object: 'chat.completion.chunk', created: chunk1.created, model: chunk1.model,
+    choices: [{ index: choice.index || 0, delta: {}, finish_reason: 'tool_calls' }]
+  };
+  
+  const stream = new ReadableStream({
+    start(controller) {
+      const enc = new TextEncoder();
+      controller.enqueue(enc.encode('data: ' + JSON.stringify(chunk1) + '\n\n'));
+      controller.enqueue(enc.encode('data: ' + JSON.stringify(chunk2) + '\n\n'));
+      controller.enqueue(enc.encode('data: ' + JSON.stringify(chunk3) + '\n\n'));
+      controller.enqueue(enc.encode('data: [DONE]\n\n'));
+      controller.close();
+    }
+  });
+  return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+}
+
 // ---- Reasoning → Content fallback ----
 async function patchReasoningToContent(res) {
   try {
@@ -1076,17 +1215,37 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       if (cached) return { response: new Response(cached.body, { status: 200, headers: new Headers(cached.headers) }) };
     }
   }
-  // 統一 body 為字串（避免下游重複 ArrayBuffer 解碼），同時判斷 vision/tools 需求、計算 token 並過濾非標準欄位
   let bodyStr = null;
   let needsVision = false, needsTools = false;
   let estimatedContextTokens = 0;
+  let clientRequestModel = "";
   if (body) {
     bodyStr = body instanceof ArrayBuffer ? new TextDecoder().decode(body) : (typeof body === "string" ? body : null);
   }
+  // 提取客戶端原始請求的 model 名稱，用於後續回射
+  if (bodyStr) {
+    try { clientRequestModel = JSON.parse(bodyStr)?.model || ""; } catch {}
+  }
+  // 優先選用模型名稱符合的渠道，不符合則全部渠道也可被選用
+  if (clientRequestModel && requiredType === "chat") {
+    const matching = eligible.filter(c => c.model === clientRequestModel || c.fallback_model === clientRequestModel);
+    if (matching.length > 0) {
+      // 將相符渠道提至陣列前方，不匹配的提至後方
+      const nonMatching = eligible.filter(c => c.model !== clientRequestModel && c.fallback_model !== clientRequestModel);
+      eligible = [...matching, ...nonMatching];
+    }
+    // 否則保持全部渠道（不限制模型名稱）
+  }
+  let originalStreamType = streamType;
+  let forceNonStream = false;
   if (bodyStr && requiredType === "chat") {
     try {
       const parsed = JSON.parse(bodyStr);
       let sanitized = false;
+      const promptTokens = Math.ceil(bodyStr.length / 3);
+      const maxTokens = parsed.max_tokens || parsed.max_completion_tokens || 0;
+      estimatedContextTokens = promptTokens + maxTokens;
+
       if (Array.isArray(parsed.messages)) {
         for (const msg of parsed.messages) {
           // 清除非標準欄位避免上游報錯
@@ -1094,17 +1253,30 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           if (Array.isArray(msg.content)) {
             for (const part of msg.content) {
               if (part.type === "image_url") needsVision = true;
-              if (part.type === "text" && typeof part.text === "string") estimatedContextTokens += part.text.length / 4;
             }
           } else if (typeof msg.content === "string") {
             if (/data:image\//.test(msg.content)) needsVision = true;
-            estimatedContextTokens += msg.content.length / 4;
           }
           if (msg.tool_calls || msg.tool_call_id) needsTools = true;
         }
       }
       if (parsed.tools || parsed.tool_choice) needsTools = true;
-      if (sanitized) bodyStr = JSON.stringify(parsed);
+
+      // Function Calling 模擬攔截
+      if (parsed.tools && Array.isArray(parsed.tools) && parsed.tools.length > 0) {
+        parsed.messages = injectToolDescriptions(parsed.messages, parsed.tools);
+        delete parsed.tools;
+        delete parsed.tool_choice;
+        parsed.stream = false;
+        forceNonStream = true;
+        sanitized = true;
+        logStructured("info", "tools injected, forcing non-stream", { rid });
+      }
+
+      if (sanitized) {
+        bodyStr = JSON.stringify(parsed);
+        estimatedContextTokens = Math.ceil(bodyStr.length / 3);
+      }
     } catch (e) {}
   }
   
@@ -1224,8 +1396,19 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         const parsed = JSON.parse(reqBody);
         if (parsed.model && parsed.model !== effectiveModel) {
           parsed.model = effectiveModel;
-          reqBody = JSON.stringify(parsed);
         }
+        // 套用渠道自訂的 max_tokens 上限
+        const chMaxTokens = channel.max_tokens || 0;
+        if (chMaxTokens > 0) {
+          if (parsed.max_tokens !== undefined) {
+            parsed.max_tokens = Math.min(parsed.max_tokens, chMaxTokens);
+          } else if (parsed.max_completion_tokens !== undefined) {
+            parsed.max_completion_tokens = Math.min(parsed.max_completion_tokens, chMaxTokens);
+          } else {
+            parsed.max_tokens = chMaxTokens;
+          }
+        }
+        reqBody = JSON.stringify(parsed);
       } catch (e) {}
     }
 
@@ -1332,7 +1515,19 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           }));
           res = new Response(monitoredBody, { status: res.status, statusText: res.statusText, headers: res.headers });
         }
-        return { response: await patchReasoningToContent(res), channel };
+        if (forceNonStream && res.headers.get("Content-Type")?.includes("application/json")) {
+          const rawText = await res.clone().text().catch(() => "");
+          const { modifiedBody } = processToolCallResponse(rawText);
+          if (modifiedBody) {
+            logStructured("info", "tool calls reformatted via CF", { rid });
+            if (originalStreamType === "stream") {
+              res = fakeSseStream(modifiedBody);
+            } else {
+              res = new Response(modifiedBody, { status: res.status, statusText: res.statusText, headers: res.headers });
+            }
+          }
+        }
+        return { response: await patchReasoningToContent(res), channel, clientRequestModel };
       }
       if (res.status >= 500 || res.status === 429) {
         res.body?.cancel().catch(() => {});
@@ -1385,6 +1580,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
       markDegraded(channel.id, env);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
+      attempted.add(channel.id);
       continue;
     }
   }
@@ -1407,7 +1603,7 @@ async function handleChatCompletions(c) {
   if (result.error) {
     return c.json({ error: { message: result.error.message, type: "upstream_error", param: null, code: "upstream_error" } }, result.error.status);
   }
-  const { response: upstream } = result;
+  const { response: upstream, clientRequestModel } = result;
   const resHeaders = cleanResponseHeaders(upstream.headers);
   resHeaders.set("X-Request-Id", rid);
   if (isStream) {
@@ -1424,9 +1620,19 @@ async function handleChatCompletions(c) {
     let sseBody = createIdleTimeoutStream(upstream.body, STREAM_IDLE_TIMEOUT_MS);
     const filters = await loadFilters(c.env);
     sseBody = sseBody.pipeThrough(createFilterTransform(filters));
+    // 將上游模型名稱覆寫為客戶端原始 model 名稱
+    if (clientRequestModel) {
+      sseBody = sseBody.pipeThrough(createModelRewriteTransform(clientRequestModel));
+    }
     resHeaders.set("Cache-Control", "no-cache");
     resHeaders.set("X-Accel-Buffering", "no");
     return new Response(sseBody, { status: upstream.status, headers: resHeaders });
+  }
+  // 非串流：直接改寫 JSON 中的 model 欄位
+  if (clientRequestModel && upstream.headers.get("Content-Type")?.includes("application/json")) {
+    const text = await upstream.text().catch(() => "");
+    const rewritten = rewriteModelInJson(text, clientRequestModel);
+    return new Response(rewritten, { status: upstream.status, headers: resHeaders });
   }
   return new Response(upstream.body, { status: upstream.status, headers: resHeaders });
 }
