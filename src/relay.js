@@ -14,7 +14,7 @@
  *  部署方式（擇一）:
  *   PM2（建議）:
  *     npm install pm2 -g
- *     pm2 start src/relay.js --name relay --watch --max-memory-restart 200M --kill-timeout 10000
+ *     PORT=3000 pm2 start src/relay.js --name relay --max-memory-restart 200M --kill-timeout 10000
  *     pm2 save
  *
  *   背景執行:
@@ -199,7 +199,7 @@ function processRequest(req, res) {
     return res.end(JSON.stringify({ error: 'unsupported protocol' }));
   }
 
-  // Phase 1: 立即回傳 headers（讓 CF Worker fetch() 快速 resolve）
+  // Phase 1: 立即回傳 headers（發送端 fetch() 快速 resolve）
   res.writeHead(200, {
     'Content-Type':     'application/json',
     'Transfer-Encoding': 'chunked',
@@ -253,7 +253,7 @@ function processRequest(req, res) {
       recordUpstreamSuccess(upstreamUrl.hostname);
     }
 
-    // 寫 metadata 行（CF Worker 端讀取這一行取得真實 status / headers）
+    // 寫 metadata 行（發送端取得真實 status / headers）
     try {
       res.write(JSON.stringify({ _relay: { status: sc, headers: proxyRes.headers } }) + '\n');
     } catch { abort(); return; }

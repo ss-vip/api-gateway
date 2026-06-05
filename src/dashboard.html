@@ -144,7 +144,7 @@
                 <th class="border-0 cursor-pointer" onclick="toggleSort('model')">Model <i id="sort-model" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 100px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('weight')">Weight <i id="sort-weight" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 90px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('channel_type')">Type <i id="sort-channel_type" class="bi bi-arrow-down-up opacity-25"></i></th>
-                <th style="width: 110px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('max_context_length')">Max Ctx <i id="sort-max_context_length" class="bi bi-arrow-down-up opacity-25"></i></th>
+                <th style="width: 110px" class="d-none d-lg-table-cell border-0 cursor-pointer" onclick="toggleSort('max_context_length')">Max Token <i id="sort-max_context_length" class="bi bi-arrow-down-up opacity-25"></i></th>
                 <th style="width: 150px" class="text-center border-0">Actions</th>
               </tr>
             </thead>
@@ -269,7 +269,7 @@
               <input type="number" id="ch-rpd" class="form-control form-control-sm" value="0" min="0">
             </div>
             <div class="col-6">
-              <label class="form-label mini-label fw-bold">Max Context (est. tokens) <span class="text-muted" style="font-weight:400">（0=不限）</span></label>
+              <label class="form-label mini-label fw-bold">Max Token <span class="text-muted" style="font-weight:400">（0=不限，測試可自動偵測）</span></label>
               <input type="number" id="ch-max-ctx" class="form-control form-control-sm" value="0" min="0" placeholder="12000">
             </div>
           </div>
@@ -706,19 +706,11 @@
         row += '<td class="align-middle"><span style="display:inline-flex;align-items:center;gap:2px"><code class="small copy-model mb-0" style="cursor:pointer" data-model="' + esc(c.model || '') + '" title="點擊複製">' + displayName + '</code>' + (c.channel_type === 'chat' && c.support_tools ? '<span style="font-size:0.7rem;line-height:1">🔧</span>' : '') + (c.channel_type === 'chat' && c.support_vision ? '<span style="font-size:0.7rem;line-height:1">👁️</span>' : '') + '</span></td>';
         row += '<td class="d-none d-lg-table-cell align-middle">' + esc(String(c.weight)) + '</td>';
         row += '<td class="d-none d-lg-table-cell align-middle"><span class="badge bg-primary bg-opacity-10 text-primary small">' + esc(c.channel_type || 'chat') + '</span></td>';
-        row += '<td class="d-none d-lg-table-cell align-middle">' + (c.max_context_length > 0 ? esc(String(c.max_context_length)) : '<span class="text-muted">∞</span>') + '</td>';
+          row += '<td class="d-none d-lg-table-cell align-middle">' + (+c.max_context_length > 0 ? esc(String(+c.max_context_length)) : '<span class="text-muted">∞</span>') + '</td>';
         row += '<td class="align-middle" style="min-width:90px">';
         row += '  <div class="d-none d-lg-flex justify-content-center gap-1">';
         row += '    <button onclick="editChannel(' + realIdx + ')" class="btn btn-sm btn-outline-primary py-1 px-2" title="Edit Channel"><i class="bi bi-pencil"></i></button>';
-        row += '    <div class="btn-group">';
-        row += '      <button onclick="testChannel(' + c.id + ',\'chat\')" class="btn btn-sm btn-outline-info py-1 px-2" title="Chat 測試"><i class="bi bi-play-fill"></i></button>';
-        row += '      <button type="button" class="btn btn-sm btn-outline-info dropdown-toggle dropdown-toggle-split py-1 px-1" data-bs-toggle="dropdown" title="更多測試"></button>';
-        row += '      <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
-        row += '        <li><button onclick="testChannel(' + c.id + ',\'vision\')" class="dropdown-item small py-2"><i class="bi bi-eye me-2"></i>Vision 測試</button></li>';
-        row += '        <li><button onclick="testChannel(' + c.id + ',\'tools\')" class="dropdown-item small py-2"><i class="bi bi-tools me-2"></i>Tools 測試</button></li>';
-        row += '        <li><button onclick="testChannel(' + c.id + ',\'all\')" class="dropdown-item small py-2"><i class="bi bi-grid-3x3-gap me-2"></i>全部測試</button></li>';
-        row += '      </ul>';
-        row += '    </div>';
+        row += '    <button onclick="testChannel(' + c.id + ',\'all\')" class="btn btn-sm btn-outline-info py-1 px-2" title="全部測試 (Chat+Vision+Tools)"><i class="bi bi-play-fill"></i></button>';
         row += '    <button onclick="copyChannel(' + realIdx + ')" class="btn btn-sm btn-outline-secondary py-1 px-2" title="Copy Channel"><i class="bi bi-copy"></i></button>';
         row += '    <button onclick="delChannel(' + realIdx + ')" class="btn btn-sm btn-outline-danger py-1 px-2" title="Delete Channel"><i class="bi bi-trash"></i></button>';
         row += '  </div>';
@@ -726,9 +718,6 @@
         row += '    <button class="btn btn-sm btn-outline-secondary py-1 px-2" data-bs-toggle="dropdown" title="Actions"><i class="bi bi-three-dots-vertical"></i></button>';
         row += '    <ul class="dropdown-menu dropdown-menu-end shadow border-0">';
         row += '      <li><button onclick="editChannel(' + realIdx + ')" class="dropdown-item small py-2"><i class="bi bi-pencil me-2"></i>Edit</button></li>';
-        row += '      <li><button onclick="testChannel(' + c.id + ',\'chat\')" class="dropdown-item small py-2"><i class="bi bi-chat me-2"></i>Test Chat</button></li>';
-        row += '      <li><button onclick="testChannel(' + c.id + ',\'vision\')" class="dropdown-item small py-2"><i class="bi bi-eye me-2"></i>Test Vision</button></li>';
-        row += '      <li><button onclick="testChannel(' + c.id + ',\'tools\')" class="dropdown-item small py-2"><i class="bi bi-tools me-2"></i>Test Tools</button></li>';
         row += '      <li><button onclick="testChannel(' + c.id + ',\'all\')" class="dropdown-item small py-2"><i class="bi bi-grid-3x3-gap me-2"></i>Test All</button></li>';
         row += '      <li><hr class="dropdown-divider"></li>';
         row += '      <li><button onclick="copyChannel(' + realIdx + ')" class="dropdown-item small py-2"><i class="bi bi-copy me-2"></i>Copy</button></li>';
@@ -767,6 +756,8 @@
         base_url: ch.base_url,
         api_key: ch.api_key,
         model: ch.model,
+        channel_type: ch.channel_type,
+        relay_url: ch.relay_url,
         type,
         autoFix: true,
       }, false);
@@ -795,6 +786,11 @@
           if (fixed.length > 0) msg += '<br><span style="color:#f39c12">已自動關閉: ' + fixed.join(', ') + '</span>';
         }
         toastHtml(msg, 'success', 6000);
+        // 同步 autoFix 結果到 UI（vision/tools 可能已被關閉，max_token 可能已被更新）
+        if (r.capabilities) {
+          const batch = await api('/admin/api/init', 'GET', null, false);
+          if (batch) { channels = batch.channels || []; filters = batch.filters || []; renderChannels(); renderStats(); }
+        }
       } else {
         const diag = typeof r.diagnosis === 'string' ? r.diagnosis : 'unknown';
         toast('❌ 測試失敗: ' + diag, 'danger');
@@ -922,7 +918,7 @@
       document.getElementById('ch-support-tools').checked = c.support_tools == 1;
       document.getElementById('ch-support-vision').checked = c.support_vision == 1;
 
-      document.getElementById('ch-max-ctx').value = c.max_context_length || 0;
+      document.getElementById('ch-max-ctx').value = +c.max_context_length || 0;
       updateCapabilities();
       chHeaders = Array.isArray(c.headers) ? c.headers.map(h => ({ key: h.key || '', value: h.value || '' })) : [];
       renderHeaders();
@@ -1077,7 +1073,7 @@
             support_embeddings: ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
             absolute_url: ch.absolute_url ? 1 : 0,
             response_time: ch.response_time || 0,
-            max_context_length: ch.max_context_length || 0,
+            max_context_length: +ch.max_context_length || 0,
 
           }));
           channels.splice(0, channels.length, ...newChannels);

@@ -505,8 +505,8 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
   const weights = pool.map(c => {
     let weight = Math.max(c.weight, 1);
     if (estimatedContextTokens > 0) {
-      if (c.max_context_length > 0) {
-        const ratio = estimatedContextTokens / c.max_context_length;
+      if (+c.max_context_length > 0) {
+        const ratio = estimatedContextTokens / +c.max_context_length;
         if (ratio >= 0.9) {
           weight *= 0.7;
         } else if (ratio >= 0.7) {
@@ -2121,7 +2121,7 @@ function createDashboardApi() {
           ch.support_embeddings != null ? (ch.support_embeddings ? 1 : 0) : 0,
           ch.absolute_url ? 1 : 0, ch.response_time || 0, ch.support_tools != null ? (ch.support_tools ? 1 : 0) : 1,
           ch.support_vision != null ? (ch.support_vision ? 1 : 0) : 0,
-          ch.max_context_length || 0
+          +ch.max_context_length || 0
         )
       );
     }
@@ -2223,9 +2223,64 @@ function createDashboardApi() {
     w(36, "data"); dv.setUint32(40, dataSz, true);
     return new Uint8Array(buf);
   }
+  // 產生測試用 PNG（64x64 純色，CompressionStream API 壓縮）
+  async function createTestPng(width = 64, height = 64) {
+    const rowBytes = 1 + width * 3;
+    const raw = new Uint8Array(height * rowBytes);
+    for (let y = 0; y < height; y++) {
+      const rs = y * rowBytes;
+      raw[rs] = 0;
+      for (let x = 0; x < width; x++) {
+        const px = rs + 1 + x * 3;
+        raw[px] = 255; raw[px + 1] = 0; raw[px + 2] = 0;
+      }
+    }
+    const cs = new CompressionStream('deflate');
+    const writer = cs.writable.getWriter();
+    writer.write(raw);
+    writer.close();
+    const reader = cs.readable.getReader();
+    const chunks = [];
+    while (true) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+    const total = chunks.reduce((s, c) => s + c.length, 0);
+    const compressed = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { compressed.set(c, off); off += c.length; }
+    const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    const ihdr = new Uint8Array(13);
+    const dv = new DataView(ihdr.buffer);
+    dv.setUint32(0, width, false); dv.setUint32(4, height, false);
+    ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    const pieces = [sig, pngChunk("IHDR", ihdr), pngChunk("IDAT", compressed), pngChunk("IEND", new Uint8Array(0))];
+    const totalLen = pieces.reduce((s, p) => s + p.length, 0);
+    const result = new Uint8Array(totalLen);
+    let pos = 0;
+    for (const p of pieces) { result.set(p, pos); pos += p.length; }
+    return result;
+  }
+  function pngChunk(type, data) {
+    const t = new Uint8Array([type.charCodeAt(0), type.charCodeAt(1), type.charCodeAt(2), type.charCodeAt(3)]);
+    const ci = new Uint8Array(4 + data.length);
+    ci.set(t, 0); ci.set(data, 4);
+    const crc = pngCrc32(ci);
+    const c = new Uint8Array(4 + 4 + data.length + 4);
+    const dv = new DataView(c.buffer);
+    dv.setUint32(0, data.length, false);
+    c.set(t, 4); c.set(data, 8);
+    dv.setUint32(8 + data.length, crc, false);
+    return c;
+  }
+  function pngCrc32(data) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) {
+      c ^= data[i];
+      for (let j = 0; j < 8; j++) c = (c >>> 1) ^ (c & 1 ? 0xEDB88320 : 0);
+    }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
   // 從回應中偵測上游的 max context 限制
   function detectMaxContextFromResult(json, headers, text) {
-    if (json?.max_context) return json.max_context;
+    if (json?.max_context) return +json.max_context;
     if (json?.max_input_tokens) return json.max_input_tokens;
     if (json?.max_total_tokens) return json.max_total_tokens;
     if (headers) {
@@ -2255,7 +2310,7 @@ function createDashboardApi() {
     switch (testType) {
       case "chat":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Say hi" }], max_tokens: 5, temperature: 0 });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Hi" }], max_tokens: 20, temperature: 0 });
         break;
       case "vision":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
@@ -2272,20 +2327,31 @@ function createDashboardApi() {
         break;
       case "stt":
         testUrl = baseUrl.replace(/\/+$/, "") + "/audio/transcriptions";
-        // 使用 multipart/form-data 傳送最小 WAV
         delete headers["Content-Type"]; // fetch 自動設 boundary
-        if (!relayUrl) { // relay 不支援 FormData，改用 endpoint 存在性檢查
+        {
           const wav = createMinimalWav();
           const fd = new FormData();
           fd.append("file", new Blob([wav], { type: "audio/wav" }), "test.wav");
           fd.append("model", ch.model || "whisper-1");
           body = fd;
           useFormData = true;
-        } else {
-          // relay 模式：送一個空的 POST 看端點是否回應
-          body = "{}";
         }
         isAudioTest = true;
+        break;
+      case "image_edit":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/images/edits";
+        delete headers["Content-Type"];
+        {
+          let png;
+          try { png = await createTestPng(); } catch (e) { png = null; }
+          if (!png) return { ok: false, status: 0, ms: 0, capOk: false, diagnosis: "無法產生測試圖片（CompressionStream 不可用）", maxContextDetected: 0 };
+          const fd = new FormData();
+          fd.append("image", new Blob([png], { type: "image/png" }), "test.png");
+          fd.append("prompt", "turn the image red");
+          if (ch.model) fd.append("model", ch.model);
+          body = fd;
+          useFormData = true;
+        }
         break;
       case "image_gen":
         testUrl = baseUrl.replace(/\/+$/, "") + "/images/generations";
@@ -2307,10 +2373,10 @@ function createDashboardApi() {
     try {
       let res;
       if (relayUrl) {
-        const fetchBody = typeof body === "string" ? body : JSON.stringify({});
+        const relayHeaders = { Authorization: headers.Authorization };
+        if (!useFormData) relayHeaders["Content-Type"] = "application/json";
         const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST",
-          { Authorization: headers.Authorization, "Content-Type": headers["Content-Type"] || "application/json" },
-          fetchBody, AbortSignal.timeout(TEST_TIMEOUT_MS), relayToken);
+          relayHeaders, body, AbortSignal.timeout(TEST_TIMEOUT_MS), relayToken);
         const timeoutPromise = new Promise((_, reject) =>
           setTimeout(() => reject(new Error("relay test timeout")), TEST_TIMEOUT_MS));
         res = await Promise.race([fetchPromise, timeoutPromise]);
@@ -2343,27 +2409,30 @@ function createDashboardApi() {
       } else if (testType === "image_gen") {
         capOk = Array.isArray(json?.data) && json.data.length > 0;
         capMsg = capOk ? "圖片生成正常" : "無 data 陣列";
+      } else if (testType === "image_edit") {
+        capOk = Array.isArray(json?.data) && json.data.length > 0;
+        capMsg = capOk ? "圖片編輯正常" : "無 data 陣列";
       } else if (testType === "embed") {
         capOk = Array.isArray(json?.data) && json.data.length > 0;
         capMsg = capOk ? "嵌入向量正常" : "無 data 陣列";
       } else if (testType === "moderate") {
         capOk = Array.isArray(json?.results);
         capMsg = capOk ? "審核正常" : "無 results 陣列";
-      } else {
-        // chat / vision / tools
-        const choice = json?.choices?.[0];
-        if (!choice) {
-          capOk = false; capMsg = "無 choices 陣列";
-        } else if (testType === "tools") {
-          capOk = !!choice.message?.tool_calls;
-          capMsg = capOk ? "工具呼叫正常" : "無 tool_calls 回應";
-        } else if (testType === "vision") {
-          capOk = !!choice.message?.content;
-          capMsg = capOk ? "圖片辨識正常" : "無內容回應";
         } else {
-          capOk = !!choice.message?.content;
-          capMsg = capOk ? "連線正常" : "無內容回應";
-        }
+          // chat / vision / tools
+          const choice = json?.choices?.[0];
+          if (!choice) {
+            capOk = false; capMsg = "無 choices 陣列";
+          } else if (testType === "tools") {
+            capOk = !!choice.message?.tool_calls;
+            capMsg = capOk ? "工具呼叫正常" : "無 tool_calls 回應";
+          } else if (testType === "vision") {
+            capOk = !!choice.message?.content;
+            capMsg = capOk ? "圖片辨識正常" : "無內容回應";
+          } else {
+            capOk = true; // chat 只驗證端點連線性，不驗證內容
+            capMsg = choice.message?.content ? "連線正常" : "端點正常（無回覆）";
+          }
       }
 
       // 偵測 max context
@@ -2382,8 +2451,14 @@ function createDashboardApi() {
     const { type: testType = "chat", autoFix = false } = reqBody;
     const fromBody = !!reqBody.base_url;
     let ch;
-    if (fromBody) { ch = { id: chId, ...reqBody }; }
-    else { const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || []; ch = rows[0]; }
+    if (fromBody) {
+      const dbRow = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || [];
+      if (!dbRow || dbRow.length === 0) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
+      ch = { ...dbRow[0], ...reqBody, id: chId };
+    } else {
+      const rows = (await c.env.DB.prepare("SELECT * FROM channels WHERE id=?").bind(chId).all()).results || [];
+      ch = rows[0];
+    }
     if (!ch) return c.json({ ok: false, error: "Channel not found", diagnosis: "渠道不存在" }, 404);
 
     // 根據渠道類型決定 "all" 要跑哪些測試
@@ -2401,15 +2476,15 @@ function createDashboardApi() {
       if (r.ok) anyOk = true;
     }
 
-    // auto-fix: 更新 DB
-    if (autoFix && !fromBody) {
+    // auto-fix: 更新 DB（fromBody 已合併 DB 值，可安全寫入）
+    if (autoFix) {
       const updates = [];
       if (results.vision && !results.vision.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(chId));
       if (results.tools && !results.tools.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_tools=0 WHERE id=?").bind(chId));
       // 從測試結果自動學習 max_context
       for (const [, r] of Object.entries(results)) {
-        if (r.maxContextDetected && r.maxContextDetected > (ch.max_context_length || 0)) {
-          updates.push(c.env.DB.prepare("UPDATE channels SET max_context_length=? WHERE id=?").bind(r.maxContextDetected, chId));
+        if (r.maxContextDetected && +r.maxContextDetected > (+ch.max_context_length || 0)) {
+          updates.push(c.env.DB.prepare("UPDATE channels SET max_context_length=? WHERE id=?").bind(+r.maxContextDetected, chId));
         }
       }
       if (updates.length > 0) await c.env.DB.batch(updates);
