@@ -2,24 +2,14 @@
  * HTTP 轉發代理
  *
  * 設計要點:
- *   1. 零緩衝串流 — request body 邊收邊轉送 upstream，不佔 RAM
- *   2. 連線上限 + 佇列 — MAX_REQS 超過時自動排隊等待
- *   3. Per-Channel 速率限制 — 單一行程精確計數（取代 D1 跨 isolate 版本）
- *   4. Upstream 錯誤退避 — 自動記錄上游 502 頻率，暫時繞過問題上游
- *   5. 30MB body 上限 — 防止大 body 撐爆記憶體
- *   6. Client 斷線自動 abort upstream — 不浪費 upstream 處理
- *   7. /health 自我健檢 — 回傳 uptime、記憶體、活躍連線數、佇列長度
- *   8. SIGTERM 緩衝關機 — 等待現有連線完成，最多 30s
- *
- *  部署方式（擇一）:
- *   PM2（建議）:
- *     npm install pm2 -g
- *     PORT=3000 pm2 start src/relay.js --name relay --max-memory-restart 200M --kill-timeout 10000
- *     pm2 save
- *
- *   背景執行:
- *     nohup node src/relay.js > relay.log 2>&1 &
- *
+ *   1. 零緩衝串流
+ *   2. 連線上限 + 佇列
+ *   3. Per-Channel 速率限制
+ *   4. Upstream 錯誤退避
+ *   5. 30MB body 上限
+ *   6. Client 斷線自動 abort upstream
+ *   7. /health 自我健檢
+ *   8. SIGTERM 緩衝關機
  */
 
 'use strict';
@@ -32,35 +22,36 @@ const PORT     = parseInt(process.env.PORT            || '3000',   10);
 const TIMEOUT  = parseInt(process.env.RELAY_TIMEOUT   || '300000', 10); // 5 min
 const MAX_REQS = parseInt(process.env.MAX_CONCURRENT  || '10',     10); // 並行上限 (預設 10)
 const QUEUE_MAX = parseInt(process.env.RELAY_QUEUE    || '20',     10); // 最大排隊數
+const QUEUE_TIMEOUT = parseInt(process.env.RELAY_QUEUE_TIMEOUT || '30000', 10); // queue 最長等待 30s
 const MAX_BODY = 31_457_280; // 30MB
+const RELAY_SECRET = process.env.RELAY_SECRET || '';
 
 const startTime = Date.now();
 let active      = 0;
 let totalReqs   = 0;
 let totalErrors = 0;
 
-// ---- Per-Channel 速率限制 (in-memory，單一行程精確) ----
-const rpmCounters = new Map(); // key: "channel_{id}_{minute}" → count
-const rpdCounters = new Map(); // key: "channel_{id}_{day}" → count
+const rpmCounters = new Map();
+const rpdCounters = new Map();
 
-// 每分鐘清除過期計數器，防止記憶體洩漏
 setInterval(() => {
   const now = Date.now();
   const currMin = Math.floor(now / 60000);
   const currDay = Math.floor(now / 86400000);
   for (const key of rpmCounters.keys()) {
-    if (parseInt(key.split(':')[2]) < currMin - 1) rpmCounters.delete(key);
+    const parts = key.split(':');
+    if (parseInt(parts[parts.length - 1], 10) < currMin - 1) rpmCounters.delete(key);
   }
   for (const key of rpdCounters.keys()) {
-    if (parseInt(key.split(':')[2]) < currDay - 1) rpdCounters.delete(key);
+    const parts = key.split(':');
+    if (parseInt(parts[parts.length - 1], 10) < currDay - 1) rpdCounters.delete(key);
   }
-  // 清除過期的 upstream error entries
   for (const [host, entry] of upstreamErrors) {
     if (now - entry.firstErrAt > 60000) upstreamErrors.delete(host);
   }
+  if (upstreamErrors.size > 500) upstreamErrors.clear();
 }, 60000);
 
-// 若總 entries 過多 (異常狀況)，強制清空
 function guardCounterMaps() {
   if (rpmCounters.size > 10000 || rpdCounters.size > 10000) {
     rpmCounters.clear();
@@ -68,11 +59,6 @@ function guardCounterMaps() {
   }
 }
 
-/**
- * 檢查並消耗 rate limit 配額
- * 回傳 { ok: boolean, reason?: string }
- * 此函式同步執行，無 async/await，利用 Node.js 單執行緒避免 race condition
- */
 function checkChannelRateLimit(channelId, rpmLimit, rpdLimit) {
   if (!channelId || (!rpmLimit && !rpdLimit)) return { ok: true };
   const now = Date.now();
@@ -95,7 +81,6 @@ function checkChannelRateLimit(channelId, rpmLimit, rpdLimit) {
   return { ok: true };
 }
 
-// ---- Upstream 錯誤退避 ----
 const upstreamErrors = new Map(); // key: hostname → { count, firstErrAt }
 
 function isUpstreamDegraded(hostname) {
@@ -119,7 +104,6 @@ function recordUpstreamError(hostname) {
     upstreamErrors.set(hostname, { count: 1, firstErrAt: now });
   } else {
     if (now - entry.firstErrAt > 60000) {
-      // 過期重置
       upstreamErrors.set(hostname, { count: 1, firstErrAt: now });
     } else {
       entry.count++;
@@ -137,18 +121,25 @@ function recordUpstreamSuccess(hostname) {
   }
 }
 
-// ---- 請求佇列 ----
 const waitQueue = [];
 
 function tryDequeue() {
   while (waitQueue.length > 0 && active < MAX_REQS) {
     const entry = waitQueue.shift();
+    clearTimeout(entry.qTimer); // 已取出的 entry 不再需要 timeout
     active++;
+    const dec = () => {
+      if (dec.called) return;
+      dec.called = true;
+      active = Math.max(0, active - 1);
+      tryDequeue();
+    };
+    entry.res.on('finish', dec);
+    entry.res.on('close',  dec);
     processRequest(entry.req, entry.res);
   }
 }
 
-// ---- /health 端點 ----
 function handleHealth(res) {
   const mem = process.memoryUsage();
   const payload = JSON.stringify({
@@ -170,14 +161,12 @@ function handleHealth(res) {
   res.end(payload);
 }
 
-// ---- 核心轉發（純事件串流）----
 function processRequest(req, res) {
   const targetUrlRaw = req.headers['x-target-url'];
   const rid   = (Math.random() * 0xffffff | 0).toString(36);
   const clientIp = req.socket?.remoteAddress || '?';
   console.log(`[${rid}] <- ${req.method} ${targetUrlRaw} from ${clientIp}`);
 
-  // 驗證 target URL
   if (!targetUrlRaw) {
     totalErrors++;
     console.log(`[${rid}] -> 400 missing x-target-url`);
@@ -233,7 +222,6 @@ function processRequest(req, res) {
     try { res.end(); } catch {}
   };
 
-  // Client 斷線 → 放棄 upstream
   res.on('close', () => {
     if (!res.writableFinished) {
       console.log(`[${rid}] client disconnected early`);
@@ -284,9 +272,9 @@ function processRequest(req, res) {
   });
 
   proxyReq.on('error', (e) => {
-    totalErrors++;
     console.log(`[${rid}] upstream ERROR: ${e.message}`);
     if (aborted) return;
+    totalErrors++;
     recordUpstreamError(upstreamUrl.hostname);
     try { res.write(JSON.stringify({ _relay: { error: 'upstream error: ' + e.message } }) + '\n'); } catch {}
     try { res.end(); } catch {}
@@ -302,9 +290,10 @@ function processRequest(req, res) {
     }
   });
 
-  // Phase 3: 串流 request body（零緩衝）
-  let bodyBytes    = 0;
-  let bodyLogTimer = Date.now();
+  // Phase 3: 串流 request body（零緩衝，但 proxyReq 就緒前先緩衝）
+  let bodyBytes     = 0;
+  let bodyLogTimer  = Date.now();
+  const bodyPending = []; // proxyReq 就緒前緩衝的資料
   req.on('data', (chunk) => {
     bodyBytes += chunk.length;
     if (Date.now() - bodyLogTimer > 5000) {
@@ -314,22 +303,40 @@ function processRequest(req, res) {
     if (bodyBytes > MAX_BODY) {
       totalErrors++;
       console.log(`[${rid}] body too large (${bodyBytes}), aborting`);
-      proxyReq.destroy(new Error('body too large'));
+      if (proxyReq) proxyReq.destroy(new Error('body too large'));
       try { res.end(JSON.stringify({ error: { message: `request body exceeds ${MAX_BODY / 1024 / 1024}MB` } })); } catch {}
       return;
     }
-    try { proxyReq.write(chunk); } catch (e) {
-      console.log(`[${rid}] write error: ${e.message}`);
-      abort();
+    if (proxyReq) {
+      flushBodyPending(proxyReq);
+      try { proxyReq.write(chunk); } catch (e) {
+        console.log(`[${rid}] write error: ${e.message}`);
+        abort();
+      }
+    } else {
+      bodyPending.push(chunk);
     }
   });
   req.on('end', () => {
     console.log(`[${rid}] body complete (${(bodyBytes / 1024).toFixed(0)} KB)`);
-    if (bodyBytes <= MAX_BODY) proxyReq.end();
+    if (bodyBytes <= MAX_BODY && proxyReq) {
+      flushBodyPending(proxyReq);
+      proxyReq.end();
+    }
   });
+
+  function flushBodyPending(dest) {
+    while (bodyPending.length > 0) {
+      const p = bodyPending.shift();
+      try { dest.write(p); } catch (e) {
+        console.log(`[${rid}] flush write error: ${e.message}`);
+        abort();
+        break;
+      }
+    }
+  }
 }
 
-// ---- 請求入口（含速率限制 + 併發 + 佇列）----
 function handleRequest(req, res) {
   totalReqs++;
 
@@ -340,6 +347,17 @@ function handleRequest(req, res) {
   if (req.url === '/' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('api server is working');
+  }
+
+  // 認證檢查：若 RELAY_SECRET 有設定，所有請求（含 rate limit 前）都需驗證
+  if (RELAY_SECRET) {
+    const token = req.headers['x-relay-token'];
+    if (token !== RELAY_SECRET) {
+      totalErrors++;
+      console.log(`[relay] rejected request without valid token`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: 'invalid relay token' }));
+    }
   }
 
   // Step 1: Per-Channel 速率限制（需在 writeHead 之前檢查）
@@ -396,13 +414,38 @@ function handleRequest(req, res) {
       }));
     }
     console.log(`[queue] enqueued (${waitQueue.length + 1}/${QUEUE_MAX})`);
-    waitQueue.push({ req, res });
+    const entry = { req, res };
+    // queue timeout：等待太久直接回 503
+    let qTimer = setTimeout(() => {
+      const idx = waitQueue.indexOf(entry);
+      if (idx >= 0) {
+        waitQueue.splice(idx, 1);
+        totalErrors++;
+        console.log(`[queue] timeout, rejecting`);
+        try {
+          res.writeHead(503, { 'Content-Type': 'application/json', 'X-Relay': '1' });
+          res.end(JSON.stringify({ error: { message: 'queue timeout' }, _relay: { status: 503, headers: {} } }));
+        } catch (e) { /* client 可能已斷線 */ }
+      }
+    }, QUEUE_TIMEOUT);
+    entry.qTimer = qTimer;
+    // client 斷線時從 queue 移除，不浪費 upstream 連線
+    res.on('close', () => {
+      const idx = waitQueue.indexOf(entry);
+      if (idx >= 0) {
+        waitQueue.splice(idx, 1);
+        clearTimeout(entry.qTimer);
+      }
+    });
+    waitQueue.push(entry);
     return;
   }
   active++;
   const dec = () => {
+    if (dec.called) return; // 防 finish + close 雙重觸發
+    dec.called = true;
     active = Math.max(0, active - 1);
-    tryDequeue(); // 有空位時從佇列取下一個
+    tryDequeue();
   };
   res.on('finish', dec);
   res.on('close',  dec);
@@ -410,7 +453,6 @@ function handleRequest(req, res) {
   processRequest(req, res);
 }
 
-// ---- 全域例外捕捉（crash 前紀錄）----
 process.on('uncaughtException', (err) => {
   console.error('[relay] UNCAUGHT EXCEPTION:', err.stack || err.message || err);
   // 不 exit，讓 process 繼續（Node.js 預設會 exit，但我們希望 PM2 重啟時有 log）
@@ -419,7 +461,6 @@ process.on('unhandledRejection', (reason) => {
   console.error('[relay] UNHANDLED REJECTION:', reason instanceof Error ? reason.stack : reason);
 });
 
-// ---- Server ----
 const server = http.createServer(handleRequest);
 server.timeout         = TIMEOUT;
 server.maxHeadersCount = 200;
@@ -427,7 +468,6 @@ server.listen(PORT, () => {
   console.log(`[relay] ready port=${PORT} timeout=${TIMEOUT}ms concurrent=${MAX_REQS} queue=${QUEUE_MAX}`);
 });
 
-// ---- SIGTERM 緩衝關機 ----
 process.on('SIGTERM', () => {
   console.log(`[relay] SIGTERM — draining ${active} active, ${waitQueue.length} queued...`);
   server.close(() => {

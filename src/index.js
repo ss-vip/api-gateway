@@ -3,10 +3,11 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import portalHtml from "./dashboard.html";
 
-const UPSTREAM_TIMEOUT_MS = 25_000;     // chat 請求總 timeout（CF Free 平台限制 30s，保留 5s 緩衝）
-const LONG_TIMEOUT_MS = 25_000;         // 非 chat 同限制
-const CHANNEL_COOLDOWN_MS = 60_000;     // channel 冷卻 60 秒（獨立於 timeout）
-const STREAM_IDLE_TIMEOUT_MS = 60_000; // 60s 無新 chunk 視為斷流，比 180s 更快回應
+const UPSTREAM_TIMEOUT_MS = 25_000;     // CF Free 平台限制 30s，保留 5s 緩衝
+const LONG_TIMEOUT_MS = 25_000;
+const CHANNEL_COOLDOWN_BASE_MS = 30_000; // 指數退避 ×2^n，上限 300s
+const CHANNEL_COOLDOWN_MAX_MS = 300_000;
+const STREAM_IDLE_TIMEOUT_MS = 60_000;  // 60s 無新 chunk 視為斷流
 
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
@@ -16,7 +17,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const adminSessions = new Map();
 let sessionPruneCounter = 0;
 
-// 自動學習：渠道實際能承載的 context 上限（從 runtime 錯誤回饋）
+// 自動學習：渠道實際 context 上限（從 runtime 錯誤回饋）
 const contextOverflowAt = new Map();
 function isContextLengthError(text) {
   return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit/i.test(text);
@@ -158,7 +159,10 @@ function bytesToHex(bytes) {
 }
 
 let pepper = "";
-function setPepper(p) { pepper = p || ""; }
+function setPepper(p) {
+  pepper = p || "";
+  if (!p) console.warn("[security] PASSWORD_PEPPER not set — using empty pepper; PBKDF2 strength reduced");
+}
 
 async function hashPassword(password) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -409,6 +413,9 @@ const typeChannelCache = new Map(); // "type" => { data, ts }
 const typeLoadPromises = new Map(); // "type" => Promise (去重用)
 const TYPE_CACHE_TTL = 30000;
 const degradedUntil = new Map();
+const degradeCount = new Map(); // channel id → 連續降級次數（用於指數退避）
+let relayHealthy = true;        // relay 健康狀態，連續錯誤時標記 false 以繞過 relay
+let relayErrorCount = 0;        // relay 連續錯誤計數
 
 async function loadChannels(env, channelType) {
   const now = Date.now();
@@ -533,8 +540,11 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
 }
 
 function markDegraded(channelId, env) {
-  const until = Date.now() + CHANNEL_COOLDOWN_MS;
+  const currentCount = degradeCount.get(channelId) || 0;
+  const backoffMs = Math.min(CHANNEL_COOLDOWN_BASE_MS * Math.pow(2, currentCount), CHANNEL_COOLDOWN_MAX_MS);
+  const until = Date.now() + backoffMs;
   degradedUntil.set(channelId, until);
+  degradeCount.set(channelId, currentCount + 1);
   if (env) {
     // 遞增 consecutive_errors；達閾值則自動關閉 channel（冷卻過後管理員可手動重啟）
     env.DB.prepare(`UPDATE channels SET cooldown_until=?, consecutive_errors=consecutive_errors+1, consecutive_successes=0 WHERE id=?`).bind(until, channelId).run().catch(() => {});
@@ -543,6 +553,7 @@ function markDegraded(channelId, env) {
 
 function markHealthy(channelId, env) {
   degradedUntil.delete(channelId);
+  degradeCount.delete(channelId);
   if (env) {
     // 遞增 consecutive_successes；達 3 次則重置 consecutive_errors 與 cooldown
     env.DB.prepare(`UPDATE channels SET cooldown_until=0, consecutive_successes=consecutive_successes+1, consecutive_errors=0 WHERE id=?`).bind(channelId).run().catch(() => {});
@@ -557,9 +568,25 @@ function isDegraded(channelId) {
   return false;
 }
 
-// ---- D1 共用速率限制（跨所有 Worker isolate） ----
-
 const localTokenBuckets = new Map(); // D1 故障時 fallback
+let cleanupRlCounter = 0;
+
+// 定期清理過期的 rate_limits 記錄，防止 D1 儲存無限增長
+async function tryCleanupRateLimits(env) {
+  try {
+    const now = Date.now();
+    await env.DB.prepare(
+      `DELETE FROM rate_limits WHERE
+        (bucket_type = 'rpm' AND window_start < ?) OR
+        (bucket_type = 'rpd' AND window_start < ?) OR
+        (bucket_type = 'client_ip' AND window_start < ?)`
+    ).bind(
+      Math.floor(now / 60000) - 1,    // RPM：保留最近 1 分鐘
+      Math.floor(now / 86400000) - 1,  // RPD：保留最近 1 天
+      Math.floor(now / 60000) - 1     // client_ip：保留最近 1 分鐘
+    ).run();
+  } catch (e) { /* 清理失敗不影響主流程 */ }
+}
 
 async function checkRateLimitD1(env, channel) {
   if (!channel.rpm_limit && !channel.rpd_limit) return { ok: true };
@@ -607,16 +634,20 @@ async function checkRateLimitD1(env, channel) {
     // D1 失敗 → fallback 到本地記憶體
     return localCheckAndConsume(channel);
   }
+  // 低成本清理：每 500 次 rate limit 查詢清理一次過期記錄
+  if (++cleanupRlCounter % 500 === 0) {
+    tryCleanupRateLimits(env);
+  }
   return { ok: true };
 }
 
 // 退還 D1 rate limit 配額（fire-and-forget，不阻塞請求）
-function refundRateLimitD1(env, channel) {
+// rpmWindow/rpdWindow 使用請求抵達時的視窗值，避免跨分鐘/日退款到錯誤 bucket
+function refundRateLimitD1(env, channel, rpmWindow, rpdWindow) {
   if (!channel.rpm_limit && !channel.rpd_limit) return;
-  const now = Date.now();
   const stmts = [];
   if (channel.rpm_limit > 0) {
-    const minute = Math.floor(now / 60000);
+    const minute = rpmWindow ?? Math.floor(Date.now() / 60000);
     stmts.push(
       env.DB.prepare(
         `UPDATE rate_limits SET count = MAX(0, count - 1)
@@ -625,7 +656,7 @@ function refundRateLimitD1(env, channel) {
     );
   }
   if (channel.rpd_limit > 0) {
-    const day = Math.floor(now / 86400000);
+    const day = rpdWindow ?? Math.floor(Date.now() / 86400000);
     stmts.push(
       env.DB.prepare(
         `UPDATE rate_limits SET count = MAX(0, count - 1)
@@ -661,7 +692,6 @@ function localCheckAndConsume(channel) {
   return { ok: true };
 }
 
-// Client IP 速率限制（D1 原子操作）
 const IP_LIMIT_PER_MIN = 60;
 
 async function checkClientIpRateLimit(env, clientIp) {
@@ -684,7 +714,6 @@ async function checkClientIpRateLimit(env, clientIp) {
   return { ok: true };
 }
 
-// 記憶體快取（non-stream 響應）
 const responseCache = new Map();
 const CACHE_MAX_ENTRIES = 200;
 
@@ -755,6 +784,12 @@ function clearGatewayCache() {
   globalConfigCache = { token: null, relay_url: null, relay_token: null, ts: 0 };
   filterCache = { data: null, ts: 0 };
   localTokenBuckets.clear();
+  responseCache.clear();
+  contextOverflowAt.clear();
+  degradedUntil.clear();
+  degradeCount.clear();
+  relayHealthy = true;
+  relayErrorCount = 0;
   clearChannelCache();
 }
 
@@ -765,7 +800,7 @@ function pruneRuntimeMaps() {
   if (pruneCounter % 50 !== 0) return;
   if (contextOverflowAt.size > 100) {
     // 只保留最近 100 筆
-    const entries = [...contextOverflowAt.entries()].sort((a, b) => b[1] - a[1]);
+    const entries = [...contextOverflowAt.entries()].sort((a, b) => a[1] - b[1]);
     contextOverflowAt.clear();
     for (let i = 0; i < Math.min(100, entries.length); i++) {
       contextOverflowAt.set(entries[i][0], entries[i][1]);
@@ -790,22 +825,23 @@ function buildBaseHeaders(reqHeaders, rid) {
   headers.delete("x-forwarded-for");
   headers.delete("x-forwarded-proto");
   headers.delete("x-real-ip");
+  headers.delete("cookie");
+  headers.delete("set-cookie");
+  headers.delete("authorization");  // 移除原始 authorization，後續重新設為 channel 的 api_key
   return headers;
 }
 
 function cleanResponseHeaders(headers) {
   const h = new Headers(headers);
-  h.delete("content-encoding");
+  // 保留 content-encoding（上游可能回傳 gzip），只移除 hop-by-hop 與 CF 內部 headers
   h.delete("transfer-encoding");
   h.delete("cf-ray");
   h.delete("cf-cache-status");
   return h;
 }
 
-// ---- Model 名稱回射工具 ----
-// 將 SSE 串流中每個 data chunk 的 model 欄位覆寫為客戶端原始請求的 model 名稱
 function createModelRewriteTransform(clientModel) {
-  if (!clientModel) return new TransformStream(); // no-op
+  if (!clientModel) return new TransformStream();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buf = "";
@@ -823,7 +859,6 @@ function createModelRewriteTransform(clientModel) {
             continue;
           } catch {}
         }
-        // [DONE] 需要完整 \n\n 才算完整 SSE 事件，否則 client 會無限期等待下一個 chunk
         if (line.startsWith("data: ") && line.includes("[DONE]")) {
           controller.enqueue(encoder.encode(line + "\n\n"));
           continue;
@@ -837,7 +872,6 @@ function createModelRewriteTransform(clientModel) {
   });
 }
 
-// 將 JSON 字串中的 model 欄位覆寫為客戶端原始請求的 model 名稱（非串流用）
 function rewriteModelInJson(text, clientModel) {
   if (!clientModel || !text) return text;
   try {
@@ -850,7 +884,6 @@ function rewriteModelInJson(text, clientModel) {
   return text;
 }
 
-// 從串流 body 偷看第一 chunk 而不消耗整個串流
 async function peekFirstChunk(body) {
   if (!body) return { done: true, value: null, tail: null };
   const reader = body.getReader();
@@ -1054,7 +1087,11 @@ function createFilterTransform(filters) {
         } else if (/^\{/.test(line)) {
           // 裸 JSON（無 data: 前綴）→ 補上 data: 前綴
           controller.enqueue(encoder.encode("data: " + line + "\n\n"));
-        } else if (/^\[DONE\]/.test(line) || /^\[ERROR\]/.test(line)) {
+        } else if (/^\[ERROR\]/.test(line)) {
+          controller.enqueue(encoder.encode("data: " + JSON.stringify({
+            choices: [{ index: 0, delta: {}, finish_reason: "error" }]
+          }) + "\n\ndata: [DONE]\n\n"));
+        } else if (/^\[DONE\]/.test(line)) {
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         } else {
           controller.enqueue(encoder.encode(line + "\n"));
@@ -1088,10 +1125,12 @@ function createIdleTimeoutStream(readable, idleMs) {
         await writer.write(result.value);
       }
     } catch (e) {
-      // 閒置逾時 → 送錯誤 chunk 讓 client 知道串流不完整
+      // 不論閒置逾時或其他串流錯誤，都送 error chunk 讓 client 知道串流不完整
+      const isIdle = e.message === "idle";
+      logStructured("warn", isIdle ? "stream idle timeout" : "stream error", { error: e.message?.slice(0, 100) || "unknown" });
       try {
         await writer.write(enc.encode("data: " + JSON.stringify({
-          id: "timeout", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "",
+          id: "stream_end", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: "",
           choices: [{ index: 0, delta: {}, finish_reason: "error" }]
         }) + "\n\ndata: [DONE]\n\n"));
       } catch (_) {}
@@ -1102,10 +1141,6 @@ function createIdleTimeoutStream(readable, idleMs) {
   return out;
 }
 
-// ---- Relay Plugin（HTTP 轉發代理）----
-
-// 解析 relay 回應格式：第一行為 {"_relay":{"status":200,"headers":{...}}} metadata
-// 其餘為實際 upstream body（以 ReadableStream 回傳）
 async function parseRelayResponse(relayRes) {
   if (!relayRes.ok || !relayRes.body) {
     const text = await relayRes.text().catch(() => "relay unavailable");
@@ -1170,7 +1205,6 @@ async function parseRelayResponse(relayRes) {
   }
 }
 
-// Global relay: 使用 env.RELAY_BASE_URL 全局設定（所有類型皆可使用）
 async function upstreamFetch(url, opts, env, rid, noRelay, channel) {
   if (noRelay || !env.RELAY_BASE_URL) {
     return fetch(url, opts);
@@ -1197,7 +1231,6 @@ async function upstreamFetch(url, opts, env, rid, noRelay, channel) {
   return parsed.response;
 }
 
-// Per-channel relay: 使用 channel.relay_url 逐一設定
 async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, signal, relaySecret) {
   const h = new Headers(baseHeaders);
   h.set("x-target-url", targetUrl);
@@ -1254,7 +1287,6 @@ function createForwardStream(initial, reader) {
   });
 }
 
-// ---- Reasoning → Content fallback ----
 async function patchReasoningToContent(res) {
   try {
     const ct = (res.headers.get("Content-Type") || "").toLowerCase();
@@ -1390,6 +1422,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   let attempts = 0;
   let reqBody = bodyStr;
   let retryAsNonStream = false;
+  const reqMinute = Math.floor(Date.now() / 60000);
+  const reqDay = Math.floor(Date.now() / 86400000);
   while (attempts < maxAttempts && attempted.size < eligible.length) {
     attempts++;
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
@@ -1510,7 +1544,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       if (requiredType === "realtime") {
         // WebSocket upgrade 無法透過 HTTP relay，必須直連
         res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, true);
-      } else if (globalRelayUrl?.trim()) {
+      } else if (globalRelayUrl?.trim() && relayHealthy) {
         const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
         // relay server 即回 meta 架構，避免 CF 邊緣網路 100s 無回應觸發 524
         // 傳遞 channel 速率限制資訊給 relay，讓 relay 做精確的 in-memory 計數
@@ -1529,8 +1563,20 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       if (res.headers.get("X-Relay-Error") === "1") {
         res.body?.cancel().catch(() => {});
         attempted.add(channel.id);
+        relayErrorCount++;
+        if (relayErrorCount >= 5) {
+          relayHealthy = false;
+          // 暫停使用 relay 60 秒（防止 relay 徹底掛掉時大量請求持續失敗）
+          setTimeout(() => { relayHealthy = true; relayErrorCount = 0; }, 60_000);
+          logStructured("warn", "relay repeatedly failing, disabling for 60s", { relay: globalRelayUrl, rid });
+        }
         logStructured("warn", "relay error, retrying", { relay: globalRelayUrl, status: res.status, rid });
         continue;
+      }
+      // relay 請求成功 → 逐漸恢復 relay 信心
+      if (globalRelayUrl?.trim() && relayErrorCount > 0) {
+        relayErrorCount = Math.max(0, relayErrorCount - 1);
+        if (relayErrorCount === 0) relayHealthy = true;
       }
       if (res.ok) {
         markHealthy(channel.id, env);
@@ -1546,7 +1592,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
                 parsed.stream = false;
                 reqBody = JSON.stringify(parsed);
                 retryAsNonStream = true;
-                refundRateLimitD1(env, channel);
+                refundRateLimitD1(env, channel, reqMinute, reqDay);
                 markDegraded(channel.id, env);
                 logStructured("warn", "invalid SSE body, retrying with stream=false", { channel: channel.name, rid });
                 continue;
@@ -1654,7 +1700,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             parsed.stream = false;
             reqBody = JSON.stringify(parsed);
             retryAsNonStream = true;
-            refundRateLimitD1(env, channel);  // 退還 rate limit 配額，避免重試同一渠道時雙重計算
+            refundRateLimitD1(env, channel, reqMinute, reqDay);  // 退還 rate limit 配額，避免重試同一渠道時雙重計算
             logStructured("warn", "4xx with stream=true, retrying same channel with stream=false", { channel: channel.name, status: res.status, rid });
             continue;
           }
@@ -1676,7 +1722,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     } catch (err) {
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
-      refundRateLimitD1(env, channel);
+      refundRateLimitD1(env, channel, reqMinute, reqDay);
       if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
       markDegraded(channel.id, env);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
@@ -1750,7 +1796,9 @@ function nonStreamToStream(bodyText, filters) {
         for (const line of bodyText.split('\n')) {
           const trimmed = line.trim();
           if (!trimmed) continue;
-          if (/^\[DONE\]/.test(trimmed) || /^\[ERROR\]/.test(trimmed)) {
+          if (/^\[ERROR\]/.test(trimmed)) {
+            await w.write(enc.encode("data: " + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "error" }] }) + "\n\ndata: [DONE]\n\n"));
+          } else if (/^\[DONE\]/.test(trimmed)) {
             await w.write(enc.encode("data: [DONE]\n\n"));
           } else if (trimmed.startsWith('{')) {
             await w.write(enc.encode("data: " + trimmed + "\n\n"));
@@ -1877,8 +1925,6 @@ async function wrapNonStreamToStream(c, upstream, headers) {
 }
 
 async function handleModels(c) {
-  // 從 channel config 直接聚合模型列表，不依賴各 upstream /v1/models
-  // 確保所有渠道類型（含 image_gen / tts / stt 等）都能正確顯示
   const channels = await loadChannels(c.env);
   const data = [];
   const seen = new Set();
@@ -1929,7 +1975,6 @@ async function handleGenericProxy(c) {
 }
 
 async function authMiddleware(c, next) {
-  // 跳過非 API 路由（admin portal、login 等）
   const path = c.req.path;
   if (path.startsWith("/admin") || path === "/login" || path === "/" || path === "/api") return next();
   if (c.req.method === "OPTIONS") return next();
@@ -1950,7 +1995,6 @@ async function authMiddleware(c, next) {
 }
 
 function registerGateway(app) {
-  // 有前綴路徑 /v1, /v1beta, /v2, /v3, /v4
   for (const p of API_PREFIXES) {
     app.use(p + "/*", authMiddleware);
     app.post(p + "/chat/completions", handleChatCompletions);
@@ -1958,7 +2002,6 @@ function registerGateway(app) {
     app.get(p + "/models", handleModels);
     app.all(p + "/*", handleGenericProxy);
   }
-  // 無前綴路徑（相容 OpenCode/Claude Code 等不含 /v1 的 client）
   app.post("/chat/completions", authMiddleware, handleChatCompletions);
   app.post("/completions", authMiddleware, handleChatCompletions);
   app.get("/models", authMiddleware, handleModels);
@@ -1973,7 +2016,12 @@ function checkSetupRateLimit(ip) {
     for (const [k, v] of setupRateLimit) {
       if (v.banUntil > 0 && now >= v.banUntil) setupRateLimit.delete(k);
     }
-    if (setupRateLimit.size > 500) setupRateLimit.clear();
+    if (setupRateLimit.size > 500) {
+      // 保留已被 ban 的 IP，移除一般記錄
+      for (const [k, v] of setupRateLimit) {
+        if (v.banUntil === 0) setupRateLimit.delete(k);
+      }
+    }
   }
   const state = setupRateLimit.get(ip) || { count: 0, banUntil: 0 };
   const attempt = state.count + 1;
@@ -2481,13 +2529,15 @@ function createDashboardApi() {
       const updates = [];
       if (results.vision && !results.vision.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(chId));
       if (results.tools && !results.tools.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_tools=0 WHERE id=?").bind(chId));
-      // 從測試結果自動學習 max_context
       for (const [, r] of Object.entries(results)) {
         if (r.maxContextDetected && +r.maxContextDetected > (+ch.max_context_length || 0)) {
           updates.push(c.env.DB.prepare("UPDATE channels SET max_context_length=? WHERE id=?").bind(+r.maxContextDetected, chId));
         }
       }
-      if (updates.length > 0) await c.env.DB.batch(updates);
+      if (updates.length > 0) {
+        await c.env.DB.batch(updates);
+        clearGatewayCache();
+      }
     }
 
     const capabilities = {};
@@ -2534,7 +2584,8 @@ function pruneLoginState() {
     if (state.banUntil > 0 && now >= state.banUntil) loginState.delete(ip);
   }
   if (loginState.size > 1000) {
-    const entries = [...loginState.entries()].sort((a, b) => a[1].count - b[1].count);
+    // 保留嘗試次數最多（最惡意）的 500 筆，清除低計數記錄
+    const entries = [...loginState.entries()].sort((a, b) => b[1].count - a[1].count);
     for (let i = 500; i < entries.length; i++) loginState.delete(entries[i][0]);
   }
 }
@@ -2618,7 +2669,6 @@ app.onError((err, c) => {
   console.error("[error]", err.message, err.stack?.slice(0, 500));
   return c.json({
     error: { message: "The server had an error processing your request", type: "server_error", param: null, code: "api_error" },
-    _debug: err.message,
   }, 500);
 });
 
