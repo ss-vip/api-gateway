@@ -909,6 +909,7 @@ function isValidSseChunk(chunk) {
   if (!chunk || chunk.byteLength === 0) return false;
   const text = new TextDecoder().decode(chunk, { stream: true });
   const trimmed = text.trimStart();
+  if (trimmed === '') return true;
   return trimmed.startsWith('data:') || trimmed.startsWith(':');
 }
 
@@ -1241,8 +1242,14 @@ async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, si
   const decoder = new TextDecoder();
   let buf = "";
   const MAX_META = 65536;
+  const READ_TIMEOUT = 30000;
   while (true) {
-    const { done, value } = await reader.read();
+    let timeoutId;
+    const result = await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error("relay read timeout")), READ_TIMEOUT); }),
+    ]).finally(() => clearTimeout(timeoutId));
+    const { done, value } = result;
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     if (buf.length > MAX_META) {
@@ -1256,6 +1263,13 @@ async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, si
       try {
         const meta = JSON.parse(metaLine);
         if (meta._relay) {
+          if (meta._relay.error) {
+            reader.cancel().catch(() => {});
+            return new Response(JSON.stringify({ error: meta._relay.error }), {
+              status: 502,
+              headers: { "content-type": "application/json", "x-relay-error": "1" }
+            });
+          }
           const upstreamStatus = meta._relay.status || relayRes.status;
           const upstreamHeaders = new Headers(meta._relay.headers || {});
           const fwd = createForwardStream(rest, reader);
@@ -1266,7 +1280,7 @@ async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, si
       return new Response(fallback, { status: relayRes.status, headers: relayRes.headers });
     }
   }
-  return new Response("", { status: relayRes.status, headers: relayRes.headers });
+  return new Response(buf || "", { status: relayRes.status, headers: relayRes.headers });
 }
 
 function createForwardStream(initial, reader) {
@@ -1385,7 +1399,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
     } catch (e) {}
   }
-  
+
   if (estimatedContextTokens > 0) {
     eligible = eligible.filter(c => {
       const configured = c.max_context_length;
@@ -1396,7 +1410,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       return estimatedContextTokens < effectiveMax;
     });
   }
-  
+
   if (needsVision) eligible = eligible.filter(c => c.support_vision && !channelNoVision.has(c.id));
   if (needsTools && !globalRelayUrl?.trim()) {
     eligible = eligible.filter(c => c.support_tools && !channelNoTools.has(c.id));
@@ -2346,27 +2360,27 @@ function createDashboardApi() {
   }
 
   async function runSingleTest(ch, testType, env) {
-    const relayUrl = ch.relay_url?.trim();
-    const { relay_token: dbRelayToken } = await resolveGlobalConfig(env);
+    const { relay_url: globalRelayUrl, relay_token: dbRelayToken } = await resolveGlobalConfig(env);
+    const relayUrl = ch.relay_url?.trim() || globalRelayUrl?.trim();
     const relayToken = dbRelayToken || env.RELAY_SECRET;
     const baseUrl = ch.base_url || "";
     const headers = { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" };
-    const TEST_TIMEOUT_MS = 10000;
+    const TEST_TIMEOUT_MS = 45000;
     let testUrl, body, useFormData = false, isAudioTest = false;
 
     // 根據 testType 設定 url、body 與 Content-Type
     switch (testType) {
       case "chat":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Hi" }], max_tokens: 20, temperature: 0 });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Hi" }], max_tokens: 20, temperature: 0, stream: false });
         break;
       case "vision":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: [{ type: "text", text: "Describe" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }], max_tokens: 10, temperature: 0 });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: [{ type: "text", text: "Describe" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }], max_tokens: 10, temperature: 0, stream: false });
         break;
       case "tools":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Weather in Tokyo" }], tools: [{ type: "function", function: { name: "get_weather", description: "Get weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }], tool_choice: "auto", max_tokens: 50, temperature: 0 });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Weather in Tokyo" }], tools: [{ type: "function", function: { name: "get_weather", description: "Get weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }], tool_choice: "auto", max_tokens: 50, temperature: 0, stream: false });
         break;
       case "tts":
         testUrl = baseUrl.replace(/\/+$/, "") + "/audio/speech";
@@ -2443,7 +2457,17 @@ function createDashboardApi() {
       }
 
       let json;
-      try { json = JSON.parse(text); } catch { json = null; }
+      try {
+        json = JSON.parse(text);
+      } catch {
+        json = null;
+        for (const line of text.split("\n")) {
+          const t = line.trim();
+          if (t.startsWith("data: ") && !t.includes("[DONE]")) {
+            try { json = JSON.parse(t.slice(6)); break; } catch { /* 繼續 */ }
+          }
+        }
+      }
 
       let capOk = false, capMsg = "無法驗證", maxCtx = 0;
 
@@ -2599,7 +2623,7 @@ function createDashboardApp() {
     const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
     if (Date.now() - lastCleanupTs > 300_000) { lastCleanupTs = Date.now(); if (loginState.size > 1000) pruneLoginState(); }
     const state = loginState.get(ip) || { count: 0, banUntil: 0 };
-    if (Date.now() < state.banUntil) return c.json({ error: "嘗試過多，請 15 分鐘後再试" }, 429);
+    if (Date.now() < state.banUntil) return c.json({ error: "嘗試過多，請 15 分鐘後重試" }, 429);
     const { password } = await c.req.json();
     if (!password) return c.json({ error: "密碼 required" }, 400);
     const storedHash = await getAdminPass(c);
@@ -2649,7 +2673,17 @@ let initLock = null;
 app.use("*", async (c, next) => {
   if (!inited) {
     if (!initLock) initLock = (async () => {
-      try { await initConfig(c.env); inited = true; } catch (e) { console.error("[init]", e.message); }
+      try {
+        if (!c.env || !c.env.DB) {
+          throw new Error("D1 database 'DB' is not bound. Please check your wrangler.toml or Cloudflare bindings.");
+        }
+        await initConfig(c.env);
+        inited = true;
+      } catch (e) {
+        console.error("[init]", e.message);
+        initLock = null;
+        throw e;
+      }
       initLock = null;
     })();
     await initLock;
