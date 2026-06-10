@@ -112,7 +112,6 @@ function recordUpstreamError(hostname) {
 }
 
 function recordUpstreamSuccess(hostname) {
-  // 連續成功可降低退避等級
   if (!hostname) return;
   const entry = upstreamErrors.get(hostname);
   if (entry && Date.now() - entry.firstErrAt <= 60000 && entry.count > 0) {
@@ -170,8 +169,8 @@ function processRequest(req, res) {
   if (!targetUrlRaw) {
     totalErrors++;
     console.log(`[${rid}] -> 400 missing x-target-url`);
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ error: 'missing x-target-url' }));
+    res.writeHead(400, { 'Content-Type': 'application/json', 'X-Relay': '1' });
+    return res.end(JSON.stringify({ error: { message: 'missing x-target-url' }, _relay: { status: 400, headers: {} } }));
   }
 
   let upstreamUrl;
@@ -179,13 +178,13 @@ function processRequest(req, res) {
   catch {
     totalErrors++;
     console.log(`[${rid}] -> 400 invalid x-target-url`);
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ error: 'invalid x-target-url' }));
+    res.writeHead(400, { 'Content-Type': 'application/json', 'X-Relay': '1' });
+    return res.end(JSON.stringify({ error: { message: 'invalid x-target-url' }, _relay: { status: 400, headers: {} } }));
   }
   if (!['http:', 'https:'].includes(upstreamUrl.protocol)) {
     totalErrors++;
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ error: 'unsupported protocol' }));
+    res.writeHead(400, { 'Content-Type': 'application/json', 'X-Relay': '1' });
+    return res.end(JSON.stringify({ error: { message: 'unsupported protocol' }, _relay: { status: 400, headers: {} } }));
   }
 
   // Phase 1: 立即回傳 headers（發送端 fetch() 快速 resolve）
@@ -208,7 +207,7 @@ function processRequest(req, res) {
   };
   // 過濾 hop-by-hop headers；保留 content-length 讓上游知道大小
   const HOP_HEADERS = new Set(['host', 'x-target-url', 'connection', 'transfer-encoding',
-    'x-channel-id', 'x-channel-rpm', 'x-channel-rpd']);
+    'x-channel-id', 'x-channel-rpm', 'x-channel-rpd', 'x-relay-token']);
   for (const [k, v] of Object.entries(req.headers)) {
     if (!HOP_HEADERS.has(k)) opts.headers[k] = v;
   }
@@ -224,7 +223,6 @@ function processRequest(req, res) {
     try { res.end(); } catch {}
   };
 
-  // 在 writeHead 之前設定 close 監聽，避免 race condition
   res.on('close', () => {
     if (!res.writableFinished) {
       console.log(`[${rid}] client disconnected early`);
@@ -246,7 +244,14 @@ function processRequest(req, res) {
 
     // 寫 metadata 行（發送端取得真實 status / headers）
     try {
-      res.write(JSON.stringify({ _relay: { status: sc, headers: proxyRes.headers } }) + '\n');
+      const safeHeaders = {};
+      if (proxyRes.headers) {
+        for (const [k, v] of Object.entries(proxyRes.headers)) {
+          if (typeof v === 'string' || typeof v === 'number') safeHeaders[k] = v;
+          else if (Array.isArray(v)) safeHeaders[k] = v.join(', ');
+        }
+      }
+      res.write(JSON.stringify({ _relay: { status: sc, headers: safeHeaders } }) + '\n');
     } catch { abort(); return; }
 
     if (aborted) return;
@@ -294,10 +299,9 @@ function processRequest(req, res) {
     }
   });
 
-  // Phase 3: 串流 request body（零緩衝，但 proxyReq 就緒前先緩衝）
-  let bodyBytes     = 0;
-  let bodyLogTimer  = Date.now();
-  const bodyPending = []; // proxyReq 就緒前緩衝的資料
+  // Phase 3: 串流 request body 到 upstream
+  let bodyBytes    = 0;
+  let bodyLogTimer = Date.now();
   req.on('data', (chunk) => {
     bodyBytes += chunk.length;
     if (Date.now() - bodyLogTimer > 5000) {
@@ -307,38 +311,20 @@ function processRequest(req, res) {
     if (bodyBytes > MAX_BODY) {
       totalErrors++;
       console.log(`[${rid}] body too large (${bodyBytes}), aborting`);
-      if (proxyReq) proxyReq.destroy(new Error('body too large'));
+      aborted = true;
+      if (proxyReq) proxyReq.destroy();
       try { res.end(JSON.stringify({ error: { message: `request body exceeds ${MAX_BODY / 1024 / 1024}MB` } })); } catch {}
       return;
     }
-    if (proxyReq) {
-      flushBodyPending(proxyReq);
-      try { proxyReq.write(chunk); } catch (e) {
-        console.log(`[${rid}] write error: ${e.message}`);
-        abort();
-      }
-    } else {
-      bodyPending.push(chunk);
+    try { proxyReq.write(chunk); } catch (e) {
+      console.log(`[${rid}] write error: ${e.message}`);
+      abort();
     }
   });
   req.on('end', () => {
     console.log(`[${rid}] body complete (${(bodyBytes / 1024).toFixed(0)} KB)`);
-    if (bodyBytes <= MAX_BODY && proxyReq) {
-      flushBodyPending(proxyReq);
-      proxyReq.end();
-    }
+    if (bodyBytes <= MAX_BODY) proxyReq.end();
   });
-
-  function flushBodyPending(dest) {
-    while (bodyPending.length > 0) {
-      const p = bodyPending.shift();
-      try { dest.write(p); } catch (e) {
-        console.log(`[${rid}] flush write error: ${e.message}`);
-        abort();
-        break;
-      }
-    }
-  }
 }
 
 function handleRequest(req, res) {
@@ -459,7 +445,7 @@ function handleRequest(req, res) {
 
 process.on('uncaughtException', (err) => {
   console.error('[relay] UNCAUGHT EXCEPTION:', err.stack || err.message || err);
-  // 不 exit，讓 process 繼續（Node.js 預設會 exit，但我們希望 PM2 重啟時有 log）
+  process.exit(1); // PM2 會自動重啟
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[relay] UNHANDLED REJECTION:', reason instanceof Error ? reason.stack : reason);

@@ -49,7 +49,7 @@ async function generateSessionToken(env) {
   const token = generateToken("sess-");
   const expiresAt = Date.now() + SESSION_TTL;
   adminSessions.set(token, expiresAt);
-  await env.DB.prepare("INSERT OR REPLACE INTO sessions (token, expires_at) VALUES (?, ?)").bind(token, expiresAt).run().catch(() => {});
+  await env.DB.prepare("INSERT OR REPLACE INTO sessions (token, expires_at) VALUES (?, ?)").bind(token, expiresAt).run().catch(e => console.error("[session] DB insert failed:", e.message));
   return token;
 }
 
@@ -288,7 +288,7 @@ const RATE_LIMITS_DDL = `CREATE TABLE IF NOT EXISTS rate_limits (
 )`;
 
 const ALL_DDLS = [CHANNELS_DDL, FILTERS_DDL, CONFIG_DDL, SCHEMA_META_DDL, SESSIONS_DDL, SESSIONS_INDEX_DDL, RATE_LIMITS_DDL];
-const ALL_TABLES = ["channels", "filters", "config", "schema_meta", "sessions"];
+const ALL_TABLES = ["channels", "filters", "config", "schema_meta", "sessions", "sessions_index", "rate_limits"];
 
 async function ensureSchema(env) {
   if (schemaReady) return;
@@ -461,10 +461,7 @@ async function loadChannels(env, channelType) {
 async function dbLoadChannels(env, channelType) {
   try {
     let sql = `SELECT id, name, base_url, api_key, weight, stream_type, channel_type, headers,
-      cooldown_until, rpm_limit, rpd_limit, rpm_count, rpm_reset_at, rpd_count, rpd_reset_at,
-      consecutive_errors, consecutive_successes, health_check_enabled, health_check_interval, health_check_timeout,
-      cache_enabled, cache_ttl,
-      rate_limit_algorithm, rate_limit_capacity, rate_limit_rate,
+      cooldown_until, rpm_limit, rpd_limit, cache_ttl,
       fallback_model, model, max_tokens, is_enabled, provider_options,
       support_tools, support_vision, max_context_length
       FROM channels WHERE is_enabled = 1`;
@@ -508,7 +505,6 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
   const healthy = channels.filter(c => !exclude.has(c.id) && !isDegraded(c.id));
   if (healthy.length === 0) return null;
   const pool = healthy;
-  // 動態權重：接近 limit 的渠道降權、小請求優先選有限 context 渠道（保留無限渠道給大請求）
   const weights = pool.map(c => {
     let weight = Math.max(c.weight, 1);
     if (estimatedContextTokens > 0) {
@@ -546,7 +542,6 @@ function markDegraded(channelId, env) {
   degradedUntil.set(channelId, until);
   degradeCount.set(channelId, currentCount + 1);
   if (env) {
-    // 遞增 consecutive_errors；達閾值則自動關閉 channel（冷卻過後管理員可手動重啟）
     env.DB.prepare(`UPDATE channels SET cooldown_until=?, consecutive_errors=consecutive_errors+1, consecutive_successes=0 WHERE id=?`).bind(until, channelId).run().catch(() => {});
   }
 }
@@ -555,7 +550,6 @@ function markHealthy(channelId, env) {
   degradedUntil.delete(channelId);
   degradeCount.delete(channelId);
   if (env) {
-    // 遞增 consecutive_successes；達 3 次則重置 consecutive_errors 與 cooldown
     env.DB.prepare(`UPDATE channels SET cooldown_until=0, consecutive_successes=consecutive_successes+1, consecutive_errors=0 WHERE id=?`).bind(channelId).run().catch(() => {});
   }
 }
@@ -592,9 +586,10 @@ async function checkRateLimitD1(env, channel) {
   if (!channel.rpm_limit && !channel.rpd_limit) return { ok: true };
   const now = Date.now();
   const stmts = [];
+  const rpmWindow = Math.floor(now / 60000);
+  const rpdWindow = Math.floor(now / 86400000);
 
   if (channel.rpm_limit > 0) {
-    const minute = Math.floor(now / 60000);
     stmts.push(
       env.DB.prepare(
         `INSERT INTO rate_limits (bucket_type, bucket_key, window_start, count)
@@ -602,11 +597,10 @@ async function checkRateLimitD1(env, channel) {
          ON CONFLICT(bucket_type, bucket_key, window_start)
          DO UPDATE SET count = count + 1
          RETURNING count`
-      ).bind(String(channel.id), minute)
+      ).bind(String(channel.id), rpmWindow)
     );
   }
   if (channel.rpd_limit > 0) {
-    const day = Math.floor(now / 86400000);
     stmts.push(
       env.DB.prepare(
         `INSERT INTO rate_limits (bucket_type, bucket_key, window_start, count)
@@ -614,7 +608,7 @@ async function checkRateLimitD1(env, channel) {
          ON CONFLICT(bucket_type, bucket_key, window_start)
          DO UPDATE SET count = count + 1
          RETURNING count`
-      ).bind(String(channel.id), day)
+      ).bind(String(channel.id), rpdWindow)
     );
   }
 
@@ -623,12 +617,12 @@ async function checkRateLimitD1(env, channel) {
     let idx = 0;
     if (channel.rpm_limit > 0) {
       const count = results[idx]?.results?.[0]?.count || 0;
-      if (count > channel.rpm_limit) return { ok: false, reason: 'rpm_limit' };
+      if (count > channel.rpm_limit) return { ok: false, reason: 'rpm_limit', rpmWindow, rpdWindow };
       idx++;
     }
     if (channel.rpd_limit > 0) {
       const count = results[idx]?.results?.[0]?.count || 0;
-      if (count > channel.rpd_limit) return { ok: false, reason: 'rpd_limit' };
+      if (count > channel.rpd_limit) return { ok: false, reason: 'rpd_limit', rpmWindow, rpdWindow };
     }
   } catch (e) {
     // D1 失敗 → fallback 到本地記憶體
@@ -638,7 +632,7 @@ async function checkRateLimitD1(env, channel) {
   if (++cleanupRlCounter % 500 === 0) {
     tryCleanupRateLimits(env);
   }
-  return { ok: true };
+  return { ok: true, rpmWindow, rpdWindow };
 }
 
 // 退還 D1 rate limit 配額（fire-and-forget，不阻塞請求）
@@ -795,21 +789,42 @@ function clearGatewayCache() {
 
 let pruneCounter = 0;
 function pruneRuntimeMaps() {
-  // 每 50 次請求清理一次 runtime Map/Set，防止記憶體洩漏
   pruneCounter++;
   if (pruneCounter % 50 !== 0) return;
-  if (contextOverflowAt.size > 100) {
-    // 只保留最近 100 筆
-    const entries = [...contextOverflowAt.entries()].sort((a, b) => a[1] - b[1]);
-    contextOverflowAt.clear();
-    for (let i = 0; i < Math.min(100, entries.length); i++) {
-      contextOverflowAt.set(entries[i][0], entries[i][1]);
+  const now = Date.now();
+  // 清理過期的 degradedUntil 與對應的 degradeCount
+  for (const [id, until] of degradedUntil) {
+    if (until <= now) {
+      degradedUntil.delete(id);
+      degradeCount.delete(id);
     }
   }
+  // contextOverflowAt：只保留最近 100 筆
+  if (contextOverflowAt.size > 100) {
+    const entries = [...contextOverflowAt.entries()].sort((a, b) => a[1] - b[1]);
+    contextOverflowAt.clear();
+    for (let i = 0; i < 100; i++) contextOverflowAt.set(entries[i][0], entries[i][1]);
+  }
+  // channelNoTools/NoVision：上限 500，超過時清理最早的一半
+  for (const set of [channelNoTools, channelNoVision]) {
+    if (set.size > 500) {
+      const arr = [...set];
+      set.clear();
+      for (let i = arr.length - 250; i < arr.length; i++) set.add(arr[i]);
+    }
+  }
+  // localTokenBuckets：上限 500
   if (localTokenBuckets.size > 500) {
     const entries = [...localTokenBuckets.entries()].slice(0, 500);
     localTokenBuckets.clear();
     for (const [k, v] of entries) localTokenBuckets.set(k, v);
+  }
+  // responseCache：被動清理（僅清理已過期條目，避免遍歷全部）
+  if (responseCache.size > CACHE_MAX_ENTRIES * 1.5) {
+    const now2 = Date.now();
+    for (const [k, v] of responseCache) {
+      if (v.expires && v.expires <= now2) responseCache.delete(k);
+    }
   }
 }
 
@@ -827,13 +842,12 @@ function buildBaseHeaders(reqHeaders, rid) {
   headers.delete("x-real-ip");
   headers.delete("cookie");
   headers.delete("set-cookie");
-  headers.delete("authorization");  // 移除原始 authorization，後續重新設為 channel 的 api_key
+  headers.delete("authorization");
   return headers;
 }
 
 function cleanResponseHeaders(headers) {
   const h = new Headers(headers);
-  // 保留 content-encoding（上游可能回傳 gzip），只移除 hop-by-hop 與 CF 內部 headers
   h.delete("transfer-encoding");
   h.delete("cf-ray");
   h.delete("cf-cache-status");
@@ -1142,6 +1156,59 @@ function createIdleTimeoutStream(readable, idleMs) {
   return out;
 }
 
+// 跨 realm 安全的 Uint8Array 檢測
+function isUint8Array(v) {
+  return Object.prototype.toString.call(v) === '[object Uint8Array]';
+}
+
+// 從 relay 回應的 chunk 串流中萃取 _relay 元資料，回傳 { meta, rest, reader }
+async function readRelayMeta(reader) {
+  const chunks = [];
+  let totalLen = 0;
+  const MAX_META = 65536;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return null;
+    const nlIdx = value.indexOf(0x0a);
+    if (nlIdx >= 0) {
+      const metaBytes = new Uint8Array(totalLen + nlIdx);
+      let off = 0;
+      for (const c of chunks) { metaBytes.set(c, off); off += c.length; }
+      metaBytes.set(value.subarray(0, nlIdx), off);
+      const rest = value.subarray(nlIdx + 1);
+      let meta;
+      try { meta = JSON.parse(new TextDecoder().decode(metaBytes)); } catch { return null; }
+      if (!meta._relay) return null;
+      return { meta: meta._relay, rest, reader };
+    }
+    chunks.push(value);
+    totalLen += value.length;
+    if (totalLen > MAX_META) return null;
+  }
+}
+
+// 建立保留剩餘 chunk 的串流（避免跨 realm instanceof 問題）
+function createRelayStream(initial, reader) {
+  let initialSent = false;
+  return new ReadableStream({
+    async pull(controller) {
+      if (!initialSent) {
+        initialSent = true;
+        if (isUint8Array(initial) && initial.length > 0) {
+          controller.enqueue(new Uint8Array(initial)); // 複製到當前 realm
+        }
+        return;
+      }
+      try {
+        const { done, value } = await reader.read();
+        if (done) { controller.close(); return; }
+        controller.enqueue(value);
+      } catch (e) { controller.error(e); }
+    },
+    cancel() { reader.cancel().catch(() => {}); },
+  });
+}
+
 async function parseRelayResponse(relayRes) {
   if (!relayRes.ok || !relayRes.body) {
     const text = await relayRes.text().catch(() => "relay unavailable");
@@ -1150,63 +1217,23 @@ async function parseRelayResponse(relayRes) {
     return { relayError: true, response: fake };
   }
   const reader = relayRes.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  const MAX_META = 65536;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      reader.cancel().catch(() => {});
-      const fake = new Response(JSON.stringify({ error: "relay response truncated" }), { status: 502, headers: { "content-type": "application/json" } });
-      fake.headers.set("X-Relay-Error", "1");
-      return { relayError: true, response: fake };
-    }
-    buf += decoder.decode(value, { stream: true });
-    if (buf.length > MAX_META) {
-      reader.cancel().catch(() => {});
-      const fake = new Response(JSON.stringify({ error: "relay metadata too large" }), { status: 502, headers: { "content-type": "application/json" } });
-      fake.headers.set("X-Relay-Error", "1");
-      return { relayError: true, response: fake };
-    }
-    const nl = buf.indexOf("\n");
-    if (nl === -1) continue;
-    const metaLine = buf.slice(0, nl);
-    const remainder = buf.slice(nl + 1);
-    let meta;
-    try { meta = JSON.parse(metaLine); } catch {
-      reader.cancel().catch(() => {});
-      const fake = new Response(JSON.stringify({ error: "invalid relay metadata" }), { status: 502, headers: { "content-type": "application/json" } });
-      fake.headers.set("X-Relay-Error", "1");
-      return { relayError: true, response: fake };
-    }
-    if (meta._relay?.error) {
-      reader.cancel().catch(() => {});
-      const fake = new Response(JSON.stringify({ error: meta._relay.error }), { status: 502, headers: { "content-type": "application/json" } });
-      fake.headers.set("X-Relay-Error", "1");
-      return { relayError: true, response: fake };
-    }
-    const upstreamStatus = meta._relay?.status || 502;
-    const upstreamHeaders = new Headers(meta._relay?.headers || {});
-    // 使用 pull() 模式，避免無 backpressure 的 fire-and-forget 导致資料堂塩
-    const enc = new TextEncoder();
-    let remainderSent = false;
-    const bodyStream = new ReadableStream({
-      async pull(controller) {
-        if (!remainderSent) {
-          remainderSent = true;
-          if (remainder) controller.enqueue(enc.encode(remainder));
-          return;
-        }
-        try {
-          const { done, value } = await reader.read();
-          if (done) { controller.close(); return; }
-          controller.enqueue(value);
-        } catch (e) { controller.error(e); }
-      },
-      cancel() { reader.cancel().catch(() => {}); },
-    });
-    return { response: new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders }) };
+  const parsed = await readRelayMeta(reader);
+  if (!parsed) {
+    reader.cancel().catch(() => {});
+    const fake = new Response(JSON.stringify({ error: "invalid relay response" }), { status: 502, headers: { "content-type": "application/json" } });
+    fake.headers.set("X-Relay-Error", "1");
+    return { relayError: true, response: fake };
   }
+  if (parsed.meta.error) {
+    reader.cancel().catch(() => {});
+    const fake = new Response(JSON.stringify({ error: parsed.meta.error }), { status: 502, headers: { "content-type": "application/json" } });
+    fake.headers.set("X-Relay-Error", "1");
+    return { relayError: true, response: fake };
+  }
+  const upstreamStatus = parsed.meta.status || relayRes.status;
+  const upstreamHeaders = new Headers(parsed.meta.headers || {});
+  const bodyStream = createRelayStream(parsed.rest, parsed.reader);
+  return { response: new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders }) };
 }
 
 async function upstreamFetch(url, opts, env, rid, noRelay, channel) {
@@ -1235,6 +1262,7 @@ async function upstreamFetch(url, opts, env, rid, noRelay, channel) {
   return parsed.response;
 }
 
+// 透過全域 relay 轉發請求（用於 D1 設定的 relay_url）
 async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, signal, relaySecret) {
   const h = new Headers(baseHeaders);
   h.set("x-target-url", targetUrl);
@@ -1242,68 +1270,22 @@ async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, si
   const relayRes = await fetch(relayBase, { method, headers: h, body, signal });
   if (relayRes.headers.get("x-relay") !== "1") return relayRes;
   const reader = relayRes.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  const MAX_META = 65536;
-  const READ_TIMEOUT = 30000;
-  while (true) {
-    let timeoutId;
-    const result = await Promise.race([
-      reader.read(),
-      new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error("relay read timeout")), READ_TIMEOUT); }),
-    ]).finally(() => clearTimeout(timeoutId));
-    const { done, value } = result;
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    if (buf.length > MAX_META) {
-      reader.cancel();
-      return new Response(JSON.stringify({ error: "relay metadata too large" }), { status: 502, headers: { "content-type": "application/json", "x-relay-error": "1" } });
-    }
-    const nl = buf.indexOf("\n");
-    if (nl >= 0) {
-      const metaLine = buf.slice(0, nl);
-      const rest = buf.slice(nl + 1);
-      try {
-        const meta = JSON.parse(metaLine);
-        if (meta._relay) {
-          if (meta._relay.error) {
-            reader.cancel().catch(() => {});
-            return new Response(JSON.stringify({ error: meta._relay.error }), {
-              status: 502,
-              headers: { "content-type": "application/json", "x-relay-error": "1" }
-            });
-          }
-          const upstreamStatus = meta._relay.status || relayRes.status;
-          const upstreamHeaders = new Headers(meta._relay.headers || {});
-          const fwd = createForwardStream(rest, reader);
-          return new Response(fwd, { status: upstreamStatus, headers: upstreamHeaders });
-        }
-      } catch (e) { /* invalid metadata — passthrough */ }
-      const fallback = createForwardStream(buf, reader);
-      return new Response(fallback, { status: relayRes.status, headers: relayRes.headers });
-    }
+  const parsed = await readRelayMeta(reader);
+  if (!parsed) {
+    reader.cancel().catch(() => {});
+    return new Response(JSON.stringify({ error: "invalid relay response" }), { status: 502, headers: { "content-type": "application/json", "x-relay-error": "1" } });
   }
-  return new Response(buf || "", { status: relayRes.status, headers: relayRes.headers });
-}
-
-function createForwardStream(initial, reader) {
-  const enc = new TextEncoder();
-  let initialSent = false;
-  return new ReadableStream({
-    async pull(controller) {
-      if (!initialSent) {
-        initialSent = true;
-        if (initial) controller.enqueue(enc.encode(initial));
-        return;
-      }
-      try {
-        const { done, value } = await reader.read();
-        if (done) { controller.close(); return; }
-        controller.enqueue(value);
-      } catch (e) { controller.error(e); }
-    },
-    cancel() { reader.cancel().catch(() => {}); },
-  });
+  if (parsed.meta.error) {
+    reader.cancel().catch(() => {});
+    return new Response(JSON.stringify({ error: parsed.meta.error }), {
+      status: 502,
+      headers: { "content-type": "application/json", "x-relay-error": "1" }
+    });
+  }
+  const upstreamStatus = parsed.meta.status || relayRes.status;
+  const upstreamHeaders = new Headers(parsed.meta.headers || {});
+  const bodyStream = createRelayStream(parsed.rest, parsed.reader);
+  return new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders });
 }
 
 async function patchReasoningToContent(res) {
@@ -1364,15 +1346,13 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   if (bodyStr) {
     try { clientRequestModel = JSON.parse(bodyStr)?.model || ""; } catch {}
   }
-  // 優先選用模型名稱符合的渠道，不符合則全部渠道也可被選用
+  // 客戶端指定 model 時，只選 model 相符的渠道；無匹配時才開放所有渠道
   if (clientRequestModel && requiredType === "chat") {
     const matching = eligible.filter(c => c.model === clientRequestModel || c.fallback_model === clientRequestModel);
     if (matching.length > 0) {
-      // 將相符渠道提至陣列前方，不匹配的提至後方
-      const nonMatching = eligible.filter(c => c.model !== clientRequestModel && c.fallback_model !== clientRequestModel);
-      eligible = [...matching, ...nonMatching];
+      eligible = matching;
     }
-    // 否則保持全部渠道（不限制模型名稱）
+    // 無匹配則保持全部渠道（讓上游自己處理未知 model）
   }
   if (bodyStr && requiredType === "chat") {
     try {
@@ -1441,8 +1421,9 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   let attempts = 0;
   let reqBody = bodyStr;
   let retryAsNonStream = false;
-  const reqMinute = Math.floor(Date.now() / 60000);
-  const reqDay = Math.floor(Date.now() / 86400000);
+  // 記錄 rate limit 實際使用的 windows，確保 refund 正確
+  let rlRpmWindow = Math.floor(Date.now() / 60000);
+  let rlRpdWindow = Math.floor(Date.now() / 86400000);
   while (attempts < maxAttempts && attempted.size < eligible.length) {
     attempts++;
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
@@ -1460,6 +1441,9 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         logStructured("warn", "rate limit exceeded, try next", { channel: channel.name, reason: rl.reason, rid });
         continue;
       }
+      // 記錄實際使用的 windows（checkRateLimitD1 可能與入口時差跨分鐘邊界）
+      if (rl.rpmWindow !== undefined) rlRpmWindow = rl.rpmWindow;
+      if (rl.rpdWindow !== undefined) rlRpdWindow = rl.rpdWindow;
     }
     const upstreamPath = suffix;
     const url = channel.base_url.replace(/\/+$/, "") + upstreamPath;
@@ -1611,7 +1595,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
                 parsed.stream = false;
                 reqBody = JSON.stringify(parsed);
                 retryAsNonStream = true;
-                refundRateLimitD1(env, channel, reqMinute, reqDay);
+                refundRateLimitD1(env, channel, rlRpmWindow, rlRpdWindow);
                 markDegraded(channel.id, env);
                 logStructured("warn", "invalid SSE body, retrying with stream=false", { channel: channel.name, rid });
                 continue;
@@ -1716,10 +1700,11 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         try {
           const parsed = JSON.parse(reqBody);
           if (parsed.stream === true) {
+            res.body?.cancel().catch(() => {});
             parsed.stream = false;
             reqBody = JSON.stringify(parsed);
             retryAsNonStream = true;
-            refundRateLimitD1(env, channel, reqMinute, reqDay);  // 退還 rate limit 配額，避免重試同一渠道時雙重計算
+            refundRateLimitD1(env, channel, rlRpmWindow, rlRpdWindow);
             logStructured("warn", "4xx with stream=true, retrying same channel with stream=false", { channel: channel.name, status: res.status, rid });
             continue;
           }
@@ -1741,7 +1726,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
     } catch (err) {
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
-      refundRateLimitD1(env, channel, reqMinute, reqDay);
+      refundRateLimitD1(env, channel, rlRpmWindow, rlRpdWindow);
       if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
       markDegraded(channel.id, env);
       logStructured("warn", "upstream fetch failed", { channel: channel.name, error: err.message, rid });
@@ -2379,6 +2364,10 @@ function createDashboardApi() {
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
         body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Hi" }], max_tokens: 20, temperature: 0, stream: false });
         break;
+      case "stream":
+        testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Count 1 to 5" }], max_tokens: 100, temperature: 0, stream: true });
+        break;
       case "vision":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
         body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: [{ type: "text", text: "Describe" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }], max_tokens: 10, temperature: 0, stream: false });
@@ -2496,7 +2485,7 @@ function createDashboardApi() {
         capOk = Array.isArray(json?.results);
         capMsg = capOk ? "審核正常" : "無 results 陣列";
         } else {
-          // chat / vision / tools
+          // chat / stream / vision / tools
           const choice = json?.choices?.[0];
           if (!choice) {
             capOk = false; capMsg = "無 choices 陣列";
@@ -2506,6 +2495,9 @@ function createDashboardApi() {
           } else if (testType === "vision") {
             capOk = !!choice.message?.content;
             capMsg = capOk ? "圖片辨識正常" : "無內容回應";
+          } else if (testType === "stream") {
+            capOk = !!(choice.delta?.content || choice.message?.content);
+            capMsg = capOk ? "串流正常" : "無 delta/content";
           } else {
             capOk = true; // chat 只驗證端點連線性，不驗證內容
             capMsg = choice.message?.content ? "連線正常" : "端點正常（無回覆）";
@@ -2541,7 +2533,7 @@ function createDashboardApi() {
     // 根據渠道類型決定 "all" 要跑哪些測試
     const chType = ch.channel_type || "chat";
     const allTypes = chType === "chat"
-      ? ["chat", "vision", "tools"]
+      ? ["chat", "stream", "vision", "tools"]
       : [chType];
 
     const typesToRun = testType === "all" ? allTypes : [testType];
@@ -2710,8 +2702,6 @@ app.onError((err, c) => {
     error: { message: "The server had an error processing your request", type: "server_error", param: null, code: "api_error" },
   }, 500);
 });
-
-export { pruneLoginState };
 
 export default {
   async fetch(request, env, ctx) {
