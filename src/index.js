@@ -1187,20 +1187,23 @@ async function parseRelayResponse(relayRes) {
     }
     const upstreamStatus = meta._relay?.status || 502;
     const upstreamHeaders = new Headers(meta._relay?.headers || {});
+    // 使用 pull() 模式，避免無 backpressure 的 fire-and-forget 导致資料堂塩
+    const enc = new TextEncoder();
+    let remainderSent = false;
     const bodyStream = new ReadableStream({
-      start(controller) {
-        if (remainder) controller.enqueue(new TextEncoder().encode(remainder));
-        (async () => {
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) { controller.close(); return; }
-              controller.enqueue(value);
-            }
-          } catch (e) { controller.error(e); }
-        })();
+      async pull(controller) {
+        if (!remainderSent) {
+          remainderSent = true;
+          if (remainder) controller.enqueue(enc.encode(remainder));
+          return;
+        }
+        try {
+          const { done, value } = await reader.read();
+          if (done) { controller.close(); return; }
+          controller.enqueue(value);
+        } catch (e) { controller.error(e); }
       },
-      cancel() { reader.cancel(); },
+      cancel() { reader.cancel().catch(() => {}); },
     });
     return { response: new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders }) };
   }
@@ -1284,20 +1287,22 @@ async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, si
 }
 
 function createForwardStream(initial, reader) {
+  const enc = new TextEncoder();
+  let initialSent = false;
   return new ReadableStream({
-    start(controller) {
-      (async () => {
-        try {
-          if (initial) controller.enqueue(new TextEncoder().encode(initial));
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) { controller.close(); return; }
-            controller.enqueue(value);
-          }
-        } catch (e) { controller.error(e); }
-      })();
+    async pull(controller) {
+      if (!initialSent) {
+        initialSent = true;
+        if (initial) controller.enqueue(enc.encode(initial));
+        return;
+      }
+      try {
+        const { done, value } = await reader.read();
+        if (done) { controller.close(); return; }
+        controller.enqueue(value);
+      } catch (e) { controller.error(e); }
     },
-    cancel() { reader.cancel(); },
+    cancel() { reader.cancel().catch(() => {}); },
   });
 }
 

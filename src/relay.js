@@ -214,14 +214,17 @@ function processRequest(req, res) {
   }
 
   let aborted = false;
-  let proxyReq = null; // 先宣告，讓 abort closure 可以引用；實際值在下方建立
+  let proxyReq = null;
+  let proxyResRef = null; // 保存 proxyRes 引用，對 pipe 做 cleanup
   const abort = () => {
     if (aborted) return;
     aborted = true;
+    if (proxyResRef) try { proxyResRef.unpipe(res); proxyResRef.destroy(); } catch {}
     if (proxyReq) try { proxyReq.destroy(); } catch {}
     try { res.end(); } catch {}
   };
 
+  // 在 writeHead 之前設定 close 監聽，避免 race condition
   res.on('close', () => {
     if (!res.writableFinished) {
       console.log(`[${rid}] client disconnected early`);
@@ -263,10 +266,11 @@ function processRequest(req, res) {
       });
     } else {
       // 正常回應：零緩衝直通
-      proxyRes.pipe(res);
+      proxyResRef = proxyRes;
+      proxyRes.pipe(res, { end: true });
       proxyRes.on('error', (e) => {
         console.log(`[${rid}] upstream stream error: ${e.message}`);
-        if (!aborted) { try { res.end(); } catch {} }
+        if (!aborted) abort();
       });
     }
   });
