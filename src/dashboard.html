@@ -339,7 +339,7 @@
       const n = getNotyf();
       if (!n) { alert(html.replace(/<[^>]+>/g, '')); return; }
       const el = document.createElement('div');
-      el.style.cssText = 'position:fixed;top:20px;right:20px;z-index:10001;padding:12px 16px;border-radius:8px;background:' + (type === 'danger' ? '#e74c3c' : '#2ecc71') + ';color:#fff;font-size:13px;line-height:1.5;max-width:420px;box-shadow:0 4px 12px rgba(0,0,0,.2);opacity:0;transition:opacity .3s';
+      el.style.cssText = 'position:fixed;top:20px;right:20px;z-index:10001;padding:12px 16px;border-radius:8px;background:' + (type === 'danger' ? '#e74c3c' : '#2ecc71') + ';color:#fff;font-size:13px;line-height:1.5;max-width:420px;max-height:60vh;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.2);opacity:0;transition:opacity .3s;word-break:break-word';
       el.innerHTML = html;
       document.body.appendChild(el);
       requestAnimationFrame(() => { el.style.opacity = '1'; });
@@ -751,7 +751,11 @@
       if (!ch) return toast('渠道不存在', 'warning');
       const btns = document.querySelectorAll('button[onclick*="testChannel(' + id + ')"]');
       btns.forEach(b => { b._orig = b.innerHTML; b.innerHTML = '<span class="spinner-border spinner-border-sm"></span>'; b.disabled = true; });
-      toast('⏳ 正在測試 ' + type + ' ...', 'info');
+      let sec = 25;
+      const timer = setInterval(() => {
+        sec--;
+        btns.forEach(b => { if (b._orig) b.innerHTML = sec > 0 ? sec + 's' : '<span class="spinner-border spinner-border-sm"></span>'; });
+      }, 1000);
       const r = await api('/admin/api/channels/' + id + '/test', 'POST', {
         base_url: ch.base_url,
         api_key: ch.api_key,
@@ -759,41 +763,50 @@
         channel_type: ch.channel_type,
         relay_url: ch.relay_url,
         type,
-        autoFix: true,
       }, false);
+      clearInterval(timer);
       btns.forEach(b => { b.innerHTML = b._orig || '<i class="bi bi-play-fill"></i>'; b.disabled = false; });
       if (!r) return;
       const results = r.results || {};
+      // 測試結果同步到 UI（不寫 DB，user 手動存檔才生效）
+      if (results.vision != null) {
+        ch.support_vision = results.vision.capOk ? 1 : 0;
+        const el = document.getElementById('ch-support-vision');
+        if (el) el.checked = results.vision.capOk;
+      }
+      if (results.tools != null) {
+        ch.support_tools = results.tools.capOk ? 1 : 0;
+        const el = document.getElementById('ch-support-tools');
+        if (el) el.checked = results.tools.capOk;
+      }
+      renderChannels(); // 更新列表圖標
+      // 從測試結果自動填入 max_context_length
+      let maxCtx = 0;
+      for (const rr of Object.values(results)) {
+        if (rr.maxContextDetected > maxCtx) maxCtx = rr.maxContextDetected;
+      }
+      if (maxCtx > 0) {
+        document.getElementById('ch-max-ctx').value = maxCtx;
+      }
       if (r.ok) {
         let msg = '';
         if (type === 'all') {
           const parts = [];
           for (const [t, rr] of Object.entries(results)) {
             const icon = rr.capOk ? '✅' : '⚠️';
-            parts.push(`${icon} <b>${t}</b>: ${rr.diagnosis} (${rr.ms}ms)`);
+            const ctx = rr.maxContextDetected ? ` ctx=${rr.maxContextDetected}` : '';
+            parts.push(`${icon} <b>${t}</b>: ${rr.diagnosis} (${rr.ms}ms${ctx})`);
           }
           msg = parts.join('<br>');
         } else {
           const rr = results[type];
           const icon = rr?.capOk ? '✅' : '⚠️';
-          msg = `${icon} <b>${type}</b> ${rr?.diagnosis || r.diagnosis} (${rr?.ms || 0}ms)`;
-        }
-        // 如果有自動修正，顯示額外資訊
-        if (r.capabilities) {
-          const fixed = [];
-          if (r.capabilities.vision === false) fixed.push('Vision');
-          if (r.capabilities.tools === false) fixed.push('Tools');
-          if (fixed.length > 0) msg += '<br><span style="color:#f39c12">已自動關閉: ' + fixed.join(', ') + '</span>';
+          const ctx = rr?.maxContextDetected ? ` ctx=${rr.maxContextDetected}` : '';
+          msg = `${icon} <b>${type}</b> ${rr?.diagnosis || r.diagnosis} (${rr?.ms || 0}ms${ctx})`;
         }
         toastHtml(msg, 'success', 6000);
-        // 同步 autoFix 結果到 UI（vision/tools 可能已被關閉，max_token 可能已被更新）
-        if (r.capabilities) {
-          const batch = await api('/admin/api/init', 'GET', null, false);
-          if (batch) { channels = batch.channels || []; filters = batch.filters || []; renderChannels(); renderStats(); }
-        }
       } else {
-        const diag = typeof r.diagnosis === 'string' ? r.diagnosis : 'unknown';
-        toast('❌ 測試失敗: ' + diag, 'danger');
+        toast('❌ 測試失敗', 'danger');
       }
     };
 

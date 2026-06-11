@@ -3,10 +3,11 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import portalHtml from "./dashboard.html";
 
-const UPSTREAM_TIMEOUT_MS = 45_000;     // 等待 relay 回應 metadata 的上限（CF Free 總時長 100s，保留緩衝）
-const LONG_TIMEOUT_MS = 45_000;
+const UPSTREAM_TIMEOUT_MS = 120_000;     // 等待 relay 回應 metadata 的上限（串流經 relay + upstream thinking 可能較久）
+const LONG_TIMEOUT_MS = 120_000;
 const CHANNEL_COOLDOWN_BASE_MS = 30_000; // 指數退避 ×2^n，上限 300s
 const CHANNEL_COOLDOWN_MAX_MS = 300_000;
+const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 10_000; // 429 無訊息時的預設冷卻
 const STREAM_IDLE_TIMEOUT_MS = 90_000;  // 串流中無新 chunk 視為斷流（free tier 上游可能較慢）
 
 const TOKEN_TTL = 60_000;
@@ -293,12 +294,19 @@ const ALL_TABLES = ["channels", "filters", "config", "schema_meta", "sessions", 
 async function ensureSchema(env) {
   if (schemaReady) return;
   let ok = 0;
-  for (let i = 0; i < ALL_DDLS.length; i++) {
-    try {
-      await env.DB.prepare(ALL_DDLS[i]).run();
-      ok++;
-    } catch (e) {
-      console.error(`[schema] failed to create table ${ALL_TABLES[i]}:`, e.message);
+  // 批次建立全部表格（1 次 subrequest vs 7 次）
+  try {
+    await env.DB.batch(ALL_DDLS.map(sql => env.DB.prepare(sql)));
+    ok = ALL_DDLS.length;
+  } catch (e) {
+    console.error("[schema] batch DDL failed, retrying individually:", e.message);
+    for (let i = 0; i < ALL_DDLS.length; i++) {
+      try {
+        await env.DB.prepare(ALL_DDLS[i]).run();
+        ok++;
+      } catch (e2) {
+        console.error(`[schema] failed to create table ${ALL_TABLES[i]}:`, e2.message);
+      }
     }
   }
   try {
@@ -316,6 +324,20 @@ async function ensureSchema(env) {
     console.error("[schema] failed to ensure config row:", e.message);
   }
   if (ok > 0) console.log(`[schema] ${ok}/${ALL_DDLS.length} tables ready`);
+  // 冷啟動時主動檢查 relay 健康狀態（fire-and-forget 不阻塞啟動）
+  // 用 env 參數讀取 relay 位址，避免首次 resolveGlobalConfig 觸發額外 D1 查詢
+  const relayUrl = env.RELAY_BASE_URL || env.RELAY_URL;
+  if (relayUrl) {
+    fetch(relayUrl.replace(/\/+$/, '') + '/health', { signal: AbortSignal.timeout(5000) })
+      .then(r => { if (!r.ok) throw new Error('health: ' + r.status); })
+      .catch(() => {
+        if (relayHealthy) {
+          relayHealthy = false;
+          relayErrorCount = 5;
+          console.warn('[relay] startup health check failed — marking unhealthy');
+        }
+      });
+  }
   // 用 DB flag 判斷 migration 是否已完成，避免重複 39 次 ALTER TABLE probe
   let schemaVer = "0";
   try {
@@ -417,6 +439,16 @@ const degradeCount = new Map(); // channel id → 連續降級次數（用於指
 let relayHealthy = true;        // relay 健康狀態，連續錯誤時標記 false 以繞過 relay
 let relayErrorCount = 0;        // relay 連續錯誤計數
 
+// 從上游錯誤訊息中解析建議冷卻時間（如 "7 seconds between messages" → 7000）
+function parseRateLimitCooldown(text) {
+  if (!text || typeof text !== "string") return 0;
+  const m = text.match(/(\d+)\s*(second|sec|s)\b/i);
+  if (m) return Math.min(parseInt(m[1], 10) * 1000, 120_000);
+  const rm = text.match(/retry[_-]?after[:\s]+(\d+)/i);
+  if (rm) return Math.min(parseInt(rm[1], 10) * 1000, 120_000);
+  return 0;
+}
+
 async function loadChannels(env, channelType) {
   const now = Date.now();
   if (channelType) {
@@ -501,10 +533,15 @@ function clearChannelCache() {
   channelNoVision.clear();
 }
 
-function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0) {
+function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0, preferredModel = null) {
   const healthy = channels.filter(c => !exclude.has(c.id) && !isDegraded(c.id));
   if (healthy.length === 0) return null;
-  const pool = healthy;
+  // 優先從 model 相符的渠道中選取；全部失敗後降級到不匹配渠道
+  let pool = healthy;
+  if (preferredModel) {
+    const matching = healthy.filter(c => c.model === preferredModel || c.fallback_model === preferredModel);
+    if (matching.length > 0) pool = matching;
+  }
   const weights = pool.map(c => {
     let weight = Math.max(c.weight, 1);
     if (estimatedContextTokens > 0) {
@@ -535,9 +572,9 @@ function selectChannel(channels, exclude = new Set(), estimatedContextTokens = 0
   return pool[pool.length - 1];
 }
 
-function markDegraded(channelId, env) {
+function markDegraded(channelId, env, customBackoffMs) {
   const currentCount = degradeCount.get(channelId) || 0;
-  const backoffMs = Math.min(CHANNEL_COOLDOWN_BASE_MS * Math.pow(2, currentCount), CHANNEL_COOLDOWN_MAX_MS);
+  const backoffMs = customBackoffMs || Math.min(CHANNEL_COOLDOWN_BASE_MS * Math.pow(2, currentCount), CHANNEL_COOLDOWN_MAX_MS);
   const until = Date.now() + backoffMs;
   degradedUntil.set(channelId, until);
   degradeCount.set(channelId, currentCount + 1);
@@ -1205,6 +1242,7 @@ async function parseRelayResponse(relayRes) {
   }
   const upstreamStatus = parsed.meta.status || relayRes.status;
   const upstreamHeaders = new Headers(parsed.meta.headers || {});
+  upstreamHeaders.delete("content-encoding");
   const bodyStream = createRelayStream(parsed.rest, parsed.reader);
   return { response: new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders }) };
 }
@@ -1257,6 +1295,8 @@ async function fetchViaRelay(relayBase, targetUrl, method, baseHeaders, body, si
   }
   const upstreamStatus = parsed.meta.status || relayRes.status;
   const upstreamHeaders = new Headers(parsed.meta.headers || {});
+  // relay 已終止上游傳輸層，移除 Content-Encoding 避免下游 double decoding
+  upstreamHeaders.delete("content-encoding");
   const bodyStream = createRelayStream(parsed.rest, parsed.reader);
   return new Response(bodyStream, { status: upstreamStatus, headers: upstreamHeaders });
 }
@@ -1319,14 +1359,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   if (bodyStr) {
     try { clientRequestModel = JSON.parse(bodyStr)?.model || ""; } catch {}
   }
-  // 客戶端指定 model 時，只選 model 相符的渠道；無匹配時才開放所有渠道
-  if (clientRequestModel && requiredType === "chat") {
-    const matching = eligible.filter(c => c.model === clientRequestModel || c.fallback_model === clientRequestModel);
-    if (matching.length > 0) {
-      eligible = matching;
-    }
-    // 無匹配則保持全部渠道（讓上游自己處理未知 model）
-  }
+  // 客戶端指定 model 時，相符渠道優先；全部失敗後降級到不匹配渠道
+  // （filter 邏輯已移到 selectChannel，改為權重優先）
   if (bodyStr && requiredType === "chat") {
     try {
       const parsed = JSON.parse(bodyStr);
@@ -1390,7 +1424,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   }
   const attempted = new Set();
   const fallbackModelsTried = new Set();
-  const maxAttempts = Math.min(Math.max(eligible.length, 1) * 3, 15);
+  const maxAttempts = Math.min(Math.max(eligible.length, 1) * 3, 8); // 15→8 減少 CF Free subrequest 超限
   let attempts = 0;
   let reqBody = bodyStr;
   let retryAsNonStream = false;
@@ -1400,7 +1434,7 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
   while (attempts < maxAttempts && attempted.size < eligible.length) {
     attempts++;
     if (clientSignal?.aborted) return { error: { message: "Client disconnected", status: 499 } };
-    const channel = selectChannel(eligible, attempted, estimatedContextTokens);
+    const channel = selectChannel(eligible, attempted, estimatedContextTokens, clientRequestModel);
     if (!channel) break;
     // 非重試時重置 reqBody 為原始值，重試時保留修改後的 reqBody（stream: false）
     if (!retryAsNonStream) reqBody = bodyStr;
@@ -1518,12 +1552,9 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       timer = setTimeout(onAbort, isChat ? UPSTREAM_TIMEOUT_MS : LONG_TIMEOUT_MS);
       let res;
       if (requiredType === "realtime") {
-        // WebSocket upgrade 無法透過 HTTP relay，必須直連
         res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, true);
       } else if (globalRelayUrl?.trim() && relayHealthy) {
         const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
-        // relay server 即回 meta 架構，避免 CF 邊緣網路 100s 無回應觸發 524
-        // 傳遞 channel 速率限制資訊給 relay，讓 relay 做精確的 in-memory 計數
         if (channel) {
           headers.set("x-channel-id", String(channel.id));
           if (channel.rpm_limit) headers.set("x-channel-rpm", String(channel.rpm_limit));
@@ -1531,7 +1562,9 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
         res = await fetchViaRelay(relayBase, url, method, headers, reqBody, controller.signal, dbRelayToken || env.RELAY_SECRET);
       } else {
-        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, false, channel);
+        // relay 不健康時繞過（relay 降級期間 direct connection 可用性仍高於卡死在 relay）
+        const bypassRelay = !relayHealthy;
+        res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, bypassRelay, channel);
       }
       clearTimeout(timer);
       if (clientSignal) clientSignal.removeEventListener("abort", onAbort);
@@ -1563,17 +1596,23 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
             const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
             // 驗證僅 log 不阻斷請求：log-only, 無論驗證成功與否都不影響回傳內容
             if (opts.validate?.response?.required_fields && res.headers.get("Content-Type")?.includes("json")) {
-              const text = await res.clone().text();
-              const parsed = JSON.parse(text);
-              for (const field of opts.validate.response.required_fields) {
-                if (field.includes(".")) {
-                  const parts = field.split(".");
-                  let val = parsed;
-                  for (const p of parts) { if (val != null) val = val[p]; }
-                  if (val == null) { logStructured("warn", "response validation failed", { channel: channel.name, missing: field, rid }); }
-                } else if (parsed[field] == null) {
-                  logStructured("warn", "response validation failed", { channel: channel.name, missing: field, rid });
-                }
+              const text = await res.clone().text().catch(() => "");
+              if (text.length > 500_000) {
+                logStructured("warn", "response too large, skip validation", { size: text.length });
+              } else {
+                try {
+                  const parsed = JSON.parse(text);
+                  for (const field of opts.validate.response.required_fields) {
+                    if (field.includes(".")) {
+                      const parts = field.split(".");
+                      let val = parsed;
+                      for (const p of parts) { if (val != null) val = val[p]; }
+                      if (val == null) { logStructured("warn", "response validation failed", { channel: channel.name, missing: field, rid }); }
+                    } else if (parsed[field] == null) {
+                      logStructured("warn", "response validation failed", { channel: channel.name, missing: field, rid });
+                    }
+                  }
+                } catch (e) {}
               }
             }
             if (opts.rewrite?.response?.headers) {
@@ -1630,7 +1669,24 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         }
         return { response: await patchReasoningToContent(res), channel, clientRequestModel };
       }
-      if (res.status >= 500 || res.status === 429) {
+      // 上游速率限制（429/403）— 優先解析 cooldown，無訊息用預設 10s
+      if (res.status === 403 || res.status === 429) {
+        const text = await res.clone().text().catch(() => "");
+        // 優先取 Retry-After header（上游標準指定），其次解析 body 文字
+        const retryAfter = res.headers.get("Retry-After");
+        const headerCooldown = retryAfter ? parseInt(retryAfter, 10) * 1000 : 0;
+        const bodyCooldown = parseRateLimitCooldown(text);
+        const cooldown = headerCooldown || bodyCooldown || (res.status === 429 ? RATE_LIMIT_DEFAULT_COOLDOWN_MS : 0);
+        if (cooldown > 0) {
+          res.body?.cancel().catch(() => {});
+          markDegraded(channel.id, env, cooldown);
+          logStructured("warn", "upstream rate limited, cooling", { channel: channel.name, cooldownMs: cooldown, rid });
+          attempted.add(channel.id);
+          continue;
+        }
+      }
+      // 5xx 錯誤（不含 429）→ 指數退避
+      if (res.status >= 500) {
         res.body?.cancel().catch(() => {});
         markDegraded(channel.id, env);
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
@@ -2301,32 +2357,37 @@ function createDashboardApi() {
     return 0;
   }
 
-  async function runSingleTest(ch, testType, env) {
+  const TOOLS_FIXTURE = [{ type: "function", function: { name: "get_weather", description: "Get weather for a city", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }];
+
+  async function runSingleTest(ch, testType, env, opts = {}) {
     const { relay_url: globalRelayUrl, relay_token: dbRelayToken } = await resolveGlobalConfig(env);
     const relayUrl = ch.relay_url?.trim() || globalRelayUrl?.trim();
     const relayToken = dbRelayToken || env.RELAY_SECRET;
     const baseUrl = ch.base_url || "";
     const headers = { Authorization: "Bearer " + (ch.api_key || ""), "Content-Type": "application/json" };
-    const TEST_TIMEOUT_MS = 45000;
+    const TEST_TIMEOUT_MS = 22000; // Workers free handler 30s 限制，留安全餘裕
     let testUrl, body, useFormData = false, isAudioTest = false;
 
     // 根據 testType 設定 url、body 與 Content-Type
     switch (testType) {
       case "chat":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Hi" }], max_tokens: 20, temperature: 0, stream: false });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Hi! Reply with just 'Hello'." }], max_tokens: 20, temperature: 0, stream: false });
         break;
-      case "stream":
+      case "stream": {
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Count 1 to 5" }], max_tokens: 100, temperature: 0, stream: true });
+        const streamPayload = { model: ch.model || "test", messages: [{ role: "user", content: opts.includeTools ? "What's the weather in Tokyo?" : "Count 1 to 5" }], max_tokens: 100, temperature: 0, stream: true };
+        if (opts.includeTools) { streamPayload.tools = TOOLS_FIXTURE; streamPayload.tool_choice = "auto"; }
+        body = JSON.stringify(streamPayload);
         break;
+      }
       case "vision":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: [{ type: "text", text: "Describe" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }], max_tokens: 10, temperature: 0, stream: false });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: [{ type: "text", text: "What color is this image? Reply with just the color name." }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" } }] }], max_tokens: 30, temperature: 0, stream: false });
         break;
       case "tools":
         testUrl = baseUrl.replace(/\/+$/, "") + "/chat/completions";
-        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "Weather in Tokyo" }], tools: [{ type: "function", function: { name: "get_weather", description: "Get weather", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }], tool_choice: "auto", max_tokens: 50, temperature: 0, stream: false });
+        body = JSON.stringify({ model: ch.model || "test", messages: [{ role: "user", content: "What's the weather in Tokyo?" }], tools: [{ type: "function", function: { name: "get_weather", description: "Get weather for a city", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }], tool_choice: "auto", max_tokens: 100, temperature: 0, stream: false });
         break;
       case "tts":
         testUrl = baseUrl.replace(/\/+$/, "") + "/audio/speech";
@@ -2380,7 +2441,7 @@ function createDashboardApi() {
     const start = Date.now();
     try {
       let res;
-      if (relayUrl) {
+      if (relayUrl && relayHealthy) {
         const relayHeaders = { Authorization: headers.Authorization };
         if (!useFormData) relayHeaders["Content-Type"] = "application/json";
         const fetchPromise = fetchViaRelay(relayUrl.replace(/\/+$/, ""), testUrl, "POST",
@@ -2396,21 +2457,32 @@ function createDashboardApi() {
       const ms = Date.now() - start;
       const text = await res.text().catch(() => "");
 
-      // 非 200 → 若端點存在（4xx）則 capOk 仍標 true，表示能力通道存在
+      // 非 200 → 渠道不支援該能力
       if (res.status !== 200) {
-        const isEndpointLive = res.status < 500;
-        return { ok: false, status: res.status, ms, capOk: isEndpointLive, diagnosis: `HTTP ${res.status}${text ? ": " + text.slice(0, 80) : ""}`, maxContextDetected: 0 };
+        const textPreview = text ? text.replace(/\s+/g, ' ').slice(0, 200) : "";
+        const viaRelay = relayUrl ? ` via=${relayUrl.replace(/https?:\/\//,'').slice(0,30)}` : "";
+        return { ok: false, status: res.status, ms, capOk: false, diagnosis: `HTTP ${res.status}${viaRelay}`, _body: textPreview || undefined, maxContextDetected: 0 };
       }
 
-      let json;
+      let json, _reconstructedContent = "", _hasToolCalls = false;
       try {
         json = JSON.parse(text);
+        if (json?.choices?.[0]?.message?.content) _reconstructedContent = json.choices[0].message.content;
+        if (json?.choices?.[0]?.message?.tool_calls) _hasToolCalls = true;
       } catch {
         json = null;
         for (const line of text.split("\n")) {
           const t = line.trim();
           if (t.startsWith("data: ") && !t.includes("[DONE]")) {
-            try { json = JSON.parse(t.slice(6)); break; } catch { /* 繼續 */ }
+            try {
+              const chunk = JSON.parse(t.slice(6));
+              const choice = chunk?.choices?.[0];
+              const piece = choice?.delta?.content || choice?.text || "";
+              if (piece) _reconstructedContent += piece;
+              if (choice?.delta?.tool_calls) _hasToolCalls = true;
+              if (!json && (choice?.delta?.content || choice?.text)) { json = chunk; }
+              if (!json) json = chunk;
+            } catch { /* 繼續 */ }
           }
         }
       }
@@ -2440,29 +2512,33 @@ function createDashboardApi() {
           // chat / stream / vision / tools
           const choice = json?.choices?.[0];
           if (!choice) {
-            capOk = false; capMsg = "無 choices 陣列";
-          } else if (testType === "tools") {
-            capOk = !!choice.message?.tool_calls;
-            capMsg = capOk ? "工具呼叫正常" : "無 tool_calls 回應";
-          } else if (testType === "vision") {
-            capOk = !!choice.message?.content;
-            capMsg = capOk ? "圖片辨識正常" : "無內容回應";
-          } else if (testType === "stream") {
-            capOk = !!(choice.delta?.content || choice.message?.content);
-            capMsg = capOk ? "串流正常" : "無 delta/content";
+            const keys = json ? Object.keys(json).join(",") : "no json";
+            capOk = false; capMsg = `回應格式異常 (keys:${keys})`;
           } else {
-            capOk = true; // chat 只驗證端點連線性，不驗證內容
-            capMsg = choice.message?.content ? "連線正常" : "端點正常（無回覆）";
+            if (testType === "tools") {
+              capOk = !!choice.message?.tool_calls;
+              capMsg = capOk ? "工具呼叫正常" : "模型未觸發工具呼叫";
+            } else if (testType === "vision") {
+              capOk = !!choice.message?.content;
+              capMsg = capOk ? "圖片辨識正常" : "模型未回應圖片內容";
+            } else if (testType === "stream") {
+              capOk = !!(choice.delta?.content || choice.message?.content || choice.text || choice.delta?.tool_calls);
+              capMsg = capOk ? "串流正常" : "無 delta/content";
+            } else {
+              capOk = !!choice.message?.content;
+              capMsg = capOk ? "連線正常" : "端點正常（無回覆）";
+            }
           }
       }
 
       // 偵測 max context
       maxCtx = detectMaxContextFromResult(json, res.headers, text);
 
-      return { ok: true, status: 200, ms, capOk, diagnosis: capMsg, maxContextDetected: maxCtx };
+      return { ok: true, status: 200, ms, capOk, diagnosis: capMsg, maxContextDetected: maxCtx, _reconstructedContent: _reconstructedContent || undefined, _hasToolCalls };
     } catch (e) {
       const ms = Date.now() - start;
-      return { ok: false, status: 0, ms, capOk: false, diagnosis: "連線失敗: " + (e.message?.slice(0, 60) || "unknown"), maxContextDetected: 0 };
+      const shortMsg = (e.message || "unknown").split('\n')[0].replace(/\s+/g, ' ').slice(0, 30);
+      return { ok: false, status: 0, ms, capOk: false, diagnosis: "連線失敗: " + shortMsg, maxContextDetected: 0 };
     }
   }
 
@@ -2489,29 +2565,44 @@ function createDashboardApi() {
       : [chType];
 
     const typesToRun = testType === "all" ? allTypes : [testType];
+    // 合併 chat+stream+tools：一次 stream 請求驗證三者
+    const hasChatStream = typesToRun.includes("chat") && typesToRun.includes("stream");
+    const hasTools = typesToRun.includes("tools");
+    const skipChat = hasChatStream;
+    const skipTools = hasChatStream && hasTools;
+    const deduped = typesToRun.filter(t => !((t === "chat" && skipChat) || (t === "tools" && skipTools)));
     const results = {};
+    const testResults = await Promise.all(deduped.map(async t => {
+      const opts = (t === "stream" && skipTools) ? { includeTools: true } : {};
+      const r = await runSingleTest(ch, t, c.env, opts);
+      // tools 被拒絕（400）時 fallback 到不帶工具的串流測試
+      if (t === "stream" && opts.includeTools && !r.ok && r.status === 400) {
+        return runSingleTest(ch, t, c.env, {});
+      }
+      return r;
+    }));
     let anyOk = false;
-    for (const t of typesToRun) {
-      const r = await runSingleTest(ch, t, c.env);
-      results[t] = r;
-      if (r.ok) anyOk = true;
+    for (let i = 0; i < deduped.length; i++) {
+      results[deduped[i]] = testResults[i];
+      if (testResults[i].ok) anyOk = true;
+    }
+    // stream 的 reconstructedContent 填回 chat 結果
+    if (skipChat && results.stream) {
+      const sr = results.stream;
+      // API 有回應（content 或 tool_calls）都算 chat 正常
+      const chatOk = !!(sr._reconstructedContent || sr._hasToolCalls);
+      results.chat = { ok: sr.ok, status: sr.status, ms: sr.ms, capOk: chatOk, diagnosis: chatOk ? "連線正常" : "端點正常（無回覆）", maxContextDetected: sr.maxContextDetected };
+      if (chatOk) anyOk = true;
+    }
+    // stream 的 tool_calls 填回 tools 結果
+    if (skipTools && results.stream) {
+      const sr = results.stream;
+      const toolsOk = !!sr._hasToolCalls;
+      results.tools = { ok: sr.ok, status: sr.status, ms: sr.ms, capOk: toolsOk, diagnosis: toolsOk ? "工具呼叫正常" : "模型未觸發工具呼叫", maxContextDetected: sr.maxContextDetected };
+      if (toolsOk) anyOk = true;
     }
 
-    // auto-fix: 更新 DB（fromBody 已合併 DB 值，可安全寫入）
-    if (autoFix) {
-      const updates = [];
-      if (results.vision && !results.vision.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(chId));
-      if (results.tools && !results.tools.capOk) updates.push(c.env.DB.prepare("UPDATE channels SET support_tools=0 WHERE id=?").bind(chId));
-      for (const [, r] of Object.entries(results)) {
-        if (r.maxContextDetected && +r.maxContextDetected > (+ch.max_context_length || 0)) {
-          updates.push(c.env.DB.prepare("UPDATE channels SET max_context_length=? WHERE id=?").bind(+r.maxContextDetected, chId));
-        }
-      }
-      if (updates.length > 0) {
-        await c.env.DB.batch(updates);
-        clearGatewayCache();
-      }
-    }
+    // 測試結果不自動寫入 DB，由 UI 讓 user 手動存檔
 
     const capabilities = {};
     if (results.vision) capabilities.vision = results.vision.capOk;
