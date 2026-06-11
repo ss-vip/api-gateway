@@ -19,10 +19,10 @@ const https = require('https');
 const os    = require('os');
 
 const PORT     = parseInt(process.env.PORT            || '3000',   10);
-const TIMEOUT  = parseInt(process.env.RELAY_TIMEOUT   || '300000', 10); // 5 min
-const MAX_REQS = parseInt(process.env.MAX_CONCURRENT  || '10',     10); // 並行上限 (預設 10)
-const QUEUE_MAX = parseInt(process.env.RELAY_QUEUE    || '20',     10); // 最大排隊數
-const QUEUE_TIMEOUT = parseInt(process.env.RELAY_QUEUE_TIMEOUT || '30000', 10); // queue 最長等待 30s
+const TIMEOUT  = parseInt(process.env.RELAY_TIMEOUT   || '600000', 10); // 10 min (某些上游 thinking 較久)
+const MAX_REQS = parseInt(process.env.MAX_CONCURRENT  || '25',     10); // 並行上限
+const QUEUE_MAX = parseInt(process.env.RELAY_QUEUE    || '50',     10); // 最大排隊數
+const QUEUE_TIMEOUT = parseInt(process.env.RELAY_QUEUE_TIMEOUT || '60000', 10); // queue 最長等待 60s
 const MAX_BODY = 31_457_280; // 30MB
 const RELAY_SECRET = process.env.RELAY_SECRET || '';
 
@@ -454,6 +454,9 @@ process.on('unhandledRejection', (reason) => {
 const server = http.createServer(handleRequest);
 server.timeout         = TIMEOUT;
 server.maxHeadersCount = 200;
+server.on('connection', (socket) => {
+  socket.setNoDelay(true); // 禁用 Nagle，確保 metadata 不因 TCP 延遲被緩衝
+});
 server.listen(PORT, () => {
   console.log(`[relay] ready port=${PORT} timeout=${TIMEOUT}ms concurrent=${MAX_REQS} queue=${QUEUE_MAX}`);
 });

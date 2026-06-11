@@ -3,11 +3,11 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import portalHtml from "./dashboard.html";
 
-const UPSTREAM_TIMEOUT_MS = 25_000;     // CF Free 平台限制 30s，保留 5s 緩衝
-const LONG_TIMEOUT_MS = 25_000;
+const UPSTREAM_TIMEOUT_MS = 45_000;     // 等待 relay 回應 metadata 的上限（CF Free 總時長 100s，保留緩衝）
+const LONG_TIMEOUT_MS = 45_000;
 const CHANNEL_COOLDOWN_BASE_MS = 30_000; // 指數退避 ×2^n，上限 300s
 const CHANNEL_COOLDOWN_MAX_MS = 300_000;
-const STREAM_IDLE_TIMEOUT_MS = 60_000;  // 60s 無新 chunk 視為斷流
+const STREAM_IDLE_TIMEOUT_MS = 90_000;  // 串流中無新 chunk 視為斷流（free tier 上游可能較慢）
 
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
@@ -898,35 +898,6 @@ function rewriteModelInJson(text, clientModel) {
   return text;
 }
 
-async function peekFirstChunk(body) {
-  if (!body) return { done: true, value: null, tail: null };
-  const reader = body.getReader();
-  const { done, value } = await reader.read();
-  if (done) { reader.releaseLock(); return { done: true, value: null, tail: null }; }
-  // 將已讀取的 chunk 放回新的 ReadableStream，串接後續資料
-  let readerCancelled = false;
-  const tail = new ReadableStream({
-    start(controller) { controller.enqueue(value); },
-    pull(controller) {
-      if (readerCancelled) { controller.close(); return; }
-      return reader.read().then(({ done, value }) => {
-        if (done) controller.close();
-        else controller.enqueue(value);
-      });
-    },
-    cancel() { readerCancelled = true; reader.cancel().catch(() => {}); },
-  });
-  return { done: false, value, tail };
-}
-
-function isValidSseChunk(chunk) {
-  if (!chunk || chunk.byteLength === 0) return false;
-  const text = new TextDecoder().decode(chunk, { stream: true });
-  const trimmed = text.trimStart();
-  if (trimmed === '') return true;
-  return trimmed.startsWith('data:') || trimmed.startsWith(':');
-}
-
 function createFilterTransform(filters) {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -1196,8 +1167,10 @@ function createRelayStream(initial, reader) {
         initialSent = true;
         if (isUint8Array(initial) && initial.length > 0) {
           controller.enqueue(new Uint8Array(initial)); // 複製到當前 realm
+          return;
         }
-        return;
+        // rest 為空（metadata 與 upstream body 分屬不同 TCP chunk）
+        // 不回傳而是繼續往下讀 reader
       }
       try {
         const { done, value } = await reader.read();
@@ -1583,29 +1556,8 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       }
       if (res.ok) {
         markHealthy(channel.id, env);
-        // 驗證 SSE 回應：若上游 stream:true 回傳非 SSE 內容，改用非串流重試
-        if (streamType === "stream" && reqBody && (res.headers.get("Content-Type") || "").includes("text/event-stream")) {
-          const peek = await peekFirstChunk(res.body);
-          if (peek.done || !isValidSseChunk(peek.value)) {
-            // 未收到 chunk 或內容不是有效 SSE → 取消並以非串流重試
-            res.body?.cancel().catch(() => {});
-            try {
-              const parsed = JSON.parse(reqBody);
-              if (parsed.stream === true) {
-                parsed.stream = false;
-                reqBody = JSON.stringify(parsed);
-                retryAsNonStream = true;
-                refundRateLimitD1(env, channel, rlRpmWindow, rlRpdWindow);
-                markDegraded(channel.id, env);
-                logStructured("warn", "invalid SSE body, retrying with stream=false", { channel: channel.name, rid });
-                continue;
-              }
-            } catch (e) {}
-          } else {
-            // 有效 SSE → 用剩餘串流取代 body 繼續處理
-            res = new Response(peek.tail, { status: res.status, statusText: res.statusText, headers: new Headers(res.headers) });
-          }
-        }
+        // 信任 upstream metadata 的 Content-Type，不再 peek 第一位元組
+        // （避免 thinking model 延遲導致 handler 阻塞）
         if (channel.provider_options) {
           try {
             const opts = typeof channel.provider_options === "string" ? JSON.parse(channel.provider_options) : channel.provider_options;
