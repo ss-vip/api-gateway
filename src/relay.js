@@ -348,6 +348,9 @@ function handleRequest(req, res) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('api server is working');
   }
+  if (req.url === '/favicon.ico') {
+    res.writeHead(204); return res.end();
+  }
 
   // 認證檢查：若 RELAY_SECRET 有設定，所有請求（含 rate limit 前）都需驗證
   if (RELAY_SECRET) {

@@ -46,6 +46,19 @@ function learnChannelNoVision(channelId, env) {
   env?.DB?.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(channelId).run().catch(() => {});
 }
 
+// 從錯誤訊息解析 max_tokens 上限 (如 "max_tokens (32000) exceeds the maximum allowed ...: 4096" → 4096)
+function parseMaxTokensError(text) {
+  if (!text || typeof text !== "string") return 0;
+  const m = text.match(/max_tokens.*?maximum.*?[:（]\s*(\d+)/i);
+  if (m) return parseInt(m[1], 10);
+  const m2 = text.match(/max_tokens.*?limit.*?(\d+)/i);
+  if (m2) return parseInt(m2[1], 10);
+  return 0;
+}
+function learnMaxTokensLimit(channelId, maxAllowed, env) {
+  env?.DB?.prepare("UPDATE channels SET max_tokens=? WHERE id=? AND (max_tokens=0 OR max_tokens>?)").bind(maxAllowed, channelId, maxAllowed).run().catch(() => {});
+}
+
 async function generateSessionToken(env) {
   const token = generateToken("sess-");
   const expiresAt = Date.now() + SESSION_TTL;
@@ -1700,6 +1713,18 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           learnContextLimit(channel.id, estimatedContextTokens);
           attempted.add(channel.id);
           logStructured("warn", "context length exceeded, learned limit", { channel: channel.name, tokens: estimatedContextTokens, overflow: contextOverflowAt.get(channel.id), rid });
+          continue;
+        }
+      }
+      // 偵測 max_tokens 超限 → 更新渠道上限
+      if (res.status === 400 || res.status === 413) {
+        const text2 = await res.clone().text().catch(() => "");
+        const maxTokensLimit = parseMaxTokensError(text2);
+        if (maxTokensLimit > 0) {
+          res.body?.cancel().catch(() => {});
+          learnMaxTokensLimit(channel.id, maxTokensLimit, env);
+          attempted.add(channel.id);
+          logStructured("warn", "max_tokens exceeded, learned limit", { channel: channel.name, maxTokens: maxTokensLimit, rid });
           continue;
         }
       }
