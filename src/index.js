@@ -1570,8 +1570,9 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
       let res;
       if (requiredType === "realtime") {
         res = await upstreamFetch(url, { method, headers, body: reqBody, signal: controller.signal }, env, rid, true);
-      } else if (globalRelayUrl?.trim() && relayHealthy) {
-        const relayBase = globalRelayUrl.trim().replace(/\/+$/, '');
+      } else if ((channel?.relay_url?.trim() || globalRelayUrl?.trim()) && relayHealthy) {
+        const chRelay = channel?.relay_url?.trim();
+        const relayBase = (chRelay || globalRelayUrl).replace(/\/+$/, '');
         if (channel) {
           headers.set("x-channel-id", String(channel.id));
           if (channel.rpm_limit) headers.set("x-channel-rpm", String(channel.rpm_limit));
