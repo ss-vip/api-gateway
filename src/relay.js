@@ -25,7 +25,7 @@ const QUEUE_MAX = parseInt(process.env.RELAY_QUEUE    || '100',    10);
 const QUEUE_TIMEOUT = parseInt(process.env.RELAY_QUEUE_TIMEOUT || '15000', 10); // queue 最長等待 15s（快速 failover）
 const MAX_BODY = 31_457_280;
 const RELAY_SECRET = process.env.RELAY_SECRET || '';
-const CHANNEL_MIN_INTERVAL_MS = parseInt(process.env.CHANNEL_MIN_INTERVAL_MS || '2000', 10);
+const CHANNEL_MIN_INTERVAL_MS = parseInt(process.env.CHANNEL_MIN_INTERVAL_MS || '0', 10);
 
 const startTime = Date.now();
 let active      = 0;
@@ -135,7 +135,7 @@ const waitQueue = [];
 function tryDequeue() {
   while (waitQueue.length > 0 && active < MAX_REQS) {
     const entry = waitQueue.shift();
-    clearTimeout(entry.qTimer); // 已取出的 entry 不再需要 timeout
+    clearTimeout(entry.qTimer);
     active++;
     const dec = () => {
       if (dec.called) return;
@@ -484,10 +484,3 @@ process.on('SIGTERM', () => {
   }, 30_000).unref();
 });
 
-// 伺服器自 ping 防止 serv00 閒置殺行程（每 5 分鐘）
-const SELF_PING_URL = `http://127.0.0.1:${PORT}/health`;
-setInterval(() => {
-  const req = http.get(SELF_PING_URL, (res) => res.resume());
-  req.setTimeout(10_000, () => req.destroy());
-  req.on('error', () => {});
-}, 300_000).unref();

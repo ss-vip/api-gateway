@@ -3,12 +3,12 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import portalHtml from "./dashboard.html";
 
-const UPSTREAM_TIMEOUT_MS = 120_000;     // 等待 relay 回應 metadata 的上限（串流經 relay + upstream thinking 可能較久）
+const UPSTREAM_TIMEOUT_MS = 120_000;
 const LONG_TIMEOUT_MS = 120_000;
-const CHANNEL_COOLDOWN_BASE_MS = 30_000; // 指數退避 ×2^n，上限 300s
+const CHANNEL_COOLDOWN_BASE_MS = 30_000; // 指數退避 ×2^n
 const CHANNEL_COOLDOWN_MAX_MS = 300_000;
-const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 10_000; // 429 無訊息時的預設冷卻
-const STREAM_IDLE_TIMEOUT_MS = 90_000;  // 串流中無新 chunk 視為斷流（free tier 上游可能較慢）
+const RATE_LIMIT_DEFAULT_COOLDOWN_MS = 10_000;
+const STREAM_IDLE_TIMEOUT_MS = 90_000;  // 串流無新 chunk 視為斷流（free tier 上游可能較慢）
 
 const TOKEN_TTL = 60_000;
 const FILTER_TTL = 180_000;
@@ -18,7 +18,6 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const adminSessions = new Map();
 let sessionPruneCounter = 0;
 
-// 自動學習：渠道實際 context 上限（從 runtime 錯誤回饋）
 const contextOverflowAt = new Map();
 function isContextLengthError(text) {
   return /context_length|context length|maximum.*(?:context|tokens)|exceeds.*limit|too many tokens|token limit/i.test(text);
@@ -34,7 +33,6 @@ function successContextObserved(channelId, tokens) {
   }
 }
 
-// 自動學習：渠道實際上無法支援 tools / vision（從上游回空內容推斷）
 const channelNoTools = new Set();
 const channelNoVision = new Set();
 function learnChannelNoTools(channelId, env) {
@@ -46,7 +44,6 @@ function learnChannelNoVision(channelId, env) {
   env?.DB?.prepare("UPDATE channels SET support_vision=0 WHERE id=?").bind(channelId).run().catch(() => {});
 }
 
-// 從錯誤訊息解析 max_tokens 上限 (如 "max_tokens (32000) exceeds the maximum allowed ...: 4096" → 4096)
 function parseMaxTokensError(text) {
   if (!text || typeof text !== "string") return 0;
   const m = text.match(/max_tokens.*?maximum.*?[:（]\s*(\d+)/i);
@@ -597,8 +594,15 @@ function markDegraded(channelId, env, customBackoffMs) {
 }
 
 function markHealthy(channelId, env) {
+  const wasDegraded = degradedUntil.has(channelId) || degradeCount.has(channelId);
   degradedUntil.delete(channelId);
   degradeCount.delete(channelId);
+  // 從降級恢復時清除已學習標記，讓渠道有機會重新評估
+  if (wasDegraded) {
+    channelNoTools.delete(channelId);
+    channelNoVision.delete(channelId);
+    contextOverflowAt.delete(channelId);
+  }
   if (env) {
     env.DB.prepare(`UPDATE channels SET cooldown_until=0, consecutive_successes=consecutive_successes+1, consecutive_errors=0 WHERE id=?`).bind(channelId).run().catch(() => {});
   }
@@ -1705,7 +1709,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
         logStructured("warn", "upstream error, retrying", { channel: channel.name, status: res.status, rid });
         continue;
       }
-      // 偵測 context overflow → 學習該渠道實際上限，跳過 model fallback
       if ((res.status === 400 || res.status === 413) && estimatedContextTokens > 0) {
         const text = await res.clone().text().catch(() => "");
         if (isContextLengthError(text)) {
@@ -1716,7 +1719,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           continue;
         }
       }
-      // 偵測 max_tokens 超限 → 更新渠道上限
       if (res.status === 400 || res.status === 413) {
         const text2 = await res.clone().text().catch(() => "");
         const maxTokensLimit = parseMaxTokensError(text2);
@@ -1743,7 +1745,6 @@ async function tryForward(env, path, method, baseHeaders, body, rid, streamType,
           }
         } catch (e) {}
       }
-      // 所有非 2xx → 先嘗試備用 model，再換下一個渠道
       if (!res.ok) {
         res.body?.cancel().catch(() => {});
         if (channel.fallback_model && !fallbackModelsTried.has(channel.id)) {
