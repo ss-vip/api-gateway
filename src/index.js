@@ -5,19 +5,30 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
+// --- timestamped logger ---
+const _ts = () => {
+  const n = new Date();
+  const p = (v) => String(v).padStart(2, '0');
+  return `${n.getFullYear()}-${p(n.getMonth()+1)}-${p(n.getDate())} ${p(n.getHours())}:${p(n.getMinutes())}:${p(n.getSeconds())}`;
+};
+function log(...a) { console.log(`[${_ts()}]`, ...a); }
+function elog(...a) { console.error(`[${_ts()}]`, ...a); }
+// --- end logger ---
+
+// --- config loading ---
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 let cfg = {};
 try {
   if (fs.existsSync(CONFIG_PATH)) cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
 } catch (e) {
-  console.error('[config] failed to load config.json:', e.message);
+  elog('[config] failed to load config.json:', e.message);
 }
 
 const ACCOUNT_ID   = process.env.ACCOUNT_ID   || cfg.account_id   || '';
 const GATEWAY_NAME = process.env.GATEWAY_NAME || cfg.gateway_name || '';
 const CF_CONFIGURED = !!(ACCOUNT_ID && GATEWAY_NAME);
 if (!CF_CONFIGURED) {
-  console.warn('[config] ACCOUNT_ID / GATEWAY_NAME not set — running degraded (chat will 502)');
+  log('[config] ACCOUNT_ID / GATEWAY_NAME not set — running degraded (chat will 502)');
 }
 
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || cfg.client_token || '';
@@ -52,13 +63,15 @@ function resolveModel(clientModel) {
   return null;
 }
 
-const PORT            = parseInt(process.env.PORT   || cfg.port   || '3000', 10);
-const TIMEOUT_MS      = parseInt(process.env.TIMEOUT || cfg.timeout || '600000', 10);
-const KEY_COOLDOWN_MS = parseInt(process.env.KEY_COOLDOWN || cfg.key_cooldown || '30000', 10);
-const MAX_KEY_BACKOFF = parseInt(process.env.MAX_KEY_BACKOFF || cfg.max_key_backoff || '300000', 10);
+const PORT             = parseInt(process.env.PORT      || cfg.port            || '3000', 10);
+const TIMEOUT_MS       = parseInt(process.env.TIMEOUT   || cfg.timeout         || '600000', 10);
+const KEY_COOLDOWN_MS  = parseInt(process.env.KEY_COOLDOWN  || cfg.key_cooldown  || '30000', 10);
+const MAX_KEY_BACKOFF  = parseInt(process.env.MAX_KEY_BACKOFF || cfg.max_key_backoff || '300000', 10);
+const MAX_BODY_SIZE    = parseInt(process.env.MAX_BODY_SIZE || cfg.max_body_size || (10 * 1024 * 1024), 10); // 10MB
 const LOG_RETENTION_DAYS = parseInt(process.env.LOG_RETENTION_DAYS || cfg.log_retention_days || '0', 10);
 const CF_API_TOKEN = process.env.CF_API_TOKEN || cfg.cf_api_token || '';
 
+// --- key pool ---
 const keyPool = new Map();
 
 function initProvider(p) {
@@ -120,57 +133,7 @@ function selectKey(p) {
   return keys[idx];
 }
 
-function forwardToGateway(provider, apiKey, body) {
-  return new Promise((resolve, reject) => {
-    const bodyObj = JSON.parse(body);
-    bodyObj.model = `${provider}/${bodyObj.model}`;
-    const newBody = JSON.stringify(bodyObj);
-    const opts = {
-      hostname: cfg.gateway_base_url || 'gateway.ai.cloudflare.com',
-      port: 443,
-      path: `/v1/${ACCOUNT_ID}/${GATEWAY_NAME}/compat/chat/completions`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Accept': 'text/event-stream',
-      },
-      timeout: TIMEOUT_MS,
-    };
-    const req = https.request(opts, resolve);
-    req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
-    req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
-    req.write(newBody);
-    req.end();
-  });
-}
-
-let lastLogCleanup = 0;
-
-function cleanupOldLogs() {
-  if (LOG_RETENTION_DAYS <= 0 || !CF_API_TOKEN || !CF_CONFIGURED) return;
-  const now = Date.now();
-  if (now - lastLogCleanup < 3600000) return;
-  const cutoff = new Date(now - LOG_RETENTION_DAYS * 86400000).toISOString();
-  const filter = JSON.stringify([{ key: 'created_at', operator: 'lt', value: cutoff }]);
-  const req = https.request({
-    hostname: 'api.cloudflare.com',
-    path: `/client/v4/accounts/${ACCOUNT_ID}/ai-gateway/gateways/${GATEWAY_NAME}/logs?filters=${encodeURIComponent(filter)}`,
-    method: 'DELETE',
-    headers: { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
-  }, (res) => {
-    let body = '';
-    res.on('data', c => body += c);
-    res.on('end', () => {
-      const ok = res.statusCode >= 200 && res.statusCode < 300;
-      if (ok) lastLogCleanup = now;
-      if (!ok) console.error(`[cleanup] ${res.statusCode} ${body.slice(0, 200)}`);
-    });
-  });
-  req.on('error', (e) => console.error(`[cleanup] ${e.message}`));
-  req.end();
-}
-
+// --- low-level helpers ---
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function rid() {
@@ -190,25 +153,122 @@ function collectBody(res) {
   });
 }
 
+// --- gateway proxy ---
+
+/**
+ * Forward a request to Cloudflare AI Gateway.
+ * @param {string} apiKey         - Provider API key
+ * @param {string} bodyStr        - Serialised JSON body
+ * @param {string} routePath      - Gateway path (e.g. '/compat/chat/completions' or '/openai/embeddings')
+ * @param {string} [accept]       - Accept header value
+ * @param {string} [contentType]  - Content-Type header value
+ * @returns {Promise<IncomingMessage>}
+ */
+function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      hostname: cfg.gateway_base_url || 'gateway.ai.cloudflare.com',
+      port: 443,
+      path: `/v1/${ACCOUNT_ID}/${GATEWAY_NAME}${routePath}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': contentType || 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'Accept': accept || 'application/json',
+      },
+      timeout: TIMEOUT_MS,
+    };
+    const req = https.request(opts, resolve);
+    req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
+    req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
+    req.write(bodyStr);
+    req.end();
+  });
+}
+
+// --- log cleanup ---
+let lastLogCleanup = 0;
+
+function cleanupOldLogs() {
+  if (LOG_RETENTION_DAYS <= 0 || !CF_API_TOKEN || !CF_CONFIGURED) return;
+  const now = Date.now();
+  if (now - lastLogCleanup < 3600000) return;
+  const cutoff = new Date(now - LOG_RETENTION_DAYS * 86400000).toISOString();
+  const filter = JSON.stringify([{ key: 'created_at', operator: 'lt', value: cutoff }]);
+  const req = https.request({
+    hostname: 'api.cloudflare.com',
+    path: `/client/v4/accounts/${ACCOUNT_ID}/ai-gateway/gateways/${GATEWAY_NAME}/logs?filters=${encodeURIComponent(filter)}`,
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
+  }, (res) => {
+    let body = '';
+    res.on('data', c => body += c);
+    res.on('end', () => {
+      const ok = res.statusCode >= 200 && res.statusCode < 300;
+      if (ok) lastLogCleanup = now;
+      if (!ok) elog(`[cleanup] ${res.statusCode} ${body.slice(0, 200)}`);
+    });
+  });
+  req.on('error', (e) => elog(`[cleanup] ${e.message}`));
+  req.end();
+}
+
+// --- payload validation ---
+function validateChatBody(body) {
+  if (!body || typeof body !== 'object') return 'invalid request body';
+  if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) return 'messages must be a non-empty array';
+  if (!body.model || typeof body.model !== 'string') return 'model is required';
+  for (let i = 0; i < body.messages.length; i++) {
+    const msg = body.messages[i];
+    if (!msg || typeof msg !== 'object') return `messages[${i}] must be an object`;
+    if (typeof msg.role !== 'string' || !msg.role) return `messages[${i}].role is required`;
+    if (msg.content === undefined || msg.content === null) return `messages[${i}].content is required`;
+  }
+  return null;
+}
+
+// ============================================================
+//  CHAT COMPLETIONS  (/v1/chat/completions)
+// ============================================================
+
 async function handleChatCompletion(req, res, bodyJson, logId) {
+  const t0 = Date.now();
   if (!CF_CONFIGURED) {
+    log(`[${logId}] ← 502  gateway not configured`);
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'gateway not configured — set ACCOUNT_ID and GATEWAY_NAME', type: 'not_configured' } }));
     return;
   }
+
+  // Validate payload
+  const validationErr = validateChatBody(bodyJson);
+  if (validationErr) {
+    log(`[${logId}] ← 400  ${validationErr}`);
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: validationErr, type: 'invalid_request' } }));
+    return;
+  }
+
   const clientModel = bodyJson.model || 'unknown';
   const targets = resolveModel(clientModel);
 
   if (!targets) {
+    log(`[${logId}] ← 400  unsupported model: ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `model '${clientModel}' not supported`, type: 'unsupported_model' } }));
     return;
   }
 
-  console.log(`[${logId}] → ${clientModel} msgs=${(bodyJson.messages || []).length}`);
+  // Determine streaming mode (default true for backward compat)
+  const isStream = bodyJson.stream !== false;
+  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}`);
 
   const rotated = rotateTargets(targets, clientModel);
-  if (rotated.length > 1) console.log(`[${logId}] order: ${rotated.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
+  if (rotated.length > 1) log(`[${logId}] fallback: ${rotated.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
+
+  // Prepare body template once — model is set per-target below
+  const bodyTemplate = { ...bodyJson, stream: isStream };
+  delete bodyTemplate.model;
 
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
   let usedModel = null;
@@ -221,23 +281,24 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     const upstreamModel = target.upstreamModel;
     const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
 
-    const bodyClone = { ...bodyJson, model: upstreamModel, stream: true };
-    const requestBody = JSON.stringify(bodyClone);
+    // Serialise body once per provider target
+    const bodyStr = JSON.stringify({ ...bodyTemplate, model: `${provider}/${upstreamModel}` });
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (clientGone) break outer;
       usedKey = selectKey(provider);
-      if (!usedKey) { console.log(`[${logId}] ${provider}/${upstreamModel} no healthy key`); break; }
+      if (!usedKey) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); break; }
 
       try {
-        upstreamRes = await forwardToGateway(provider, usedKey, requestBody);
+        const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
+        upstreamRes = await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
         usedProvider = provider;
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
 
         if (sc === 429 || sc >= 500) {
           const body = await collectBody(upstreamRes);
-          console.log(`[${logId}] ${provider}/${upstreamModel} ${sc} attempt=${attempt+1}/${maxAttempts} body=${body.slice(0, 200)}`);
+          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  attempt=${attempt+1}/${maxAttempts}  key=...${usedKey.slice(-4)}`);
           markKeyError(provider, usedKey);
           lastErr = { status: sc, body };
           upstreamRes = null;
@@ -247,18 +308,19 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
         if (sc >= 400) {
           const body = await collectBody(upstreamRes);
-          console.log(`[${logId}] ${provider}/${upstreamModel} ${sc} non-retryable body=${body.slice(0, 200)}`);
+          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}  ${body.slice(0, 100)}`);
           lastErr = { status: sc, body };
           upstreamRes = null;
           break;
         }
 
+        // Success
         markKeySuccess(provider, usedKey);
-        console.log(`[${logId}] ${provider}/${upstreamModel} 200 key=...${usedKey.slice(-4)}`);
+        log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}`);
         break outer;
 
       } catch (e) {
-        console.log(`[${logId}] ${provider}/${upstreamModel} error: ${e.message} attempt=${attempt+1}/${maxAttempts}`);
+        log(`[${logId}] ${provider}/${upstreamModel} → error  attempt=${attempt+1}/${maxAttempts}  ${e.message}`);
         markKeyError(provider, usedKey);
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
         upstreamRes = null;
@@ -268,30 +330,165 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   if (!upstreamRes || !usedProvider) {
     const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
-    res.writeHead(lastErr?.status || 502, { 'Content-Type': 'application/json' });
+    const sc = lastErr?.status || 502;
+    log(`[${logId}] ← ${sc}  all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    res.writeHead(sc, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `all failed: ${errMsg}` } }));
     return;
   }
 
-  const needModelRewrite = usedModel !== clientModel;
+  // --- success path ---
+  log(`[${logId}] ← 200  ${((Date.now()-t0)/1000).toFixed(1)}s  ${usedProvider}/${usedModel}`);
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'X-Request-Id': logId,
-    'X-Provider': usedProvider,
-    'X-Upstream-Model': usedModel,
-  });
+  if (isStream) {
+    // SSE streaming response
+    const needModelRewrite = usedModel !== clientModel;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Request-Id': logId,
+      'X-Provider': usedProvider,
+      'X-Upstream-Model': usedModel,
+    });
 
-  const pipe = needModelRewrite
-    ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
-    : (c) => { try { res.write(c); } catch {} };
+    const pipe = needModelRewrite
+      ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
+      : (c) => { try { res.write(c); } catch {} };
 
-  upstreamRes.on('data', pipe);
-  upstreamRes.on('end',   () => { try { res.end(); } catch {} });
-  upstreamRes.on('error', (e) => { console.log(`[${logId}] stream: ${e.message}`); try { res.end(); } catch {} });
-  req.on('close', () => { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); });
+    upstreamRes.on('data', pipe);
+    upstreamRes.on('end',   () => { try { res.end(); } catch {} });
+    upstreamRes.on('error', (e) => { log(`[${logId}] stream: ${e.message}`); try { res.end(); } catch {} });
+    req.on('close', () => { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); });
+  } else {
+    // Non-streaming JSON response
+    const body = await collectBody(upstreamRes);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'X-Request-Id': logId,
+      'X-Provider': usedProvider,
+      'X-Upstream-Model': usedModel,
+    });
+    res.end(body);
+  }
+}
+
+// ============================================================
+//  GENERIC PROXY  (embeddings, images, audio, etc.)
+// ============================================================
+
+/**
+ * Generic proxy for non-chat endpoints.
+ * @param {string} endpointPath  - Gateway sub-path, e.g. '/embeddings', '/images/generations'
+ * @param {boolean} [jsonBody]   - Whether request body is JSON (true) or raw (false)
+ */
+async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, contentType) {
+  const t0 = Date.now();
+  if (!CF_CONFIGURED) {
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'gateway not configured', type: 'not_configured' } }));
+    return;
+  }
+
+  if (jsonBody !== false) {
+    if (!bodyJson || typeof bodyJson !== 'object') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid request body', type: 'invalid_request' } }));
+      return;
+    }
+  }
+
+  const clientModel = bodyJson?.model || 'unknown';
+
+  // Try configured model mapping first, fall back to openai default
+  let targets = resolveModel(clientModel);
+  if (!targets) {
+    targets = [{ provider: 'openai', upstreamModel: clientModel }];
+    log(`[${logId}] → ${clientModel}  ${endpointPath}  (default openai)`);
+  } else {
+    log(`[${logId}] → ${clientModel}  ${endpointPath}`);
+  }
+
+  let lastErr = null;
+  let clientGone = false;
+  req.on('close', () => { clientGone = true; });
+
+  for (const target of targets) {
+    if (clientGone) break;
+    const { provider, upstreamModel } = target;
+    const key = selectKey(provider);
+    if (!key) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); continue; }
+
+    // Provider-specific route: /{provider}/{endpoint}
+    const routePath = `/${provider}${endpointPath}`;
+    let bodyStr;
+
+    if (jsonBody !== false) {
+      bodyStr = JSON.stringify({ ...bodyJson, model: upstreamModel });
+    } else {
+      // Raw body passthrough (e.g., multipart audio) — bodyJson is actually the raw Buffer
+      bodyStr = bodyJson;
+    }
+
+    // Use original Content-Type for raw body; application/json otherwise
+    const upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
+
+    try {
+      const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType);
+      if (clientGone) return;
+      const sc = upstreamRes.statusCode;
+
+      if (sc >= 200 && sc < 300) {
+        markKeySuccess(provider, key);
+        log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+        // Forward response headers & body
+        const ctype = upstreamRes.headers['content-type'] || 'application/json';
+        const body = await collectBody(upstreamRes);
+        res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
+        res.end(body);
+        return;
+      }
+
+      // Upstream error
+      const body = await collectBody(upstreamRes);
+      if (sc === 429 || sc >= 500) {
+        log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
+        markKeyError(provider, key);
+        lastErr = { status: sc, body };
+        if (sc === 429) await sleep(1000);
+        continue;
+      }
+
+      // Non-retryable client error — forward upstream error to client
+      log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
+      markKeyError(provider, key);
+      res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId });
+      res.end(body);
+      return;
+
+    } catch (e) {
+      log(`[${logId}] ${provider}/${upstreamModel} → error  ${e.message}`);
+      markKeyError(provider, key);
+      lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
+    }
+  }
+
+  // All attempts exhausted
+  const sc = lastErr?.status || 502;
+  log(`[${logId}] ← ${sc}  all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  res.writeHead(sc, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
+}
+
+// ============================================================
+//  HTTP SERVER
+// ============================================================
+
+function isJsonEndpoint(url) {
+  return url.startsWith('/v1/chat/completions') ||
+         url.startsWith('/v1/embeddings') ||
+         url.startsWith('/v1/images/generations') ||
+         url.startsWith('/v1/audio/speech');
 }
 
 const server = http.createServer((req, res) => {
@@ -304,7 +501,9 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  if (CLIENT_TOKEN) {
+  // Auth check for protected endpoints
+  const needsAuth = (req.method === 'POST' || (req.url !== '/health' && req.url !== '/v1/health' && req.url !== '/'));
+  if (needsAuth && CLIENT_TOKEN) {
     const auth = req.headers['authorization'];
     if (!auth || !auth.startsWith('Bearer ') || auth.slice(7) !== CLIENT_TOKEN) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -313,7 +512,8 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  if (req.url === '/health' || req.url === '/v1/health') {
+  // --- GET /health — NO upstream key consumption ---
+  if ((req.url === '/health' || req.url === '/v1/health') && req.method === 'GET') {
     cleanupOldLogs();
     const s = { status: 'ok', uptime: Math.floor(process.uptime()), providers: {}, degraded: [] };
     for (const [p] of keyPool) {
@@ -327,67 +527,137 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // --- GET / ---
   if (req.url === '/' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Server is working');
     return;
   }
 
-  if (req.method === 'POST' && req.url.startsWith('/v1/chat/completions')) {
-    let body = '';
-    req.on('data',  (c) => { body += c; });
-    req.on('end', () => {
-      let json;
-      try { json = JSON.parse(body); }
-      catch {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: 'invalid JSON', type: 'invalid_request' } }));
-        return;
-      }
-      handleChatCompletion(req, res, json, logId);
+  // --- GET /v1/models ---
+  if (req.url === '/v1/models' && req.method === 'GET') {
+    const modelList = Object.entries(MODELS).map(([id, targets]) => {
+      let owned_by = 'unknown';
+      if (typeof targets === 'string') owned_by = targets;
+      else if (Array.isArray(targets)) owned_by = targets.map(t => t.provider).join(',');
+      return { id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by };
     });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ object: 'list', data: modelList }));
     return;
   }
 
+  // --- POST endpoints: collect body ---
+  if (req.method === 'POST') {
+    const chunks = [];
+    let bodySize = 0;
+
+    req.on('data', (c) => {
+      bodySize += c.length;
+      if (bodySize > MAX_BODY_SIZE) {
+        req.destroy(new Error('request body too large'));
+        return;
+      }
+      chunks.push(c);
+    });
+
+    req.on('end', () => {
+      // Check for premature destroy
+      if (req.destroyed) return;
+
+      const rawBody = Buffer.concat(chunks);
+      let json, rawStr;
+
+      // Try JSON parse for JSON endpoints
+      if (isJsonEndpoint(req.url)) {
+        try {
+          json = JSON.parse(rawBody.toString('utf8'));
+        } catch {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'invalid JSON', type: 'invalid_request' } }));
+          return;
+        }
+      } else {
+        // Raw body for non-JSON endpoints (audio transcriptions, etc.)
+        rawStr = rawBody;
+      }
+
+      // Route to appropriate handler
+      if (req.url.startsWith('/v1/chat/completions')) {
+        handleChatCompletion(req, res, json, logId);
+      } else if (req.url.startsWith('/v1/embeddings')) {
+        handleProxy(req, res, json, logId, '/embeddings', true);
+      } else if (req.url.startsWith('/v1/images/generations')) {
+        handleProxy(req, res, json, logId, '/images/generations', true);
+      } else if (req.url.startsWith('/v1/audio/speech')) {
+        handleProxy(req, res, json, logId, '/audio/speech', true);
+      } else if (req.url.startsWith('/v1/audio/transcriptions')) {
+        // Multipart form-data — pass raw body + original Content-Type
+        handleProxy(req, res, rawStr, logId, '/audio/transcriptions', false, req.headers['content-type']);
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'not found' } }));
+      }
+    });
+
+    // Handle oversized body destroy
+    req.on('error', (e) => {
+      if (e.message === 'request body too large') {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'request body too large', type: 'payload_too_large' } }));
+      }
+    });
+
+    return;
+  }
+
+  // --- 404 ---
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: 'not found' } }));
 });
 
+// --- provider initialisation ---
 Object.keys(PROVIDER_KEYS).forEach(initProvider);
 
 server.timeout = 0;
 server.keepAliveTimeout = 0;
 
 server.on('error', (e) => {
-  console.error(`[gateway] server error: ${e.message}`);
-  if (e.code === 'EADDRINUSE') console.error(`[gateway] port ${PORT} is already in use`);
+  elog(`[gateway] server error: ${e.message}`);
+  if (e.code === 'EADDRINUSE') elog(`[gateway] port ${PORT} is already in use`);
   setTimeout(() => process.exit(1), 1000).unref();
 });
 
 server.listen(PORT, () => {
-  console.log(`[gateway] started port=${PORT} account=${ACCOUNT_ID || '(degraded)'} gateway=${GATEWAY_NAME || '(degraded)'}`);
+  log(`[gateway] started port=${PORT} account=${ACCOUNT_ID || '(degraded)'} gateway=${GATEWAY_NAME || '(degraded)'}`);
   for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
-    console.log(`[gateway]   ${p}: ${keys.length} key(s)`);
+    log(`[gateway]   ${p}: ${keys.length} key(s)`);
   }
-  console.log(`[gateway] timeout=${TIMEOUT_MS}ms cooldown=${KEY_COOLDOWN_MS}ms`);
+  log(`[gateway] timeout=${TIMEOUT_MS}ms cooldown=${KEY_COOLDOWN_MS}ms maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
 });
 
+// --- graceful config reload ---
 if (fs.existsSync(CONFIG_PATH)) {
+  let reloadTimer = null;
   fs.watch(CONFIG_PATH, (event) => {
-    if (event === 'change') {
-      console.log(`[config] ${path.basename(CONFIG_PATH)} changed — restarting...`);
-      setTimeout(() => process.exit(0), 1000).unref();
+    if (event === 'change' && !reloadTimer) {
+      reloadTimer = setTimeout(() => {
+        log(`[config] ${path.basename(CONFIG_PATH)} changed — graceful restart...`);
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(1), 15000).unref();
+      }, 1000).unref();
     }
   });
 }
 
+// --- shutdown handlers ---
 function shutdown(signal) {
-  console.log(`\n[gateway] ${signal} — closing...`);
-  server.close(() => { console.log('[gateway] done'); process.exit(0); });
-  setTimeout(() => { console.error('[gateway] force exit'); process.exit(1); }, 10000).unref();
+  log(`\n[gateway] ${signal} — closing...`);
+  server.close(() => { log('[gateway] done'); process.exit(0); });
+  setTimeout(() => { elog('[gateway] force exit'); process.exit(1); }, 10000).unref();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('uncaughtException', (e) => { console.error('[gateway] FATAL:', e.stack); process.exit(1); });
-process.on('unhandledRejection', (r) => { console.error('[gateway] REJECTION:', r instanceof Error ? r.stack : r); });
+process.on('uncaughtException', (e) => { elog('[gateway] FATAL:', e.stack); process.exit(1); });
+process.on('unhandledRejection', (r) => { elog('[gateway] REJECTION:', r instanceof Error ? r.stack : r); });

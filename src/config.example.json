@@ -10,6 +10,7 @@
   "timeout": 600000,
   "key_cooldown": 30000,
   "max_key_backoff": 300000,
+  "max_body_size": 10485760,
 
   "log_retention_days": 7,
   "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
@@ -29,6 +30,13 @@
       { "provider": "mistral",    "model": "mistral-large-latest" },
       { "provider": "cerebras",   "model": "llama3.1-70b" },
       { "provider": "deepseek",   "model": "deepseek-chat" }
-    ]
+    ],
+
+    "text-embedding-3-small": "openai",
+    "text-embedding-3-large": "openai",
+    "dall-e-3":  "openai",
+    "tts-1":     "openai",
+    "tts-1-hd":  "openai",
+    "whisper-1": "openai"
   }
 }
