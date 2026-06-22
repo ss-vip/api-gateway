@@ -1,16 +1,9 @@
 {
   "name": "api-gateway",
-  "type": "module",
-  "version": "2.0.0",
-  "description": "AI API Gateway — Cloudflare Workers Edition",
+  "version": "1.0.0",
+  "description": "AI API Gateway — Cloudflare AI Gateway Multi-Key Polling Proxy",
+  "main": "src/index.js",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
-  },
-  "dependencies": {
-    "hono": "^4.12.25"
-  },
-  "devDependencies": {
-    "wrangler": "^4.100.0"
+    "start": "node src/index.js"
   }
 }
