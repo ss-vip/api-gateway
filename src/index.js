@@ -15,7 +15,6 @@ const _ts = () => {
 };
 function log(...a) { console.log(`[${_ts()}]`, ...a); }
 function elog(...a) { console.error(`[${_ts()}]`, ...a); }
-// --- end logger ---
 
 // --- config loading ---
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
@@ -55,7 +54,7 @@ const PROVIDERS_WITH_KEYS = new Set(
 
 // --- free keys (scraped from GitHub README) ---
 const FREE_KEYS_DEFAULT_URL = 'https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md';
-const freeKeyModels = new Map();    // model → string[] (keys)
+let freeKeyModels = new Map();    // model → string[] (keys), reassigned atomically
 let freeKeysLastFetch = 0;
 
 function resolveModel(clientModel) {
@@ -191,25 +190,38 @@ function fetchFreeKeys() {
   const url = fk.url || FREE_KEYS_DEFAULT_URL;
   https.get(url, (res) => {
     if (res.statusCode !== 200) { elog(`[freekeys] fetch ${res.statusCode}`); return; }
-    let body = '';
-    res.on('data', c => body += c);
-    res.on('end', () => {
+    const MAX_LINES = 500;
+    const END_MARKER = '## 🚀 How to Use';
+    let body = '', lines = 0, parsed = false;
+    const parse = () => {
+      if (parsed) return;
+      parsed = true;
       const pairs = parseFreeKeys(body);
       if (pairs.length === 0) { elog('[freekeys] parsed 0 keys'); return; }
       freeKeysLastFetch = Date.now();
       const allKeys = [...new Set(pairs.map(p => p[0]))];
       PROVIDER_KEYS['freekeys'] = allKeys;
       PROVIDERS_WITH_KEYS.add('freekeys');
-      // Replace entire key pool (expired keys are removed)
       keyPool.set('freekeys', new Map(allKeys.map(k => [k, { degradedUntil: 0, errorCount: 0, successCount: 0 }])));
-
-      freeKeyModels.clear();
+      // Build new map in private, then swap atomically — avoids race window
+      const newModelMap = new Map();
       for (const [key, model] of pairs) {
-        if (!freeKeyModels.has(model)) freeKeyModels.set(model, []);
-        freeKeyModels.get(model).push(key);
+        if (!newModelMap.has(model)) newModelMap.set(model, []);
+        newModelMap.get(model).push(key);
       }
+      freeKeyModels = newModelMap;
       log(`[freekeys] ${allKeys.length} keys across ${freeKeyModels.size} models`);
+    };
+    res.on('data', (c) => {
+      const s = c.toString();
+      body += s;
+      const markerIdx = body.indexOf(END_MARKER);
+      if (markerIdx !== -1) { body = body.slice(0, markerIdx); res.destroy(); parse(); return; }
+      lines += s.split('\n').length - 1;
+      if (lines >= MAX_LINES) { res.destroy(); parse(); }
     });
+    res.on('end', parse);
+    res.on('close', parse);
   }).on('error', (e) => elog(`[freekeys] fetch error: ${e.message}`));
 }
 
@@ -218,11 +230,13 @@ function getFreeKeyTargets(clientModel) {
   const baseUrl = cfg.free_keys?.base_url;
   if (!baseUrl) return [];
   const m = clientModel.toLowerCase();
-  // First try exact/prefix match
+  // Only prefix-match when client model contains '/' (specific model name like 'openai/gpt-4o')
+  // Short aliases (e.g. 'openai', 'gpt-4') should exact-match only, avoiding false prefix hits
+  const hasSlash = m.includes('/');
   const exact = [];
   for (const [model] of freeKeyModels) {
     const ml = model.toLowerCase();
-    if (m === ml || m.startsWith(ml) || ml.startsWith(m)) {
+    if (m === ml || (hasSlash && (m.startsWith(ml) || ml.startsWith(m)))) {
       exact.push(model);
     }
   }
@@ -261,7 +275,28 @@ function sanitizeMessages(messages) {
   });
 }
 
+// CF AI Gateway Issue #547: Gemini translation layer rejects assistant messages
+// with content:null + tool_calls in multi-turn conversations. Normalize to "".
+function normalizeContent(messages) {
+  if (!Array.isArray(messages)) return messages;
+  return messages.map(msg => {
+    if (msg && typeof msg === 'object' && msg.content === null && Array.isArray(msg.tool_calls)) {
+      return { ...msg, content: '' };
+    }
+    return msg;
+  });
+}
+
 // --- gateway proxy ---
+
+function resolveBaseUrl(raw) {
+  if (!raw) return { hostname: 'gateway.ai.cloudflare.com', port: 443, prefix: '' };
+  if (raw.includes('://')) {
+    const u = new URL(raw);
+    return { hostname: u.hostname, port: u.port || 443, prefix: u.pathname.replace(/\/+$/, '') };
+  }
+  return { hostname: raw.split('/')[0], port: 443, prefix: raw.includes('/') ? '/' + raw.split('/').slice(1).join('/').replace(/\/+$/, '') : '' };
+}
 
 /**
  * Forward a request to Cloudflare AI Gateway.
@@ -274,10 +309,11 @@ function sanitizeMessages(messages) {
  */
 function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
   return new Promise((resolve, reject) => {
+    const gw = resolveBaseUrl(cfg.gateway_base_url);
     const opts = {
-      hostname: cfg.gateway_base_url || 'gateway.ai.cloudflare.com',
-      port: 443,
-      path: `/v1/${ACCOUNT_ID}/${GATEWAY_NAME}${routePath}`,
+      hostname: gw.hostname,
+      port: gw.port,
+      path: `${gw.prefix}/v1/${ACCOUNT_ID}/${GATEWAY_NAME}${routePath}`,
       method: 'POST',
       headers: {
         'Content-Type': contentType || 'application/json',
@@ -302,10 +338,11 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
   return new Promise((resolve, reject) => {
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
     const url = new URL(joined);
+    const isHttps = url.protocol === 'https:';
     const opts = {
       hostname: url.hostname,
-      port: 443,
-      path: url.pathname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
       method: 'POST',
       headers: {
         'Content-Type': contentType || 'application/json',
@@ -314,7 +351,8 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
       },
       timeout: TIMEOUT_MS,
     };
-    const req = https.request(opts, resolve);
+    const mod = isHttps ? https : http;
+    const req = mod.request(opts, resolve);
     req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
     req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
     req.write(bodyStr);
@@ -324,6 +362,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
 
 // --- log cleanup ---
 let lastLogCleanup = 0;
+let cleanupAuthFailed = false;
 
 function cleanupOldLogs() {
   if (LOG_RETENTION_DAYS <= 0 || !CF_API_TOKEN || !CF_CONFIGURED) return;
@@ -341,8 +380,15 @@ function cleanupOldLogs() {
     res.on('data', c => body += c);
     res.on('end', () => {
       const ok = res.statusCode >= 200 && res.statusCode < 300;
-      if (ok) lastLogCleanup = now;
-      if (!ok) elog(`[cleanup] ${res.statusCode} ${body.slice(0, 200)}`);
+      if (ok) { lastLogCleanup = now; return; }
+      if (res.statusCode === 401) {
+        if (!cleanupAuthFailed) {
+          cleanupAuthFailed = true;
+          elog(`[cleanup] 401 — cf_api_token missing AI Gateway Edit permission, disable log_retention_days or fix token`);
+        }
+        return;
+      }
+      elog(`[cleanup] ${res.statusCode} ${body.slice(0, 200)}`);
     });
   });
   req.on('error', (e) => elog(`[cleanup] ${e.message}`));
@@ -358,14 +404,18 @@ function validateChatBody(body) {
     const msg = body.messages[i];
     if (!msg || typeof msg !== 'object') return `messages[${i}] must be an object`;
     if (typeof msg.role !== 'string' || !msg.role) return `messages[${i}].role is required`;
-    if (msg.content === undefined || msg.content === null) return `messages[${i}].content is required`;
+    if (msg.role === 'assistant') {
+      if ((msg.content === undefined || msg.content === null) && (!msg.tool_calls || !Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0))
+        return `messages[${i}].content or tool_calls required for assistant`;
+    } else if (msg.role === 'tool') {
+      if (!msg.tool_call_id) return `messages[${i}].tool_call_id required`;
+      if (msg.content === undefined || msg.content === null) return `messages[${i}].content is required for tool message`;
+    } else {
+      if (msg.content === undefined || msg.content === null) return `messages[${i}].content is required`;
+    }
   }
   return null;
 }
-
-// ============================================================
-//  CHAT COMPLETIONS  (/v1/chat/completions)
-// ============================================================
 
 async function handleChatCompletion(req, res, bodyJson, logId) {
   const t0 = Date.now();
@@ -398,7 +448,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 
   // Fast-skip targets whose provider has no keys configured
-  const activeTargets = CF_CONFIGURED ? targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider)) : [];
+  const activeTargets = CF_CONFIGURED ? targets.filter(t => t.provider !== 'freekeys' && PROVIDERS_WITH_KEYS.has(t.provider)) : [];
   if (activeTargets.length === 0 && !hasFreeKeys) {
     log(`[${logId}] ← 400  no keys available for ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -408,7 +458,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   // Determine streaming mode (default true for backward compat)
   const isStream = bodyJson.stream !== false;
-  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}`);
+  const providerKeyCount = Object.keys(PROVIDER_KEYS).filter(k => k !== 'freekeys').reduce((s, k) => s + (PROVIDER_KEYS[k] || []).length, 0);
+  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${providerKeyCount}  free=${freeKeyModels.size}`);
+
 
   const rotated = rotateTargets(activeTargets, clientModel);
   if (rotated.length > 1) log(`[${logId}] fallback: ${rotated.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
@@ -430,8 +482,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
     // Serialise body once per provider target
     const bodyObj = { ...bodyTemplate, model: `${provider}/${upstreamModel}` };
-    if (!supportsReasoningContent(provider, upstreamModel) && Array.isArray(bodyObj.messages)) {
-      bodyObj.messages = sanitizeMessages(bodyObj.messages);
+    if (Array.isArray(bodyObj.messages)) {
+      if (!supportsReasoningContent(provider, upstreamModel)) {
+        bodyObj.messages = sanitizeMessages(bodyObj.messages);
+      }
+      // CF Issue #547: Gemini rejects content:null + tool_calls in multi-turn
+      if (provider === 'google-ai-studio') {
+        bodyObj.messages = normalizeContent(bodyObj.messages);
+      }
     }
     const bodyStr = JSON.stringify(bodyObj);
 
@@ -482,47 +540,67 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   if (!upstreamRes || !usedProvider) {
     // --- CF all failed → try free keys as last resort ---
     if (cfg.free_keys?.enabled && !clientGone) {
-      const freeTargets = getFreeKeyTargets(clientModel);
-      if (freeTargets.length > 0) log(`[${logId}] fallback: ${freeTargets.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
-      for (const ft of freeTargets) {
-        if (clientGone) break;
-        const fbBody = { ...bodyTemplate, model: ft.upstreamModel };
-        if (!supportsReasoningContent(ft.provider, ft.upstreamModel) && Array.isArray(fbBody.messages)) {
-          fbBody.messages = sanitizeMessages(fbBody.messages);
-        }
-        const bodyStr = JSON.stringify(fbBody);
-        for (const key of ft.keys) {
-          if (clientGone) break;
-          try {
-            const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-            upstreamRes = await forwardToDirect(key, bodyStr, ft.base_url, 'chat/completions', acceptHdr);
-            usedProvider = ft.provider;
-            usedModel = ft.upstreamModel;
-            const sc = upstreamRes.statusCode;
-            if (sc === 429 || sc >= 500) {
-              const bd = await collectBody(upstreamRes);
-              log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
-              lastErr = { status: sc, body: bd };
+      const baseUrl = cfg.free_keys?.base_url;
+      if (baseUrl) {
+        // Build ordered list: matched models first, then up to MAX_FREE_MODELS total
+        const MAX_FREE_MODELS = 7;
+        const matchedModels = getFreeKeyTargets(clientModel).map(t => t.upstreamModel);
+        const matchedSet = new Set(matchedModels);
+        const fkMap = freeKeyModels; // snapshot reference to avoid race with concurrent fetchFreeKeys swap
+        const allModels = [...fkMap.keys()];
+        const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m))).slice(0, MAX_FREE_MODELS);
+        if (orderedModels.length > 0) log(`[${logId}] fallback: ${orderedModels.length} free models (${matchedModels.length} matched)`);
+        let freeIdx = 0;
+        for (const model of orderedModels) {
+          freeIdx++;
+          log(`[${logId}] freekeys[${freeIdx}/${orderedModels.length}] model=${model} upstreamRes=${!!upstreamRes} clientGone=${clientGone}`);
+          if (clientGone || upstreamRes) break;
+          const keys = fkMap.get(model) || [];
+          const fbBody = { ...bodyTemplate, model };
+          if (Array.isArray(fbBody.messages)) {
+            if (!supportsReasoningContent('freekeys', model)) fbBody.messages = sanitizeMessages(fbBody.messages);
+            fbBody.messages = normalizeContent(fbBody.messages);
+          }
+          const bodyStr = JSON.stringify(fbBody);
+          for (const key of keys) {
+            if (clientGone || upstreamRes) break;
+            try {
+              const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
+              upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
+              usedProvider = 'freekeys';
+              usedModel = model;
+              const sc = upstreamRes.statusCode;
+              // Free keys: 401/402 are key-level (try next key); 403 is model-level (skip model)
+              if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
+                const bd = await collectBody(upstreamRes);
+                log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
+                lastErr = { status: sc, body: bd }; upstreamRes = null;
+                if (sc === 429) await sleep(1000);
+                continue;
+              }
+              if (sc >= 400) {
+                const bd = await collectBody(upstreamRes);
+                log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}  ${bd.slice(0,100)}`);
+                lastErr = { status: sc, body: bd }; upstreamRes = null;
+                break;
+              }
+              log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
+              break;
+            } catch (e) {
+              log(`[${logId}] freekeys/${model} → error  ${e.message}`);
+              lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
               upstreamRes = null;
-              if (sc === 429) await sleep(1000);
               continue;
             }
-            if (sc >= 400) {
-              const bd = await collectBody(upstreamRes);
-              log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${bd.slice(0,100)}`);
-              lastErr = { status: sc, body: bd };
-              upstreamRes = null;
-              break;
+          }
+          if (!upstreamRes && keys.length > 0) {
+            if (lastErr?.status === 403) {
+              log(`[${logId}] freekeys/${model} → blocked (403), skip to next model`);
+            } else {
+              log(`[${logId}] freekeys/${model} → all ${keys.length} keys exhausted`);
             }
-            log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
-            break;
-          } catch (e) {
-            log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → error  ${e.message}`);
-            lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
-            upstreamRes = null;
           }
         }
-        if (upstreamRes) break;
       }
     }
   }
@@ -572,10 +650,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 }
 
-// ============================================================
-//  GENERIC PROXY  (embeddings, images, audio, etc.)
-// ============================================================
-
 /**
  * Generic proxy for non-chat endpoints.
  * @param {string} endpointPath  - Gateway sub-path, e.g. '/embeddings', '/images/generations'
@@ -610,7 +684,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   // Fast-skip targets without configured keys
-  const activeTargets = CF_CONFIGURED ? targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider)) : [];
+  const activeTargets = CF_CONFIGURED ? targets.filter(t => t.provider !== 'freekeys' && PROVIDERS_WITH_KEYS.has(t.provider)) : [];
   if (activeTargets.length === 0 && !hasFreeKeys) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
@@ -716,10 +790,6 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   res.writeHead(sc, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
-
-// ============================================================
-//  HTTP SERVER
-// ============================================================
 
 function isJsonEndpoint(url) {
   return url.startsWith('/v1/chat/completions') ||
@@ -887,7 +957,7 @@ server.listen(PORT, () => {
 if (fs.existsSync(CONFIG_PATH)) {
   let reloadTimer = null;
   fs.watch(CONFIG_PATH, (event) => {
-    if (event === 'change' && !reloadTimer) {
+    if ((event === 'change' || event === 'rename') && !reloadTimer) {
       reloadTimer = setTimeout(() => {
         log(`[config] ${path.basename(CONFIG_PATH)} changed — graceful restart...`);
         server.close(() => process.exit(0));
