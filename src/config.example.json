@@ -1,5 +1,6 @@
 {
   "_note": "複製為 config.json。所有值可由同名環境變數覆寫。",
+  "_providers_note": "只填入你有 API key 的 provider 即可。無 key 的 provider 在請求時會被自動略過。",
 
   "account_id": "your-cloudflare-account-id",
   "gateway_name": "your-ai-gateway-name",
@@ -15,28 +16,98 @@
   "log_retention_days": 7,
   "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
 
+  "free_keys": {
+    "_note": " (選用)以下若設為 true 啟用：訪問 /health 路由將會從 GitHub 爬取公開免費 key 做為備援。",
+    "enabled": true,
+    "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
+    "base_url": "https://aiapiv2.pekpik.com/v1",
+    "interval_ms": 300000
+  },
+
   "providers": {
-    "google-ai-studio":  ["AIzaSy...", "AIzaSy..."],
-    "mistral":    ["MISTRAL_KEY_1"],
-    "cerebras":   ["CEREBRAS_KEY_1"],
-    "openai":     ["sk-proj-..."],
-    "deepseek":   ["sk-..."]
+    "openai":            ["sk-proj-..."],
+    "anthropic":         ["sk-ant-..."],
+    "google-ai-studio":  ["AIzaSy..."],
+    "google-vertex-ai":  ["your-vertex-key"],
+    "azure-openai":      ["your-azure-key"],
+    "aws-bedrock":       ["your-bedrock-key"],
+    "mistral":           ["MISTRAL_KEY_1"],
+    "cerebras":          ["CEREBRAS_KEY_1"],
+    "deepseek":          ["sk-..."],
+    "xai":               ["xai-..."],
+    "groq":              ["gsk_..."],
+    "openrouter":        ["sk-or-..."],
+    "together":          ["tgpv_..."],
+    "perplexity":        ["pplx-..."],
+    "cohere":            ["co-..."],
+    "replicate":         ["r8_..."],
+    "huggingface":       ["hf_..."],
+    "cartesia":          ["cartesia-key"],
+    "elevenlabs":        ["eleven-key"],
+    "deepgram":          ["deepgram-key"],
+    "baseten":           ["baseten-key"],
+    "fal-ai":            ["fal-key"],
+    "ideogram":          ["ideogram-key"],
+    "parallel":          ["parallel-key"],
+    "workers-ai":        ["your-cf-api-token"]
   },
 
   "models": {
+    "gpt-4o": "openai",
+    "gpt-4o-mini": "openai",
+    "claude-sonnet-4-20250514": "anthropic",
+    "claude-haiku-3-5": "anthropic",
+
     "openai": [
       { "provider": "google-ai-studio",  "model": "gemini-2.0-flash" },
       { "provider": "google-ai-studio",  "model": "gemini-2.5-pro-exp-03-25" },
-      { "provider": "mistral",    "model": "mistral-large-latest" },
-      { "provider": "cerebras",   "model": "llama3.1-70b" },
-      { "provider": "deepseek",   "model": "deepseek-chat" }
+      { "provider": "mistral",           "model": "mistral-large-latest" },
+      { "provider": "cerebras",          "model": "llama3.1-70b" },
+      { "provider": "deepseek",          "model": "deepseek-chat" },
+      { "provider": "groq",              "model": "llama-3.3-70b-versatile" },
+      { "provider": "openai",            "model": "gpt-4o-mini" }
     ],
+
+    "claude-3-haiku": [
+      { "provider": "anthropic",         "model": "claude-3-5-haiku-latest" },
+      { "provider": "google-ai-studio",  "model": "gemini-2.0-flash" },
+      { "provider": "mistral",           "model": "mistral-small-latest" }
+    ],
+
+    "gemini-2.0-flash": "google-ai-studio",
+
+    "gemini-2.5-pro": [
+      { "provider": "google-ai-studio",  "model": "gemini-2.5-pro-exp-03-25" },
+      { "provider": "anthropic",         "model": "claude-sonnet-4-20250514" }
+    ],
+
+    "deepseek-chat": [
+      { "provider": "deepseek",          "model": "deepseek-chat" },
+      { "provider": "together",          "model": "deepseek-ai/DeepSeek-V3" },
+      { "provider": "openrouter",        "model": "deepseek/deepseek-chat" }
+    ],
+
+    "llama-3.1-70b": [
+      { "provider": "cerebras",          "model": "llama3.1-70b" },
+      { "provider": "groq",              "model": "llama-3.1-70b-versatile" },
+      { "provider": "together",          "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo" },
+      { "provider": "replicate",         "model": "meta/meta-llama-3.1-70b-instruct" }
+    ],
+
+    "llama-3.3-70b": "groq",
+
+    "mistral-large": "mistral",
+    "mistral-small": "mistral",
+
+    "command-r-plus": "cohere",
+
+    "sonar-pro": "perplexity",
 
     "text-embedding-3-small": "openai",
     "text-embedding-3-large": "openai",
-    "dall-e-3":  "openai",
-    "tts-1":     "openai",
-    "tts-1-hd":  "openai",
-    "whisper-1": "openai"
+    "dall-e-3":               "openai",
+    "tts-1":                  "openai",
+    "tts-1-hd":               "openai",
+    "whisper-1":              "openai"
   }
 }
