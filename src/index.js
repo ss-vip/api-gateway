@@ -55,6 +55,7 @@ const PROVIDERS_WITH_KEYS = new Set(
 // --- free keys (scraped from GitHub README) ---
 const FREE_KEYS_DEFAULT_URL = 'https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md';
 let freeKeyModels = new Map();    // model → string[] (keys), reassigned atomically
+let freeKeysHash = '';           // JSON.stringify(pairs) cache, skip swap when unchanged
 let freeKeysLastFetch = 0;
 
 function resolveModel(clientModel) {
@@ -158,7 +159,11 @@ function formatUptime(sec) {
 
 function rewriteModelInSse(chunk, toModel) {
   if (!toModel) return chunk;
-  return chunk.toString().replace(/"model"\s*:\s*"[^"]+"/g, `"model":"${toModel}"`);
+  return chunk.toString().split('\n').map(line => {
+    if (!line.startsWith('data: ')) return line;
+    try { const p = JSON.parse(line.slice(6)); if (p.model) p.model = toModel; return 'data: ' + JSON.stringify(p); }
+    catch { return line; }
+  }).join('\n');
 }
 
 function collectBody(res) {
@@ -198,6 +203,9 @@ function fetchFreeKeys() {
       parsed = true;
       const pairs = parseFreeKeys(body);
       if (pairs.length === 0) { elog('[freekeys] parsed 0 keys'); return; }
+      const newHash = JSON.stringify(pairs);
+      if (newHash === freeKeysHash) { freeKeysLastFetch = Date.now(); return; }
+      freeKeysHash = newHash;
       freeKeysLastFetch = Date.now();
       const allKeys = [...new Set(pairs.map(p => p[0]))];
       PROVIDER_KEYS['freekeys'] = allKeys;
@@ -230,13 +238,10 @@ function getFreeKeyTargets(clientModel) {
   const baseUrl = cfg.free_keys?.base_url;
   if (!baseUrl) return [];
   const m = clientModel.toLowerCase();
-  // Only prefix-match when client model contains '/' (specific model name like 'openai/gpt-4o')
-  // Short aliases (e.g. 'openai', 'gpt-4') should exact-match only, avoiding false prefix hits
-  const hasSlash = m.includes('/');
   const exact = [];
   for (const [model] of freeKeyModels) {
     const ml = model.toLowerCase();
-    if (m === ml || (hasSlash && (m.startsWith(ml) || ml.startsWith(m)))) {
+    if (m === ml || m.startsWith(ml) || ml.startsWith(m)) {
       exact.push(model);
     }
   }
@@ -295,7 +300,12 @@ function resolveBaseUrl(raw) {
     const u = new URL(raw);
     return { hostname: u.hostname, port: u.port || 443, prefix: u.pathname.replace(/\/+$/, '') };
   }
-  return { hostname: raw.split('/')[0], port: 443, prefix: raw.includes('/') ? '/' + raw.split('/').slice(1).join('/').replace(/\/+$/, '') : '' };
+  const hostpart = raw.split('/')[0];
+  const ci = hostpart.lastIndexOf(':');
+  const hostname = ci > 0 ? hostpart.slice(0, ci) : hostpart;
+  const port = ci > 0 ? parseInt(hostpart.slice(ci + 1), 10) || 443 : 443;
+  const prefix = raw.includes('/') ? '/' + raw.split('/').slice(1).join('/').replace(/\/+$/, '') : '';
+  return { hostname, port, prefix };
 }
 
 /**
@@ -542,18 +552,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     if (cfg.free_keys?.enabled && !clientGone) {
       const baseUrl = cfg.free_keys?.base_url;
       if (baseUrl) {
-        // Build ordered list: matched models first, then up to MAX_FREE_MODELS total
-        const MAX_FREE_MODELS = 7;
+        // Build ordered list: matched models first, then all others
+        const fkMap = freeKeyModels; // snapshot reference to avoid race with concurrent fetchFreeKeys swap
         const matchedModels = getFreeKeyTargets(clientModel).map(t => t.upstreamModel);
         const matchedSet = new Set(matchedModels);
-        const fkMap = freeKeyModels; // snapshot reference to avoid race with concurrent fetchFreeKeys swap
         const allModels = [...fkMap.keys()];
-        const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m))).slice(0, MAX_FREE_MODELS);
-        if (orderedModels.length > 0) log(`[${logId}] fallback: ${orderedModels.length} free models (${matchedModels.length} matched)`);
-        let freeIdx = 0;
+        const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m)));
+        if (orderedModels.length > 0) log(`[${logId}] freekeys try ${orderedModels.length} models (${matchedModels.length} matched)`);
         for (const model of orderedModels) {
-          freeIdx++;
-          log(`[${logId}] freekeys[${freeIdx}/${orderedModels.length}] model=${model} upstreamRes=${!!upstreamRes} clientGone=${clientGone}`);
           if (clientGone || upstreamRes) break;
           const keys = fkMap.get(model) || [];
           const fbBody = { ...bodyTemplate, model };
@@ -564,17 +570,22 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           const bodyStr = JSON.stringify(fbBody);
           for (const key of keys) {
             if (clientGone || upstreamRes) break;
+            // Skip degraded keys (marked by markKeyError on 401/402/5xx)
+            const kp = keyPool.get('freekeys');
+            const ks = kp?.get(key);
+            if (ks && Date.now() < ks.degradedUntil) continue;
             try {
               const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
               upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
               usedProvider = 'freekeys';
               usedModel = model;
               const sc = upstreamRes.statusCode;
-              // Free keys: 401/402 are key-level (try next key); 403 is model-level (skip model)
+              // Free keys: 401/402/429/5xx are key-level (try next key); 403 is model-level (skip model)
               if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
                 const bd = await collectBody(upstreamRes);
                 log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
                 lastErr = { status: sc, body: bd }; upstreamRes = null;
+                markKeyError('freekeys', key);
                 if (sc === 429) await sleep(1000);
                 continue;
               }
@@ -752,14 +763,20 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     }
   }
 
-  // All attempts exhausted
-  if ((lastErr || activeTargets.length === 0) && cfg.free_keys?.enabled && !clientGone) {
+  // All attempts exhausted — also triggered when loop ran (activeTargets.length>0)
+  // but every key was degraded and no upstream ever returned (lastErr stays null)
+  if (!lastErr) lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) };
+  if (cfg.free_keys?.enabled && !clientGone) {
     const freeTargets = getFreeKeyTargets(clientModel);
     if (freeTargets.length > 0) log(`[${logId}] freekey fallback: ${freeTargets.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
     for (const ft of freeTargets) {
       if (clientGone) break;
       for (const key of ft.keys) {
         if (clientGone) break;
+        // Skip degraded keys
+        const kp = keyPool.get('freekeys');
+        const ks = kp?.get(key);
+        if (ks && Date.now() < ks.degradedUntil) continue;
         try {
           const fbBody = jsonBody !== false
             ? JSON.stringify({ ...bodyJson, model: ft.upstreamModel })
@@ -778,8 +795,10 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
             return;
           }
           log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0,100)}`);
+          if (sc === 401 || sc === 402 || sc >= 500) markKeyError('freekeys', key);
         } catch (e) {
           log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → error  ${e.message}`);
+          markKeyError('freekeys', key);
         }
       }
     }

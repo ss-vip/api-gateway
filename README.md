@@ -9,16 +9,18 @@ Cloudflare AI Gateway 代理 — 支援多 API Key 輪詢、故障轉移、Model
 - **多 Key 輪詢** — 每個 Provider 獨立 Round-Robin 選 Key
 - **Key 故障轉移** — 429/5xx/網路錯誤 -> 指數退避降級 (30s×2ⁿ, max 5min)，成功後逐步恢復
 - **Provider 降級** — Fallback Chain 依序嘗試備援 Provider
-- **Model 別名路由** — 統一 model 名稱（如 `openai`）
-- **SSE 串流** — 強制 stream 模式，透傳上游串流
-- **CORS 全開** — 允許跨域請求
-- **健康檢查** — `GET /health` 回報各 Provider Key 健康狀態
+- **Model 別名路由** — 統一 model 名稱（如 `openai`）或相符的模型名稱優先調用
+- **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
+- **健康檢查** — `GET /health` （帶 client token）查各渠道健康狀態，觸發 free keys 更新與 cloudflare log 清理
+- **Free Keys 備援** — 當 CF AI Gateway 所有 key 都失敗時，自動嘗試 free keys
+- **非 Chat 端點** — 支援 embeddings、images/generations、audio/speech、audio/transcriptions
+- **配置熱重載** — 修改 `config.json` 自動重啟（1秒 debounce）
 
 ## 前置需求
 
 - Node.js 18+
-- Cloudflare 帳號 (AI Gateway)
-- Node.js 的主機 (選用)
+- Cloudflare 帳號 (啟用 AI Gateway 服務)
+- Node.js 主機 (選用)
 
 ## 快速開始
 
@@ -44,14 +46,44 @@ npm start
 
 ## 設定
 
-`src/config.json` 完整欄位參考 `src/config.example.json`：
+`src/config.json` 完整欄位參考 `src/config.example.json`。
+
+| 欄位 | 說明 |
+|------|------|
+| `account_id` | Cloudflare Account ID |
+| `gateway_name` | Cloudflare AI Gateway 名稱 |
+| `gateway_base_url` | （選用）自訂 CF AI Gateway 網址，預設 `gateway.ai.cloudflare.com` |
+| `client_token` | （選用）Client 端 Bearer Token，設定後所有 POST 需帶此 Token |
+| `timeout` | 上游請求超時（ms，預設 600000） |
+| `key_cooldown` | Key 錯誤冷卻時間（ms，預設 30000），指數退避 ×2ⁿ |
+| `max_key_backoff` | Key 最長退避時間（ms，預設 300000） |
+| `free_keys.enabled` | 是否啟用公開免費 Key 備援 |
+| `free_keys.url` | 免費 Key 來源 URL（GitHub README） |
+| `free_keys.base_url` | 免費 Key 的 API 端點 |
+| `free_keys.interval_ms` | 輪詢間隔（ms，預設 300000） |
+| `log_retention_days` | （選用）CF AI Gateway 日誌保留天數，>0 時 `/health` 會自動清理 |
+| `cf_api_token` | （選用）CF API Token，需有 AI Gateway Edit 權限 |
+| `providers` | Provider 名稱到 Key 陣列的對應 |
+| `models` | Model 別名路由表，可指向字串（單一 provider）或陣列（fallback chain） |
 
 ```json
 {
   "account_id": "your-account-id",
   "gateway_name": "your-gateway-name",
+  "gateway_base_url": "",
 
   "client_token": "your-secret-token",
+
+  "timeout": 600000,
+  "key_cooldown": 30000,
+  "max_key_backoff": 300000,
+
+  "free_keys": {
+    "enabled": true,
+    "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
+    "base_url": "https://aiapiv2.pekpik.com/v1",
+    "interval_ms": 300000
+  },
 
   "providers": {
     "google-ai-studio": ["key1", "key2"],
@@ -89,14 +121,17 @@ curl http://localhost:3000/v1/chat/completions \
 - 回應 header `X-Provider` 標示實際使用的 Provider, `X-Upstream-Model` 標示實際上游 model
 - 別名路由的 SSE 回應中 model 欄位自動改回 client 請求的名稱
 
-## 健康檢查
+## 健康檢查 (推薦排程)
 
 ```bash
 curl http://localhost:3000/health
-# 支援自動清理 Cloudflare AI Gateway logs, 需要建立 Profile API Token 儲存於 config.json
+# 未帶 Token 時僅回傳 {status, uptime}
+# 帶 Token 時回傳各 Provider 的 key 健康狀態，並觸發：
+#   1. 自動清理 Cloudflare AI Gateway logs（需 cf_api_token、log_retention_days）
+#   2. 重新爬取免費 key（需 free_keys.enabled）
 ```
 
-## PM2 部署
+## PM2 部署 (選用)
 
 ```bash
 npm install -g pm2
