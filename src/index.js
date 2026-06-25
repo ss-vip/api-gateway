@@ -500,6 +500,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   outer: for (const target of rotated) {
     if (clientGone) break;
+    if (lastErr) await sleep(Math.random() * 300); // jitter between provider targets
     const provider = target.provider;
     const upstreamModel = target.upstreamModel;
     const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
@@ -519,6 +520,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (clientGone) break outer;
+      if (attempt > 0) await sleep(Math.random() * 300); // jitter to spread concurrent retries
       usedKey = selectKey(provider);
       if (!usedKey) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); errorLog({ provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
@@ -587,6 +589,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           const bodyStr = JSON.stringify(fbBody);
           for (const key of keys) {
             if (clientGone || upstreamRes) break;
+            await sleep(Math.random() * 200); // jitter to spread concurrent requests
             // Skip degraded keys (marked by markKeyError on 401/402/5xx)
             const kp = keyPool.get('freekeys');
             const ks = kp?.get(key);
@@ -734,6 +737,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     const { provider, upstreamModel } = target;
     const key = selectKey(provider);
     if (!key) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); continue; }
+    // jitter before each provider attempt to spread concurrent requests
+    if (lastErr) await sleep(Math.random() * 300);
 
     // Provider-specific route: /{provider}/{endpoint}
     const routePath = `/${provider}${endpointPath}`;
