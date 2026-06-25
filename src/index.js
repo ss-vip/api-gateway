@@ -17,19 +17,38 @@ function log(...a) { console.log(`[${_ts()}]`, ...a); }
 function elog(...a) { console.error(`[${_ts()}]`, ...a); }
 
 // --- error log file ---
+function _errMsg(body) {
+  if (!body) return '-';
+  const raw = typeof body === 'string' ? body : body.toString();
+  // Strip BOM, trim whitespace
+  const clean = raw.replace(/^\ufeff/, '').trim();
+  // Try to extract a clean error message from JSON
+  try {
+    const p = JSON.parse(clean);
+    const r = Array.isArray(p) ? p[0] : p;
+    const msg = r?.error?.message || r?.error?.type || r?.message;
+    if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, 500);
+  } catch {
+    // Raw newlines inside JSON string values make parse fail.
+    // Escape literal newlines inside strings, then retry parse.
+    try {
+      const escaped = clean.replace(/("(?:[^"\\]|\\.)*")/g, s => s.replace(/\n/g, '\\n'));
+      const p = JSON.parse(escaped);
+      const r = Array.isArray(p) ? p[0] : p;
+      const msg = r?.error?.message || r?.error?.type || r?.message;
+      if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, 500);
+    } catch {}
+  }
+  // Fallback: strip newlines, limit length
+  return clean.replace(/\n/g, ' ').slice(0, 500);
+}
 let _errLogCount = 0;
 function errorLog({ provider, model, key, status, body }) {
   const ec = cfg.error_log;
   if (ec?.enabled === false) return;
   const p = ec?.path || './error.log';
-  const entry = JSON.stringify({
-    ts: _ts(), epoch: Date.now(),
-    provider: provider || '-', model: model || '-',
-    key: key ? `...${key.slice(-4)}` : '-',
-    status: status || '-',
-    body: (body || '').slice(0, 200),
-  }) + '\n';
-  fs.appendFile(p, entry, (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
+  const k = key ? `...${key.slice(-4)}` : '-';
+  fs.appendFile(p, `${_ts()} | ${String(status||'-').padStart(3)} | ${(provider||'-').padEnd(18)} | ${(model||'-').padEnd(24)} | ${k} | ${_errMsg(body)}\n`, (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
   _errLogCount++;
   // Cleanup once per ~50 writes
   if (_errLogCount % 50 === 1) {
@@ -38,7 +57,7 @@ function errorLog({ provider, model, key, status, body }) {
     fs.readFile(p, 'utf8', (err, c) => {
       if (err) return;
       const lines = c.split('\n').filter(l => {
-        try { return JSON.parse(l).epoch > cutoff; } catch { return false; }
+        try { return new Date(l.slice(0, 19)).getTime() > cutoff; } catch { return false; }
       });
       if (lines.length > 0) fs.writeFile(p, lines.join('\n') + '\n', () => {});
     });
@@ -152,6 +171,7 @@ function markKeySuccess(p, key) {
   s.successCount++;
 }
 
+const keyInFlight = new Set();
 const rrCursor = new Map();
 const modelCursor = new Map();
 
@@ -164,12 +184,21 @@ function rotateTargets(targets, clientModel) {
 }
 
 function selectKey(p) {
-  const keys = getHealthyKeys(p);
-  if (keys.length === 0) return null;
+  // Prefer keys without an in-flight request; fall back to any key if all are busy
+  const healthy = getHealthyKeys(p);
+  if (healthy.length === 0) return null;
+  const free = healthy.filter(k => !keyInFlight.has(`${p}:${k}`));
+  const keys = free.length > 0 ? free : healthy;
   let idx = rrCursor.get(p) ?? -1;
   idx = (idx + 1) % keys.length;
   rrCursor.set(p, idx);
-  return keys[idx];
+  const key = keys[idx];
+  keyInFlight.add(`${p}:${key}`);
+  return key;
+}
+
+function releaseKey(p, key) {
+  if (p && key) keyInFlight.delete(`${p}:${key}`);
 }
 
 // --- low-level helpers ---
@@ -496,8 +525,17 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
   let usedModel = null;
   let clientGone = false;
+  let loopTries = 0;
+  const MAX_LOOP_TRIES = 3;
   req.on('close', () => { clientGone = true; });
 
+  while (!upstreamRes && !clientGone && loopTries < MAX_LOOP_TRIES && Date.now() - t0 < TIMEOUT_MS) {
+    loopTries++;
+    if (loopTries > 1) {
+      const wait = Math.min((loopTries - 1) * 2000, 10000);
+      log(`[${logId}] retry ${loopTries} — waiting ${wait}ms for key recovery...`);
+      await sleep(wait);
+    }
   outer: for (const target of rotated) {
     if (clientGone) break;
     if (lastErr) await sleep(Math.random() * 300); // jitter between provider targets
@@ -531,18 +569,21 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
 
+        // degrade BEFORE releasing — prevents race where concurrent request picks up key before markKeyError runs
         if (sc === 429 || sc >= 500) {
-          markKeyError(provider, usedKey); // degrade before any I/O — no race with concurrent requests
+          markKeyError(provider, usedKey);
+          releaseKey(provider, usedKey);
           const body = await collectBody(upstreamRes);
           log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  attempt=${attempt+1}/${maxAttempts}  key=...${usedKey.slice(-4)}`);
           errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
           lastErr = { status: sc, body };
           upstreamRes = null;
-          if (sc === 429) await sleep(1000);
           continue;
         }
 
         if (sc >= 400) {
+          markKeyError(provider, usedKey);
+          releaseKey(provider, usedKey);
           const body = await collectBody(upstreamRes);
           log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}  ${body.slice(0, 100)}`);
           errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
@@ -552,91 +593,95 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
 
         // Success
+        releaseKey(provider, usedKey);
         markKeySuccess(provider, usedKey);
         log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}`);
         break outer;
 
       } catch (e) {
+        markKeyError(provider, usedKey);
+        releaseKey(provider, usedKey);
         log(`[${logId}] ${provider}/${upstreamModel} → error  attempt=${attempt+1}/${maxAttempts}  ${e.message}`);
         errorLog({ provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
-        markKeyError(provider, usedKey);
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
         upstreamRes = null;
       }
     }
+
   }
 
-  if (!upstreamRes || !usedProvider) {
-    // --- CF all failed → try free keys as last resort ---
-    if (cfg.free_keys?.enabled && !clientGone) {
-      const baseUrl = cfg.free_keys?.base_url;
-      if (baseUrl) {
-        // Build ordered list: matched models first, then all others
-        const fkMap = freeKeyModels; // snapshot reference to avoid race with concurrent fetchFreeKeys swap
-        const matchedModels = getFreeKeyTargets(clientModel).map(t => t.upstreamModel);
-        const matchedSet = new Set(matchedModels);
-        const allModels = [...fkMap.keys()];
-        const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m)));
-        if (orderedModels.length > 0) log(`[${logId}] freekeys try ${orderedModels.length} models (${matchedModels.length} matched)`);
-        for (const model of orderedModels) {
+  // --- CF all failed → try free keys as last resort ---
+  if (!upstreamRes && cfg.free_keys?.enabled && !clientGone) {
+    const baseUrl = cfg.free_keys?.base_url;
+    if (baseUrl) {
+      const fkMap = freeKeyModels;
+      const matchedModels = getFreeKeyTargets(clientModel).map(t => t.upstreamModel);
+      const matchedSet = new Set(matchedModels);
+      const allModels = [...fkMap.keys()];
+      const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m)));
+      if (orderedModels.length > 0) log(`[${logId}] freekeys try ${orderedModels.length} models (${matchedModels.length} matched)`);
+      for (const model of orderedModels) {
+        if (clientGone || upstreamRes) break;
+        const keys = fkMap.get(model) || [];
+        const fbBody = { ...bodyTemplate, model };
+        if (Array.isArray(fbBody.messages)) {
+          if (!supportsReasoningContent('freekeys', model)) fbBody.messages = sanitizeMessages(fbBody.messages);
+          fbBody.messages = normalizeContent(fbBody.messages);
+        }
+        const bodyStr = JSON.stringify(fbBody);
+        for (const key of keys) {
           if (clientGone || upstreamRes) break;
-          const keys = fkMap.get(model) || [];
-          const fbBody = { ...bodyTemplate, model };
-          if (Array.isArray(fbBody.messages)) {
-            if (!supportsReasoningContent('freekeys', model)) fbBody.messages = sanitizeMessages(fbBody.messages);
-            fbBody.messages = normalizeContent(fbBody.messages);
-          }
-          const bodyStr = JSON.stringify(fbBody);
-          for (const key of keys) {
-            if (clientGone || upstreamRes) break;
-            await sleep(Math.random() * 200); // jitter to spread concurrent requests
-            // Skip degraded keys (marked by markKeyError on 401/402/5xx)
-            const kp = keyPool.get('freekeys');
-            const ks = kp?.get(key);
-            if (ks && Date.now() < ks.degradedUntil) continue;
-            try {
-              const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-              upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
-              usedProvider = 'freekeys';
-              usedModel = model;
-              const sc = upstreamRes.statusCode;
-              // Free keys: 401/402/429/5xx are key-level (try next key); 403 is model-level (skip model)
-              if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
-                markKeyError('freekeys', key); // degrade before any I/O
-                const bd = await collectBody(upstreamRes);
-                log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
-                errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
-                lastErr = { status: sc, body: bd }; upstreamRes = null;
-                if (sc === 429) await sleep(1000);
-                continue;
-              }
-              if (sc >= 400) {
-                const bd = await collectBody(upstreamRes);
-                log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}  ${bd.slice(0,100)}`);
-                errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
-                lastErr = { status: sc, body: bd }; upstreamRes = null;
-                break;
-              }
+          await sleep(Math.random() * 200);
+          const kp = keyPool.get('freekeys');
+          const ks = kp?.get(key);
+          if (ks && Date.now() < ks.degradedUntil) continue;
+          try {
+            const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
+            upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
+            usedProvider = 'freekeys';
+            usedModel = model;
+            const sc = upstreamRes.statusCode;
+            if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
+              markKeyError('freekeys', key);
+              releaseKey('freekeys', key);
+              const bd = await collectBody(upstreamRes);
               log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
-              break;
-            } catch (e) {
-              log(`[${logId}] freekeys/${model} → error  ${e.message}`);
-              errorLog({ provider: 'freekeys', model, key, status: 502, body: e.message });
-              lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
-              upstreamRes = null;
+              errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
+              lastErr = { status: sc, body: bd }; upstreamRes = null;
               continue;
             }
-          }
-          if (!upstreamRes && keys.length > 0) {
-            if (lastErr?.status === 403) {
-              log(`[${logId}] freekeys/${model} → blocked (403), skip to next model`);
-            } else {
-              log(`[${logId}] freekeys/${model} → all ${keys.length} keys exhausted`);
+            if (sc >= 400) {
+              markKeyError('freekeys', key);
+              releaseKey('freekeys', key);
+              const bd = await collectBody(upstreamRes);
+              log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}  ${bd.slice(0,100)}`);
+              errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
+              lastErr = { status: sc, body: bd }; upstreamRes = null;
+              break;
             }
+            releaseKey('freekeys', key);
+            log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
+            break;
+          } catch (e) {
+            markKeyError('freekeys', key);
+            releaseKey('freekeys', key);
+            log(`[${logId}] freekeys/${model} → error  ${e.message}`);
+            errorLog({ provider: 'freekeys', model, key, status: 502, body: e.message });
+            lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
+            upstreamRes = null;
+            continue;
+          }
+        }
+        if (!upstreamRes && keys.length > 0) {
+          if (lastErr?.status === 403) {
+            log(`[${logId}] freekeys/${model} → blocked (403), skip to next model`);
+          } else {
+            log(`[${logId}] freekeys/${model} → all ${keys.length} keys exhausted`);
           }
         }
       }
     }
+  }
   }
 
   if (!upstreamRes || !usedProvider) {
@@ -753,13 +798,13 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
     try {
       const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType);
-      if (clientGone) return;
+      if (clientGone) { releaseKey(provider, key); return; }
       const sc = upstreamRes.statusCode;
 
       if (sc >= 200 && sc < 300) {
+        releaseKey(provider, key);
         markKeySuccess(provider, key);
         log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-        // Forward response headers & body
         const ctype = upstreamRes.headers['content-type'] || 'application/json';
         const body = await collectBody(upstreamRes);
         res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
@@ -767,28 +812,26 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         return;
       }
 
-      // Upstream error
+      // degrade before releasing — no race window
+      markKeyError(provider, key);
+      releaseKey(provider, key);
+      const body = await collectBody(upstreamRes);
       if (sc === 429 || sc >= 500) {
-        markKeyError(provider, key); // degrade before any I/O
-        const body = await collectBody(upstreamRes);
         log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
         errorLog({ provider, model: upstreamModel, key, status: sc, body });
         lastErr = { status: sc, body };
-        if (sc === 429) await sleep(1000);
-        continue;
+      } else {
+        log(`[${logId}] ${provider}/${upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
+        errorLog({ provider, model: upstreamModel, key, status: sc, body });
+        lastErr = { status: sc, body };
       }
-
-      // Upstream client error — skip to next target (provider may not support this endpoint)
-      const body = await collectBody(upstreamRes);
-      log(`[${logId}] ${provider}/${upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
-      errorLog({ provider, model: upstreamModel, key, status: sc, body });
-      lastErr = { status: sc, body };
       continue;
 
     } catch (e) {
+      markKeyError(provider, key);
+      releaseKey(provider, key);
       log(`[${logId}] ${provider}/${upstreamModel} → error  ${e.message}`);
       errorLog({ provider, model: upstreamModel, key, status: 502, body: e.message });
-      markKeyError(provider, key);
       lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
     }
   }
