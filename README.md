@@ -25,9 +25,8 @@ Cloudflare AI Gateway 代理 — 支援多 API Key 輪詢、故障轉移、Model
 ## 快速開始
 
 ```bash
-# 設定
+# 複製設定檔並修改 src/config.json 填入 ACCOUNT_ID, GATEWAY_NAME, API Keys
 cp src/config.example.json src/config.json
-# 編輯 src/config.json 填入 ACCOUNT_ID, GATEWAY_NAME, API Keys
 
 npm start
 ```
@@ -35,12 +34,10 @@ npm start
 ### 環境變數 (可覆蓋 config.json)
 
 ```bash
+export PORT=3000
 export ACCOUNT_ID=your-account-id
 export GATEWAY_NAME=your-gateway-name
-export GEMINI_KEYS=key1,key2,key3
-export MISTRAL_KEYS=key1,key2
-export OPENAI_KEYS=key1
-export PORT=3000
+export GEMINI_KEYS=key1,key2
 npm start
 ```
 
@@ -52,11 +49,13 @@ npm start
 |------|------|
 | `account_id` | Cloudflare Account ID |
 | `gateway_name` | Cloudflare AI Gateway 名稱 |
-| `gateway_base_url` | （選用）自訂 CF AI Gateway 網址，預設 `gateway.ai.cloudflare.com` |
 | `client_token` | （選用）Client 端 Bearer Token，設定後所有 POST 需帶此 Token |
 | `timeout` | 上游請求超時（ms，預設 600000） |
 | `key_cooldown` | Key 錯誤冷卻時間（ms，預設 30000），指數退避 ×2ⁿ |
 | `max_key_backoff` | Key 最長退避時間（ms，預設 300000） |
+| `error_log.enabled` | （選用）非200錯誤紀錄檔開關（預設 true） |
+| `error_log.path` | （選用）紀錄檔路徑（預設 ./error.log） |
+| `error_log.retention_days` | （選用）紀錄保留天數（預設 7） |
 | `free_keys.enabled` | 是否啟用公開免費 Key 備援 |
 | `free_keys.url` | 免費 Key 來源 URL（GitHub README） |
 | `free_keys.base_url` | 免費 Key 的 API 端點 |
@@ -66,25 +65,10 @@ npm start
 | `providers` | Provider 名稱到 Key 陣列的對應 |
 | `models` | Model 別名路由表，可指向字串（單一 provider）或陣列（fallback chain） |
 
+- 以下設定範例，client 發送請求使用 model 名稱 `openai` 將會隨機調用 provider `google-ai-studio`、`mistral` 的對應模型與 keys 做轉發
+
 ```json
 {
-  "account_id": "your-account-id",
-  "gateway_name": "your-gateway-name",
-  "gateway_base_url": "",
-
-  "client_token": "your-secret-token",
-
-  "timeout": 600000,
-  "key_cooldown": 30000,
-  "max_key_backoff": 300000,
-
-  "free_keys": {
-    "enabled": true,
-    "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
-    "base_url": "https://aiapiv2.pekpik.com/v1",
-    "interval_ms": 300000
-  },
-
   "providers": {
     "google-ai-studio": ["key1", "key2"],
     "mistral": ["key1"]
@@ -94,6 +78,7 @@ npm start
     "gemini-2.0-flash": "google-ai-studio",
 
     "openai": [
+      { "provider": "google-ai-studio", "model": "gemini-2.5-flash" },
       { "provider": "google-ai-studio", "model": "gemini-2.0-flash" },
       { "provider": "mistral",   "model": "mistral-large-latest" }
     ]
@@ -142,3 +127,8 @@ pm2 start src/index.js --name api-gateway \
 pm2 save
 pm2 startup
 ```
+
+## 補充
+
+- Client 請求若非使用 chat 端點（TTS/STT/圖像生成）僅 OpenAI providers 可用。
+- 在 Cloudflare AI Gateway 中，有支援 cartesia、elevenlabs、deepgram、fal-ai、ideogram 服務使用，但由於上游 API 不同，目前在此專案不適用。

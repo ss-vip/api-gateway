@@ -16,6 +16,35 @@ const _ts = () => {
 function log(...a) { console.log(`[${_ts()}]`, ...a); }
 function elog(...a) { console.error(`[${_ts()}]`, ...a); }
 
+// --- error log file ---
+let _errLogCount = 0;
+function errorLog({ provider, model, key, status, body }) {
+  const ec = cfg.error_log;
+  if (ec?.enabled === false) return;
+  const p = ec?.path || './error.log';
+  const entry = JSON.stringify({
+    ts: _ts(), epoch: Date.now(),
+    provider: provider || '-', model: model || '-',
+    key: key ? `...${key.slice(-4)}` : '-',
+    status: status || '-',
+    body: (body || '').slice(0, 200),
+  }) + '\n';
+  fs.appendFile(p, entry, (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
+  _errLogCount++;
+  // Cleanup once per ~50 writes
+  if (_errLogCount % 50 === 1) {
+    const days = (ec?.retention_days || 7);
+    const cutoff = Date.now() - days * 86400000;
+    fs.readFile(p, 'utf8', (err, c) => {
+      if (err) return;
+      const lines = c.split('\n').filter(l => {
+        try { return JSON.parse(l).epoch > cutoff; } catch { return false; }
+      });
+      if (lines.length > 0) fs.writeFile(p, lines.join('\n') + '\n', () => {});
+    });
+  }
+}
+
 // --- config loading ---
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 let cfg = {};
@@ -294,20 +323,6 @@ function normalizeContent(messages) {
 
 // --- gateway proxy ---
 
-function resolveBaseUrl(raw) {
-  if (!raw) return { hostname: 'gateway.ai.cloudflare.com', port: 443, prefix: '' };
-  if (raw.includes('://')) {
-    const u = new URL(raw);
-    return { hostname: u.hostname, port: u.port || 443, prefix: u.pathname.replace(/\/+$/, '') };
-  }
-  const hostpart = raw.split('/')[0];
-  const ci = hostpart.lastIndexOf(':');
-  const hostname = ci > 0 ? hostpart.slice(0, ci) : hostpart;
-  const port = ci > 0 ? parseInt(hostpart.slice(ci + 1), 10) || 443 : 443;
-  const prefix = raw.includes('/') ? '/' + raw.split('/').slice(1).join('/').replace(/\/+$/, '') : '';
-  return { hostname, port, prefix };
-}
-
 /**
  * Forward a request to Cloudflare AI Gateway.
  * @param {string} apiKey         - Provider API key
@@ -319,11 +334,10 @@ function resolveBaseUrl(raw) {
  */
 function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
   return new Promise((resolve, reject) => {
-    const gw = resolveBaseUrl(cfg.gateway_base_url);
     const opts = {
-      hostname: gw.hostname,
-      port: gw.port,
-      path: `${gw.prefix}/v1/${ACCOUNT_ID}/${GATEWAY_NAME}${routePath}`,
+      hostname: 'gateway.ai.cloudflare.com',
+      port: 443,
+      path: `/v1/${ACCOUNT_ID}/${GATEWAY_NAME}${routePath}`,
       method: 'POST',
       headers: {
         'Content-Type': contentType || 'application/json',
@@ -506,7 +520,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (clientGone) break outer;
       usedKey = selectKey(provider);
-      if (!usedKey) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); break; }
+      if (!usedKey) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); errorLog({ provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
       try {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
@@ -516,9 +530,10 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const sc = upstreamRes.statusCode;
 
         if (sc === 429 || sc >= 500) {
+          markKeyError(provider, usedKey); // degrade before any I/O — no race with concurrent requests
           const body = await collectBody(upstreamRes);
           log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  attempt=${attempt+1}/${maxAttempts}  key=...${usedKey.slice(-4)}`);
-          markKeyError(provider, usedKey);
+          errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
           lastErr = { status: sc, body };
           upstreamRes = null;
           if (sc === 429) await sleep(1000);
@@ -528,6 +543,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (sc >= 400) {
           const body = await collectBody(upstreamRes);
           log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}  ${body.slice(0, 100)}`);
+          errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
           lastErr = { status: sc, body };
           upstreamRes = null;
           break;
@@ -540,6 +556,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
       } catch (e) {
         log(`[${logId}] ${provider}/${upstreamModel} → error  attempt=${attempt+1}/${maxAttempts}  ${e.message}`);
+        errorLog({ provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
         markKeyError(provider, usedKey);
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
         upstreamRes = null;
@@ -582,16 +599,18 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               const sc = upstreamRes.statusCode;
               // Free keys: 401/402/429/5xx are key-level (try next key); 403 is model-level (skip model)
               if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
+                markKeyError('freekeys', key); // degrade before any I/O
                 const bd = await collectBody(upstreamRes);
                 log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
+                errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
                 lastErr = { status: sc, body: bd }; upstreamRes = null;
-                markKeyError('freekeys', key);
                 if (sc === 429) await sleep(1000);
                 continue;
               }
               if (sc >= 400) {
                 const bd = await collectBody(upstreamRes);
                 log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}  ${bd.slice(0,100)}`);
+                errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
                 lastErr = { status: sc, body: bd }; upstreamRes = null;
                 break;
               }
@@ -599,6 +618,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               break;
             } catch (e) {
               log(`[${logId}] freekeys/${model} → error  ${e.message}`);
+              errorLog({ provider: 'freekeys', model, key, status: 502, body: e.message });
               lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
               upstreamRes = null;
               continue;
@@ -620,6 +640,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
     const sc = lastErr?.status || 502;
     log(`[${logId}] ← ${sc}  all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    errorLog({ provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: sc, body: errMsg });
     res.writeHead(sc, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `all failed: ${errMsg}` } }));
     return;
@@ -742,22 +763,26 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       }
 
       // Upstream error
-      const body = await collectBody(upstreamRes);
       if (sc === 429 || sc >= 500) {
+        markKeyError(provider, key); // degrade before any I/O
+        const body = await collectBody(upstreamRes);
         log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
-        markKeyError(provider, key);
+        errorLog({ provider, model: upstreamModel, key, status: sc, body });
         lastErr = { status: sc, body };
         if (sc === 429) await sleep(1000);
         continue;
       }
 
       // Upstream client error — skip to next target (provider may not support this endpoint)
+      const body = await collectBody(upstreamRes);
       log(`[${logId}] ${provider}/${upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
+      errorLog({ provider, model: upstreamModel, key, status: sc, body });
       lastErr = { status: sc, body };
       continue;
 
     } catch (e) {
       log(`[${logId}] ${provider}/${upstreamModel} → error  ${e.message}`);
+      errorLog({ provider, model: upstreamModel, key, status: 502, body: e.message });
       markKeyError(provider, key);
       lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
     }
@@ -765,7 +790,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   // All attempts exhausted — also triggered when loop ran (activeTargets.length>0)
   // but every key was degraded and no upstream ever returned (lastErr stays null)
-  if (!lastErr) lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) };
+  if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
   if (cfg.free_keys?.enabled && !clientGone) {
     const freeTargets = getFreeKeyTargets(clientModel);
     if (freeTargets.length > 0) log(`[${logId}] freekey fallback: ${freeTargets.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
@@ -795,9 +820,11 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
             return;
           }
           log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0,100)}`);
+          errorLog({ provider: 'freekeys', model: ft.upstreamModel, key, status: sc, body });
           if (sc === 401 || sc === 402 || sc >= 500) markKeyError('freekeys', key);
         } catch (e) {
           log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → error  ${e.message}`);
+          errorLog({ provider: 'freekeys', model: ft.upstreamModel, key, status: 502, body: e.message });
           markKeyError('freekeys', key);
         }
       }
@@ -806,6 +833,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   const sc = lastErr?.status || 502;
   log(`[${logId}] ← ${sc}  all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  errorLog({ provider: '-', model: clientModel, key: '-', status: sc, body: (lastErr?.body || '').slice(0,200) });
   res.writeHead(sc, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
@@ -969,6 +997,8 @@ server.listen(PORT, () => {
   const summary = Object.entries(PROVIDER_KEYS).map(([p, ks]) => `${p}:${ks.length}`).join(' ');
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
+  const elCfg = cfg.error_log;
+  if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || './error.log'} retention=${elCfg?.retention_days || 7}d`);
   if (cfg.free_keys?.enabled) setTimeout(() => fetchFreeKeys(), 3000);
 });
 

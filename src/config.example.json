@@ -1,13 +1,8 @@
 {
   "_note": "複製為 config.json。所有值可由同名環境變數覆寫。",
-  "_providers_note": "只填入你有 API key 的 provider 即可。無 key 的 provider 在請求時會被自動略過。",
 
   "account_id": "your-cloudflare-account-id",
   "gateway_name": "your-ai-gateway-name",
-
-  "_gateway_base_url_note": " (選用) Cloudflare AI Gateway 的自訂 base URL，預設為 gateway.ai.cloudflare.com",
-  "gateway_base_url": "",
-
   "client_token": "optional-auth-bearer-token",
 
   "port": 3000,
@@ -16,9 +11,12 @@
   "max_key_backoff": 300000,
   "max_body_size": 10485760,
 
-  "_log_retention_note": " (選用)以下若設定大於 0 的天數，訪問 /health 路由將會以調用 cloudflare API 來清理該天數之前的 log。",
-  "log_retention_days": 0,
-  "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
+  "error_log": {
+    "_note": "  (選用)錯誤回應日誌，自動刪除超過 retention_days 的舊資料",
+    "enabled": true,
+    "path": "./error.log",
+    "retention_days": 7
+  },
 
   "free_keys": {
     "_note": " (選用)以下若設為 true 啟用：訪問 /health 路由將會從 GitHub 爬取公開免費 key 做為備援(推薦排程)。",
@@ -28,32 +26,33 @@
     "interval_ms": 300000
   },
 
+  "_log_retention_note": " (選用)以下若設定大於 0 的天數，訪問 /health 路由將會以調用 cloudflare API 來清理該天數之前的 log。",
+  "log_retention_days": 0,
+  "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
+
   "providers": {
-    "openai":            ["sk-proj-..."],
-    "anthropic":         ["sk-ant-..."],
-    "google-ai-studio":  ["AIzaSy..."],
-    "google-vertex-ai":  ["your-vertex-key"],
-    "azure-openai":      ["your-azure-key"],
-    "aws-bedrock":       ["your-bedrock-key"],
-    "mistral":           ["MISTRAL_KEY_1"],
-    "cerebras":          ["CEREBRAS_KEY_1"],
-    "deepseek":          ["sk-..."],
-    "xai":               ["xai-..."],
-    "groq":              ["gsk_..."],
-    "openrouter":        ["sk-or-..."],
-    "together":          ["tgpv_..."],
-    "perplexity":        ["pplx-..."],
-    "cohere":            ["co-..."],
-    "replicate":         ["r8_..."],
-    "huggingface":       ["hf_..."],
-    "cartesia":          ["cartesia-key"],
-    "elevenlabs":        ["eleven-key"],
-    "deepgram":          ["deepgram-key"],
-    "baseten":           ["baseten-key"],
-    "fal-ai":            ["fal-key"],
-    "ideogram":          ["ideogram-key"],
-    "parallel":          ["parallel-key"],
-    "workers-ai":        ["your-cf-api-token"]
+    "_note":  "只填入有 API key 的 provider 即可。未使用的可以刪除或留空值，在請求時會被自動略過。",
+
+    "openai": ["sk-proj-..."],
+    "anthropic": ["sk-ant-..."],
+    "google-ai-studio": ["AIzaSy..."],
+    "google-vertex-ai": ["your-vertex-key"],
+    "azure-openai": ["your-azure-key"],
+    "aws-bedrock": ["your-bedrock-key"],
+    "mistral": ["MISTRAL_KEY_1"],
+    "cerebras": ["CEREBRAS_KEY_1"],
+    "deepseek": ["sk-..."],
+    "xai": ["xai-..."],
+    "groq": ["gsk_..."],
+    "openrouter": ["sk-or-..."],
+    "together": ["tgpv_..."],
+    "perplexity": ["pplx-..."],
+    "cohere": ["co-..."],
+    "replicate": ["r8_..."],
+    "huggingface": ["hf_..."],
+    "baseten": ["baseten-key"],
+    "parallel": ["parallel-key"],
+    "workers-ai": ["your-cf-api-token"]
   },
 
   "models": {
@@ -63,39 +62,42 @@
     "claude-haiku-3-5": "anthropic",
 
     "openai": [
-      { "provider": "google-ai-studio",  "model": "gemini-2.0-flash" },
-      { "provider": "google-ai-studio",  "model": "gemini-2.5-pro-exp-03-25" },
-      { "provider": "mistral",           "model": "mistral-large-latest" },
-      { "provider": "cerebras",          "model": "llama3.1-70b" },
-      { "provider": "deepseek",          "model": "deepseek-chat" },
-      { "provider": "groq",              "model": "llama-3.3-70b-versatile" },
-      { "provider": "openai",            "model": "gpt-4o-mini" }
+      { "provider": "google-ai-studio", "model": "gemini-2.0-flash" },
+      { "provider": "google-ai-studio", "model": "gemini-2.5-pro-exp-03-25" },
+      { "provider": "mistral", "model": "mistral-large-latest" },
+      { "provider": "cerebras", "model": "llama3.1-70b" },
+      { "provider": "deepseek", "model": "deepseek-chat" },
+      { "provider": "groq", "model": "llama-3.3-70b-versatile" },
+      { "provider": "openai", "model": "gpt-4o-mini" }
     ],
 
     "claude-3-haiku": [
-      { "provider": "anthropic",         "model": "claude-3-5-haiku-latest" },
-      { "provider": "google-ai-studio",  "model": "gemini-2.0-flash" },
-      { "provider": "mistral",           "model": "mistral-small-latest" }
+      { "provider": "anthropic", "model": "claude-3-5-haiku-latest" },
+      { "provider": "google-ai-studio", "model": "gemini-2.0-flash" },
+      { "provider": "mistral", "model": "mistral-small-latest" }
     ],
 
     "gemini-2.0-flash": "google-ai-studio",
 
     "gemini-2.5-pro": [
-      { "provider": "google-ai-studio",  "model": "gemini-2.5-pro-exp-03-25" },
-      { "provider": "anthropic",         "model": "claude-sonnet-4-20250514" }
+      { "provider": "google-ai-studio", "model": "gemini-2.5-pro-exp-03-25" },
+      { "provider": "anthropic", "model": "claude-sonnet-4-20250514" }
     ],
 
     "deepseek-chat": [
-      { "provider": "deepseek",          "model": "deepseek-chat" },
-      { "provider": "together",          "model": "deepseek-ai/DeepSeek-V3" },
-      { "provider": "openrouter",        "model": "deepseek/deepseek-chat" }
+      { "provider": "deepseek", "model": "deepseek-chat" },
+      { "provider": "together", "model": "deepseek-ai/DeepSeek-V3" },
+      { "provider": "openrouter", "model": "deepseek/deepseek-chat" }
     ],
 
     "llama-3.1-70b": [
-      { "provider": "cerebras",          "model": "llama3.1-70b" },
-      { "provider": "groq",              "model": "llama-3.1-70b-versatile" },
-      { "provider": "together",          "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo" },
-      { "provider": "replicate",         "model": "meta/meta-llama-3.1-70b-instruct" }
+      { "provider": "cerebras", "model": "llama3.1-70b" },
+      { "provider": "groq", "model": "llama-3.1-70b-versatile" },
+      {
+        "provider": "together",
+        "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"
+      },
+      { "provider": "replicate", "model": "meta/meta-llama-3.1-70b-instruct" }
     ],
 
     "llama-3.3-70b": "groq",
@@ -109,9 +111,9 @@
 
     "text-embedding-3-small": "openai",
     "text-embedding-3-large": "openai",
-    "dall-e-3":               "openai",
-    "tts-1":                  "openai",
-    "tts-1-hd":               "openai",
-    "whisper-1":              "openai"
+    "dall-e-3": "openai",
+    "tts-1": "openai",
+    "tts-1-hd": "openai",
+    "whisper-1": "openai"
   }
 }
