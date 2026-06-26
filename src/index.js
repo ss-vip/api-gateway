@@ -64,22 +64,17 @@ function errorLog({ provider, model, key, status, body }) {
   }
 }
 
-// --- content compression (PAKT-inspired, format-preserving) ---
-// ponytail: 5 safe text-level transforms (no format change), no PAKT system prompt injection needed
+// ponytail: 5 safe text-level transforms, no PAKT system prompt injection needed
 function compressContent(str) {
   if (!str || typeof str !== 'string' || str.length < 200) return str;
 
-  // 1. Unicode normalization (fancy quotes/dashes → ASCII)
   str = str.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'")
            .replace(/[\u2013\u2014]/g, '--').replace(/\u2026/g, '...');
 
-  // 2. Trailing whitespace per line
   str = str.replace(/[ \t]+$/gm, '');
 
-  // 3. Blank line collapse (3+ → single)
   str = str.replace(/\n{3,}/g, '\n\n');
 
-  // 4. Large JSON array truncation (keep head + tail)
   const trimmed = str.trimStart();
   if ((trimmed.startsWith('[') || trimmed.startsWith('{')) && str.length > 4000) {
     try {
@@ -90,7 +85,6 @@ function compressContent(str) {
     } catch {}
   }
 
-  // 5. Duplicate line collapse: repeated lines → `(×N)` suffix (× = \u00d7)
   const lines = str.split('\n');
   if (lines.length > 8) {
     const out = [];
@@ -235,7 +229,6 @@ function rotateTargets(targets, clientModel) {
 }
 
 function selectKey(p) {
-  // Prefer keys without an in-flight request; fall back to any key if all are busy
   const healthy = getHealthyKeys(p);
   if (healthy.length === 0) return null;
   const free = healthy.filter(k => !keyInFlight.has(`${p}:${k}`));
@@ -285,6 +278,7 @@ function collectBody(res) {
 
 // --- token-based alias routing ---
 // ponytail: all model aliases participate, sorted by models.dev context limit. Unknown models get large default (last fallback).
+let MODELS_DEV_LIMITS = new Map();
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
@@ -314,7 +308,6 @@ function estimateTokens(messages) {
 
 // --- models.dev auto-lookup for model context limits ---
 const MODELS_DEV_URL = 'https://models.dev/api.json';
-let MODELS_DEV_LIMITS = new Map();
 
 function fetchModelsDev() {
   return new Promise(resolve => {
@@ -467,15 +460,6 @@ function normalizeContent(messages) {
 
 // --- gateway proxy ---
 
-/**
- * Forward a request to Cloudflare AI Gateway.
- * @param {string} apiKey         - Provider API key
- * @param {string} bodyStr        - Serialised JSON body
- * @param {string} routePath      - Gateway path (e.g. '/compat/chat/completions' or '/openai/embeddings')
- * @param {string} [accept]       - Accept header value
- * @param {string} [contentType]  - Content-Type header value
- * @returns {Promise<IncomingMessage>}
- */
 function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
   return new Promise((resolve, reject) => {
     const opts = {
@@ -498,10 +482,6 @@ function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
   });
 }
 
-/**
- * Forward a request directly to a custom base URL (bypass CF AI Gateway).
- * Used for free keys (aiapiv2.pekpik.com) and other direct endpoints.
- */
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType) {
   return new Promise((resolve, reject) => {
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
@@ -631,8 +611,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     for (const alias of TOKEN_ORDER) {
       const newTargets = resolveModel(alias);
       if (!newTargets) continue;
-      // Get limit: manual config > models.dev (from first target's provider/model) > unlimited
-      const t = newTargets[0];
       const limit = getAliasLimit(alias);
       if (limit > 0 && est > limit) continue;
       if (alias !== clientModel) {
@@ -705,7 +683,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       if (!supportsReasoningContent(provider, upstreamModel)) {
         bodyObj.messages = sanitizeMessages(bodyObj.messages);
       }
-      // CF Issue #547: Gemini rejects content:null + tool_calls in multi-turn
       if (provider === 'google-ai-studio') {
         bodyObj.messages = normalizeContent(bodyObj.messages);
       }
@@ -883,11 +860,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 }
 
-/**
- * Generic proxy for non-chat endpoints.
- * @param {string} endpointPath  - Gateway sub-path, e.g. '/embeddings', '/images/generations'
- * @param {boolean} [jsonBody]   - Whether request body is JSON (true) or raw (false)
- */
 async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, contentType) {
   const t0 = Date.now();
   const hasFreeKeys = cfg.free_keys?.enabled && freeKeyModels.size > 0;
@@ -1174,8 +1146,7 @@ const server = http.createServer((req, res) => {
     });
 
     req.on('end', () => {
-      // Check for premature destroy
-      if (req.destroyed) return;
+  if (req.destroyed) return;
 
       const rawBody = Buffer.concat(chunks);
       let json, rawStr;

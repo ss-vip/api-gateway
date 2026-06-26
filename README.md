@@ -7,15 +7,16 @@ Cloudflare AI Gateway 代理 — 支援多 API Key 輪詢、故障轉移、Model
 ## 功能
 
 - **多 Key 輪詢** — 每個 Provider 獨立 Round-Robin 選 Key
-- **Key 故障轉移** — 429/5xx/網路錯誤 -> 指數退避降級 (30s×2ⁿ, max 5min)，成功後逐步恢復
+- **Key 故障轉移** — 429/5xx/網路錯誤 -> 退避降級，成功後逐步恢復
 - **Provider 降級** — Fallback Chain 依序嘗試備援 Provider
 - **Model 別名路由** — 統一 model 名稱（如 `openai`）或相符的模型名稱優先調用
 - **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
 - **健康檢查** — `GET /health` （帶 client token）查各渠道健康狀態，觸發 free keys 更新與 cloudflare log 清理
-- **Free Keys 備援** — 當 CF AI Gateway 所有 key 都失敗時，自動嘗試 free keys
+- **Free Keys 備援** — 取得 free keys 加入渠道列隊參與調用
 - **非 Chat 端點** — 支援 embeddings、images/generations、audio/speech、audio/transcriptions
-- **配置熱重載** — 修改 `config.json` 自動重啟（1秒 debounce）
-
+- **配置檔熱重載** — 修改 `config.json` 自動重啟（1秒 debounce）
+- **上下文壓縮** — 輕量壓縮 context 節省 token
+-
 ## 前置需求
 
 - Node.js 18+
@@ -51,7 +52,7 @@ npm start
 | `gateway_name` | Cloudflare AI Gateway 名稱 |
 | `client_token` | （選用）Client 端 Bearer Token，設定後所有 POST 需帶此 Token |
 | `timeout` | 上游請求超時（ms，預設 600000） |
-| `key_cooldown` | Key 錯誤冷卻時間（ms，預設 30000），指數退避 ×2ⁿ |
+| `key_cooldown` | Key 錯誤冷卻時間（ms，預設 30000），退避降級 |
 | `max_key_backoff` | Key 最長退避時間（ms，預設 300000） |
 | `error_log.enabled` | （選用）非200錯誤紀錄檔開關（預設 true） |
 | `error_log.path` | （選用）紀錄檔路徑（預設 ./error.log） |
@@ -129,7 +130,7 @@ pm2 startup
 ```
 
 ## 補充
-- 免費資源來自 (free-llm-api-keys)[https://github.com/alistaitsacle/free-llm-api-keys]
+- 免費資源來自 [free-llm-api-keys](https://github.com/alistaitsacle/free-llm-api-keys)
 - Client 請求若非使用 chat 端點（TTS/STT/圖像生成）僅 OpenAI providers 可用。
 - 在 Cloudflare AI Gateway 中，有支援 cartesia、elevenlabs、deepgram、fal-ai、ideogram 服務使用，但由於上游 API 不同，目前在此專案不適用。
 - 加入支援 provider:
