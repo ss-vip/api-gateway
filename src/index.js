@@ -1,6 +1,6 @@
 'use strict';
 
-process.env.TZ = 'Asia/Taipei';
+process.env.TZ = process.env.TZ || 'Asia/Taipei';
 
 const http = require('http');
 const https = require('https');
@@ -72,6 +72,7 @@ try {
 } catch (e) {
   elog('[config] failed to load config.json:', e.message);
 }
+if (cfg.timezone) process.env.TZ = cfg.timezone;
 
 const ACCOUNT_ID   = process.env.ACCOUNT_ID   || cfg.account_id   || '';
 const GATEWAY_NAME = process.env.GATEWAY_NAME || cfg.gateway_name || '';
@@ -230,6 +231,28 @@ function collectBody(res) {
     res.on('end', () => r(Buffer.concat(c).toString()));
     res.on('error', () => r(''));
   });
+}
+
+// --- token-based alias routing ---
+const MAX_TOKEN = cfg.max_token || {};
+const TOKEN_ORDER = Object.entries(MAX_TOKEN)
+  .filter(([, v]) => v > 0)
+  .sort((a, b) => a[1] - b[1])
+  .map(([k]) => k)
+  .concat(Object.entries(MAX_TOKEN).filter(([, v]) => !v || v <= 0).map(([k]) => k));
+
+function estimateTokens(messages) {
+  if (!Array.isArray(messages)) return 0;
+  let chars = 0;
+  for (const m of messages) {
+    const c = m.content;
+    if (typeof c === 'string') chars += c.length;
+    else if (c && typeof c === 'object') {
+      const parts = Array.isArray(c) ? c : [c];
+      for (const p of parts) { if (p.text) chars += p.text.length; }
+    }
+  }
+  return Math.ceil(chars / 1.5 * 1.2);
 }
 
 // --- free keys scraping ---
@@ -491,7 +514,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 
   const clientModel = bodyJson.model || 'unknown';
-  const targets = resolveModel(clientModel);
+  let targets = resolveModel(clientModel);
 
   if (!targets) {
     log(`[${logId}] ← 400  unsupported model: ${clientModel}`);
@@ -500,8 +523,25 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
+  // Token-based alias routing — pick smallest model alias that fits the request
+  if (TOKEN_ORDER.length > 0) {
+    const est = estimateTokens(bodyJson.messages);
+    for (const alias of TOKEN_ORDER) {
+      const limit = MAX_TOKEN[alias] || 0;
+      if (limit > 0 && est > limit) continue;
+      if (alias !== clientModel) {
+        const newTargets = resolveModel(alias);
+        if (newTargets) {
+          log(`[${logId}] token routing: ${clientModel} → ${alias} (est=${est})`);
+          targets = newTargets;
+        }
+      }
+      break;
+    }
+  }
+
   // Fast-skip targets whose provider has no keys configured
-  const activeTargets = CF_CONFIGURED ? targets.filter(t => t.provider !== 'freekeys' && PROVIDERS_WITH_KEYS.has(t.provider)) : [];
+  let activeTargets = CF_CONFIGURED ? targets.filter(t => t.provider !== 'freekeys' && PROVIDERS_WITH_KEYS.has(t.provider)) : [];
   if (activeTargets.length === 0 && !hasFreeKeys) {
     log(`[${logId}] ← 400  no keys available for ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
