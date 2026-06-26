@@ -129,6 +129,9 @@ pm2 startup
 ```
 
 ## 補充
-
+- 免費資源來自 (free-llm-api-keys)[https://github.com/alistaitsacle/free-llm-api-keys]
 - Client 請求若非使用 chat 端點（TTS/STT/圖像生成）僅 OpenAI providers 可用。
 - 在 Cloudflare AI Gateway 中，有支援 cartesia、elevenlabs、deepgram、fal-ai、ideogram 服務使用，但由於上游 API 不同，目前在此專案不適用。
+- 加入支援 provider:
+  1. [pollinations](https://pollinations.ai)
+  2. [literouter](https://literouter.com/)

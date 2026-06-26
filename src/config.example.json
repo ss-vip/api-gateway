@@ -53,25 +53,21 @@
     "huggingface": ["hf_..."],
     "baseten": ["baseten-key"],
     "parallel": ["parallel-key"],
-    "workers-ai": ["your-cf-api-token"]
-  },
-
-  "max_token": {
-    "_note": "依 token 估算自動選擇最小適用的 model alias。值=0 或未設定表示無限制（最後才調用）",
-    "openai-lite": 100000,
-    "openai": 0
+    "workers-ai": ["your-cf-api-token"],
+    "pollinations": ["your-api-token"],
+    "literouter": ["your-api-token"]
   },
 
   "models": {
-    "openai-lite": [{ "provider": "groq", "model": "llama-3.3-70b-versatile" }],
-
     "openai": [
       { "provider": "google-ai-studio", "model": "gemini-2.0-flash" },
       { "provider": "google-ai-studio", "model": "gemini-2.5-flash" },
       { "provider": "mistral", "model": "mistral-large-latest" },
       { "provider": "cerebras", "model": "llama3.1-70b" },
       { "provider": "deepseek", "model": "deepseek-chat" },
-      { "provider": "openai", "model": "gpt-4o-mini" }
+      { "provider": "openai", "model": "gpt-4o-mini" },
+      { "provider": "pollinations", "model": "mistral-small-3.2" },
+      { "provider": "literouter", "model": "owl-alpha:free:full-context" }
     ],
 
     "text-embedding-3-small": "openai",

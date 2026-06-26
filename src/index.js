@@ -64,6 +64,52 @@ function errorLog({ provider, model, key, status, body }) {
   }
 }
 
+// --- content compression (PAKT-inspired, format-preserving) ---
+// ponytail: 5 safe text-level transforms (no format change), no PAKT system prompt injection needed
+function compressContent(str) {
+  if (!str || typeof str !== 'string' || str.length < 200) return str;
+
+  // 1. Unicode normalization (fancy quotes/dashes → ASCII)
+  str = str.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'")
+           .replace(/[\u2013\u2014]/g, '--').replace(/\u2026/g, '...');
+
+  // 2. Trailing whitespace per line
+  str = str.replace(/[ \t]+$/gm, '');
+
+  // 3. Blank line collapse (3+ → single)
+  str = str.replace(/\n{3,}/g, '\n\n');
+
+  // 4. Large JSON array truncation (keep head + tail)
+  const trimmed = str.trimStart();
+  if ((trimmed.startsWith('[') || trimmed.startsWith('{')) && str.length > 4000) {
+    try {
+      const p = JSON.parse(trimmed);
+      if (Array.isArray(p) && p.length > 30) {
+        str = JSON.stringify([...p.slice(0, 10), { _omitted: p.length - 20 }, ...p.slice(-10)]);
+      }
+    } catch {}
+  }
+
+  // 5. Duplicate line collapse: repeated lines → `(×N)` suffix (× = \u00d7)
+  const lines = str.split('\n');
+  if (lines.length > 8) {
+    const out = [];
+    let run = 1;
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0 && lines[i] === lines[i - 1] && lines[i].length > 5) {
+        run++;
+      } else {
+        if (run > 2) out[out.length - 1] += ` (\u00d7${run})`;
+        run = 1;
+        out.push(lines[i]);
+      }
+    }
+    if (run > 2) out[out.length - 1] += ` (\u00d7${run})`;
+    str = out.join('\n');
+  }
+
+  return str;
+}
 // --- config loading ---
 const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
 let cfg = {};
@@ -89,7 +135,11 @@ const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter',
 };
+
+// Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL when adding new direct provider)
+const DIRECT_PROVIDERS = { pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com' };
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -234,12 +284,19 @@ function collectBody(res) {
 }
 
 // --- token-based alias routing ---
-const MAX_TOKEN = cfg.max_token || {};
-const TOKEN_ORDER = Object.entries(MAX_TOKEN)
-  .filter(([, v]) => v > 0)
-  .sort((a, b) => a[1] - b[1])
-  .map(([k]) => k)
-  .concat(Object.entries(MAX_TOKEN).filter(([, v]) => !v || v <= 0).map(([k]) => k));
+// ponytail: all model aliases participate, sorted by models.dev context limit. Unknown models get large default (last fallback).
+function getAliasLimit(alias) {
+  const t = resolveModel(alias)?.[0];
+  if (!t) return 999999;
+  const aliasProv = ({ 'google-ai-studio': 'google', 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
+  return MODELS_DEV_LIMITS.get(`${aliasProv}/${t.model || alias}`.toLowerCase()) || 999999;
+}
+let TOKEN_ORDER = [];
+function rebuildTokenOrder() {
+  const aliases = Object.keys(cfg.models || {});
+  TOKEN_ORDER = aliases.map(a => [a, getAliasLimit(a)]).sort((a, b) => a[1] - b[1]).map(([a]) => a);
+}
+rebuildTokenOrder();
 
 function estimateTokens(messages) {
   if (!Array.isArray(messages)) return 0;
@@ -255,6 +312,39 @@ function estimateTokens(messages) {
   return Math.ceil(chars / 1.5 * 1.2);
 }
 
+// --- models.dev auto-lookup for model context limits ---
+const MODELS_DEV_URL = 'https://models.dev/api.json';
+let MODELS_DEV_LIMITS = new Map();
+
+function fetchModelsDev() {
+  return new Promise(resolve => {
+    https.get(MODELS_DEV_URL, (res) => {
+      if (res.statusCode !== 200) { elog(`[models.dev] fetch ${res.statusCode}`); resolve(); return; }
+      let body = '';
+      res.on('data', c => { body += c.toString(); if (body.length > 5e6) { res.destroy(); } });
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const m = new Map();
+          for (const [pid, prov] of Object.entries(data)) {
+            if (!prov?.models) continue;
+            for (const [mid, model] of Object.entries(prov.models)) {
+              const ctx = model?.limit?.context;
+              if (ctx && typeof ctx === 'number' && ctx > 0) {
+                m.set(`${pid}/${mid}`.toLowerCase(), ctx);
+              }
+            }
+          }
+          MODELS_DEV_LIMITS = m;
+          rebuildTokenOrder();
+          log(`[models.dev] ${m.size} model context limits loaded`);
+        } catch (e) { elog(`[models.dev] parse error: ${e.message}`); }
+        resolve();
+      });
+      res.on('error', () => resolve());
+    }).on('error', (e) => { elog(`[models.dev] fetch error: ${e.message}`); resolve(); });
+  });
+}
 // --- free keys scraping ---
 const FREE_KEY_RE = /^\|\s*`(sk-[a-zA-Z0-9]+)`\s*\|\s*([a-zA-Z0-9_\/.\-:]+)\s*\|/gm;
 
@@ -270,48 +360,50 @@ function parseFreeKeys(md) {
 
 function fetchFreeKeys() {
   const fk = cfg.free_keys;
-  if (!fk?.enabled) return;
+  if (!fk?.enabled) return Promise.resolve();
   const now = Date.now();
-  if (now - freeKeysLastFetch < (fk.interval_ms || 300000)) return;
+  if (now - freeKeysLastFetch < (fk.interval_ms || 300000)) return Promise.resolve();
   const url = fk.url || FREE_KEYS_DEFAULT_URL;
-  https.get(url, (res) => {
-    if (res.statusCode !== 200) { elog(`[freekeys] fetch ${res.statusCode}`); return; }
-    const MAX_LINES = 500;
-    const END_MARKER = '## 🚀 How to Use';
-    let body = '', lines = 0, parsed = false;
-    const parse = () => {
-      if (parsed) return;
-      parsed = true;
-      const pairs = parseFreeKeys(body);
-      if (pairs.length === 0) { elog('[freekeys] parsed 0 keys'); return; }
-      const newHash = JSON.stringify(pairs);
-      if (newHash === freeKeysHash) { freeKeysLastFetch = Date.now(); return; }
-      freeKeysHash = newHash;
-      freeKeysLastFetch = Date.now();
-      const allKeys = [...new Set(pairs.map(p => p[0]))];
-      PROVIDER_KEYS['freekeys'] = allKeys;
-      PROVIDERS_WITH_KEYS.add('freekeys');
-      keyPool.set('freekeys', new Map(allKeys.map(k => [k, { degradedUntil: 0, errorCount: 0, successCount: 0 }])));
-      // Build new map in private, then swap atomically — avoids race window
-      const newModelMap = new Map();
-      for (const [key, model] of pairs) {
-        if (!newModelMap.has(model)) newModelMap.set(model, []);
-        newModelMap.get(model).push(key);
-      }
-      freeKeyModels = newModelMap;
-      log(`[freekeys] ${allKeys.length} keys across ${freeKeyModels.size} models`);
-    };
-    res.on('data', (c) => {
-      const s = c.toString();
-      body += s;
-      const markerIdx = body.indexOf(END_MARKER);
-      if (markerIdx !== -1) { body = body.slice(0, markerIdx); res.destroy(); parse(); return; }
-      lines += s.split('\n').length - 1;
-      if (lines >= MAX_LINES) { res.destroy(); parse(); }
-    });
-    res.on('end', parse);
-    res.on('close', parse);
-  }).on('error', (e) => elog(`[freekeys] fetch error: ${e.message}`));
+  return new Promise(resolve => {
+    https.get(url, (res) => {
+      if (res.statusCode !== 200) { elog(`[freekeys] fetch ${res.statusCode}`); resolve(); return; }
+      const MAX_LINES = 500;
+      const END_MARKER = '## 🚀 How to Use';
+      let body = '', lines = 0, parsed = false;
+      const parse = () => {
+        if (parsed) return;
+        parsed = true;
+        const pairs = parseFreeKeys(body);
+        if (pairs.length === 0) { elog('[freekeys] parsed 0 keys'); resolve(); return; }
+        const newHash = JSON.stringify(pairs);
+        if (newHash === freeKeysHash) { freeKeysLastFetch = Date.now(); resolve(); return; }
+        freeKeysHash = newHash;
+        freeKeysLastFetch = Date.now();
+        const allKeys = [...new Set(pairs.map(p => p[0]))];
+        PROVIDER_KEYS['freekeys'] = allKeys;
+        PROVIDERS_WITH_KEYS.add('freekeys');
+        keyPool.set('freekeys', new Map(allKeys.map(k => [k, { degradedUntil: 0, errorCount: 0, successCount: 0 }])));
+        const newModelMap = new Map();
+        for (const [key, model] of pairs) {
+          if (!newModelMap.has(model)) newModelMap.set(model, []);
+          newModelMap.get(model).push(key);
+        }
+        freeKeyModels = newModelMap;
+        log(`[freekeys] ${allKeys.length} keys across ${freeKeyModels.size} models`);
+        resolve();
+      };
+      res.on('data', (c) => {
+        const s = c.toString();
+        body += s;
+        const markerIdx = body.indexOf(END_MARKER);
+        if (markerIdx !== -1) { body = body.slice(0, markerIdx); res.destroy(); parse(); return; }
+        lines += s.split('\n').length - 1;
+        if (lines >= MAX_LINES) { res.destroy(); parse(); }
+      });
+      res.on('end', () => { if (!parsed) parse(); resolve(); });
+      res.on('close', () => { resolve(); });
+    }).on('error', (e) => { elog(`[freekeys] fetch error: ${e.message}`); resolve(); });
+  });
 }
 
 function getFreeKeyTargets(clientModel) {
@@ -523,18 +615,29 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
+  // Format-preserving content compression (before token routing for accurate sizing)
+  if (Array.isArray(bodyJson.messages)) {
+    bodyJson.messages = bodyJson.messages.map(m => {
+      if (typeof m.content === 'string' && m.content.length > 200) {
+        return { ...m, content: compressContent(m.content) };
+      }
+      return m;
+    });
+  }
+
   // Token-based alias routing — pick smallest model alias that fits the request
   if (TOKEN_ORDER.length > 0) {
     const est = estimateTokens(bodyJson.messages);
     for (const alias of TOKEN_ORDER) {
-      const limit = MAX_TOKEN[alias] || 0;
+      const newTargets = resolveModel(alias);
+      if (!newTargets) continue;
+      // Get limit: manual config > models.dev (from first target's provider/model) > unlimited
+      const t = newTargets[0];
+      const limit = getAliasLimit(alias);
       if (limit > 0 && est > limit) continue;
       if (alias !== clientModel) {
-        const newTargets = resolveModel(alias);
-        if (newTargets) {
-          log(`[${logId}] token routing: ${clientModel} → ${alias} (est=${est})`);
-          targets = newTargets;
-        }
+        log(`[${logId}] token routing: ${clientModel} → ${alias} (est=${est}, limit=${limit})`);
+        targets = newTargets;
       }
       break;
     }
@@ -565,17 +668,29 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
   let usedModel = null;
   let clientGone = false;
-  let loopTries = 0;
-  const MAX_LOOP_TRIES = 3;
+  let retryRound = 0;
+  let sseStarted = false;
   req.on('close', () => { clientGone = true; });
 
-  while (!upstreamRes && !clientGone && loopTries < MAX_LOOP_TRIES && Date.now() - t0 < TIMEOUT_MS) {
-    loopTries++;
-    if (loopTries > 1) {
-      const wait = Math.min((loopTries - 1) * 2000, 10000);
-      log(`[${logId}] retry ${loopTries} — waiting ${wait}ms for key recovery...`);
+  // SSE mode: respond immediately with 200 + SSE headers, then try upstreams in background
+  if (isStream) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Request-Id': logId,
+    });
+    sseStarted = true;
+  }
+
+  while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS) {
+    if (retryRound > 0) {
+      // Progressive wait: 5s, 10s, 15s, 20s, 25s, 30s...
+      const wait = Math.min(retryRound * 5000, 30000);
+      log(`[${logId}] retry ${retryRound} — waiting ${wait}ms for key recovery...`);
       await sleep(wait);
     }
+    retryRound++;
   outer: for (const target of rotated) {
     if (clientGone) break;
     if (lastErr) await sleep(Math.random() * 300); // jitter between provider targets
@@ -584,7 +699,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
 
     // Serialise body once per provider target
-    const bodyObj = { ...bodyTemplate, model: `${provider}/${upstreamModel}` };
+    const isDirect = DIRECT_PROVIDERS[provider];
+    const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
     if (Array.isArray(bodyObj.messages)) {
       if (!supportsReasoningContent(provider, upstreamModel)) {
         bodyObj.messages = sanitizeMessages(bodyObj.messages);
@@ -604,7 +720,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
       try {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-        upstreamRes = await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
+        upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], '/v1/chat/completions', acceptHdr) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
         usedProvider = provider;
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
@@ -726,33 +842,30 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   if (!upstreamRes || !usedProvider) {
     const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
-    const sc = lastErr?.status || 502;
-    log(`[${logId}] ← ${sc}  all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-    errorLog({ provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: sc, body: errMsg });
-    res.writeHead(sc, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: `all failed: ${errMsg}` } }));
+    const errCode = lastErr?.status || 502;
+    log(`[${logId}] ← ${sseStarted ? 'SSE' : '502'}  all failed (upstream=${errCode})  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    errorLog({ provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
+    if (sseStarted) {
+      // SSE already 200'd — send error event then close
+      const sseErr = { error: { message: `all failed: ${errMsg}`, type: 'proxy_error' } };
+      try { res.write(`data: ${JSON.stringify(sseErr)}\n\n`); } catch {}
+      try { res.write('data: [DONE]\n\n'); res.end(); } catch {}
+    } else {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `all failed: ${errMsg}` } }));
+    }
     return;
   }
 
   // --- success path ---
   log(`[${logId}] ← 200  ${((Date.now()-t0)/1000).toFixed(1)}s  ${usedProvider}/${usedModel}`);
 
-  if (isStream) {
-    // SSE streaming response
+  if (sseStarted) {
+    // SSE headers already sent — pipe upstream directly
     const needModelRewrite = usedModel !== clientModel;
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-      'X-Request-Id': logId,
-      'X-Provider': usedProvider,
-      'X-Upstream-Model': usedModel,
-    });
-
     const pipe = needModelRewrite
       ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
       : (c) => { try { res.write(c); } catch {} };
-
     upstreamRes.on('data', pipe);
     upstreamRes.on('end',   () => { try { res.end(); } catch {} });
     upstreamRes.on('error', (e) => { log(`[${logId}] stream: ${e.message}`); try { res.end(); } catch {} });
@@ -824,6 +937,53 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     if (!key) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); continue; }
     // jitter before each provider attempt to spread concurrent requests
     if (lastErr) await sleep(Math.random() * 300);
+
+    const directBase = DIRECT_PROVIDERS[provider];
+
+    if (directBase) {
+      // Direct provider (e.g. pollinations) — bypass CF gateway
+      if (jsonBody !== false) {
+        bodyStr = JSON.stringify({ ...bodyJson, model: upstreamModel });
+      } else {
+        bodyStr = bodyJson;
+      }
+      upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
+      try {
+        const upstreamRes = await forwardToDirect(key, bodyStr, directBase, endpointPath, 'application/json', upstreamContentType);
+        if (clientGone) { releaseKey(provider, key); return; }
+        const sc = upstreamRes.statusCode;
+        if (sc >= 200 && sc < 300) {
+          releaseKey(provider, key);
+          markKeySuccess(provider, key);
+          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+          const ctype = upstreamRes.headers['content-type'] || 'application/json';
+          const body = await collectBody(upstreamRes);
+          res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
+          res.end(body);
+          return;
+        }
+        markKeyError(provider, key);
+        releaseKey(provider, key);
+        const body = await collectBody(upstreamRes);
+        if (sc === 429 || sc >= 500) {
+          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
+          errorLog({ provider, model: upstreamModel, key, status: sc, body });
+          lastErr = { status: sc, body };
+        } else {
+          log(`[${logId}] ${provider}/${upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
+          errorLog({ provider, model: upstreamModel, key, status: sc, body });
+          lastErr = { status: sc, body };
+        }
+        continue;
+      } catch (e) {
+        markKeyError(provider, key);
+        releaseKey(provider, key);
+        log(`[${logId}] ${provider}/${upstreamModel} → error  ${e.message}`);
+        errorLog({ provider, model: upstreamModel, key, status: 502, body: e.message });
+        lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
+        continue;
+      }
+    }
 
     // Provider-specific route: /{provider}/{endpoint}
     const routePath = `/${provider}${endpointPath}`;
@@ -919,10 +1079,10 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     }
   }
 
-  const sc = lastErr?.status || 502;
-  log(`[${logId}] ← ${sc}  all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-  errorLog({ provider: '-', model: clientModel, key: '-', status: sc, body: (lastErr?.body || '').slice(0,200) });
-  res.writeHead(sc, { 'Content-Type': 'application/json' });
+  const errCode = lastErr?.status || 502;
+  log(`[${logId}] ← 502  all failed (upstream=${errCode})  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  errorLog({ provider: '-', model: clientModel, key: '-', status: errCode, body: (lastErr?.body || '').slice(0,200) });
+  res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
 
@@ -1080,15 +1240,18 @@ server.on('error', (e) => {
   setTimeout(() => process.exit(1), 1000).unref();
 });
 
-server.listen(PORT, () => {
+const onListening = () => {
   log(`[config] started port=${PORT} account=${ACCOUNT_ID || '(degraded)'} gateway=${GATEWAY_NAME || '(degraded)'}`);
   const summary = Object.entries(PROVIDER_KEYS).map(([p, ks]) => `${p}:${ks.length}`).join(' ');
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
   const elCfg = cfg.error_log;
   if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || './error.log'} retention=${elCfg?.retention_days || 7}d`);
-  if (cfg.free_keys?.enabled) setTimeout(() => fetchFreeKeys(), 3000);
-});
+};
+const startup = [];
+startup.push(fetchModelsDev());
+if (cfg.free_keys?.enabled) startup.push(fetchFreeKeys());
+Promise.all(startup).then(() => server.listen(PORT, onListening));
 
 // --- graceful config reload ---
 if (fs.existsSync(CONFIG_PATH)) {
