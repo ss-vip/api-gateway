@@ -133,7 +133,15 @@ const ENV_MAP = {
 };
 
 // Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL when adding new direct provider)
-const DIRECT_PROVIDERS = { pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io' };
+const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io' };
+
+// Fields known to cause 4xx for specific providers (strip before forwarding)
+const PROVIDER_BANNED_FIELDS = {
+  mistral:       new Set(['user','n','logit_bias','top_logprobs']),
+  cohere:        new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']),
+  huggingface:   new Set(['user']),
+  'freekeys':    new Set(['user']),
+};
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -605,19 +613,23 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     });
   }
 
-  // Token-based alias routing — pick smallest model alias that fits the request
+  // Token-based alias routing — only when client model can't handle the request
   if (TOKEN_ORDER.length > 0) {
     const est = estimateTokens(bodyJson.messages);
-    for (const alias of TOKEN_ORDER) {
-      const newTargets = resolveModel(alias);
-      if (!newTargets) continue;
-      const limit = getAliasLimit(alias);
-      if (limit > 0 && est > limit) continue;
-      if (alias !== clientModel) {
-        log(`[${logId}] token routing: ${clientModel} → ${alias} (est=${est}, limit=${limit})`);
-        targets = newTargets;
+    const clientTargets = resolveModel(clientModel);
+    const clientLimit = getAliasLimit(clientModel);
+    if (!clientTargets || (clientLimit > 0 && est > clientLimit)) {
+      for (const alias of TOKEN_ORDER) {
+        const newTargets = resolveModel(alias);
+        if (!newTargets) continue;
+        const limit = getAliasLimit(alias);
+        if (limit > 0 && est > limit) continue;
+        if (alias !== clientModel) {
+          log(`[${logId}] token routing: ${clientModel} → ${alias} (est=${est}, limit=${limit})`);
+          targets = newTargets;
+        }
+        break;
       }
-      break;
     }
   }
 
@@ -669,16 +681,21 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       await sleep(wait);
     }
     retryRound++;
-  outer: for (const target of rotated) {
-    if (clientGone) break;
-    if (lastErr) await sleep(Math.random() * 300); // jitter between provider targets
+  for (let ti = 0; ti < rotated.length; ti++) {
+    const target = rotated[ti];
+    if (upstreamRes) break; // only success stops the chain
+    try {
     const provider = target.provider;
     const upstreamModel = target.upstreamModel;
     const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
 
+    if (lastErr) await sleep(Math.random() * 300); // jitter between provider targets
+
     // Serialise body once per provider target
     const isDirect = DIRECT_PROVIDERS[provider];
     const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
+    const banned = PROVIDER_BANNED_FIELDS[provider];
+    if (banned) for (const f of banned) delete bodyObj[f];
     if (Array.isArray(bodyObj.messages)) {
       if (!supportsReasoningContent(provider, upstreamModel)) {
         bodyObj.messages = sanitizeMessages(bodyObj.messages);
@@ -690,7 +707,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     const bodyStr = JSON.stringify(bodyObj);
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (clientGone) break outer;
+      if (upstreamRes) break;
       if (attempt > 0) await sleep(Math.random() * 300); // jitter to spread concurrent retries
       usedKey = selectKey(provider);
       if (!usedKey) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); errorLog({ provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
@@ -702,7 +719,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
 
-        // degrade BEFORE releasing — prevents race where concurrent request picks up key before markKeyError runs
         if (sc === 429 || sc >= 500) {
           markKeyError(provider, usedKey);
           releaseKey(provider, usedKey);
@@ -722,14 +738,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
           lastErr = { status: sc, body };
           upstreamRes = null;
-          break;
+          continue;
         }
 
         // Success
         releaseKey(provider, usedKey);
         markKeySuccess(provider, usedKey);
         log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}`);
-        break outer;
+        break;
 
       } catch (e) {
         markKeyError(provider, usedKey);
@@ -740,7 +756,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         upstreamRes = null;
       }
     }
-
+    } catch (e) { log(`[${logId}] ${target?.provider}/${target?.upstreamModel} → fatal ${e.message}`); errorLog({ provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
+  }
   }
 
   // --- CF all failed → try free keys as last resort ---
@@ -757,6 +774,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (clientGone || upstreamRes) break;
         const keys = fkMap.get(model) || [];
         const fbBody = { ...bodyTemplate, model };
+        const fkBanned = PROVIDER_BANNED_FIELDS['freekeys'];
+        if (fkBanned) for (const f of fkBanned) delete fbBody[f];
         if (Array.isArray(fbBody.messages)) {
           if (!supportsReasoningContent('freekeys', model)) fbBody.messages = sanitizeMessages(fbBody.messages);
           fbBody.messages = normalizeContent(fbBody.messages);
@@ -814,7 +833,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
       }
     }
-  }
   }
 
   if (!upstreamRes || !usedProvider) {
@@ -903,7 +921,6 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   req.on('close', () => { clientGone = true; });
 
   for (const target of activeTargets) {
-    if (clientGone) break;
     const { provider, upstreamModel } = target;
     const key = selectKey(provider);
     if (!key) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); continue; }
@@ -915,7 +932,10 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     if (directBase) {
       // Direct provider (e.g. pollinations) — bypass CF gateway
       if (jsonBody !== false) {
-        bodyStr = JSON.stringify({ ...bodyJson, model: upstreamModel });
+        const proxyBody = { ...bodyJson, model: upstreamModel };
+        const banned = PROVIDER_BANNED_FIELDS[provider];
+        if (banned) for (const f of banned) delete proxyBody[f];
+        bodyStr = JSON.stringify(proxyBody);
       } else {
         bodyStr = bodyJson;
       }
