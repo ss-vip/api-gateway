@@ -129,11 +129,11 @@ const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7',
 };
 
 // Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL when adding new direct provider)
-const DIRECT_PROVIDERS = { pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com' };
+const DIRECT_PROVIDERS = { pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io' };
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -921,7 +921,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       }
       upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
       try {
-        const upstreamRes = await forwardToDirect(key, bodyStr, directBase, endpointPath, 'application/json', upstreamContentType);
+        const upstreamRes = await forwardToDirect(key, bodyStr, directBase, '/v1' + endpointPath, 'application/json', upstreamContentType);
         if (clientGone) { releaseKey(provider, key); return; }
         const sc = upstreamRes.statusCode;
         if (sc >= 200 && sc < 300) {
