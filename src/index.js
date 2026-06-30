@@ -16,6 +16,48 @@ const _ts = () => {
 function log(...a) { console.log(`[${_ts()}]`, ...a); }
 function elog(...a) { console.error(`[${_ts()}]`, ...a); }
 
+// --- JSONC parser (strip comments + trailing commas before JSON.parse) ---
+function parseJsonc(str) {
+  if (!str) return null;
+  // Pass 1: strip // and /* */ comments
+  let out = '', inStr = false, lineCom = false, blockCom = false, esc = false;
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i], n = str[i + 1];
+    if (lineCom) { if (c === '\n') lineCom = false; continue; }
+    if (blockCom) { if (c === '*' && n === '/') { i++; blockCom = false; } continue; }
+    if (inStr) {
+      if (esc) { esc = false; out += c; continue; }
+      if (c === '\\') { esc = true; out += c; continue; }
+      if (c === '"') inStr = false;
+      out += c; continue;
+    }
+    if (c === '"') { inStr = true; out += c; continue; }
+    if (c === '/' && n === '/') { lineCom = true; i++; continue; }
+    if (c === '/' && n === '*') { blockCom = true; i++; continue; }
+    out += c;
+  }
+  // Pass 2: strip trailing commas before ] or } (valid in JSONC editors)
+  let clean = '', inStr2 = false, esc2 = false;
+  for (let i = 0; i < out.length; i++) {
+    const c = out[i];
+    if (inStr2) {
+      if (esc2) { esc2 = false; clean += c; continue; }
+      if (c === '\\') { esc2 = true; clean += c; continue; }
+      if (c === '"') inStr2 = false;
+      clean += c; continue;
+    }
+    if (c === '"') { inStr2 = true; clean += c; continue; }
+    if (c === ',') {
+      let j = i + 1;
+      while (j < out.length && (out[j] === ' ' || out[j] === '\t' || out[j] === '\n' || out[j] === '\r')) j++;
+      if (out[j] === ']' || out[j] === '}') continue;
+    }
+    clean += c;
+  }
+  const t = clean.trim();
+  return t ? JSON.parse(t) : null;
+}
+
 // --- error log file ---
 function _errMsg(body) {
   if (!body) return '-';
@@ -42,24 +84,28 @@ function _errMsg(body) {
   // Fallback: strip newlines, limit length
   return clean.replace(/\n/g, ' ').slice(0, 500);
 }
-let _errLogCount = 0;
+let _errLogCount = 0, _errCleaning = false;
 function errorLog({ provider, model, key, status, body }) {
   const ec = cfg.error_log;
   if (ec?.enabled === false) return;
-  const p = ec?.path || './error.log';
+  const p = ec?.path || './error.jsonc';
   const k = key ? `...${key.slice(-4)}` : '-';
-  fs.appendFile(p, `${_ts()} | ${String(status||'-').padStart(3)} | ${(provider||'-').padEnd(18)} | ${(model||'-').padEnd(24)} | ${k} | ${_errMsg(body)}\n`, (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
+  const entry = JSON.stringify({ ts: _ts(), provider, model, key: k, status, body: _errMsg(body) });
+  fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
   _errLogCount++;
-  // Cleanup once per ~50 writes
-  if (_errLogCount % 50 === 1) {
+  // Cleanup once per ~50 writes (locked to prevent concurrent read-modify-write race)
+  if (_errLogCount % 50 === 1 && !_errCleaning) {
+    _errCleaning = true;
     const days = (ec?.retention_days || 7);
     const cutoff = Date.now() - days * 86400000;
     fs.readFile(p, 'utf8', (err, c) => {
-      if (err) return;
-      const lines = c.split('\n').filter(l => {
-        try { return new Date(l.slice(0, 19)).getTime() > cutoff; } catch { return false; }
+      if (err) { _errCleaning = false; return; }
+      const header = '// error.jsonc — auto-generated, each line is a JSON object';
+      const kept = c.split('\n').filter(l => l && !l.startsWith('//')).filter(l => {
+        try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
-      if (lines.length > 0) fs.writeFile(p, lines.join('\n') + '\n', () => {});
+      if (kept.length > 0) { kept.unshift(header); fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; }); }
+      else { _errCleaning = false; }
     });
   }
 }
@@ -104,13 +150,19 @@ function compressContent(str) {
 
   return str;
 }
-// --- config loading ---
-const CONFIG_PATH = process.env.CONFIG_PATH || path.join(__dirname, 'config.json');
+// --- config loading (JSONC with comments support) ---
+const CONFIG_PATH = process.env.CONFIG_PATH || (() => {
+  const jc = path.join(__dirname, 'config.jsonc');
+  return fs.existsSync(jc) ? jc : path.join(__dirname, 'config.json');
+})();
 let cfg = {};
 try {
-  if (fs.existsSync(CONFIG_PATH)) cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+  if (fs.existsSync(CONFIG_PATH)) {
+    const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
+    cfg = CONFIG_PATH.endsWith('.jsonc') ? parseJsonc(raw) : JSON.parse(raw);
+  }
 } catch (e) {
-  elog('[config] failed to load config.json:', e.message);
+  elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
@@ -1237,7 +1289,7 @@ const onListening = () => {
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
   const elCfg = cfg.error_log;
-  if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || './error.log'} retention=${elCfg?.retention_days || 7}d`);
+  if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || './error.jsonc'} retention=${elCfg?.retention_days || 7}d`);
 };
 const startup = [];
 startup.push(fetchModelsDev());
@@ -1245,18 +1297,21 @@ if (cfg.free_keys?.enabled) startup.push(fetchFreeKeys());
 Promise.all(startup).then(() => server.listen(PORT, onListening));
 
 // --- graceful config reload ---
-if (fs.existsSync(CONFIG_PATH)) {
+const watchPaths = [CONFIG_PATH];
+const altPath = path.join(__dirname, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
+if (fs.existsSync(altPath)) watchPaths.push(altPath);
+watchPaths.forEach(wp => {
   let reloadTimer = null;
-  fs.watch(CONFIG_PATH, (event) => {
+  fs.watch(wp, (event) => {
     if ((event === 'change' || event === 'rename') && !reloadTimer) {
       reloadTimer = setTimeout(() => {
-        log(`[config] ${path.basename(CONFIG_PATH)} changed — graceful restart...`);
+        log(`[config] ${path.basename(wp)} changed — graceful restart...`);
         server.close(() => process.exit(0));
         setTimeout(() => process.exit(1), 15000).unref();
       }, 1000).unref();
     }
   });
-}
+});
 
 // --- shutdown handlers ---
 function shutdown(signal) {

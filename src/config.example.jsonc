@@ -1,6 +1,5 @@
 {
-  "_note": "複製為 config.json。所有值可由同名環境變數覆寫。",
-
+  // 複製為 config.jsonc。所有值可由同名環境變數覆寫。
   "account_id": "your-cloudflare-account-id",
   "gateway_name": "your-ai-gateway-name",
   "client_token": "optional-auth-bearer-token",
@@ -12,28 +11,27 @@
   "max_key_backoff": 300000,
   "max_body_size": 10485760,
 
+  /* (選用) 錯誤回應日誌，自動刪除超過 retention_days 的舊資料 */
   "error_log": {
-    "_note": "  (選用)錯誤回應日誌，自動刪除超過 retention_days 的舊資料",
     "enabled": true,
-    "path": "./error.log",
+    "path": "./error.jsonc",
     "retention_days": 7
   },
 
+  /* (選用) 啟用後訪問 /health 路由會從 GitHub 爬取公開免費 key 做備援 */
   "free_keys": {
-    "_note": " (選用)以下若設為 true 啟用：訪問 /health 路由將會從 GitHub 爬取公開免費 key 做為備援(推薦排程)。",
     "enabled": true,
     "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
     "base_url": "https://aiapiv2.pekpik.com/v1",
     "interval_ms": 300000
   },
 
-  "_log_retention_note": " (選用)以下若設定大於 0 的天數，訪問 /health 路由將會以調用 cloudflare API 來清理該天數之前的 log。",
+  /* (選用) 設 >0 天數，訪問 /health 時會調用 Cloudflare API 清理舊 log */
   "log_retention_days": 0,
   "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
 
   "providers": {
-    "_note": "只填入有 API key 的 provider 即可。未使用的可以刪除或留空值，在請求時會被自動略過。",
-
+    // 只填入有 key 的 provider，未使用的可刪除或留空
     "openai": [""],
     "anthropic": [""],
     "google-ai-studio": [""],
