@@ -84,28 +84,37 @@ function _errMsg(body) {
   // Fallback: strip newlines, limit length
   return clean.replace(/\n/g, ' ').slice(0, 500);
 }
+function getErrorLogPath() {
+  const ec = cfg.error_log;
+  if (ec?.path) return ec.path;
+  const j = path.join(__dirname, 'error.json');
+  if (fs.existsSync(j)) return j;
+  const jc = path.join(__dirname, 'error.jsonc');
+  return fs.existsSync(jc) ? jc : j;
+}
 let _errLogCount = 0, _errCleaning = false;
-function errorLog({ provider, model, key, status, body }) {
+function errorLog({ logId, provider, model, key, status, body }) {
   const ec = cfg.error_log;
   if (ec?.enabled === false) return;
-  const p = ec?.path || './error.jsonc';
-  const k = key ? `...${key.slice(-4)}` : '-';
-  const entry = JSON.stringify({ ts: _ts(), provider, model, key: k, status, body: _errMsg(body) });
+  const p = getErrorLogPath();
+  const msg = _errMsg(body);
+  const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', status, error: msg });
   fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
   _errLogCount++;
-  // Cleanup once per ~50 writes (locked to prevent concurrent read-modify-write race)
   if (_errLogCount % 50 === 1 && !_errCleaning) {
     _errCleaning = true;
     const days = (ec?.retention_days || 7);
     const cutoff = Date.now() - days * 86400000;
     fs.readFile(p, 'utf8', (err, c) => {
-      if (err) { _errCleaning = false; return; }
-      const header = '// error.jsonc — auto-generated, each line is a JSON object';
-      const kept = c.split('\n').filter(l => l && !l.startsWith('//')).filter(l => {
+      if (err || !c) { _errCleaning = false; return; }
+      const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
-      if (kept.length > 0) { kept.unshift(header); fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; }); }
-      else { _errCleaning = false; }
+      if (kept.length > 0) {
+        const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
+        kept.unshift(header);
+        fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
+      } else { _errCleaning = false; }
     });
   }
 }
@@ -152,8 +161,8 @@ function compressContent(str) {
 }
 // --- config loading (JSONC with comments support) ---
 const CONFIG_PATH = process.env.CONFIG_PATH || (() => {
-  const jc = path.join(__dirname, 'config.jsonc');
-  return fs.existsSync(jc) ? jc : path.join(__dirname, 'config.json');
+  const j = path.join(__dirname, 'config.json');
+  return fs.existsSync(j) ? j : path.join(__dirname, 'config.jsonc');
 })();
 let cfg = {};
 try {
@@ -181,11 +190,11 @@ const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', COPILOT_KEYS:'github-copilot',
 };
 
 // Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL when adding new direct provider)
-const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io' };
+const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-copilot': 'https://api.githubcopilot.com' };
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {
@@ -292,11 +301,15 @@ function selectKey(p) {
   const healthy = getHealthyKeys(p);
   if (healthy.length === 0) return null;
   const free = healthy.filter(k => !keyInFlight.has(`${p}:${k}`));
-  const keys = free.length > 0 ? free : healthy;
-  let idx = rrCursor.get(p) ?? -1;
-  idx = (idx + 1) % keys.length;
-  rrCursor.set(p, idx);
-  const key = keys[idx];
+  if (free.length > 0) {
+    let idx = ((rrCursor.get(p) ?? -1) + 1) % free.length;
+    rrCursor.set(p, idx);
+    const key = free[idx];
+    keyInFlight.add(`${p}:${key}`);
+    return key;
+  }
+  // All healthy keys in-flight — pick a random one to minimise collisions
+  const key = healthy[Math.floor(Math.random() * healthy.length)];
   keyInFlight.add(`${p}:${key}`);
   return key;
 }
@@ -307,9 +320,11 @@ function releaseKey(p, key) {
 
 // --- low-level helpers ---
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const logKey = (k) => k ? `...${k.slice(-4)}` : '-';
 
+let _ridSeq = 0;
 function rid() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  return Date.now().toString(36) + (++_ridSeq).toString(36) + Math.random().toString(36).slice(2, 4);
 }
 
 function formatUptime(sec) {
@@ -339,11 +354,12 @@ function collectBody(res) {
 // --- token-based alias routing ---
 // ponytail: all model aliases participate, sorted by models.dev context limit. Unknown models get large default (last fallback).
 let MODELS_DEV_LIMITS = new Map();
+const PROVIDER_DEFAULT_LIMITS = { 'github-copilot': 8000 };
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
   const aliasProv = ({ 'google-ai-studio': 'google', 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
-  return MODELS_DEV_LIMITS.get(`${aliasProv}/${t.model || alias}`.toLowerCase()) || 999999;
+  return MODELS_DEV_LIMITS.get(`${aliasProv}/${t.model || alias}`.toLowerCase()) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
 }
 let TOKEN_ORDER = [];
 function rebuildTokenOrder() {
@@ -627,8 +643,6 @@ function validateChatBody(body) {
 
 async function handleChatCompletion(req, res, bodyJson, logId) {
   const t0 = Date.now();
-
-  // Validate payload
   const validationErr = validateChatBody(bodyJson);
   if (validationErr) {
     log(`[${logId}] ← 400  ${validationErr}`);
@@ -647,7 +661,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   const clientModel = bodyJson.model || 'unknown';
   let targets = resolveModel(clientModel);
-
   if (!targets) {
     log(`[${logId}] ← 400  unsupported model: ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -655,7 +668,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
-  // Format-preserving content compression (before token routing for accurate sizing)
   if (Array.isArray(bodyJson.messages)) {
     bodyJson.messages = bodyJson.messages.map(m => {
       if (typeof m.content === 'string' && m.content.length > 200) {
@@ -665,7 +677,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     });
   }
 
-  // Token-based alias routing — only when client model can't handle the request
   if (TOKEN_ORDER.length > 0) {
     const est = estimateTokens(bodyJson.messages);
     const clientTargets = resolveModel(clientModel);
@@ -677,7 +688,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const limit = getAliasLimit(alias);
         if (limit > 0 && est > limit) continue;
         if (alias !== clientModel) {
-          log(`[${logId}] token routing: ${clientModel} → ${alias} (est=${est}, limit=${limit})`);
+          log(`[${logId}] ◆ ${clientModel} → ${alias}  (est=${est}, ctx=${limit})`);
           targets = newTargets;
         }
         break;
@@ -685,25 +696,28 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     }
   }
 
-  // Fast-skip targets whose provider has no keys configured
-  let activeTargets = CF_CONFIGURED ? targets.filter(t => t.provider !== 'freekeys' && PROVIDERS_WITH_KEYS.has(t.provider)) : [];
+  let activeTargets = targets.filter(t => {
+    if (t.provider === 'freekeys') return false;
+    if (!PROVIDERS_WITH_KEYS.has(t.provider)) return false;
+    if (!CF_CONFIGURED && !DIRECT_PROVIDERS[t.provider]) return false;
+    return true;
+  });
   if (activeTargets.length === 0 && !hasFreeKeys) {
-    log(`[${logId}] ← 400  no keys available for ${clientModel}`);
+    log(`[${logId}] ← 400  no keys for ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `no keys available for model '${clientModel}'`, type: 'no_keys' } }));
     return;
   }
 
-  // Determine streaming mode (default true for backward compat)
   const isStream = bodyJson.stream !== false;
-  const providerKeyCount = Object.keys(PROVIDER_KEYS).filter(k => k !== 'freekeys').reduce((s, k) => s + (PROVIDER_KEYS[k] || []).length, 0);
-  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${providerKeyCount}  free=${freeKeyModels.size}`);
-
+  const pkCount = Object.keys(PROVIDER_KEYS).filter(k => k !== 'freekeys').reduce((s, k) => s + (PROVIDER_KEYS[k] || []).length, 0);
+  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}  free=${freeKeyModels.size}`);
 
   const rotated = rotateTargets(activeTargets, clientModel);
-  if (rotated.length > 1) log(`[${logId}] fallback: ${rotated.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
+  if (rotated.length > 1) {
+    log(`[${logId}] ◆ fallback chain: ${rotated.map(t => `[${t.provider}/${t.upstreamModel}]`).join(' > ')}`);
+  }
 
-  // Prepare body template once — model is set per-target below
   const bodyTemplate = { ...bodyJson, stream: isStream };
   delete bodyTemplate.model;
 
@@ -714,12 +728,10 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let sseStarted = false;
   req.on('close', () => { clientGone = true; });
 
-  // SSE mode: respond immediately with 200 + SSE headers, then try upstreams in background
   if (isStream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
+      'Cache-Control': 'no-cache', 'Connection': 'keep-alive',
       'X-Request-Id': logId,
     });
     sseStarted = true;
@@ -727,23 +739,21 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS) {
     if (retryRound > 0) {
-      // Progressive wait: 5s, 10s, 15s, 20s, 25s, 30s...
       const wait = Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] retry ${retryRound} — waiting ${wait}ms for key recovery...`);
+      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms for key recovery`);
       await sleep(wait);
     }
     retryRound++;
   for (let ti = 0; ti < rotated.length; ti++) {
     const target = rotated[ti];
-    if (upstreamRes) break; // only success stops the chain
+    if (upstreamRes) break;
     try {
     const provider = target.provider;
     const upstreamModel = target.upstreamModel;
     const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
 
-    if (lastErr) await sleep(Math.random() * 300); // jitter between provider targets
+    if (lastErr) await sleep(Math.random() * 300);
 
-    // Serialise body once per provider target
     const isDirect = DIRECT_PROVIDERS[provider];
     const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
     const banned = PROVIDER_BANNED_FIELDS[provider];
@@ -760,9 +770,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (upstreamRes) break;
-      if (attempt > 0) await sleep(Math.random() * 300); // jitter to spread concurrent retries
+      if (attempt > 0) await sleep(Math.random() * 300);
       usedKey = selectKey(provider);
-      if (!usedKey) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); errorLog({ provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
+      if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); errorLog({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
       try {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
@@ -775,8 +785,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           markKeyError(provider, usedKey);
           releaseKey(provider, usedKey);
           const body = await collectBody(upstreamRes);
-          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  attempt=${attempt+1}/${maxAttempts}  key=...${usedKey.slice(-4)}`);
-          errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
+          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
+          errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
           lastErr = { status: sc, body };
           upstreamRes = null;
           continue;
@@ -786,33 +796,31 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           markKeyError(provider, usedKey);
           releaseKey(provider, usedKey);
           const body = await collectBody(upstreamRes);
-          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}  ${body.slice(0, 100)}`);
-          errorLog({ provider, model: upstreamModel, key: usedKey, status: sc, body });
+          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${body.slice(0, 100)}`);
+          errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
           lastErr = { status: sc, body };
           upstreamRes = null;
           continue;
         }
 
-        // Success
         releaseKey(provider, usedKey);
         markKeySuccess(provider, usedKey);
-        log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${usedKey.slice(-4)}`);
+        log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
         break;
 
       } catch (e) {
         markKeyError(provider, usedKey);
         releaseKey(provider, usedKey);
-        log(`[${logId}] ${provider}/${upstreamModel} → error  attempt=${attempt+1}/${maxAttempts}  ${e.message}`);
-        errorLog({ provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
+        log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
+        errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
         upstreamRes = null;
       }
     }
-    } catch (e) { log(`[${logId}] ${target?.provider}/${target?.upstreamModel} → fatal ${e.message}`); errorLog({ provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
+    } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); errorLog({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
   }
   }
 
-  // --- CF all failed → try free keys as last resort ---
   if (!upstreamRes && cfg.free_keys?.enabled && !clientGone) {
     const baseUrl = cfg.free_keys?.base_url;
     if (baseUrl) {
@@ -821,7 +829,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       const matchedSet = new Set(matchedModels);
       const allModels = [...fkMap.keys()];
       const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m)));
-      if (orderedModels.length > 0) log(`[${logId}] freekeys try ${orderedModels.length} models (${matchedModels.length} matched)`);
+      if (orderedModels.length > 0) log(`[${logId}] ◆ freekeys fallback: ${orderedModels.length} models (${matchedModels.length} matched)`);
       for (const model of orderedModels) {
         if (clientGone || upstreamRes) break;
         const keys = fkMap.get(model) || [];
@@ -849,8 +857,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               markKeyError('freekeys', key);
               releaseKey('freekeys', key);
               const bd = await collectBody(upstreamRes);
-              log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
-              errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
+              log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
+              errorLog({ logId, provider: 'freekeys', model, key, status: sc, body: bd });
               lastErr = { status: sc, body: bd }; upstreamRes = null;
               continue;
             }
@@ -858,30 +866,27 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               markKeyError('freekeys', key);
               releaseKey('freekeys', key);
               const bd = await collectBody(upstreamRes);
-              log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}  ${bd.slice(0,100)}`);
-              errorLog({ provider: 'freekeys', model, key, status: sc, body: bd });
+              log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)} ${bd.slice(0,100)}`);
+              errorLog({ logId, provider: 'freekeys', model, key, status: sc, body: bd });
               lastErr = { status: sc, body: bd }; upstreamRes = null;
               break;
             }
             releaseKey('freekeys', key);
-            log(`[${logId}] freekeys/${model} → ${sc}  key=...${key.slice(-4)}`);
+            log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
             break;
           } catch (e) {
             markKeyError('freekeys', key);
             releaseKey('freekeys', key);
-            log(`[${logId}] freekeys/${model} → error  ${e.message}`);
-            errorLog({ provider: 'freekeys', model, key, status: 502, body: e.message });
+            log(`[${logId}] ← 502 [freekeys/${model}] key=${logKey(key)} ${e.message}`);
+            errorLog({ logId, provider: 'freekeys', model, key, status: 502, body: e.message });
             lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
             upstreamRes = null;
             continue;
           }
         }
         if (!upstreamRes && keys.length > 0) {
-          if (lastErr?.status === 403) {
-            log(`[${logId}] freekeys/${model} → blocked (403), skip to next model`);
-          } else {
-            log(`[${logId}] freekeys/${model} → all ${keys.length} keys exhausted`);
-          }
+          const reason = lastErr?.status === 403 ? 'blocked (403)' : `all ${keys.length} keys exhausted`;
+          log(`[${logId}] ◆ freekeys/${model} ${reason}`);
         }
       }
     }
@@ -890,10 +895,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   if (!upstreamRes || !usedProvider) {
     const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
     const errCode = lastErr?.status || 502;
-    log(`[${logId}] ← ${sseStarted ? 'SSE' : '502'}  all failed (upstream=${errCode})  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-    errorLog({ provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
+    log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    errorLog({ logId, provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
     if (sseStarted) {
-      // SSE already 200'd — send error event then close
       const sseErr = { error: { message: `all failed: ${errMsg}`, type: 'proxy_error' } };
       try { res.write(`data: ${JSON.stringify(sseErr)}\n\n`); } catch {}
       try { res.write('data: [DONE]\n\n'); res.end(); } catch {}
@@ -904,27 +908,23 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
-  // --- success path ---
-  log(`[${logId}] ← 200  ${((Date.now()-t0)/1000).toFixed(1)}s  ${usedProvider}/${usedModel}`);
+  const dur = ((Date.now() - t0) / 1000).toFixed(1);
+  log(`[${logId}] ← 200 ${dur}s [${usedProvider}/${usedModel}]`);
 
   if (sseStarted) {
-    // SSE headers already sent — pipe upstream directly
     const needModelRewrite = usedModel !== clientModel;
     const pipe = needModelRewrite
       ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
       : (c) => { try { res.write(c); } catch {} };
     upstreamRes.on('data', pipe);
     upstreamRes.on('end',   () => { try { res.end(); } catch {} });
-    upstreamRes.on('error', (e) => { log(`[${logId}] stream: ${e.message}`); try { res.end(); } catch {} });
+    upstreamRes.on('error', (e) => { log(`[${logId}] ◆ stream error: ${e.message}`); try { res.end(); } catch {} });
     req.on('close', () => { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); });
   } else {
-    // Non-streaming JSON response
     const body = await collectBody(upstreamRes);
     res.writeHead(200, {
       'Content-Type': 'application/json',
-      'X-Request-Id': logId,
-      'X-Provider': usedProvider,
-      'X-Upstream-Model': usedModel,
+      'X-Request-Id': logId, 'X-Provider': usedProvider, 'X-Upstream-Model': usedModel,
     });
     res.end(body);
   }
@@ -934,6 +934,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   const t0 = Date.now();
   const hasFreeKeys = cfg.free_keys?.enabled && freeKeyModels.size > 0;
   if (!CF_CONFIGURED && !hasFreeKeys) {
+    log(`[${logId}] ← 502  gateway not configured`);
     res.writeHead(502, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'gateway not configured', type: 'not_configured' } }));
     return;
@@ -941,6 +942,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   if (jsonBody !== false) {
     if (!bodyJson || typeof bodyJson !== 'object') {
+      log(`[${logId}] ← 400  invalid request body`);
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'invalid request body', type: 'invalid_request' } }));
       return;
@@ -948,19 +950,22 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   const clientModel = bodyJson?.model || 'unknown';
-
-  // Try configured model mapping first, fall back to openai default
   let targets = resolveModel(clientModel);
   if (!targets) {
     targets = [{ provider: 'openai', upstreamModel: clientModel }];
-    log(`[${logId}] → ${clientModel}  ${endpointPath}  (default openai)`);
+    log(`[${logId}] ◆ ${clientModel}  ${endpointPath}  (default openai)`);
   } else {
-    log(`[${logId}] → ${clientModel}  ${endpointPath}`);
+    log(`[${logId}] ◆ ${clientModel}  ${endpointPath}`);
   }
 
-  // Fast-skip targets without configured keys
-  const activeTargets = CF_CONFIGURED ? targets.filter(t => t.provider !== 'freekeys' && PROVIDERS_WITH_KEYS.has(t.provider)) : [];
+  const activeTargets = targets.filter(t => {
+    if (t.provider === 'freekeys') return false;
+    if (!PROVIDERS_WITH_KEYS.has(t.provider)) return false;
+    if (!CF_CONFIGURED && !DIRECT_PROVIDERS[t.provider]) return false;
+    return true;
+  });
   if (activeTargets.length === 0 && !hasFreeKeys) {
+    log(`[${logId}] ← 400  no keys for ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
     return;
@@ -975,14 +980,12 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   for (const target of activeTargets) {
     const { provider, upstreamModel } = target;
     const key = selectKey(provider);
-    if (!key) { log(`[${logId}] ${provider}/${upstreamModel} → no key`); continue; }
-    // jitter before each provider attempt to spread concurrent requests
+    if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
     if (lastErr) await sleep(Math.random() * 300);
 
     const directBase = DIRECT_PROVIDERS[provider];
 
     if (directBase) {
-      // Direct provider (e.g. pollinations) — bypass CF gateway
       if (jsonBody !== false) {
         const proxyBody = { ...bodyJson, model: upstreamModel };
         const banned = PROVIDER_BANNED_FIELDS[provider];
@@ -999,7 +1002,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         if (sc >= 200 && sc < 300) {
           releaseKey(provider, key);
           markKeySuccess(provider, key);
-          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
           const ctype = upstreamRes.headers['content-type'] || 'application/json';
           const body = await collectBody(upstreamRes);
           res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
@@ -1009,88 +1012,66 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         markKeyError(provider, key);
         releaseKey(provider, key);
         const body = await collectBody(upstreamRes);
-        if (sc === 429 || sc >= 500) {
-          log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
-          errorLog({ provider, model: upstreamModel, key, status: sc, body });
-          lastErr = { status: sc, body };
-        } else {
-          log(`[${logId}] ${provider}/${upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
-          errorLog({ provider, model: upstreamModel, key, status: sc, body });
-          lastErr = { status: sc, body };
-        }
+        log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
+        errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
+        lastErr = { status: sc, body };
         continue;
       } catch (e) {
         markKeyError(provider, key);
         releaseKey(provider, key);
-        log(`[${logId}] ${provider}/${upstreamModel} → error  ${e.message}`);
-        errorLog({ provider, model: upstreamModel, key, status: 502, body: e.message });
+        log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
+        errorLog({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
         continue;
       }
     }
 
-    // Provider-specific route: /{provider}/{endpoint}
     const routePath = `/${provider}${endpointPath}`;
-
     if (jsonBody !== false) {
       bodyStr = JSON.stringify({ ...bodyJson, model: upstreamModel });
     } else {
       bodyStr = bodyJson;
     }
-
     upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
 
     try {
       const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType);
       if (clientGone) { releaseKey(provider, key); return; }
       const sc = upstreamRes.statusCode;
-
       if (sc >= 200 && sc < 300) {
         releaseKey(provider, key);
         markKeySuccess(provider, key);
-        log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+        log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
         const ctype = upstreamRes.headers['content-type'] || 'application/json';
         const body = await collectBody(upstreamRes);
         res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
         res.end(body);
         return;
       }
-
-      // degrade before releasing — no race window
       markKeyError(provider, key);
       releaseKey(provider, key);
       const body = await collectBody(upstreamRes);
-      if (sc === 429 || sc >= 500) {
-        log(`[${logId}] ${provider}/${upstreamModel} → ${sc}  key=...${key.slice(-4)}`);
-        errorLog({ provider, model: upstreamModel, key, status: sc, body });
-        lastErr = { status: sc, body };
-      } else {
-        log(`[${logId}] ${provider}/${upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0, 100)}`);
-        errorLog({ provider, model: upstreamModel, key, status: sc, body });
-        lastErr = { status: sc, body };
-      }
+      log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
+      errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
+      lastErr = { status: sc, body };
       continue;
-
     } catch (e) {
       markKeyError(provider, key);
       releaseKey(provider, key);
-      log(`[${logId}] ${provider}/${upstreamModel} → error  ${e.message}`);
-      errorLog({ provider, model: upstreamModel, key, status: 502, body: e.message });
+      log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
+      errorLog({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
       lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
     }
   }
 
-  // All attempts exhausted — also triggered when loop ran (activeTargets.length>0)
-  // but every key was degraded and no upstream ever returned (lastErr stays null)
-  if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
+  if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
   if (cfg.free_keys?.enabled && !clientGone) {
     const freeTargets = getFreeKeyTargets(clientModel);
-    if (freeTargets.length > 0) log(`[${logId}] freekey fallback: ${freeTargets.map(t => `${t.provider}/${t.upstreamModel}`).join(' > ')}`);
+    if (freeTargets.length > 0) log(`[${logId}] ◆ freekeys fallback: ${freeTargets.map(t => `[${t.provider}/${t.upstreamModel}]`).join(' > ')}`);
     for (const ft of freeTargets) {
       if (clientGone) break;
       for (const key of ft.keys) {
         if (clientGone) break;
-        // Skip degraded keys
         const kp = keyPool.get('freekeys');
         const ks = kp?.get(key);
         if (ks && Date.now() < ks.degradedUntil) continue;
@@ -1105,18 +1086,18 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const sc = upstreamRes.statusCode;
           const body = await collectBody(upstreamRes);
           if (sc >= 200 && sc < 300) {
-            log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc}  key=...${key.slice(-4)}  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+            log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
             const ctype = upstreamRes.headers['content-type'] || 'application/json';
             res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': ft.provider });
             res.end(body);
             return;
           }
-          log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → ${sc} skip  key=...${key.slice(-4)}  ${body.slice(0,100)}`);
-          errorLog({ provider: 'freekeys', model: ft.upstreamModel, key, status: sc, body });
+          log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
+          errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: sc, body });
           if (sc === 401 || sc === 402 || sc >= 500) markKeyError('freekeys', key);
         } catch (e) {
-          log(`[${logId}] ${ft.provider}/${ft.upstreamModel} → error  ${e.message}`);
-          errorLog({ provider: 'freekeys', model: ft.upstreamModel, key, status: 502, body: e.message });
+          log(`[${logId}] ← 502 [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${e.message}`);
+          errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: 502, body: e.message });
           markKeyError('freekeys', key);
         }
       }
@@ -1124,10 +1105,173 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   const errCode = lastErr?.status || 502;
-  log(`[${logId}] ← 502  all failed (upstream=${errCode})  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-  errorLog({ provider: '-', model: clientModel, key: '-', status: errCode, body: (lastErr?.body || '').slice(0,200) });
+  log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  errorLog({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: (lastErr?.body || '').slice(0,200) });
   res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
+}
+
+// --- console management page & API ---
+const CONSOLE_HTML = `<!DOCTYPE html>
+<html lang="zh-TW">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>API Gateway Console</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/dracula.min.css">
+<style>
+*{margin:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px}
+.c{max-width:1000px;margin:0 auto}
+.header{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #333;margin-bottom:20px}
+.header h2{font-size:20px}
+.header button{padding:6px 16px;border-radius:6px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer;font-size:13px}
+.header button:hover{background:#333}
+.login{text-align:center;padding:60px 20px}
+.login h2{font-size:24px;margin-bottom:8px}
+.login p{margin:12px 0 24px;color:#888}
+.login input{padding:10px 14px;width:300px;font-size:16px;border-radius:6px;border:1px solid #333;background:#16213e;color:#eee;outline:none}
+.login input:focus{border-color:#0f3460}
+.login button,.editor button{padding:10px 24px;font-size:16px;border-radius:6px;border:none;cursor:pointer}
+.login button{background:#0f3460;color:#fff}
+.login button:hover{background:#1a5276}
+.hidden{display:none}
+.editor{margin-top:0}
+.editor h3{margin:20px 0 8px;display:flex;align-items:center;gap:12px;font-size:16px}
+.editor .btn-bar{display:flex;gap:8px;margin-top:8px}
+.editor button{background:#0f3460;color:#fff}
+.editor button:hover{background:#1a5276}
+.editor button.danger{background:#6c2020}
+.editor button.danger:hover{background:#8a2a2a}
+.status{font-size:14px;margin-top:16px;color:#888}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 24px;border-radius:8px;color:#fff;z-index:999;transition:opacity .3s;font-size:14px}
+.toast.ok{background:#27ae60}
+.toast.err{background:#e74c3c}
+.CodeMirror{height:360px;font-size:13px;border-radius:6px;border:1px solid #333}
+.CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
+.CodeMirror-cursor{border-color:#eee}
+.CodeMirror pre{font-family:Consolas,'Courier New',monospace}
+</style></head>
+<body>
+<div class="c">
+<div class="header hidden" id="header"><h2>API Gateway Console</h2><button onclick="logout()">登出</button></div>
+<div class="login" id="login">
+<h2>API Gateway Console</h2>
+<p>請輸入 Client Token 以管理設定檔</p>
+<input type="password" id="token" placeholder="Client Token" autofocus onkeydown="if(event.key==='Enter')auth()">
+<p><button onclick="auth()">登入</button></p>
+<p class="status" id="loginStatus"></p>
+</div>
+<div class="editor hidden" id="editor">
+<div><h3>Config <span class="status" style="color:#888;font-weight:400;font-size:13px">(儲存後伺服器將自動重啟)</span></h3>
+<textarea id="configText"></textarea>
+<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('config')">儲存 Config</button></div></div>
+<div><h3>Error Log</h3>
+<textarea id="errorText"></textarea>
+<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('error')">儲存 Error Log</button><button class="danger" onclick="clearError()">清空</button></div></div>
+</div>
+</div>
+<div id="toast"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
+<script>
+let _token='',_cmInit=false;let cmConfig,cmError;
+function logout(){_token='';if(cmConfig)cmConfig.setValue('');if(cmError)cmError.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
+function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
+async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
+if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
+try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){s('驗證失敗：token 不正確',1);return}
+document.getElementById('header').classList.remove('hidden');
+document.getElementById('login').classList.add('hidden');document.getElementById('editor').classList.remove('hidden');
+if(!_cmInit){_cmInit=true;
+const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
+cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
+cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cmConfig.refresh();cmError.refresh()}
+load();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
+async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'')}catch(e){toast('載入錯誤: '+e.message,0)}}
+async function save(t){const cm=t==='config'?cmConfig:cmError;const c=cm.getValue()
+try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')setTimeout(()=>{s('伺服器重啟中...',1)},500)}catch(e){toast('儲存錯誤: '+e.message,0)}}
+async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
+function s(m,e){document.getElementById('loginStatus').textContent=m}
+function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
+</script></body></html>`;
+
+function checkConsoleAuth(req, res) {
+  if (!CLIENT_TOKEN) return true;
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ') || auth.slice(7) !== CLIENT_TOKEN) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'unauthorized' }));
+    return false;
+  }
+  return true;
+}
+
+function serveConsolePage(res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(CONSOLE_HTML);
+}
+
+function handleConsoleValidate(req, res, body, logId) {
+  log(`[${logId}] /api/console/validate`);
+  if (!checkConsoleAuth(req, res)) return;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+}
+
+function handleConsoleLoad(req, res, logId) {
+  log(`[${logId}] /api/console/load`);
+  if (!checkConsoleAuth(req, res)) return;
+  const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ config: read(CONFIG_PATH), error: read(getErrorLogPath()) }));
+}
+
+function handleConsoleSave(req, res, body, logId) {
+  log(`[${logId}] /api/console/save`);
+  if (!checkConsoleAuth(req, res)) return;
+  if (!body || !body.file || body.content === undefined) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'file and content required' }));
+    return;
+  }
+  if (body.file !== 'config' && body.file !== 'error') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid file type' }));
+    return;
+  }
+  const target = body.file === 'config' ? CONFIG_PATH : getErrorLogPath();
+  log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
+  try {
+    if (body.file === 'config') {
+      try { JSON.parse(body.content); } catch {
+        try { parseJsonc(body.content); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid config content: ' + e.message }));
+          return;
+        }
+      }
+    } else if (body.file === 'error' && body.content.trim()) {
+      let lineNo = 0;
+      for (const rawLine of body.content.split('\n')) {
+        const l = rawLine.trim();
+        if (!l || l.startsWith('#')) continue;
+        lineNo++;
+        try { JSON.parse(l); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `error log line ${lineNo} is not valid JSON: ${e.message}` }));
+          return;
+        }
+      }
+    }
+    // Write back with exactly the content the user submitted (no BOM)
+    fs.writeFileSync(target, body.content, 'utf-8');
+    log(`[${logId}] saved ${path.basename(target)}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  } catch (e) {
+    log(`[${logId}] save error: ${e.message}`);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: e.message }));
+  }
 }
 
 function isJsonEndpoint(url) {
@@ -1147,8 +1291,9 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // Auth check for protected endpoints
-  const needsAuth = (req.method === 'POST' || (req.url !== '/health' && req.url !== '/v1/health' && req.url !== '/'));
+  // Auth check for protected endpoints (console routes handle auth themselves)
+  const isConsolePath = req.url === '/console' || req.url.startsWith('/api/console/');
+  const needsAuth = (req.method === 'POST' && !isConsolePath) || (!isConsolePath && req.url !== '/health' && req.url !== '/v1/health' && req.url !== '/');
   if (needsAuth && CLIENT_TOKEN) {
     const auth = req.headers['authorization'];
     if (!auth || !auth.startsWith('Bearer ') || auth.slice(7) !== CLIENT_TOKEN) {
@@ -1181,6 +1326,14 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(s));
     return;
+  }
+
+  // --- GET /console ---
+  if (req.url === '/console' && req.method === 'GET') {
+    serveConsolePage(res); return;
+  }
+  if (req.url === '/api/console/load' && req.method === 'GET') {
+    handleConsoleLoad(req, res, logId); return;
   }
 
   // --- GET / ---
@@ -1223,20 +1376,19 @@ const server = http.createServer((req, res) => {
       const rawBody = Buffer.concat(chunks);
       let json, rawStr;
 
-      // Try JSON parse for JSON endpoints
-      if (isJsonEndpoint(req.url)) {
-        try {
-          json = JSON.parse(rawBody.toString('utf8'));
-        } catch {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: { message: 'invalid JSON', type: 'invalid_request' } }));
-          return;
-        }
+      if (isJsonEndpoint(req.url) || req.url === '/api/console/validate' || req.url === '/api/console/save') {
+        const s = rawBody.toString('utf8').trim();
+        if (s) { try { json = JSON.parse(s); } catch { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'invalid JSON', type: 'invalid_request' } })); return; } }
       } else {
-        // Raw body for non-JSON endpoints (audio transcriptions, etc.)
         rawStr = rawBody;
       }
 
+      // Console API routes
+      if (req.url === '/api/console/validate') {
+        handleConsoleValidate(req, res, json, logId);
+      } else if (req.url === '/api/console/save') {
+        handleConsoleSave(req, res, json, logId);
+      } else
       // Route to appropriate handler
       if (req.url.startsWith('/v1/chat/completions')) {
         handleChatCompletion(req, res, json, logId);
@@ -1289,7 +1441,8 @@ const onListening = () => {
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
   const elCfg = cfg.error_log;
-  if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || './error.jsonc'} retention=${elCfg?.retention_days || 7}d`);
+  const defErrPath = './error.json';
+  if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || defErrPath} retention=${elCfg?.retention_days || 7}d`);
 };
 const startup = [];
 startup.push(fetchModelsDev());
@@ -1298,8 +1451,11 @@ Promise.all(startup).then(() => server.listen(PORT, onListening));
 
 // --- graceful config reload ---
 const watchPaths = [CONFIG_PATH];
-const altPath = path.join(__dirname, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
-if (fs.existsSync(altPath)) watchPaths.push(altPath);
+// Only watch the alternate default filename when CONFIG_PATH is the default (not env override)
+if (!process.env.CONFIG_PATH) {
+  const altPath = path.join(__dirname, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
+  if (fs.existsSync(altPath)) watchPaths.push(altPath);
+}
 watchPaths.forEach(wp => {
   let reloadTimer = null;
   fs.watch(wp, (event) => {

@@ -16,7 +16,8 @@ Cloudflare AI Gateway 代理 — 支援多 API Key 輪詢、故障轉移、Model
 - **非 Chat 端點** — 支援 embeddings、images/generations、audio/speech、audio/transcriptions
 - **配置檔熱重載** — 修改 `config.json` 自動重啟（1秒 debounce）
 - **上下文壓縮** — 輕量壓縮 context 節省 token
--
+- **管理介面** — `GET /console` 使用 client-token 登入到管理後台
+
 ## 前置需求
 
 - Node.js 18+
@@ -136,3 +137,4 @@ pm2 startup
 - 加入支援 provider:
   1. [pollinations](https://pollinations.ai)
   2. [literouter](https://literouter.com/)
+  3. [github-copilot](https://github.com/)

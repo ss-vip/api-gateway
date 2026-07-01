@@ -1,5 +1,5 @@
 {
-  // 複製為 config.jsonc。所有值可由同名環境變數覆寫。
+  "_note": "複製為 config.json。所有值可由同名環境變數覆寫",
   "account_id": "your-cloudflare-account-id",
   "gateway_name": "your-ai-gateway-name",
   "client_token": "optional-auth-bearer-token",
@@ -11,27 +11,27 @@
   "max_key_backoff": 300000,
   "max_body_size": 10485760,
 
-  /* (選用) 錯誤回應日誌，自動刪除超過 retention_days 的舊資料 */
   "error_log": {
+    "_note": "(選用) 啟用錯誤回應日誌，自動刪除超過 retention_days 的舊資料",
     "enabled": true,
-    "path": "./error.jsonc",
-    "retention_days": 7
+    "retention_days": 7,
+    "path": "./error.json"
   },
 
-  /* (選用) 啟用後訪問 /health 路由會從 GitHub 爬取公開免費 key 做備援 */
   "free_keys": {
+    "_note": "(選用) 啟用後訪問 /health 路由會從 GitHub 爬取公開免費 key 做備援",
     "enabled": true,
     "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
     "base_url": "https://aiapiv2.pekpik.com/v1",
     "interval_ms": 300000
   },
 
-  /* (選用) 設 >0 天數，訪問 /health 時會調用 Cloudflare API 清理舊 log */
+  "_cf_log_note": "(選用) 設 >0 天數，訪問 /health 時會調用 Cloudflare API 清理舊 log",
   "log_retention_days": 0,
   "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
 
   "providers": {
-    // 只填入有 key 的 provider，未使用的可刪除或留空
+    "_note": "只填入有 key 的 provider，未使用的可刪除或留空",
     "openai": [""],
     "anthropic": [""],
     "google-ai-studio": [""],
@@ -54,7 +54,8 @@
     "workers-ai": [""],
     "pollinations": [""],
     "literouter": [""],
-    "llm7": [""]
+    "llm7": [""],
+    "github-copilot": [""]
   },
 
   "models": {
@@ -67,7 +68,8 @@
       { "provider": "openai", "model": "gpt-4o-mini" },
       { "provider": "pollinations", "model": "mistral-small-3.2" },
       { "provider": "literouter", "model": "owl-alpha:free:full-context" },
-      { "provider": "llm7", "model": "fast" }
+      { "provider": "llm7", "model": "fast" },
+      [{ "provider": "github-copilot", "model": "gpt-4o" }]
     ],
 
     "text-embedding-3-small": "openai",
