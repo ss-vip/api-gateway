@@ -1153,6 +1153,11 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 .CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
 .CodeMirror-cursor{border-color:#eee}
 .CodeMirror pre{font-family:Consolas,'Courier New',monospace}
+.overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.overlay.hidden{display:none}
+.overlay .spinner{width:40px;height:40px;border:4px solid #444;border-top-color:#0f3460;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.overlay p{margin-top:16px;color:#aaa;font-size:14px}
 </style></head>
 <body>
 <div class="c">
@@ -1174,6 +1179,7 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 </div>
 </div>
 <div id="toast"></div>
+<div class="overlay hidden" id="overlay"><div class="spinner"></div><p>伺服器重啟中，請稍候...</p></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
@@ -1192,10 +1198,13 @@ cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cm
 load();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
 async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'')}catch(e){toast('載入錯誤: '+e.message,0)}}
 async function save(t){const cm=t==='config'?cmConfig:cmError;const c=cm.getValue()
-try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')setTimeout(()=>{s('伺服器重啟中...',1)},500)}catch(e){toast('儲存錯誤: '+e.message,0)}}
+try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config'){showOverlay();waitForServer()}}catch(e){toast('儲存錯誤: '+e.message,0)}}
 async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
-function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
+function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
+function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
+function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
+async function waitForServer(){for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay()}
 </script></body></html>`;
 
 function checkConsoleAuth(req, res) {
