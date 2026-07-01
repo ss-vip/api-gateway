@@ -190,11 +190,12 @@ const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', COPILOT_KEYS:'github-copilot',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models',
 };
 
-// Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL when adding new direct provider)
-const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-copilot': 'https://api.githubcopilot.com' };
+// Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL + path prefix when adding new direct provider)
+const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-models': 'https://models.github.ai' };
+const DIRECT_PATH_PREFIX = { 'github-models': '/inference' };
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {
@@ -354,7 +355,7 @@ function collectBody(res) {
 // --- token-based alias routing ---
 // ponytail: all model aliases participate, sorted by models.dev context limit. Unknown models get large default (last fallback).
 let MODELS_DEV_LIMITS = new Map();
-const PROVIDER_DEFAULT_LIMITS = { 'github-copilot': 8000 };
+const PROVIDER_DEFAULT_LIMITS = { 'github-models': 8000 };
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
@@ -558,7 +559,7 @@ function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
   });
 }
 
-function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType) {
+function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders) {
   return new Promise((resolve, reject) => {
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
     const url = new URL(joined);
@@ -572,6 +573,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
         'Content-Type': contentType || 'application/json',
         'Authorization': `Bearer ${apiKey}`,
         'Accept': accept || 'application/json',
+        ...(extraHeaders || {}),
       },
       timeout: TIMEOUT_MS,
     };
@@ -776,7 +778,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
       try {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-        upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], '/v1/chat/completions', acceptHdr) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
+        const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+        upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
         usedProvider = provider;
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
@@ -996,7 +999,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       }
       upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
       try {
-        const upstreamRes = await forwardToDirect(key, bodyStr, directBase, '/v1' + endpointPath, 'application/json', upstreamContentType);
+        const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+        const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs);
         if (clientGone) { releaseKey(provider, key); return; }
         const sc = upstreamRes.statusCode;
         if (sc >= 200 && sc < 300) {

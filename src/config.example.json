@@ -55,7 +55,7 @@
     "pollinations": [""],
     "literouter": [""],
     "llm7": [""],
-    "github-copilot": [""]
+    "github-models": [""]
   },
 
   "models": {
@@ -69,7 +69,7 @@
       { "provider": "pollinations", "model": "mistral-small-3.2" },
       { "provider": "literouter", "model": "owl-alpha:free:full-context" },
       { "provider": "llm7", "model": "fast" },
-      [{ "provider": "github-copilot", "model": "gpt-4o" }]
+      [{ "provider": "github-models", "model": "openai/gpt-4o-mini" }]
     ],
 
     "text-embedding-3-small": "openai",
