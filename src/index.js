@@ -188,11 +188,11 @@ const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models', NVIDIA_KEYS:'nvidia',
 };
 
 // Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL + path prefix when adding new direct provider)
-const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-models': 'https://models.github.ai' };
+const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-models': 'https://models.github.ai', nvidia: 'https://integrate.api.nvidia.com' };
 const DIRECT_PATH_PREFIX = { 'github-models': '/inference' };
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)

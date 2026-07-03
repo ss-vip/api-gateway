@@ -139,3 +139,5 @@ pm2 startup
   1. [pollinations](https://pollinations.ai)
   2. [literouter](https://literouter.com/)
   3. [github-copilot](https://github.com/)
+  4. [Nvidia](https://build.nvidia.com/explore/discover)
+  5.

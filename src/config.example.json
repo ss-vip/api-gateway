@@ -55,7 +55,8 @@
     "pollinations": [""],
     "literouter": [""],
     "llm7": [""],
-    "github-models": [""]
+    "github-models": [""],
+    "nvidia": [""]
   },
 
   "model_limits": {
