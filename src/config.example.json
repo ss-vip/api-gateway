@@ -58,6 +58,20 @@
     "github-models": [""]
   },
 
+  "model_limits": {
+    "_note": "token 上限: provider/model → max context",
+    "github-models/openai/gpt-4o": 8000,
+    "mistral/mistral-large": 32000
+  },
+
+  "rate_limit": {
+    "_note": "每個 key 請求間隔: 毫秒",
+    "mistral": 1000,
+    "pollinations": 2000,
+    "cohere": 1000,
+    "freekeys": 1000
+  },
+
   "models": {
     "openai": [
       { "provider": "google-ai-studio", "model": "gemini-2.0-flash" },

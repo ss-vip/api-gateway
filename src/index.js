@@ -110,11 +110,9 @@ function errorLog({ logId, provider, model, key, status, body }) {
       const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
-      if (kept.length > 0) {
-        const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
-        kept.unshift(header);
-        fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
-      } else { _errCleaning = false; }
+      const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
+      kept.unshift(header);
+      fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
     });
   }
 }
@@ -356,11 +354,27 @@ function collectBody(res) {
 // ponytail: all model aliases participate, sorted by models.dev context limit. Unknown models get large default (last fallback).
 let MODELS_DEV_LIMITS = new Map();
 const PROVIDER_DEFAULT_LIMITS = { 'github-models': 8000 };
+const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k, v]) => [k.toLowerCase(), v]));
+const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
+const _keyLastUsed = new Map(); // provider → Map(key → timestamp)
+let _rlDate = new Date().toDateString();
+async function waitRateLimit(provider, key) {
+  const now = new Date().toDateString();
+  if (now !== _rlDate) { _rlDate = now; _keyLastUsed.clear(); }
+  const interval = RATE_LIMITS.get(provider);
+  if (!interval) return;
+  if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
+  const byProv = _keyLastUsed.get(provider);
+  const last = byProv.get(key);
+  if (last) { const elapsed = Date.now() - last; if (elapsed < interval) await new Promise(r => setTimeout(r, interval - elapsed)); }
+  byProv.set(key, Date.now());
+}
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
   const aliasProv = ({ 'google-ai-studio': 'google', 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
-  return MODELS_DEV_LIMITS.get(`${aliasProv}/${t.model || alias}`.toLowerCase()) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
+  const key = `${aliasProv}/${t.model || alias}`.toLowerCase();
+  return USER_MODEL_LIMITS.get(key) || MODELS_DEV_LIMITS.get(key) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
 }
 let TOKEN_ORDER = [];
 function rebuildTokenOrder() {
@@ -779,6 +793,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       try {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
         const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+        if (isDirect) await waitRateLimit(provider, usedKey);
         upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
         usedProvider = provider;
         usedModel = upstreamModel;
@@ -852,6 +867,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           if (ks && Date.now() < ks.degradedUntil) continue;
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
+            await waitRateLimit('freekeys', key);
             upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
             usedProvider = 'freekeys';
             usedModel = model;
@@ -999,6 +1015,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       }
       upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
       try {
+        await waitRateLimit(provider, key);
         const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
         const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs);
         if (clientGone) { releaseKey(provider, key); return; }
@@ -1085,6 +1102,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
             : bodyJson;
           const fbContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
           const routePath = endpointPath.replace(/^\//, '');
+          await waitRateLimit('freekeys', key);
           const upstreamRes = await forwardToDirect(key, fbBody, ft.base_url, routePath, 'application/json', fbContentType);
           if (clientGone) return;
           const sc = upstreamRes.statusCode;
@@ -1196,7 +1214,7 @@ const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,l
 cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
 cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cmConfig.refresh();cmError.refresh()}
 load();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'')}catch(e){toast('載入錯誤: '+e.message,0)}}
+async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){const d=await r.json().catch(()=>{});toast('載入失敗: '+(d?.error||r.status),0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'');toast('已載入',1)}catch(e){toast('載入錯誤: '+e.message,0)}}
 async function save(t){const cm=t==='config'?cmConfig:cmError;const c=cm.getValue()
 try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config'){showOverlay();waitForServer()}}catch(e){toast('儲存錯誤: '+e.message,0)}}
 async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}

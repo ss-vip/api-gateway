@@ -14,6 +14,7 @@ Cloudflare AI Gateway 代理 — 支援多 API Key 輪詢、故障轉移、Model
 - **健康檢查** — `GET /health` （帶 client token）查各渠道健康狀態，觸發 free keys 更新與 cloudflare log 清理
 - **Free Keys 備援** — 取得 free keys 加入渠道列隊參與調用
 - **非 Chat 端點** — 支援 embeddings、images/generations、audio/speech、audio/transcriptions
+- **請求頻率限制** — 可設定 max token 與請求間隔時間
 - **配置檔熱重載** — 修改 `config.json` 自動重啟（1秒 debounce）
 - **上下文壓縮** — 輕量壓縮 context 節省 token
 - **管理介面** — `GET /console` 使用 client-token 登入到管理後台
