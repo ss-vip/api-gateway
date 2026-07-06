@@ -56,7 +56,8 @@
     "literouter": [""],
     "llm7": [""],
     "github-models": [""],
-    "nvidia": [""]
+    "nvidia": [""],
+    "gpt4free": [""]
   },
 
   "model_limits": {
