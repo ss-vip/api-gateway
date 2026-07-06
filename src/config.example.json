@@ -60,10 +60,9 @@
     "gpt4free": [""]
   },
 
-  "model_limits": {
-    "_note": "token 上限: provider/model → max context",
-    "github-models/openai/gpt-4o": 8000,
-    "mistral/mistral-large": 32000
+  "tpm_limit": {
+    "_note": "每 key 每分鐘 token 限制",
+    "cerebras": 4000
   },
 
   "rate_limit": {
@@ -72,6 +71,12 @@
     "pollinations": 2000,
     "cohere": 1000,
     "freekeys": 1000
+  },
+
+  "model_limits": {
+    "_note": "token 上限: provider/model → max context",
+    "github-models/openai/gpt-4o": 8000,
+    "mistral/mistral-large": 32000
   },
 
   "models": {

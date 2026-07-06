@@ -135,6 +135,26 @@ pm2 startup
 - 免費資源來自 [free-llm-api-keys](https://github.com/alistaitsacle/free-llm-api-keys)
 - Client 請求若非使用 chat 端點（TTS/STT/圖像生成）僅 OpenAI providers 可用。
 - 在 Cloudflare AI Gateway 中，有支援 cartesia、elevenlabs、deepgram、fal-ai、ideogram 服務使用，但由於上游 API 不同，目前在此專案不適用。
+- limit 設定範例：
+  以 Cerebras Free Trial 限制如下：
+  - 5 RPM (requests/min)
+  - 30K TPM (tokens/min)
+  - 1M TPD (tokens/day)
+  - 8K context cap (free tier)
+ ``` json
+ {
+    "rate_limit": {
+      "cerebras": 12000    // 每 key 兩請求至少間隔 12s (60s ÷ 5 RPM = 12s)
+    },
+    "tpm_limit": {
+      "cerebras": 30000    // 每 key 每分鐘 total tokens ≤ 30K
+    },
+    "model_limits": {
+      "cerebras/zai-glm-4.7": 8192 // 超過限制將自動換更大 context 的 alias
+    }
+  }
+  ```
+
 - 加入支援 provider:
   1. [pollinations](https://pollinations.ai)
   2. [literouter](https://literouter.com/)

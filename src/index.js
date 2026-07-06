@@ -369,6 +369,28 @@ async function waitRateLimit(provider, key) {
   if (last) { const elapsed = Date.now() - last; if (elapsed < interval) await new Promise(r => setTimeout(r, interval - elapsed)); }
   byProv.set(key, Date.now());
 }
+const TPM_LIMITS = new Map(Object.entries(cfg.tpm_limit || {}).map(([k, v]) => [k, v]));
+const _tpmLog = new Map(); // provider → Map(key → [{ts, tokens}])
+function _tpmClean(entries) { const cutoff = Date.now() - 60000; while (entries.length && entries[0].ts < cutoff) entries.shift(); }
+async function waitTpmLimit(provider, key, tokens) {
+  const limit = TPM_LIMITS.get(provider);
+  if (!limit || !tokens) return;
+  if (!_tpmLog.has(provider)) _tpmLog.set(provider, new Map());
+  const byProv = _tpmLog.get(provider);
+  if (!byProv.has(key)) byProv.set(key, []);
+  const entries = byProv.get(key);
+  _tpmClean(entries);
+  let sum = entries.reduce((s, e) => s + e.tokens, 0);
+  while (sum + tokens > limit) {
+    if (!entries.length) break;
+    const wait = entries[0].ts + 60000 - Date.now() + 50;
+    if (wait <= 0) { _tpmClean(entries); sum = entries.reduce((s, e) => s + e.tokens, 0); continue; }
+    await new Promise(r => setTimeout(r, wait));
+    _tpmClean(entries);
+    sum = entries.reduce((s, e) => s + e.tokens, 0);
+  }
+  entries.push({ ts: Date.now(), tokens });
+}
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
@@ -385,16 +407,19 @@ rebuildTokenOrder();
 
 function estimateTokens(messages) {
   if (!Array.isArray(messages)) return 0;
-  let chars = 0;
+  let chars = 0, images = 0;
   for (const m of messages) {
     const c = m.content;
     if (typeof c === 'string') chars += c.length;
     else if (c && typeof c === 'object') {
       const parts = Array.isArray(c) ? c : [c];
-      for (const p of parts) { if (p.text) chars += p.text.length; }
+      for (const p of parts) {
+        if (p.text) chars += p.text.length;
+        if (p.type === 'image_url') images++;
+      }
     }
   }
-  return Math.ceil(chars / 1.5 * 1.2);
+  return Math.ceil(chars / 1.5 * 1.2) + images * 1000;
 }
 
 // --- models.dev auto-lookup for model context limits ---
@@ -529,9 +554,11 @@ function supportsReasoningContent(provider, model) {
 function sanitizeMessages(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(msg => {
-    if (msg && typeof msg === 'object' && msg.role === 'assistant' && 'reasoning_content' in msg) {
-      const { reasoning_content, ...rest } = msg;
-      return rest;
+    if (msg && typeof msg === 'object' && msg.role === 'assistant') {
+      const clean = { ...msg };
+      delete clean.reasoning_content;
+      delete clean.reasoning;
+      return clean;
     }
     return msg;
   });
@@ -693,18 +720,20 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     });
   }
 
+  const est = estimateTokens(bodyJson.messages);
+  const maxOut = bodyJson.max_tokens || 4096;
+  const totalEst = est + maxOut;
   if (TOKEN_ORDER.length > 0) {
-    const est = estimateTokens(bodyJson.messages);
     const clientTargets = resolveModel(clientModel);
     const clientLimit = getAliasLimit(clientModel);
-    if (!clientTargets || (clientLimit > 0 && est > clientLimit)) {
+    if (!clientTargets || (clientLimit > 0 && totalEst > clientLimit)) {
       for (const alias of TOKEN_ORDER) {
         const newTargets = resolveModel(alias);
         if (!newTargets) continue;
         const limit = getAliasLimit(alias);
-        if (limit > 0 && est > limit) continue;
+        if (limit > 0 && totalEst > limit) continue;
         if (alias !== clientModel) {
-          log(`[${logId}] ◆ ${clientModel} → ${alias}  (est=${est}, ctx=${limit})`);
+          log(`[${logId}] ◆ ${clientModel} → ${alias}  (prompt=${est}, max_out=${maxOut}, total=${totalEst}, ctx=${limit})`);
           targets = newTargets;
         }
         break;
@@ -774,6 +803,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
     const banned = PROVIDER_BANNED_FIELDS[provider];
     if (banned) for (const f of banned) delete bodyObj[f];
+    if (Array.isArray(bodyObj.tools)) for (const t of bodyObj.tools) delete t.strict;
     if (Array.isArray(bodyObj.messages)) {
       if (!supportsReasoningContent(provider, upstreamModel)) {
         bodyObj.messages = sanitizeMessages(bodyObj.messages);
@@ -794,6 +824,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
         const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
         if (isDirect) await waitRateLimit(provider, usedKey);
+        await waitTpmLimit(provider, usedKey, totalEst);
         upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
         usedProvider = provider;
         usedModel = upstreamModel;
@@ -868,6 +899,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             await waitRateLimit('freekeys', key);
+            await waitTpmLimit('freekeys', key, totalEst);
             upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
             usedProvider = 'freekeys';
             usedModel = model;
@@ -890,6 +922,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               lastErr = { status: sc, body: bd }; upstreamRes = null;
               break;
             }
+            markKeySuccess('freekeys', key);
             releaseKey('freekeys', key);
             log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
             break;
@@ -1009,6 +1042,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         const proxyBody = { ...bodyJson, model: upstreamModel };
         const banned = PROVIDER_BANNED_FIELDS[provider];
         if (banned) for (const f of banned) delete proxyBody[f];
+        if (Array.isArray(proxyBody.tools)) for (const t of proxyBody.tools) delete t.strict;
         bodyStr = JSON.stringify(proxyBody);
       } else {
         bodyStr = bodyJson;
@@ -1049,7 +1083,9 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
     const routePath = `/${provider}${endpointPath}`;
     if (jsonBody !== false) {
-      bodyStr = JSON.stringify({ ...bodyJson, model: upstreamModel });
+      const gwBody = { ...bodyJson, model: upstreamModel };
+      if (Array.isArray(gwBody.tools)) for (const t of gwBody.tools) delete t.strict;
+      bodyStr = JSON.stringify(gwBody);
     } else {
       bodyStr = bodyJson;
     }
@@ -1108,6 +1144,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const sc = upstreamRes.statusCode;
           const body = await collectBody(upstreamRes);
           if (sc >= 200 && sc < 300) {
+            markKeySuccess('freekeys', key);
+            releaseKey('freekeys', key);
             log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
             const ctype = upstreamRes.headers['content-type'] || 'application/json';
             res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': ft.provider });
