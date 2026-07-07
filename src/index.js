@@ -93,6 +93,7 @@ function getErrorLogPath() {
   const jc = path.join(__dirname, 'error.jsonc');
   return fs.existsSync(jc) ? jc : j;
 }
+let _errLogCount = 0, _errCleaning = false;
 function errorLog({ logId, provider, model, key, status, body }) {
   const ec = cfg.error_log;
   if (ec?.enabled === false) return;
@@ -100,6 +101,21 @@ function errorLog({ logId, provider, model, key, status, body }) {
   const msg = _errMsg(body);
   const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', status, error: msg });
   fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
+  _errLogCount++;
+  if (_errLogCount % 50 === 1 && !_errCleaning) {
+    _errCleaning = true;
+    const days = (ec?.retention_days || 7);
+    const cutoff = Date.now() - days * 86400000;
+    fs.readFile(p, 'utf8', (err, c) => {
+      if (err || !c) { _errCleaning = false; return; }
+      const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
+        try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
+      });
+      const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
+      kept.unshift(header);
+      fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
+    });
+  }
 }
 
 // --- config loading (JSONC with comments support) ---
@@ -850,6 +866,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             const sc = upstreamRes.statusCode;
             if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
               markKeyError('freekeys', key);
+              releaseKey('freekeys', key);
               const bd = await collectBody(upstreamRes);
               log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
               errorLog({ logId, provider: 'freekeys', model, key, status: sc, body: bd });
@@ -858,6 +875,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             }
             if (sc >= 400) {
               markKeyError('freekeys', key);
+              releaseKey('freekeys', key);
               const bd = await collectBody(upstreamRes);
               log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)} ${bd.slice(0,100)}`);
               errorLog({ logId, provider: 'freekeys', model, key, status: sc, body: bd });
@@ -865,6 +883,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               break;
             }
             markKeySuccess('freekeys', key);
+            releaseKey('freekeys', key);
             log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
             break;
           } catch (e) {
@@ -1090,6 +1109,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const sc = upstreamRes.statusCode;
           if (sc >= 200 && sc < 300) {
             markKeySuccess('freekeys', key);
+            releaseKey('freekeys', key);
             log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
             const ctype = upstreamRes.headers['content-type'] || 'application/json';
             res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': ft.provider });
@@ -1099,11 +1119,12 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const body = await collectBody(upstreamRes);
           log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
           errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: sc, body });
-          if (sc === 401 || sc === 402 || sc >= 500) markKeyError('freekeys', key);
+          if (sc === 401 || sc === 402 || sc >= 500) { markKeyError('freekeys', key); releaseKey('freekeys', key); }
         } catch (e) {
           log(`[${logId}] ← 502 [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${e.message}`);
           errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: 502, body: e.message });
           markKeyError('freekeys', key);
+          releaseKey('freekeys', key);
         }
       }
     }
@@ -1139,7 +1160,8 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   // Auth check for protected endpoints
-  const needsAuth = req.method === 'POST' || (req.url !== '/health' && req.url !== '/v1/health' && req.url !== '/');
+  const isConsolePath = req.url === '/console' || req.url.startsWith('/api/console/');
+  const needsAuth = !isConsolePath && (req.method === 'POST' || (req.url !== '/health' && req.url !== '/v1/health' && req.url !== '/'));
   if (needsAuth && CLIENT_TOKEN) {
     const auth = req.headers['authorization'];
     if (!auth || !auth.startsWith('Bearer ')) {

@@ -19,7 +19,7 @@
   },
 
   "free_keys": {
-    "_note": "(選用) 啟用後訪問 /health 路由會從 GitHub 爬取公開免費 key 做備援",
+    "_note": "(選用) 啟用後啟動時與訪問 /health 時會從 GitHub 爬取公開免費 key 做備援",
     "enabled": true,
     "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
     "base_url": "https://aiapiv2.pekpik.com/v1",
@@ -62,7 +62,7 @@
 
   "tpm_limit": {
     "_note": "每 key 每分鐘 token 限制",
-    "cerebras": 4000
+    "cerebras": 30000
   },
 
   "rate_limit": {
@@ -74,9 +74,11 @@
   },
 
   "model_limits": {
-    "_note": "token 上限: provider/model → max context",
-    "github-models/openai/gpt-4o": 8000,
-    "mistral/mistral-large": 32000
+    "_note": "每次請求 token 上限: provider/model → max context",
+    "cerebras/gpt-oss-120b": 8192,
+    "github-models/openai/gpt-4o-mini": 8000,
+    "mistral/mistral-large": 32000,
+    "nvidia/mistralai/mistral-small-4-119b-2603": 128000
   },
 
   "models": {
@@ -90,7 +92,7 @@
       { "provider": "pollinations", "model": "mistral-small-3.2" },
       { "provider": "literouter", "model": "owl-alpha:free:full-context" },
       { "provider": "llm7", "model": "fast" },
-      [{ "provider": "github-models", "model": "openai/gpt-4o-mini" }]
+      { "provider": "github-models", "model": "openai/gpt-4o-mini" }
     ],
 
     "text-embedding-3-small": "openai",
