@@ -165,6 +165,7 @@ const PROVIDER_BANNED_FIELDS = {
   'freekeys':    new Set(['user']),
 };
 const PROVIDER_MAX_TOKENS = { groq: 8192 };
+const NO_TOOLS_TARGETS = new Set();
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -769,6 +770,15 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
       continue;
     }
+    if (Array.isArray(bodyTemplate.tools) && NO_TOOLS_TARGETS.has(targetLimitKey)) {
+      log(`[${logId}] → [${provider}/${upstreamModel}] skip (tools not supported)`);
+      continue;
+    }
+    const tpmLimit = TPM_LIMITS.get(provider);
+    if (tpmLimit && totalEst > tpmLimit) {
+      log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${totalEst} > TPM=${tpmLimit})`);
+      continue;
+    }
 
     const isDirect = DIRECT_PROVIDERS[provider];
     const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
@@ -776,7 +786,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
     const banned = PROVIDER_BANNED_FIELDS[provider];
     if (banned) for (const f of banned) delete bodyObj[f];
-    if (Array.isArray(bodyObj.tools)) for (const t of bodyObj.tools) delete t.strict;
+    if (Array.isArray(bodyObj.tools)) for (const t of bodyObj.tools) { delete t.strict; if (t.function) delete t.function.strict; }
     if (Array.isArray(bodyObj.messages)) {
       if (!supportsReasoningContent(provider, upstreamModel)) {
         bodyObj.messages = sanitizeMessages(bodyObj.messages);
