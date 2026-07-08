@@ -76,7 +76,6 @@
   "model_limits": {
     "_note": "每次請求 token 上限: provider/model → max context",
     "cerebras/gpt-oss-120b": 8192,
-    "github-models/openai/gpt-4o-mini": 8000,
     "mistral/mistral-large": 32000,
     "nvidia/mistralai/mistral-small-4-119b-2603": 128000
   },

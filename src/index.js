@@ -161,8 +161,10 @@ const PROVIDER_BANNED_FIELDS = {
   mistral:       new Set(['user','n','logit_bias','top_logprobs']),
   cohere:        new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']),
   huggingface:   new Set(['user']),
+  gpt4free:      new Set(['top_p']),
   'freekeys':    new Set(['user']),
 };
+const PROVIDER_MAX_TOKENS = { groq: 8192 };
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -760,8 +762,18 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
     if (lastErr) await sleep(Math.random() * 300);
 
+    // ponytail: skip targets whose context can't fit the request
+    const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
+    const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || MODELS_DEV_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
+    if (totalEst > targetCtx) {
+      log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
+      continue;
+    }
+
     const isDirect = DIRECT_PROVIDERS[provider];
     const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
+    const maxCap = PROVIDER_MAX_TOKENS[provider];
+    if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
     const banned = PROVIDER_BANNED_FIELDS[provider];
     if (banned) for (const f of banned) delete bodyObj[f];
     if (Array.isArray(bodyObj.tools)) for (const t of bodyObj.tools) delete t.strict;
