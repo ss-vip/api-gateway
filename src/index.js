@@ -253,6 +253,13 @@ const keyInFlight = new Map(); // key -> timestamp
 const rrCursor = new Map();
 const modelCursor = new Map();
 let _flightCleanTick = 0;
+const _providerActive = new Map(); // provider → concurrent request count
+const PROVIDER_MAX_CONCURRENT = 1;
+function addActive(p) { _providerActive.set(p, (_providerActive.get(p) || 0) + 1); }
+function decActive(p) {
+  const c = (_providerActive.get(p) || 0) - 1;
+  if (c <= 0) _providerActive.delete(p); else _providerActive.set(p, c);
+}
 
 function rotateTargets(targets, clientModel) {
   if (targets.length <= 1) return targets;
@@ -324,12 +331,10 @@ function collectBody(res) {
 }
 
 // --- token-based alias routing ---
-// ponytail: all model aliases participate, sorted by models.dev context limit. Unknown models get large default (last fallback).
-let MODELS_DEV_LIMITS = new Map();
 const PROVIDER_DEFAULT_LIMITS = { 'github-models': 8000 };
 const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k, v]) => [k.toLowerCase(), v]));
 const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
-const _keyLastUsed = new Map(); // provider → Map(key → timestamp)
+const _keyLastUsed = new Map(); // provider → Map(key → last timestamp)
 let _rlDate = new Date().toDateString();
 async function waitRateLimit(provider, key) {
   const now = new Date().toDateString();
@@ -342,16 +347,26 @@ async function waitRateLimit(provider, key) {
   if (last) { const elapsed = Date.now() - last; if (elapsed < interval) await new Promise(r => setTimeout(r, interval - elapsed)); }
   byProv.set(key, Date.now());
 }
+function isRateLimited(provider) {
+  const interval = RATE_LIMITS.get(provider);
+  if (!interval) return false;
+  const byProv = _keyLastUsed.get(provider);
+  if (!byProv) return false;
+  const keys = PROVIDER_KEYS[provider] || [];
+  for (const k of keys) {
+    const last = byProv.get(k);
+    if (!last || (Date.now() - last) >= interval) return false;
+  }
+  return true;
+}
 const TPM_LIMITS = new Map(Object.entries(cfg.tpm_limit || {}).map(([k, v]) => [k, v]));
-const _tpmLog = new Map(); // provider → Map(key → [{ts, tokens}])
+const _tpmLog = new Map(); // provider → [{ts, tokens}]
 function _tpmClean(entries) { const cutoff = Date.now() - 60000; let i = 0; while (i < entries.length && entries[i].ts < cutoff) i++; if (i > 0) entries.splice(0, i); if (entries.length > 1000) entries.splice(0, entries.length - 1000); }
-async function waitTpmLimit(provider, key, tokens) {
+async function waitTpmLimit(provider, tokens) {
   const limit = TPM_LIMITS.get(provider);
   if (!limit || !tokens) return;
-  if (!_tpmLog.has(provider)) _tpmLog.set(provider, new Map());
-  const byProv = _tpmLog.get(provider);
-  if (!byProv.has(key)) byProv.set(key, []);
-  const entries = byProv.get(key);
+  if (!_tpmLog.has(provider)) _tpmLog.set(provider, []);
+  const entries = _tpmLog.get(provider);
   _tpmClean(entries);
   let sum = entries.reduce((s, e) => s + e.tokens, 0);
   while (sum + tokens > limit) {
@@ -369,7 +384,7 @@ function getAliasLimit(alias) {
   if (!t) return 999999;
   const aliasProv = ({ 'google-ai-studio': 'google', 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
   const key = `${aliasProv}/${t.model || alias}`.toLowerCase();
-  return USER_MODEL_LIMITS.get(key) || MODELS_DEV_LIMITS.get(key) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
+  return USER_MODEL_LIMITS.get(key) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
 }
 let TOKEN_ORDER = [];
 function rebuildTokenOrder() {
@@ -392,41 +407,10 @@ function estimateTokens(messages) {
       }
     }
   }
-  return Math.ceil(chars / 1.5 * 1.2) + images * 1000;
+  return Math.ceil(chars / 3 * 1.2) + images * 1000;
 }
 
-// --- models.dev auto-lookup for model context limits ---
-const MODELS_DEV_URL = 'https://models.dev/api.json';
 
-function fetchModelsDev() {
-  return new Promise(resolve => {
-    https.get(MODELS_DEV_URL, (res) => {
-      if (res.statusCode !== 200) { elog(`[models.dev] fetch ${res.statusCode}`); resolve(); return; }
-      let body = '';
-      res.on('data', c => { body += c.toString(); if (body.length > 5e6) { res.destroy(); resolve(); } });
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          const m = new Map();
-          for (const [pid, prov] of Object.entries(data)) {
-            if (!prov?.models) continue;
-            for (const [mid, model] of Object.entries(prov.models)) {
-              const ctx = model?.limit?.context;
-              if (ctx && typeof ctx === 'number' && ctx > 0) {
-                m.set(`${pid}/${mid}`.toLowerCase(), ctx);
-              }
-            }
-          }
-          MODELS_DEV_LIMITS = m;
-          rebuildTokenOrder();
-          log(`[models.dev] ${m.size} model context limits loaded`);
-        } catch (e) { elog(`[models.dev] parse error: ${e.message}`); }
-        resolve();
-      });
-      res.on('error', () => resolve());
-    }).on('error', (e) => { elog(`[models.dev] fetch error: ${e.message}`); resolve(); });
-  });
-}
 // --- free keys scraping ---
 const FREE_KEY_RE = /^\|\s*`(sk-[a-zA-Z0-9]+)`\s*\|\s*([a-zA-Z0-9_\/.\-:]+)\s*\|/gm;
 
@@ -447,7 +431,7 @@ function fetchFreeKeys() {
   if (now - freeKeysLastFetch < (fk.interval_ms || 300000)) return Promise.resolve();
   const url = fk.url || FREE_KEYS_DEFAULT_URL;
   return new Promise(resolve => {
-    https.get(url, (res) => {
+    const req = https.get(url, (res) => {
       if (res.statusCode !== 200) { elog(`[freekeys] fetch ${res.statusCode}`); resolve(); return; }
       const MAX_LINES = 500;
       const END_MARKER = '## 🚀 How to Use';
@@ -484,7 +468,9 @@ function fetchFreeKeys() {
       });
       res.on('end', () => { if (!parsed) parse(); resolve(); });
       res.on('close', () => { resolve(); });
-    }).on('error', (e) => { elog(`[freekeys] fetch error: ${e.message}`); resolve(); });
+    });
+    req.setTimeout(10000, () => { req.destroy(); freeKeysLastFetch = Date.now(); elog(`[freekeys] request timed out`); resolve(); });
+    req.on('error', (e) => { freeKeysLastFetch = Date.now(); elog(`[freekeys] fetch error: ${e.message}`); resolve(); });
   });
 }
 
@@ -616,6 +602,7 @@ function cleanupOldLogs() {
     path: `/client/v4/accounts/${ACCOUNT_ID}/ai-gateway/gateways/${GATEWAY_NAME}/logs?filters=${encodeURIComponent(filter)}`,
     method: 'DELETE',
     headers: { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
+    timeout: 10000,
   }, (res) => {
     let body = '';
     res.on('data', c => body += c);
@@ -633,6 +620,7 @@ function cleanupOldLogs() {
     });
   });
   req.on('error', (e) => elog(`[cleanup] ${e.message}`));
+  req.on('timeout', () => { req.destroy(); elog(`[cleanup] request timed out`); });
   req.end();
 }
 
@@ -718,7 +706,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
-  const isStream = bodyJson.stream !== false;
+  const isStream = bodyJson.stream === true;
   const pkCount = Object.keys(PROVIDER_KEYS).filter(k => k !== 'freekeys').reduce((s, k) => s + (PROVIDER_KEYS[k] || []).length, 0);
   log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}  free=${freeKeyModels.size}`);
 
@@ -735,6 +723,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let clientGone = false;
   let retryRound = 0;
   let sseStarted = false;
+  let sseRetryTargets = [];
   req.on('close', () => { clientGone = true; });
 
   if (isStream) {
@@ -765,7 +754,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
     // ponytail: skip targets whose context can't fit the request
     const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
-    const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || MODELS_DEV_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
+    const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
     if (totalEst > targetCtx) {
       log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
       continue;
@@ -779,6 +768,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${totalEst} > TPM=${tpmLimit})`);
       continue;
     }
+    if (isRateLimited(provider)) {
+      log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`);
+      continue;
+    }
+    if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
+      log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
+      continue;
+    }
 
     const isDirect = DIRECT_PROVIDERS[provider];
     const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
@@ -786,7 +783,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
     const banned = PROVIDER_BANNED_FIELDS[provider];
     if (banned) for (const f of banned) delete bodyObj[f];
-    if (Array.isArray(bodyObj.tools)) for (const t of bodyObj.tools) { delete t.strict; if (t.function) delete t.function.strict; }
+    if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
     if (Array.isArray(bodyObj.messages)) {
       if (!supportsReasoningContent(provider, upstreamModel)) {
         bodyObj.messages = sanitizeMessages(bodyObj.messages);
@@ -806,13 +803,19 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       try {
         const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
         const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
-        await waitTpmLimit(provider, usedKey, totalEst);
+        await waitTpmLimit(provider, totalEst);
+        if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
+          log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
+          releaseKey(provider, usedKey); break;
+        }
+        addActive(provider);
         upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
         usedProvider = provider;
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
 
         if (sc === 429 || sc >= 500) {
+          decActive(provider);
           markKeyError(provider, usedKey);
           releaseKey(provider, usedKey);
           const body = await collectBody(upstreamRes);
@@ -824,6 +827,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
 
         if (sc >= 400) {
+          decActive(provider);
           markKeyError(provider, usedKey);
           releaseKey(provider, usedKey);
           const body = await collectBody(upstreamRes);
@@ -837,9 +841,11 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         releaseKey(provider, usedKey);
         markKeySuccess(provider, usedKey);
         log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
+        if (isStream) sseRetryTargets = rotated.slice(ti + 1);
         break;
 
       } catch (e) {
+        decActive(provider);
         markKeyError(provider, usedKey);
         releaseKey(provider, usedKey);
         log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
@@ -850,6 +856,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     }
     } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); errorLog({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
   }
+  if (!upstreamRes && !lastErr) { log(`[${logId}] ◆ all targets skipped — no retry`); break; }
   }
 
   if (!upstreamRes && cfg.free_keys?.enabled && !clientGone) {
@@ -863,6 +870,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       if (orderedModels.length > 0) log(`[${logId}] ◆ freekeys fallback: ${orderedModels.length} models (${matchedModels.length} matched)`);
       for (const model of orderedModels) {
         if (clientGone || upstreamRes) break;
+        if (Array.isArray(bodyTemplate.tools) && NO_TOOLS_TARGETS.has(`freekeys/${model}`.toLowerCase())) continue;
         const keys = fkMap.get(model) || [];
         const fbBody = { ...bodyTemplate, model };
         const fkBanned = PROVIDER_BANNED_FIELDS['freekeys'];
@@ -881,7 +889,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             await waitRateLimit('freekeys', key);
-            await waitTpmLimit('freekeys', key, totalEst);
+            await waitTpmLimit('freekeys', totalEst);
             upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
             usedProvider = 'freekeys';
             usedModel = model;
@@ -945,14 +953,55 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   log(`[${logId}] ← 200 ${dur}s [${usedProvider}/${usedModel}]`);
 
   if (sseStarted) {
-    const needModelRewrite = usedModel !== clientModel;
-    const pipe = needModelRewrite
-      ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
-      : (c) => { try { res.write(c); } catch {} };
-    upstreamRes.on('data', pipe);
-    upstreamRes.on('end',   () => { try { res.end(); } catch {} });
-    upstreamRes.on('error', (e) => { log(`[${logId}] ◆ stream error: ${e.message}`); try { res.end(); } catch {} });
-    req.on('close', () => { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); });
+    let sseUpstream = upstreamRes;
+    let sseProvider = usedProvider;
+    let sseModel = usedModel;
+    for (let r = 0; r < 3; r++) {
+      const needModelRewrite = sseModel !== clientModel;
+      const pipe = needModelRewrite
+        ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
+        : (c) => { try { res.write(c); } catch {} };
+      try {
+        await new Promise((resolve, reject) => {
+          sseUpstream.on('data', pipe);
+          sseUpstream.on('end', () => { decActive(sseProvider); resolve(); });
+          sseUpstream.on('error', (e) => { decActive(sseProvider); reject(e); });
+          req.on('close', () => { if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); resolve(); });
+        });
+        break; // stream ended cleanly
+      } catch (e) {
+        log(`[${logId}] ◆ sse stream error (retry ${r+1}): ${e.message}`);
+        if (sseRetryTargets.length === 0) break;
+        // Try next target
+        const t = sseRetryTargets.shift();
+        sseProvider = t.provider;
+        sseModel = t.upstreamModel;
+        const nk = await selectKey(sseProvider, !!DIRECT_PROVIDERS[sseProvider]);
+        if (!nk) { log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] no key`); continue; }
+        const bodyObj2 = { ...bodyTemplate, model: DIRECT_PROVIDERS[sseProvider] ? sseModel : `${sseProvider}/${sseModel}` };
+        const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
+        if (banned2) for (const f of banned2) delete bodyObj2[f];
+        if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
+        const maxCap2 = PROVIDER_MAX_TOKENS[sseProvider];
+        if (maxCap2 && (bodyObj2.max_tokens || 4096) > maxCap2) bodyObj2.max_tokens = maxCap2;
+        const b2 = JSON.stringify(bodyObj2);
+        try {
+          addActive(sseProvider);
+          const base = DIRECT_PROVIDERS[sseProvider];
+          const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
+          sseUpstream = await (base ? forwardToDirect(nk, b2, base, ep, 'text/event-stream') : forwardToGateway(nk, b2, `/${sseProvider}/compat/chat/completions`, 'text/event-stream'));
+          if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
+            log(`[${logId}] ◆ sse retry → [${sseProvider}/${sseModel}]`);
+            releaseKey(sseProvider, nk);
+            continue; // go back to pipe the new stream
+          }
+          decActive(sseProvider);
+          releaseKey(sseProvider, nk);
+          log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${sseUpstream.statusCode}`);
+        } catch (e2) { decActive(sseProvider); releaseKey(sseProvider, nk); log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${e2.message}`); }
+      }
+    }
+    try { res.end(); } catch {}
   } else {
     const body = await collectBody(upstreamRes);
     res.writeHead(200, {
@@ -960,6 +1009,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       'X-Request-Id': logId, 'X-Provider': usedProvider, 'X-Upstream-Model': usedModel,
     });
     res.end(body);
+    decActive(usedProvider);
   }
 }
 
@@ -1022,6 +1072,19 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     for (const target of activeTargets) {
       const { provider, upstreamModel } = target;
       const directBase = DIRECT_PROVIDERS[provider];
+      let proxyEst = 0;
+      if (jsonBody !== false && bodyJson) {
+        const text = bodyJson.input || bodyJson.prompt || '';
+        const inputLen = typeof text === 'string' ? text.length : Array.isArray(text) ? text.join('').length : 0;
+        proxyEst = Math.ceil(inputLen / 3 * 1.2);
+      }
+      const pLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
+      const pCtx = USER_MODEL_LIMITS.get(pLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
+      if (proxyEst > pCtx) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
+      if (directBase && isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); continue; }
+      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); continue; }
+      const tpmLimit = TPM_LIMITS.get(provider);
+      if (tpmLimit && proxyEst > tpmLimit) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${proxyEst} > TPM=${tpmLimit})`); continue; }
       const key = await selectKey(provider, !!directBase);
       if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
       if (lastErr) await sleep(Math.random() * 300);
@@ -1031,7 +1094,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const proxyBody = { ...bodyJson, model: upstreamModel };
           const banned = PROVIDER_BANNED_FIELDS[provider];
           if (banned) for (const f of banned) delete proxyBody[f];
-          if (Array.isArray(proxyBody.tools)) for (const t of proxyBody.tools) delete t.strict;
+          if (Array.isArray(proxyBody.tools)) proxyBody.tools = proxyBody.tools.map(t => { const c = { ...t }; delete c.strict; return c; });
           bodyStr = JSON.stringify(proxyBody);
         } else {
           bodyStr = bodyJson;
@@ -1039,18 +1102,22 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
           const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+          addActive(provider);
           const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs);
-          if (clientGone) { releaseKey(provider, key); return; }
+          if (clientGone) { decActive(provider); releaseKey(provider, key); return; }
           const sc = upstreamRes.statusCode;
           if (sc >= 200 && sc < 300) {
+            decActive(provider);
             releaseKey(provider, key);
             markKeySuccess(provider, key);
             log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
             const ctype = upstreamRes.headers['content-type'] || 'application/json';
             res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
-            pipeRes = upstreamRes; upstreamRes.pipe(res);
+            pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
+            upstreamRes.pipe(res);
             return;
           }
+          decActive(provider);
           markKeyError(provider, key);
           releaseKey(provider, key);
           const body = await collectBody(upstreamRes);
@@ -1059,6 +1126,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           lastErr = { status: sc, body };
           continue;
         } catch (e) {
+          decActive(provider);
           markKeyError(provider, key);
           releaseKey(provider, key);
           log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
@@ -1071,7 +1139,9 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       const routePath = `/${provider}${endpointPath}`;
       if (jsonBody !== false) {
         const gwBody = { ...bodyJson, model: upstreamModel };
-        if (Array.isArray(gwBody.tools)) for (const t of gwBody.tools) delete t.strict;
+        const banned = PROVIDER_BANNED_FIELDS[provider];
+        if (banned) for (const f of banned) delete gwBody[f];
+        if (Array.isArray(gwBody.tools)) gwBody.tools = gwBody.tools.map(t => { const c = { ...t }; delete c.strict; return c; });
         bodyStr = JSON.stringify(gwBody);
       } else {
         bodyStr = bodyJson;
@@ -1079,18 +1149,22 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
 
       try {
+        addActive(provider);
         const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType);
-        if (clientGone) { releaseKey(provider, key); return; }
+        if (clientGone) { decActive(provider); releaseKey(provider, key); return; }
         const sc = upstreamRes.statusCode;
         if (sc >= 200 && sc < 300) {
+          decActive(provider);
           releaseKey(provider, key);
           markKeySuccess(provider, key);
           log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
           const ctype = upstreamRes.headers['content-type'] || 'application/json';
           res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
-          pipeRes = upstreamRes; upstreamRes.pipe(res);
+          pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
+          upstreamRes.pipe(res);
           return;
         }
+        decActive(provider);
         markKeyError(provider, key);
         releaseKey(provider, key);
         const body = await collectBody(upstreamRes);
@@ -1099,6 +1173,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         lastErr = { status: sc, body };
         continue;
       } catch (e) {
+        decActive(provider);
         markKeyError(provider, key);
         releaseKey(provider, key);
         log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
@@ -1106,6 +1181,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
       }
     }
+    if (!lastErr) { log(`[${logId}] ◆ all targets skipped`); break; }
   }
 
   if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
@@ -1135,13 +1211,14 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
             log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
             const ctype = upstreamRes.headers['content-type'] || 'application/json';
             res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': ft.provider });
-            pipeRes = upstreamRes; upstreamRes.pipe(res);
+            pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
+            upstreamRes.pipe(res);
             return;
           }
           const body = await collectBody(upstreamRes);
           log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
           errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: sc, body });
-          if (sc === 401 || sc === 402 || sc >= 500) { markKeyError('freekeys', key); releaseKey('freekeys', key); }
+          if (sc === 401 || sc === 402 || sc === 429 || sc >= 500) { markKeyError('freekeys', key); releaseKey('freekeys', key); }
         } catch (e) {
           log(`[${logId}] ← 502 [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${e.message}`);
           errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: 502, body: e.message });
@@ -1166,8 +1243,20 @@ function isJsonEndpoint(url) {
          url.startsWith('/v1/audio/speech');
 }
 
+let _activeRequests = 0;
+let _reqCount = 0;
+function _memGuard() {
+  _reqCount++;
+  if (_reqCount % 100 === 0) {
+    const mem = process.memoryUsage().heapUsed;
+    if (mem > 400 * 1024 * 1024) { elog(`[mem] heap ${(mem/1024/1024).toFixed(0)}MB > 400MB — exiting`); process.exit(1); }
+  }
+}
+
 const server = http.createServer((req, res) => {
   const logId = rid();
+  _activeRequests++;
+  _memGuard();
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PATCH');
@@ -1176,8 +1265,15 @@ const server = http.createServer((req, res) => {
 
   // Safe response helpers — silently no-op if client already disconnected
   const _wh = res.writeHead.bind(res), _end = res.end.bind(res);
+  let _reqClosed = false;
   res.writeHead = (...a) => { try { return _wh(...a); } catch {} };
-  res.end = (...a) => { try { return _end(...a); } catch {} };
+  res.end = (...a) => { try { if (!_reqClosed) { _reqClosed = true; _activeRequests--; } return _end(...a); } catch {} };
+  req.on('close', () => { if (!_reqClosed) { _reqClosed = true; _activeRequests--; } });
+  // Body idle timeout — destroy if no data for 30s
+  let _bodyTimer = null;
+  const _resetBodyTimer = () => { if (_bodyTimer) clearTimeout(_bodyTimer); _bodyTimer = setTimeout(() => { if (!req.destroyed) req.destroy(new Error('request body idle timeout')); }, 30000).unref(); };
+  req.on('data', _resetBodyTimer);
+  _resetBodyTimer();
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
@@ -1207,7 +1303,13 @@ const server = http.createServer((req, res) => {
     const uptime = formatUptime(process.uptime());
     if (CLIENT_TOKEN) {
       const auth = req.headers['authorization'];
-      if (!auth || !auth.startsWith('Bearer ') || auth.slice(7) !== CLIENT_TOKEN) {
+      if (!auth || !auth.startsWith('Bearer ')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok', uptime }));
+        return;
+      }
+      const t = auth.slice(7), tb = Buffer.from(t), cb = Buffer.from(CLIENT_TOKEN);
+      if (tb.length !== cb.length || !crypto.timingSafeEqual(tb, cb)) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'ok', uptime }));
         return;
@@ -1261,6 +1363,7 @@ const server = http.createServer((req, res) => {
 
     req.on('end', () => {
   if (req.destroyed) return;
+  if (_bodyTimer) clearTimeout(_bodyTimer);
 
       const rawBody = Buffer.concat(chunks);
       let json, rawStr;
@@ -1336,8 +1439,7 @@ const onListening = () => {
   if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || defErrPath} retention=${elCfg?.retention_days || 7}d`);
 };
 const startup = [];
-startup.push(withTimeout(fetchModelsDev(), 10000, 'models.dev'));
-if (cfg.free_keys?.enabled) startup.push(withTimeout(fetchFreeKeys(), 15000, 'freekeys'));
+if (cfg.free_keys?.enabled) startup.push(withTimeout(fetchFreeKeys(), 20000, 'freekeys'));
 Promise.allSettled(startup).then(() => server.listen(PORT, onListening));
 
 // --- graceful config reload ---
@@ -1364,11 +1466,16 @@ watchPaths.forEach(wp => {
 // --- shutdown handlers ---
 function shutdown(signal) {
   log(`[config] ${signal} — closing...`);
-  server.close(() => { log('[config] done'); process.exit(0); });
-  setTimeout(() => { elog('[config] force exit'); process.exit(1); }, 10000).unref();
+  server.close(() => {
+    if (_activeRequests <= 0) { log('[config] done'); process.exit(0); }
+    const drain = setInterval(() => {
+      if (_activeRequests <= 0) { clearInterval(drain); log('[config] done'); process.exit(0); }
+    }, 500).unref();
+  });
+  setTimeout(() => { elog(`[config] force exit (${_activeRequests} active)`); process.exit(1); }, 10000).unref();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('uncaughtException', (e) => { elog('[config] FATAL:', e.stack); process.exit(1); });
-process.on('unhandledRejection', (r) => { elog('[config] REJECTION:', r instanceof Error ? r.stack : r); });
+process.on('unhandledRejection', (r) => { elog('[config] REJECTION:', r instanceof Error ? r.stack : r); process.exit(1); });
