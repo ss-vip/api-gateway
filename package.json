@@ -4,6 +4,6 @@
   "description": "AI API Gateway — Cloudflare AI Gateway Multi-Key Polling Proxy",
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node --max-old-space-size=192 src/index.js"
   }
 }

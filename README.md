@@ -61,7 +61,7 @@ curl http://localhost:3000/health
 
 ```bash
 npm install -g pm2
-pm2 start src/index.js --name api-gateway --max-memory-restart 200M --exp-backoff-restart-delay 10000
+pm2 start index.js --name api-gateway --node-args="--max-old-space-size=192" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
 pm2 save && pm2 startup
 ```
 

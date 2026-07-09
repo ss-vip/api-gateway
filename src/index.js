@@ -300,8 +300,8 @@ async function selectKey(p) {
     let idx = ((rrCursor.get(p) ?? -1) + 1) % free.length;
     rrCursor.set(p, idx);
     const key = free[idx];
-    await waitRateLimit(p, key);
     keyInFlight.set(`${p}:${key}`, now);
+    await waitRateLimit(p, key);
     return key;
   }
   // All keys in-flight — return null instead of double-booking a key
@@ -959,6 +959,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     const sc = upstreamRes.statusCode;
     if (sc >= 200 && sc < 300) {
       decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key);
+      if (!sig.aborted) ac.abort();
       log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
       const ctype = upstreamRes.headers['content-type'] || 'application/json';
       res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
@@ -1109,6 +1110,14 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 .CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
 .CodeMirror-cursor{border-color:#eee}
 .CodeMirror pre{font-family:Consolas,'Courier New',monospace}
+.st{width:100%;border-collapse:collapse;font-size:13px;margin:4px 0}
+.st th,.st td{text-align:left;padding:3px 8px;border-bottom:1px solid #333}
+.st th{color:#888;font-weight:400}
+.degraded{color:#e74c3c;font-weight:700}
+.st-info{color:#888;font-size:12px;margin-top:4px}
+.CodeMirror-vscrollbar::-webkit-scrollbar,.CodeMirror-hscrollbar::-webkit-scrollbar,textarea::-webkit-scrollbar{width:8px;height:8px}
+.CodeMirror-vscrollbar::-webkit-scrollbar-thumb,.CodeMirror-hscrollbar::-webkit-scrollbar-thumb,textarea::-webkit-scrollbar-thumb{background:#555;border-radius:4px}
+.CodeMirror-vscrollbar::-webkit-scrollbar-track,.CodeMirror-hscrollbar::-webkit-scrollbar-track,textarea::-webkit-scrollbar-track{background:#1e1e1e}
 .overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center}
 .overlay.hidden{display:none}
 .overlay .spinner{width:40px;height:40px;border:4px solid #444;border-top-color:#0f3460;border-radius:50%;animation:spin .8s linear infinite}
@@ -1126,6 +1135,8 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 <p class="status" id="loginStatus"></p>
 </div>
 <div class="editor hidden" id="editor">
+<div><h3>Status <button onclick="refreshStatus()" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
+<div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div></div>
 <div><h3>Config <span class="status" style="color:#888;font-weight:400;font-size:13px">(儲存後伺服器將自動重啟)</span></h3>
 <textarea id="configText"></textarea>
 <div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('config')">儲存 Config</button></div></div>
@@ -1151,10 +1162,10 @@ if(!_cmInit){_cmInit=true;
 const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
 cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
 cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cmConfig.refresh();cmError.refresh()}
-load();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'')}catch(e){toast('載入錯誤: '+e.message,0)}}
-async function save(t){const cm=t==='config'?cmConfig:cmError;const c=cm.getValue()
-try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config'){showOverlay();waitForServer()}}catch(e){toast('儲存錯誤: '+e.message,0)}}
+load();refreshStatus();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
+async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'');hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
+async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
+async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmError;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
 async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
 function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
@@ -1192,6 +1203,18 @@ function handleConsoleLoad(req, res, logId) {
   const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ config: read(CONFIG_PATH), error: read(getErrorLogPath()) }));
+}
+
+function handleConsoleStatus(req, res, logId) {
+  log(`[${logId}] /api/console/status`);
+  if (!checkConsoleAuth(req, res)) return;
+  const mem = process.memoryUsage();
+  const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
+  const now = Date.now();
+  const providers = {};
+  for (const [p, m] of keyPool) providers[p] = { keys: m.size, degraded: [...m.values()].filter(s => s.degradedUntil > now).length };
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024), uptime: formatUptime(process.uptime()), keys: totalKeys, providers }));
 }
 
 function handleConsoleSave(req, res, body, logId) {
@@ -1246,13 +1269,13 @@ function isJsonEndpoint(url) {
          url.startsWith('/v1/embeddings') ||
          url.startsWith('/v1/images/generations') ||
          url.startsWith('/v1/audio/speech') ||
-         url === '/api/console/validate' ||
-         url === '/api/console/save';
+          url === '/api/console/validate' ||
+          url === '/api/console/save';
 }
 
 let _activeRequests = 0;
 let _reqCount = 0;
-const MEM_LIMIT_MB = parseInt(process.env.MEM_LIMIT_MB || '420', 10);
+const MEM_LIMIT_MB = parseInt(process.env.MEM_LIMIT_MB || '300', 10);
 function _memGuard() {
   _reqCount++;
   if (_reqCount % 100 === 0) {
@@ -1285,11 +1308,14 @@ const server = http.createServer((req, res) => {
   req.on('data', _resetBodyTimer);
   _resetBodyTimer();
 
+  const urlPath = req.url.split('?')[0].replace(/\/\/+/g, '/').replace(/\/+$/, '') || '/';
+  const isHealth = urlPath === '/health' || urlPath === '/v1/health';
+
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   // Auth check for protected endpoints
-  const isConsolePath = req.url === '/console' || req.url.startsWith('/api/console/');
-  const needsAuth = !isConsolePath && (req.method === 'POST' || (req.url !== '/health' && req.url !== '/v1/health' && req.url !== '/'));
+  const isConsolePath = urlPath === '/console' || urlPath.startsWith('/api/console/');
+  const needsAuth = !isConsolePath && !isHealth && urlPath !== '/' && (req.method === 'POST' || true);
   if (needsAuth && CLIENT_TOKEN) {
     const auth = req.headers['authorization'];
     if (!auth || !auth.startsWith('Bearer ')) {
@@ -1307,10 +1333,10 @@ const server = http.createServer((req, res) => {
   }
 
   // --- GET /health — pure liveness, no overhead ---
-  if ((req.url === '/health' || req.url === '/v1/health') && req.method === 'GET') {
+  if (isHealth && req.method === 'GET') {
     cleanupOldLogs();
     res.writeHead(200, { 'Content-Type' : 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()) }));
+    res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()), active: _activeRequests }));
     return;
   }
 
@@ -1341,6 +1367,10 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === '/api/console/load' && req.method === 'GET') {
     handleConsoleLoad(req, res, logId);
+    return;
+  }
+  if (req.url === '/api/console/status' && req.method === 'GET') {
+    handleConsoleStatus(req, res, logId);
     return;
   }
 
