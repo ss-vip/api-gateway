@@ -18,14 +18,6 @@
     "path": "./error.json"
   },
 
-  "free_keys": {
-    "_note": "(選用) 啟用後啟動時與訪問 /health 時會從 GitHub 爬取公開免費 key 做備援",
-    "enabled": true,
-    "url": "https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md",
-    "base_url": "https://aiapiv2.pekpik.com/v1",
-    "interval_ms": 300000
-  },
-
   "_cf_log_note": "(選用) 設 >0 天數，訪問 /health 時會調用 Cloudflare API 清理舊 log",
   "log_retention_days": 0,
   "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
@@ -66,11 +58,8 @@
   },
 
   "rate_limit": {
-    "_note": "每個 key 請求間隔: 毫秒",
-    "mistral": 1000,
-    "pollinations": 2000,
-    "cohere": 1000,
-    "freekeys": 1000
+    "_note": "每個 key 請求間隔: 毫秒。不在此清單的 provider 會依 key 數量與 PROVIDER_RPM 自動計算",
+    "cohere": 1000
   },
 
   "model_limits": {

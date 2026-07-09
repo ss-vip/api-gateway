@@ -1,7 +1,7 @@
 # API Gateway
 
 Client → Proxy (Node) → [Cloudflare AI Gateway | 直接 Provider]。  
-多 Key 輪詢、故障轉移、Model 別名路由、SSE 串流、Free keys 備援。
+多 Key 輪詢、故障轉移、Model 別名路由、SSE 串流。
 
 ## 功能
 
@@ -12,7 +12,6 @@ Client → Proxy (Node) → [Cloudflare AI Gateway | 直接 Provider]。
 - **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
 - **非 Chat 端點** — embeddings、images/generations、audio/speech、audio/transcriptions
 - **請求頻率限制** — 可設定 RPM（rate_limit）與 TPM（tpm_limit）
-- **Free Keys 備援** — 自動爬取公開免費 key 作為最後一線備援
 - **管理後台** — `GET /console` 使用 client-token 登入
 - **配置檔熱重啟** — 修改 config 檔 1 秒後自動重啟
 
@@ -55,7 +54,7 @@ curl http://localhost:3000/v1/chat/completions \
 
 ```bash
 curl http://localhost:3000/health
-# 帶 token 時回傳各 provider 健康狀態、觸發 CF log 清理、重新爬取 free keys
+# 帶 token 時可觸發 CF log 清理（需設定 log_retention_days）
 ```
 
 ## PM2 部署

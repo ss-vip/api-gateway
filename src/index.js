@@ -118,7 +118,7 @@ function errorLog({ logId, provider, model, key, status, body }) {
         if (kept.length > 0) {
           const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
           kept.unshift(header);
-          fs.appendFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
+          fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[errorLog] cleanup write: ${e2.message}`); _errCleaning = false; });
         } else {
           _errCleaning = false;
         }
@@ -180,7 +180,6 @@ const PROVIDER_BANNED_FIELDS = {
   cohere:        new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']),
   huggingface:   new Set(['user']),
   gpt4free:      new Set(['top_p']),
-  'freekeys':    new Set(['user']),
 };
 const PROVIDER_MAX_TOKENS = { groq: 8192 };
 const NO_TOOLS_TARGETS = new Set();
@@ -194,12 +193,6 @@ const MODEL_ENTRIES = Object.entries(MODELS).sort((a, b) => b[0].length - a[0].l
 const PROVIDERS_WITH_KEYS = new Set(
   Object.entries(PROVIDER_KEYS).filter(([, ks]) => ks.length > 0).map(([p]) => p)
 );
-
-// --- free keys (scraped from GitHub README) ---
-const FREE_KEYS_DEFAULT_URL = 'https://raw.githubusercontent.com/alistaitsacle/free-llm-api-keys/refs/heads/main/README.md';
-let freeKeyModels = new Map();    // model → string[] (keys), reassigned atomically
-let freeKeysHash = '';           // JSON.stringify(pairs) cache, skip swap when unchanged
-let freeKeysLastFetch = 0;
 
 function resolveModel(clientModel) {
   const m = (clientModel || '').toLowerCase();
@@ -352,6 +345,30 @@ function collectBody(res) {
 const PROVIDER_DEFAULT_LIMITS = { 'github-models': 8000 };
 const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k, v]) => [k.toLowerCase(), v]));
 const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
+// ponytail: known provider RPM (account-level), auto-calc per-key interval when not manually set
+// ponytail: known free-plan RPM per provider, auto-calc per-key rate_limit = 60000 / (rpm / numKeys)
+// Manual rate_limit in config overrides auto-calculation. Missing providers = no auto-limit (set manually if needed).
+const PROVIDER_RPM = {
+  'github-models': 15,  // 10–15 RPM
+  literouter: 1,        // per-key ~1 RPM (5 keys → ~5 RPM)
+  pollinations: 60,     // no published limits
+  gpt4free: 60,         // no published limits
+  mistral: 60,          // free plan: 1 RPS (~60 RPM), covers ≥1 RPS models; slower models (0.03-0.83 RPS) have long gen time, naturally self-throttle
+  llm7: 40,             // ~40 RPM
+  nvidia: 40,           // NIM free: ~40 RPM
+  openrouter: 20,       // free models: 20 RPM
+  groq: 30,             // free tier: 30 RPM (org-level, per-model)
+  cerebras: 5,          // free tier: 5 RPM (gpt-oss-120b), others up to 30
+  deepseek: 30,         // conservative; actual: concurrency-based (500/2500)
+  'google-ai-studio': 10, // free: 10 RPM (Flash), 15 RPM (Flash-Lite)
+  'workers-ai': 30,     // 10K neurons/day — soft limit
+};
+for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
+  const rpm = PROVIDER_RPM[p];
+  if (rpm && keys.length > 0 && !RATE_LIMITS.has(p)) {
+    RATE_LIMITS.set(p, Math.max(100, Math.round(60000 / (rpm / keys.length))));
+  }
+}
 const _keyLastUsed = new Map(); // provider → Map(key → last timestamp)
 let _rlDate = new Date().toDateString();
 async function waitRateLimit(provider, key) {
@@ -386,7 +403,7 @@ async function waitTpmLimit(provider, tokens) {
   if (!_tpmLog.has(provider)) _tpmLog.set(provider, []);
   const entries = _tpmLog.get(provider);
   let sum = entries.reduce((s, e) => s + e.tokens, 0);
-  sum -= _tpmClean(entries); // ponytail: incremental sum, O(1) per cleanup
+  sum -= _tpmClean(entries);
   while (sum + tokens > limit) {
     if (!entries.length) break;
     const wait = entries[0].ts + 60000 - Date.now() + 50;
@@ -427,97 +444,6 @@ function estimateTokens(messages) {
   return Math.ceil(chars / 3 * 1.2) + images * 1000;
 }
 
-
-// --- free keys scraping ---
-const FREE_KEY_RE = /^\|\s*`(sk-[a-zA-Z0-9]+)`\s*\|\s*([a-zA-Z0-9_\/.\-:]+)\s*\|/gm;
-
-function parseFreeKeys(md) {
-  const pairs = []; // [key, model][]
-  FREE_KEY_RE.lastIndex = 0;
-  let m;
-  while ((m = FREE_KEY_RE.exec(md)) !== null) {
-    pairs.push([m[1], m[2].trim()]);
-  }
-  return pairs;
-}
-
-function fetchFreeKeys() {
-  const fk = cfg.free_keys;
-  if (!fk?.enabled) return Promise.resolve();
-  const now = Date.now();
-  if (now - freeKeysLastFetch < (fk.interval_ms || 300000)) return Promise.resolve();
-  const url = fk.url || FREE_KEYS_DEFAULT_URL;
-  return new Promise(resolve => {
-    let _intentionalDestroy = false;
-    const req = https.get(url, (res) => {
-      if (res.statusCode !== 200) { elog(`[freekeys] fetch ${res.statusCode}`); resolve(); return; }
-      const MAX_LINES = 500;
-      const END_MARKER = '## 🚀 How to Use';
-      let body = '', lines = 0, parsed = false;
-      const parse = () => {
-        if (parsed) return;
-        parsed = true;
-        const pairs = parseFreeKeys(body);
-        if (pairs.length === 0) { elog('[freekeys] parsed 0 keys'); resolve(); return; }
-        const newHash = JSON.stringify(pairs);
-        if (newHash === freeKeysHash) { freeKeysLastFetch = Date.now(); resolve(); return; }
-        freeKeysHash = newHash;
-        freeKeysLastFetch = Date.now();
-        const allKeys = [...new Set(pairs.map(p => p[0]))];
-        PROVIDER_KEYS['freekeys'] = allKeys;
-        PROVIDERS_WITH_KEYS.add('freekeys');
-        keyPool.set('freekeys', new Map(allKeys.map(k => [k, { degradedUntil: 0, errorCount: 0, successCount: 0 }])));
-        const newModelMap = new Map();
-        for (const [key, model] of pairs) {
-          if (!newModelMap.has(model)) newModelMap.set(model, []);
-          newModelMap.get(model).push(key);
-        }
-        freeKeyModels = newModelMap;
-        log(`[freekeys] ${allKeys.length} keys across ${freeKeyModels.size} models`);
-        resolve();
-      };
-      const destroy = () => { _intentionalDestroy = true; res.destroy(); parse(); };
-      res.on('data', (c) => {
-        const s = c.toString();
-        body += s;
-        const markerIdx = body.indexOf(END_MARKER);
-        if (markerIdx !== -1) { body = body.slice(0, markerIdx); destroy(); return; }
-        lines += s.split('\n').length - 1;
-        if (lines >= MAX_LINES) { destroy(); }
-      });
-      res.on('end', () => { if (!parsed) parse(); resolve(); });
-      res.on('close', () => { resolve(); });
-    });
-    req.setTimeout(10000, () => { req.destroy(); freeKeysLastFetch = Date.now(); elog(`[freekeys] request timed out`); resolve(); });
-    req.on('error', (e) => { if (_intentionalDestroy) return; freeKeysLastFetch = Date.now(); elog(`[freekeys] fetch error: ${e.message}`); resolve(); });
-  });
-}
-
-function getFreeKeyTargets(clientModel) {
-  if (freeKeyModels.size === 0) return [];
-  const baseUrl = cfg.free_keys?.base_url;
-  if (!baseUrl) return [];
-  const m = clientModel.toLowerCase();
-  const hasSlash = m.includes('/');
-  const exact = [];
-  for (const [model] of freeKeyModels) {
-    const ml = model.toLowerCase();
-    if (m === ml || (hasSlash && (m.startsWith(ml) || ml.startsWith(m)))) {
-      exact.push(model);
-    }
-  }
-  if (exact.length > 0) return exact.slice(0, 5).map(model => ({ provider: 'freekeys', upstreamModel: model, keys: freeKeyModels.get(model), base_url: baseUrl }));
-  // Fallback: smart-chat (auto-routing) then first 2 models
-  const fallback = [];
-  if (freeKeyModels.has('smart-chat')) fallback.push('smart-chat');
-  let idx = 0;
-  for (const model of freeKeyModels.keys()) {
-    if (model === 'smart-chat') continue;
-    if (idx >= 2) break;
-    fallback.push(model); idx++;
-  }
-  return fallback.map(model => ({ provider: 'freekeys', upstreamModel: model, keys: freeKeyModels.get(model), base_url: baseUrl }));
-}
 
 // --- context sanitization ---
 const REASONING_PROVIDERS = new Set(['deepseek']);
@@ -679,14 +605,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
-  const hasFreeKeys = cfg.free_keys?.enabled && freeKeyModels.size > 0;
-  if (!CF_CONFIGURED && !hasFreeKeys) {
-    log(`[${logId}] ← 502  gateway not configured`);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'gateway not configured — set ACCOUNT_ID and GATEWAY_NAME', type: 'not_configured' } }));
-    return;
-  }
-
   const clientModel = bodyJson.model || 'unknown';
   let targets = resolveModel(clientModel);
   if (!targets) {
@@ -717,12 +635,11 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 
   let activeTargets = targets.filter(t => {
-    if (t.provider === 'freekeys') return false;
     if (!PROVIDERS_WITH_KEYS.has(t.provider)) return false;
     if (!CF_CONFIGURED && !DIRECT_PROVIDERS[t.provider]) return false;
     return true;
   });
-  if (activeTargets.length === 0 && !hasFreeKeys) {
+  if (activeTargets.length === 0) {
     log(`[${logId}] ← 400  no keys for ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `no keys available for model '${clientModel}'`, type: 'no_keys' } }));
@@ -730,8 +647,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 
   const isStream = bodyJson.stream === true;
-  const pkCount = Object.keys(PROVIDER_KEYS).filter(k => k !== 'freekeys').reduce((s, k) => s + (PROVIDER_KEYS[k] || []).length, 0);
-  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}  free=${freeKeyModels.size}`);
+  const pkCount = Object.entries(PROVIDER_KEYS).reduce((s, [, ks]) => s + ks.length, 0);
+  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}`);
 
   const rotated = rotateTargets(activeTargets, clientModel);
   if (rotated.length > 1) {
@@ -884,80 +801,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   if (!upstreamRes && !lastErr) { log(`[${logId}] ◆ all targets skipped — no retry`); break; }
   }
 
-  if (!upstreamRes && cfg.free_keys?.enabled && !clientGone) {
-    const baseUrl = cfg.free_keys?.base_url;
-    if (baseUrl) {
-      const fkMap = freeKeyModels;
-      const matchedModels = getFreeKeyTargets(clientModel).map(t => t.upstreamModel);
-      const matchedSet = new Set(matchedModels);
-      const allModels = [...fkMap.keys()];
-      const orderedModels = matchedModels.concat(allModels.filter(m => !matchedSet.has(m))).slice(0, 7);
-      if (orderedModels.length > 0) log(`[${logId}] ◆ freekeys fallback: ${orderedModels.length} models (${matchedModels.length} matched)`);
-      for (const model of orderedModels) {
-        if (clientGone || upstreamRes) break;
-        if (Array.isArray(bodyTemplate.tools) && NO_TOOLS_TARGETS.has(`freekeys/${model}`.toLowerCase())) continue;
-        const keys = fkMap.get(model) || [];
-        const fbBody = { ...bodyTemplate, model };
-        const fkBanned = PROVIDER_BANNED_FIELDS['freekeys'];
-        if (fkBanned) for (const f of fkBanned) delete fbBody[f];
-        if (Array.isArray(fbBody.messages)) {
-          if (!supportsReasoningContent('freekeys', model)) fbBody.messages = sanitizeMessages(fbBody.messages);
-          fbBody.messages = normalizeContent(fbBody.messages);
-        }
-        const bodyStr = JSON.stringify(fbBody);
-        for (const key of keys) {
-          if (clientGone || upstreamRes) break;
-          await sleep(Math.random() * 200);
-          const kp = keyPool.get('freekeys');
-          const ks = kp?.get(key);
-          if (ks && Date.now() < ks.degradedUntil) continue;
-          try {
-            const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-            await waitRateLimit('freekeys', key);
-            await waitTpmLimit('freekeys', totalEst);
-            upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr, 'application/json', undefined, sig);
-            usedProvider = 'freekeys';
-            usedModel = model;
-            const sc = upstreamRes.statusCode;
-            if (sc === 429 || sc >= 500 || sc === 402 || sc === 401) {
-              markKeyError('freekeys', key);
-              releaseKey('freekeys', key);
-              const bd = await collectBody(upstreamRes);
-              log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
-              errorLog({ logId, provider: 'freekeys', model, key, status: sc, body: bd });
-              lastErr = { status: sc, body: bd }; upstreamRes = null;
-              continue;
-            }
-            if (sc >= 400) {
-              markKeyError('freekeys', key);
-              releaseKey('freekeys', key);
-              const bd = await collectBody(upstreamRes);
-              log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)} ${bd.slice(0,100)}`);
-              errorLog({ logId, provider: 'freekeys', model, key, status: sc, body: bd });
-              lastErr = { status: sc, body: bd }; upstreamRes = null;
-              break;
-            }
-            markKeySuccess('freekeys', key);
-            releaseKey('freekeys', key);
-            log(`[${logId}] ← ${sc} [freekeys/${model}] key=${logKey(key)}`);
-            break;
-          } catch (e) {
-            markKeyError('freekeys', key);
-            log(`[${logId}] ← 502 [freekeys/${model}] key=${logKey(key)} ${e.message}`);
-            errorLog({ logId, provider: 'freekeys', model, key, status: 502, body: e.message });
-            lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
-            upstreamRes = null;
-            continue;
-          }
-        }
-        if (!upstreamRes && keys.length > 0) {
-          const reason = lastErr?.status === 403 ? 'blocked (403)' : `all ${keys.length} keys exhausted`;
-          log(`[${logId}] ◆ freekeys/${model} ${reason}`);
-        }
-      }
-    }
-  }
-
   if (!upstreamRes || !usedProvider) {
     const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
     const errCode = lastErr?.status || 502;
@@ -992,7 +835,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           sseUpstream.on('data', pipe);
           sseUpstream.on('end', () => { decActive(sseProvider); resolve(); });
           sseUpstream.on('error', (e) => { decActive(sseProvider); reject(e); });
-          req.on('close', () => { if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); resolve(); });
+          const onClose = () => { req.removeListener('close', onClose); if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); resolve(); };
+          req.on('close', onClose);
         });
         break; // stream ended cleanly
       } catch (e) {
@@ -1041,14 +885,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
 async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, contentType) {
   const t0 = Date.now();
-  const hasFreeKeys = cfg.free_keys?.enabled && freeKeyModels.size > 0;
-  if (!CF_CONFIGURED && !hasFreeKeys) {
-    log(`[${logId}] ← 502  gateway not configured`);
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'gateway not configured', type: 'not_configured' } }));
-    return;
-  }
-
   if (jsonBody !== false) {
     if (!bodyJson || typeof bodyJson !== 'object') {
       log(`[${logId}] ← 400  invalid request body`);
@@ -1068,12 +904,11 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   const activeTargets = targets.filter(t => {
-    if (t.provider === 'freekeys') return false;
     if (!PROVIDERS_WITH_KEYS.has(t.provider)) return false;
     if (!CF_CONFIGURED && !DIRECT_PROVIDERS[t.provider]) return false;
     return true;
   });
-  if (activeTargets.length === 0 && !hasFreeKeys) {
+  if (activeTargets.length === 0) {
     log(`[${logId}] ← 400  no keys for ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
@@ -1213,49 +1048,6 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
-  if (cfg.free_keys?.enabled && !clientGone) {
-    const freeTargets = getFreeKeyTargets(clientModel).slice(0, 7);
-    if (freeTargets.length > 0) log(`[${logId}] ◆ freekeys fallback: ${freeTargets.map(t => `[${t.provider}/${t.upstreamModel}]`).join(' > ')}`);
-    for (const ft of freeTargets) {
-      if (clientGone) break;
-      for (const key of ft.keys) {
-        if (clientGone) break;
-        const kp = keyPool.get('freekeys');
-        const ks = kp?.get(key);
-        if (ks && Date.now() < ks.degradedUntil) continue;
-        try {
-          const fbBody = jsonBody !== false
-            ? JSON.stringify({ ...bodyJson, model: ft.upstreamModel })
-            : bodyJson;
-          const fbContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
-          const routePath = endpointPath.replace(/^\//, '');
-          await waitRateLimit('freekeys', key);
-          const upstreamRes = await forwardToDirect(key, fbBody, ft.base_url, routePath, 'application/json', fbContentType, undefined, sig);
-          if (clientGone) return;
-          const sc = upstreamRes.statusCode;
-          if (sc >= 200 && sc < 300) {
-            markKeySuccess('freekeys', key);
-            releaseKey('freekeys', key);
-            log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
-            const ctype = upstreamRes.headers['content-type'] || 'application/json';
-            res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': ft.provider });
-            pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
-            upstreamRes.pipe(res);
-            return;
-          }
-          const body = await collectBody(upstreamRes);
-          log(`[${logId}] ← ${sc} [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
-          errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: sc, body });
-          if (sc === 401 || sc === 402 || sc === 429 || sc >= 500) { markKeyError('freekeys', key); releaseKey('freekeys', key); }
-        } catch (e) {
-          log(`[${logId}] ← 502 [freekeys/${ft.upstreamModel}] key=${logKey(key)} ${e.message}`);
-          errorLog({ logId, provider: 'freekeys', model: ft.upstreamModel, key, status: 502, body: e.message });
-          markKeyError('freekeys', key);
-          releaseKey('freekeys', key);
-        }
-      }
-    }
-  }
 
   const errCode = lastErr?.status || 502;
   log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
@@ -1439,8 +1231,8 @@ let _reqCount = 0;
 function _memGuard() {
   _reqCount++;
   if (_reqCount % 100 === 0) {
-    const mem = process.memoryUsage().heapUsed;
-    if (mem > 400 * 1024 * 1024) { elog(`[mem] heap ${(mem/1024/1024).toFixed(0)}MB > 400MB — exiting`); process.exit(1); }
+    const mem = process.memoryUsage().rss;
+    if (mem > 420 * 1024 * 1024) { elog(`[mem] RSS ${(mem/1024/1024).toFixed(0)}MB > 420MB — exiting`); process.exit(1); }
   }
 }
 
@@ -1448,6 +1240,8 @@ const server = http.createServer((req, res) => {
   const logId = rid();
   _activeRequests++;
   _memGuard();
+  req.on('error', () => {});
+  res.on('error', () => {});
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PATCH');
@@ -1589,17 +1383,6 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: { message: 'not found' } }));
 });
 
-// --- startup ---
-function withTimeout(p, ms, label) {
-  return Promise.race([
-    p,
-    new Promise((_, reject) => setTimeout(() => {
-      elog(`[config] ${label} timed out after ${ms}ms`);
-      reject(new Error(`${label} timeout`));
-    }, ms))
-  ]);
-}
-
 server.timeout = 30000;
 server.keepAliveTimeout = 5000;
 
@@ -1619,9 +1402,7 @@ const onListening = () => {
   const defErrPath = './error.json';
   if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || defErrPath} retention=${elCfg?.retention_days || 7}d`);
 };
-const startup = [];
-if (cfg.free_keys?.enabled) startup.push(withTimeout(fetchFreeKeys(), 20000, 'freekeys'));
-Promise.allSettled(startup).then(() => server.listen(PORT, onListening));
+server.listen(PORT, onListening);
 
 // --- graceful config reload ---
 const watchPaths = [CONFIG_PATH];
