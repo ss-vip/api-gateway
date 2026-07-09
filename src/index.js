@@ -101,7 +101,7 @@ function errorLog({ logId, provider, model, key, status, body }) {
   const msg = _errMsg(body);
   const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', status, error: msg });
   fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
-  _errLogCount++;
+  _errLogCount = (_errLogCount + 1) % 1000000007;
   if (_errLogCount % 50 === 1 && !_errCleaning) {
     _errCleaning = true;
     const days = (ec?.retention_days || 7);
@@ -161,7 +161,9 @@ if (!CF_CONFIGURED) {
 
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || cfg.client_token || '';
 
-const PROVIDER_KEYS = { ...(cfg.providers || {}) };
+const PROVIDER_KEYS = Object.fromEntries(
+  Object.entries(cfg.providers || {}).filter(([k]) => !k.startsWith('_'))
+);
 
 const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
@@ -666,12 +668,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let sseRetryTargets = [];
   const ac = new AbortController();
   const sig = ac.signal;
-  req.on('close', () => { if (!sig.aborted) ac.abort(); clientGone = true; });
+  req.on('close', () => { clientGone = true; });
 
   if (isStream) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache', 'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
       'X-Request-Id': logId,
     });
     sseStarted = true;
@@ -684,121 +687,121 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       await sleep(wait);
     }
     retryRound++;
-  for (let ti = 0; ti < rotated.length; ti++) {
-    const target = rotated[ti];
-    if (upstreamRes) break;
-    try {
-    const provider = target.provider;
-    const upstreamModel = target.upstreamModel;
-    const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
-
-    if (lastErr) await sleep(Math.random() * 300);
-
-    // ponytail: skip targets whose context can't fit the request
-    const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
-    const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
-    if (totalEst > targetCtx) {
-      log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
-      continue;
-    }
-    if (Array.isArray(bodyTemplate.tools) && NO_TOOLS_TARGETS.has(targetLimitKey)) {
-      log(`[${logId}] → [${provider}/${upstreamModel}] skip (tools not supported)`);
-      continue;
-    }
-    const tpmLimit = TPM_LIMITS.get(provider);
-    if (tpmLimit && totalEst > tpmLimit) {
-      log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${totalEst} > TPM=${tpmLimit})`);
-      continue;
-    }
-    if (isRateLimited(provider)) {
-      log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`);
-      continue;
-    }
-    if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
-      log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
-      continue;
-    }
-
-    const isDirect = DIRECT_PROVIDERS[provider];
-    const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
-    const maxCap = PROVIDER_MAX_TOKENS[provider];
-    if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
-    const banned = PROVIDER_BANNED_FIELDS[provider];
-    if (banned) for (const f of banned) delete bodyObj[f];
-    if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
-    if (Array.isArray(bodyObj.messages)) {
-      if (!supportsReasoningContent(provider, upstreamModel)) {
-        bodyObj.messages = sanitizeMessages(bodyObj.messages);
-      }
-      if (provider === 'google-ai-studio') {
-        bodyObj.messages = normalizeContent(bodyObj.messages);
-      }
-    }
-    const bodyStr = JSON.stringify(bodyObj);
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    for (let ti = 0; ti < rotated.length; ti++) {
+      const target = rotated[ti];
       if (upstreamRes) break;
-      if (attempt > 0) await sleep(Math.random() * 300);
-      usedKey = await selectKey(provider, isDirect);
-      if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); errorLog({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
-
       try {
-        const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-        const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
-        await waitTpmLimit(provider, totalEst);
+        const provider = target.provider;
+        const upstreamModel = target.upstreamModel;
+        const maxAttempts = Math.max(1, (PROVIDER_KEYS[provider] || []).length);
+
+        if (lastErr) await sleep(Math.random() * 300);
+
+        // ponytail: skip targets whose context can't fit the request
+        const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
+        const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
+        if (totalEst > targetCtx) {
+          log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
+          continue;
+        }
+        if (Array.isArray(bodyTemplate.tools) && NO_TOOLS_TARGETS.has(targetLimitKey)) {
+          log(`[${logId}] → [${provider}/${upstreamModel}] skip (tools not supported)`);
+          continue;
+        }
+        const tpmLimit = TPM_LIMITS.get(provider);
+        if (tpmLimit && totalEst > tpmLimit) {
+          log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${totalEst} > TPM=${tpmLimit})`);
+          continue;
+        }
+        if (isRateLimited(provider)) {
+          log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`);
+          continue;
+        }
         if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
-          releaseKey(provider, usedKey); break;
-        }
-        addActive(provider);
-        upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr, 'application/json', sig);
-        usedProvider = provider;
-        usedModel = upstreamModel;
-        const sc = upstreamRes.statusCode;
-
-        if (sc === 429 || sc >= 500) {
-          decActive(provider);
-          markKeyError(provider, usedKey);
-          releaseKey(provider, usedKey);
-          const body = await collectBody(upstreamRes);
-          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
-          errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
-          lastErr = { status: sc, body };
-          upstreamRes = null;
           continue;
         }
 
-        if (sc >= 400) {
-          decActive(provider);
-          markKeyError(provider, usedKey);
-          releaseKey(provider, usedKey);
-          const body = await collectBody(upstreamRes);
-          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${body.slice(0, 100)}`);
-          errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
-          lastErr = { status: sc, body };
-          upstreamRes = null;
-          continue;
+        const isDirect = DIRECT_PROVIDERS[provider];
+        const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
+        const maxCap = PROVIDER_MAX_TOKENS[provider];
+        if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
+        const banned = PROVIDER_BANNED_FIELDS[provider];
+        if (banned) for (const f of banned) delete bodyObj[f];
+        if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
+        if (Array.isArray(bodyObj.messages)) {
+          if (!supportsReasoningContent(provider, upstreamModel)) {
+            bodyObj.messages = sanitizeMessages(bodyObj.messages);
+          }
+          if (provider === 'google-ai-studio') {
+            bodyObj.messages = normalizeContent(bodyObj.messages);
+          }
         }
+        const bodyStr = JSON.stringify(bodyObj);
 
-        releaseKey(provider, usedKey);
-        markKeySuccess(provider, usedKey);
-        log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
-        if (isStream) sseRetryTargets = rotated.slice(ti + 1);
-        break;
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          if (upstreamRes) break;
+          if (attempt > 0) await sleep(Math.random() * 300);
+          usedKey = await selectKey(provider, isDirect);
+          if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); errorLog({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
-      } catch (e) {
-        decActive(provider);
-        markKeyError(provider, usedKey);
-        releaseKey(provider, usedKey);
-        log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
-        errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
-        lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
-        upstreamRes = null;
-      }
+          try {
+            const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
+            const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+            await waitTpmLimit(provider, totalEst);
+            if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
+              log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
+              releaseKey(provider, usedKey); break;
+            }
+            addActive(provider);
+            upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr, 'application/json', sig);
+            usedProvider = provider;
+            usedModel = upstreamModel;
+            const sc = upstreamRes.statusCode;
+
+            if (sc === 429 || sc >= 500) {
+              decActive(provider);
+              markKeyError(provider, usedKey);
+              releaseKey(provider, usedKey);
+              const body = await collectBody(upstreamRes);
+              log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
+              errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
+              lastErr = { status: sc, body };
+              upstreamRes = null;
+              continue;
+            }
+
+            if (sc >= 400) {
+              decActive(provider);
+              markKeyError(provider, usedKey);
+              releaseKey(provider, usedKey);
+              const body = await collectBody(upstreamRes);
+              log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${body.slice(0, 100)}`);
+              errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
+              lastErr = { status: sc, body };
+              upstreamRes = null;
+              continue;
+            }
+
+            releaseKey(provider, usedKey);
+            markKeySuccess(provider, usedKey);
+            log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
+            if (isStream) sseRetryTargets = rotated.slice(ti + 1);
+            break;
+
+          } catch (e) {
+            decActive(provider);
+            markKeyError(provider, usedKey);
+            releaseKey(provider, usedKey);
+            log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
+            errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
+            lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
+            upstreamRes = null;
+          }
+        }
+      } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); errorLog({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
-    } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); errorLog({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
-  }
-  if (!upstreamRes && !lastErr) { log(`[${logId}] ◆ all targets skipped — no retry`); break; }
+    if (!upstreamRes && !lastErr) { log(`[${logId}] ◆ all targets skipped — no retry`); break; }
   }
 
   if (!upstreamRes || !usedProvider) {
@@ -835,7 +838,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           sseUpstream.on('data', pipe);
           sseUpstream.on('end', () => { decActive(sseProvider); resolve(); });
           sseUpstream.on('error', (e) => { decActive(sseProvider); reject(e); });
-          const onClose = () => { req.removeListener('close', onClose); if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); resolve(); };
+          const onClose = () => { req.removeListener('close', onClose); if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); decActive(sseProvider); resolve(); };
           req.on('close', onClose);
         });
         break; // stream ended cleanly
@@ -881,6 +884,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     res.end(body);
     decActive(usedProvider);
   }
+  if (!sig.aborted) ac.abort();
 }
 
 async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, contentType) {
@@ -917,12 +921,31 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   let lastErr = null;
   let clientGone = false;
-  let pipeRes = null;
   let bodyStr = '';
   let upstreamContentType = '';
   const ac = new AbortController();
   const sig = ac.signal;
-  req.on('close', () => { if (!sig.aborted) ac.abort(); clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
+  let pipeRes = null;
+  req.on('close', () => { clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
+  const processResponse = async (upstreamRes, provider, upstreamModel, key) => {
+    if (clientGone) { decActive(provider); releaseKey(provider, key); return 'done'; }
+    const sc = upstreamRes.statusCode;
+    if (sc >= 200 && sc < 300) {
+      decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key);
+      log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
+      const ctype = upstreamRes.headers['content-type'] || 'application/json';
+      res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
+      pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
+      upstreamRes.pipe(res);
+      return 'done';
+    }
+    decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+    const body = await collectBody(upstreamRes);
+    log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
+    errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
+    lastErr = { status: sc, body };
+    return 'retry';
+  };
 
   let retryRound = 0;
   while (!clientGone && Date.now() - t0 < TIMEOUT_MS && retryRound < 3) {
@@ -967,26 +990,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
           addActive(provider);
           const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs, sig);
-          if (clientGone) { decActive(provider); releaseKey(provider, key); return; }
-          const sc = upstreamRes.statusCode;
-          if (sc >= 200 && sc < 300) {
-            decActive(provider);
-            releaseKey(provider, key);
-            markKeySuccess(provider, key);
-            log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
-            const ctype = upstreamRes.headers['content-type'] || 'application/json';
-            res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
-            pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
-            upstreamRes.pipe(res);
-            return;
-          }
-          decActive(provider);
-          markKeyError(provider, key);
-          releaseKey(provider, key);
-          const body = await collectBody(upstreamRes);
-          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
-          errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
-          lastErr = { status: sc, body };
+          if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
           continue;
         } catch (e) {
           decActive(provider);
@@ -1014,26 +1018,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       try {
         addActive(provider);
         const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType, sig);
-        if (clientGone) { decActive(provider); releaseKey(provider, key); return; }
-        const sc = upstreamRes.statusCode;
-        if (sc >= 200 && sc < 300) {
-          decActive(provider);
-          releaseKey(provider, key);
-          markKeySuccess(provider, key);
-          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
-          const ctype = upstreamRes.headers['content-type'] || 'application/json';
-          res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
-          pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
-          upstreamRes.pipe(res);
-          return;
-        }
-        decActive(provider);
-        markKeyError(provider, key);
-        releaseKey(provider, key);
-        const body = await collectBody(upstreamRes);
-        log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
-        errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
-        lastErr = { status: sc, body };
+        if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
         continue;
       } catch (e) {
         decActive(provider);
@@ -1047,6 +1032,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     if (!lastErr) { log(`[${logId}] ◆ all targets skipped`); break; }
   }
 
+  if (!sig.aborted) ac.abort();
   if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
 
   const errCode = lastErr?.status || 502;
@@ -1094,6 +1080,11 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 .CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
 .CodeMirror-cursor{border-color:#eee}
 .CodeMirror pre{font-family:Consolas,'Courier New',monospace}
+.overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.overlay.hidden{display:none}
+.overlay .spinner{width:40px;height:40px;border:4px solid #444;border-top-color:#0f3460;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.overlay p{margin-top:16px;color:#aaa;font-size:14px}
 </style></head>
 <body>
 <div class="c">
@@ -1115,6 +1106,7 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 </div>
 </div>
 <div id="toast"></div>
+<div class="overlay hidden" id="overlay"><div class="spinner"></div><p>伺服器重啟中，請稍候...</p></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
@@ -1133,10 +1125,13 @@ cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cm
 load();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
 async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'')}catch(e){toast('載入錯誤: '+e.message,0)}}
 async function save(t){const cm=t==='config'?cmConfig:cmError;const c=cm.getValue()
-try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')setTimeout(()=>{s('伺服器重啟中...',1)},500)}catch(e){toast('儲存錯誤: '+e.message,0)}}
+try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config'){showOverlay();waitForServer()}}catch(e){toast('儲存錯誤: '+e.message,0)}}
 async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
-function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
+function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
+function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
+function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
+async function waitForServer(){for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay()}
 </script></body></html>`;
 
 function checkConsoleAuth(req, res) {
