@@ -184,7 +184,7 @@ const PROVIDER_BANNED_FIELDS = {
   gpt4free:      new Set(['top_p']),
 };
 const PROVIDER_MAX_TOKENS = { groq: 8192 };
-const NO_TOOLS_TARGETS = new Set();
+
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -267,7 +267,7 @@ const rrCursor = new Map();
 const modelCursor = new Map();
 let _flightCleanTick = 0;
 const _providerActive = new Map(); // provider → concurrent request count
-const PROVIDER_MAX_CONCURRENT = 1;
+const PROVIDER_MAX_CONCURRENT = 4;
 function addActive(p) { _providerActive.set(p, (_providerActive.get(p) || 0) + 1); }
 function decActive(p) {
   const c = (_providerActive.get(p) || 0) - 1;
@@ -282,7 +282,7 @@ function rotateTargets(targets, clientModel) {
   return [...targets.slice(idx), ...targets.slice(0, idx)];
 }
 
-async function selectKey(p, needRateLimit) {
+async function selectKey(p) {
   const healthy = getHealthyKeys(p);
   if (healthy.length === 0) return null;
   const now = Date.now();
@@ -300,7 +300,7 @@ async function selectKey(p, needRateLimit) {
     let idx = ((rrCursor.get(p) ?? -1) + 1) % free.length;
     rrCursor.set(p, idx);
     const key = free[idx];
-    if (needRateLimit) await waitRateLimit(p, key);
+    await waitRateLimit(p, key);
     keyInFlight.set(`${p}:${key}`, now);
     return key;
   }
@@ -355,7 +355,7 @@ const PROVIDER_RPM = {
   literouter: 1,        // per-key ~1 RPM (5 keys → ~5 RPM)
   pollinations: 60,     // no published limits
   gpt4free: 60,         // no published limits
-  mistral: 60,          // free plan: 1 RPS (~60 RPM), covers ≥1 RPS models; slower models (0.03-0.83 RPS) have long gen time, naturally self-throttle
+  mistral: 30,          // free plan: large=0.07, small=0.83-5, ministral-8b=3.13 RPS. 30 RPM (~0.5 RPS) is a safe middle; very slow models (0.03-0.08 RPS) self-throttle via generation time
   llm7: 40,             // ~40 RPM
   nvidia: 40,           // NIM free: ~40 RPM
   openrouter: 20,       // free models: 20 RPM
@@ -400,13 +400,15 @@ function isRateLimited(provider) {
   return true;
 }
 const TPM_LIMITS = new Map(Object.entries(cfg.tpm_limit || {}).map(([k, v]) => [k, v]));
-const _tpmLog = new Map(); // provider → [{ts, tokens}]
+const _tpmLog = new Map(); // provider → Map(key → [{ts, tokens}])
 function _tpmClean(entries) { const cutoff = Date.now() - 60000; let i = 0, removed = 0; while (i < entries.length && entries[i].ts < cutoff) { removed += entries[i].tokens; i++; } if (i > 0) entries.splice(0, i); if (entries.length > 1000) { const excess = entries.length - 1000; for (let j = 0; j < excess; j++) removed += entries[j].tokens; entries.splice(0, excess); } return removed; }
-async function waitTpmLimit(provider, tokens) {
+async function waitTpmLimit(provider, key, tokens) {
   const limit = TPM_LIMITS.get(provider);
   if (!limit || !tokens) return;
-  if (!_tpmLog.has(provider)) _tpmLog.set(provider, []);
-  const entries = _tpmLog.get(provider);
+  if (!_tpmLog.has(provider)) _tpmLog.set(provider, new Map());
+  const byProv = _tpmLog.get(provider);
+  if (!byProv.has(key)) byProv.set(key, []);
+  const entries = byProv.get(key);
   let sum = entries.reduce((s, e) => s + e.tokens, 0);
   sum -= _tpmClean(entries);
   while (sum + tokens > limit) {
@@ -432,21 +434,28 @@ function rebuildTokenOrder() {
 }
 rebuildTokenOrder();
 
+function estimateStrTokens(str) {
+  const cjk = (str.match(/[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u1100-\u11ff]/g) || []).length;
+  const nonCjk = str.length - cjk;
+  return Math.ceil(nonCjk / 4 * 1.2 + cjk / 1.5 * 1.2);
+}
+
 function estimateTokens(messages) {
   if (!Array.isArray(messages)) return 0;
-  let chars = 0, images = 0;
+  let est = 0, images = 0;
   for (const m of messages) {
     const c = m.content;
-    if (typeof c === 'string') chars += c.length;
-    else if (c && typeof c === 'object') {
+    if (typeof c === 'string') {
+      est += estimateStrTokens(c);
+    } else if (c && typeof c === 'object') {
       const parts = Array.isArray(c) ? c : [c];
       for (const p of parts) {
-        if (p.text) chars += p.text.length;
+        if (p.text) est += estimateStrTokens(p.text);
         if (p.type === 'image_url') images++;
       }
     }
   }
-  return Math.ceil(chars / 3 * 1.2) + images * 1000;
+  return est + images * 1000;
 }
 
 
@@ -651,7 +660,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return;
   }
 
-  const isStream = bodyJson.stream === true;
+  const isStream = bodyJson.stream !== false;
   const pkCount = Object.entries(PROVIDER_KEYS).reduce((s, [, ks]) => s + ks.length, 0);
   log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}`);
 
@@ -673,7 +682,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let sseRetryTargets = [];
   const ac = new AbortController();
   const sig = ac.signal;
-  res.on('close', () => { if (!res.writableEnded) clientGone = true; });
+  res.on('close', () => { if (!res.writableEnded) { clientGone = true; if (!sig.aborted) ac.abort(); } });
 
   if (isStream) {
     res.writeHead(200, {
@@ -709,10 +718,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
         if (totalEst > targetCtx) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
-          continue;
-        }
-        if (Array.isArray(bodyTemplate.tools) && NO_TOOLS_TARGETS.has(targetLimitKey)) {
-          log(`[${logId}] → [${provider}/${upstreamModel}] skip (tools not supported)`);
           continue;
         }
         const tpmLimit = TPM_LIMITS.get(provider);
@@ -752,13 +757,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
           if (upstreamRes) break;
           if (attempt > 0) await sleep(Math.random() * 300);
-          usedKey = await selectKey(provider, isDirect);
+          usedKey = await selectKey(provider);
           if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); errorLog({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
-            await waitTpmLimit(provider, totalEst);
+            await waitTpmLimit(provider, usedKey, totalEst);
             if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
               log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
               releaseKey(provider, usedKey); transientSkipped = true; break;
@@ -770,7 +775,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             curProvider = provider; curUpstream = upstreamRes;
             const sc = upstreamRes.statusCode;
 
-            if (sc === 429 || sc >= 500) {
+            if (sc === 429) {
               decActive(provider);
               markKeyError(provider, usedKey);
               releaseKey(provider, usedKey);
@@ -791,7 +796,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               upstreamRes = null;
-              continue;
+              break;
             }
 
             releaseKey(provider, usedKey);
@@ -870,7 +875,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const t = sseRetryTargets.shift();
         sseProvider = t.provider;
         sseModel = t.upstreamModel;
-        const nk = await selectKey(sseProvider, !!DIRECT_PROVIDERS[sseProvider]);
+        const nk = await selectKey(sseProvider);
         if (!nk) { log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] no key`); continue; }
         const bodyObj2 = { ...bodyTemplate, model: DIRECT_PROVIDERS[sseProvider] ? sseModel : `${sseProvider}/${sseModel}` };
         const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
@@ -948,9 +953,9 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   const ac = new AbortController();
   const sig = ac.signal;
   let pipeRes = null;
-  res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
+  res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (!sig.aborted) ac.abort(); if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
   const processResponse = async (upstreamRes, provider, upstreamModel, key) => {
-    if (clientGone) { decActive(provider); releaseKey(provider, key); return 'done'; }
+    if (clientGone) { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); decActive(provider); releaseKey(provider, key); return 'done'; }
     const sc = upstreamRes.statusCode;
     if (sc >= 200 && sc < 300) {
       decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key);
@@ -985,8 +990,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       let proxyEst = 0;
       if (jsonBody !== false && bodyJson) {
         const text = bodyJson.input || bodyJson.prompt || '';
-        const inputLen = typeof text === 'string' ? text.length : Array.isArray(text) ? text.join('').length : 0;
-        proxyEst = Math.ceil(inputLen / 3 * 1.2);
+        const inputText = typeof text === 'string' ? text : Array.isArray(text) ? text.join('') : '';
+        proxyEst = estimateStrTokens(inputText);
       }
       const pLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
       const pCtx = USER_MODEL_LIMITS.get(pLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
@@ -995,7 +1000,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); transientSkipped = true; continue; }
       const tpmLimit = TPM_LIMITS.get(provider);
       if (tpmLimit && proxyEst > tpmLimit) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${proxyEst} > TPM=${tpmLimit})`); transientSkipped = true; continue; }
-      const key = await selectKey(provider, !!directBase);
+      const key = await selectKey(provider);
       if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
       if (lastErr) await sleep(Math.random() * 300);
 
@@ -1303,7 +1308,8 @@ const server = http.createServer((req, res) => {
 
   // --- GET /health — pure liveness, no overhead ---
   if ((req.url === '/health' || req.url === '/v1/health') && req.method === 'GET') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    cleanupOldLogs();
+    res.writeHead(200, { 'Content-Type' : 'application/json' });
     res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()) }));
     return;
   }
