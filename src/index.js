@@ -106,31 +106,49 @@ function errorLog({ logId, provider, model, key, status, body }) {
     _errCleaning = true;
     const days = (ec?.retention_days || 7);
     const cutoff = Date.now() - days * 86400000;
-    fs.readFile(p, 'utf8', (err, c) => {
-      if (err || !c) { _errCleaning = false; return; }
-      const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
-        try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
+    const old = p + '.old';
+    fs.rename(p, old, (err) => {
+      if (err) { _errCleaning = false; return; }
+      fs.readFile(old, 'utf8', (_, c) => {
+        fs.unlink(old, () => {});
+        if (!c) { _errCleaning = false; return; }
+        const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
+          try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
+        });
+        if (kept.length > 0) {
+          const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
+          kept.unshift(header);
+          fs.appendFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
+        } else {
+          _errCleaning = false;
+        }
       });
-      const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
-      kept.unshift(header);
-      fs.writeFile(p, kept.join('\n') + '\n', () => { _errCleaning = false; });
     });
   }
 }
 
 // --- config loading (JSONC with comments support) ---
-const CONFIG_PATH = process.env.CONFIG_PATH || (() => {
-  const j = path.join(__dirname, 'config.json');
-  return fs.existsSync(j) ? j : path.join(__dirname, 'config.jsonc');
-})();
+function _findConfig() {
+  const dirs = [__dirname, process.cwd()];
+  for (const d of dirs) {
+    const j = path.join(d, 'config.json');
+    if (fs.existsSync(j)) return j;
+    const jc = path.join(d, 'config.jsonc');
+    if (fs.existsSync(jc)) return jc;
+  }
+  return null;
+}
+const CONFIG_PATH = process.env.CONFIG_PATH || _findConfig();
 let cfg = {};
-try {
-  if (fs.existsSync(CONFIG_PATH)) {
+if (CONFIG_PATH) {
+  try {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
     cfg = CONFIG_PATH.endsWith('.jsonc') ? parseJsonc(raw) : JSON.parse(raw);
+  } catch (e) {
+    elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
   }
-} catch (e) {
-  elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
+} else {
+  elog(`[config] no config.json or config.jsonc found in ${__dirname} or ${process.cwd()}`);
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
@@ -361,21 +379,20 @@ function isRateLimited(provider) {
 }
 const TPM_LIMITS = new Map(Object.entries(cfg.tpm_limit || {}).map(([k, v]) => [k, v]));
 const _tpmLog = new Map(); // provider → [{ts, tokens}]
-function _tpmClean(entries) { const cutoff = Date.now() - 60000; let i = 0; while (i < entries.length && entries[i].ts < cutoff) i++; if (i > 0) entries.splice(0, i); if (entries.length > 1000) entries.splice(0, entries.length - 1000); }
+function _tpmClean(entries) { const cutoff = Date.now() - 60000; let i = 0, removed = 0; while (i < entries.length && entries[i].ts < cutoff) { removed += entries[i].tokens; i++; } if (i > 0) entries.splice(0, i); if (entries.length > 1000) { const excess = entries.length - 1000; for (let j = 0; j < excess; j++) removed += entries[j].tokens; entries.splice(0, excess); } return removed; }
 async function waitTpmLimit(provider, tokens) {
   const limit = TPM_LIMITS.get(provider);
   if (!limit || !tokens) return;
   if (!_tpmLog.has(provider)) _tpmLog.set(provider, []);
   const entries = _tpmLog.get(provider);
-  _tpmClean(entries);
   let sum = entries.reduce((s, e) => s + e.tokens, 0);
+  sum -= _tpmClean(entries); // ponytail: incremental sum, O(1) per cleanup
   while (sum + tokens > limit) {
     if (!entries.length) break;
     const wait = entries[0].ts + 60000 - Date.now() + 50;
-    if (wait <= 0) { _tpmClean(entries); sum = entries.reduce((s, e) => s + e.tokens, 0); continue; }
+    if (wait <= 0) { sum -= _tpmClean(entries); continue; }
     await new Promise(r => setTimeout(r, wait));
-    _tpmClean(entries);
-    sum = entries.reduce((s, e) => s + e.tokens, 0);
+    sum -= _tpmClean(entries);
   }
   entries.push({ ts: Date.now(), tokens });
 }
@@ -431,6 +448,7 @@ function fetchFreeKeys() {
   if (now - freeKeysLastFetch < (fk.interval_ms || 300000)) return Promise.resolve();
   const url = fk.url || FREE_KEYS_DEFAULT_URL;
   return new Promise(resolve => {
+    let _intentionalDestroy = false;
     const req = https.get(url, (res) => {
       if (res.statusCode !== 200) { elog(`[freekeys] fetch ${res.statusCode}`); resolve(); return; }
       const MAX_LINES = 500;
@@ -458,19 +476,20 @@ function fetchFreeKeys() {
         log(`[freekeys] ${allKeys.length} keys across ${freeKeyModels.size} models`);
         resolve();
       };
+      const destroy = () => { _intentionalDestroy = true; res.destroy(); parse(); };
       res.on('data', (c) => {
         const s = c.toString();
         body += s;
         const markerIdx = body.indexOf(END_MARKER);
-        if (markerIdx !== -1) { body = body.slice(0, markerIdx); res.destroy(); parse(); return; }
+        if (markerIdx !== -1) { body = body.slice(0, markerIdx); destroy(); return; }
         lines += s.split('\n').length - 1;
-        if (lines >= MAX_LINES) { res.destroy(); parse(); }
+        if (lines >= MAX_LINES) { destroy(); }
       });
       res.on('end', () => { if (!parsed) parse(); resolve(); });
       res.on('close', () => { resolve(); });
     });
     req.setTimeout(10000, () => { req.destroy(); freeKeysLastFetch = Date.now(); elog(`[freekeys] request timed out`); resolve(); });
-    req.on('error', (e) => { freeKeysLastFetch = Date.now(); elog(`[freekeys] fetch error: ${e.message}`); resolve(); });
+    req.on('error', (e) => { if (_intentionalDestroy) return; freeKeysLastFetch = Date.now(); elog(`[freekeys] fetch error: ${e.message}`); resolve(); });
   });
 }
 
@@ -538,8 +557,9 @@ function normalizeContent(messages) {
 
 // --- gateway proxy ---
 
-function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
+function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error('aborted')); return; }
     const opts = {
       hostname: 'gateway.ai.cloudflare.com',
       port: 443,
@@ -555,13 +575,15 @@ function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType) {
     const req = https.request(opts, resolve);
     req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
     req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
+    if (signal) signal.addEventListener('abort', () => { req.destroy(); reject(new Error('aborted')); }, { once: true });
     req.write(bodyStr);
     req.end();
   });
 }
 
-function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders) {
+function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new Error('aborted')); return; }
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
     const url = new URL(joined);
     const isHttps = url.protocol === 'https:';
@@ -582,6 +604,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
     const req = mod.request(opts, resolve);
     req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
     req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
+    if (signal) signal.addEventListener('abort', () => { req.destroy(); reject(new Error('aborted')); }, { once: true });
     req.write(bodyStr);
     req.end();
   });
@@ -724,7 +747,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let retryRound = 0;
   let sseStarted = false;
   let sseRetryTargets = [];
-  req.on('close', () => { clientGone = true; });
+  const ac = new AbortController();
+  const sig = ac.signal;
+  req.on('close', () => { if (!sig.aborted) ac.abort(); clientGone = true; });
 
   if (isStream) {
     res.writeHead(200, {
@@ -809,7 +834,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           releaseKey(provider, usedKey); break;
         }
         addActive(provider);
-        upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr);
+        upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr, 'application/json', sig);
         usedProvider = provider;
         usedModel = upstreamModel;
         const sc = upstreamRes.statusCode;
@@ -890,7 +915,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             await waitRateLimit('freekeys', key);
             await waitTpmLimit('freekeys', totalEst);
-            upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr);
+            upstreamRes = await forwardToDirect(key, bodyStr, baseUrl, 'chat/completions', acceptHdr, 'application/json', undefined, sig);
             usedProvider = 'freekeys';
             usedModel = model;
             const sc = upstreamRes.statusCode;
@@ -957,6 +982,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     let sseProvider = usedProvider;
     let sseModel = usedModel;
     for (let r = 0; r < 3; r++) {
+      if (clientGone) break;
       const needModelRewrite = sseModel !== clientModel;
       const pipe = needModelRewrite
         ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
@@ -989,7 +1015,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           addActive(sseProvider);
           const base = DIRECT_PROVIDERS[sseProvider];
           const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
-          sseUpstream = await (base ? forwardToDirect(nk, b2, base, ep, 'text/event-stream') : forwardToGateway(nk, b2, `/${sseProvider}/compat/chat/completions`, 'text/event-stream'));
+          sseUpstream = await (base ? forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig) : forwardToGateway(nk, b2, `/${sseProvider}/compat/chat/completions`, 'text/event-stream', undefined, sig));
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
             log(`[${logId}] ◆ sse retry → [${sseProvider}/${sseModel}]`);
             releaseKey(sseProvider, nk);
@@ -1059,7 +1085,9 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   let pipeRes = null;
   let bodyStr = '';
   let upstreamContentType = '';
-  req.on('close', () => { clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
+  const ac = new AbortController();
+  const sig = ac.signal;
+  req.on('close', () => { if (!sig.aborted) ac.abort(); clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
 
   let retryRound = 0;
   while (!clientGone && Date.now() - t0 < TIMEOUT_MS && retryRound < 3) {
@@ -1081,7 +1109,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       const pLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
       const pCtx = USER_MODEL_LIMITS.get(pLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
       if (proxyEst > pCtx) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
-      if (directBase && isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); continue; }
+      if (isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); continue; }
       const tpmLimit = TPM_LIMITS.get(provider);
       if (tpmLimit && proxyEst > tpmLimit) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${proxyEst} > TPM=${tpmLimit})`); continue; }
@@ -1103,7 +1131,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         try {
           const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
           addActive(provider);
-          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs);
+          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs, sig);
           if (clientGone) { decActive(provider); releaseKey(provider, key); return; }
           const sc = upstreamRes.statusCode;
           if (sc >= 200 && sc < 300) {
@@ -1150,7 +1178,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
       try {
         addActive(provider);
-        const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType);
+        const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType, sig);
         if (clientGone) { decActive(provider); releaseKey(provider, key); return; }
         const sc = upstreamRes.statusCode;
         if (sc >= 200 && sc < 300) {
@@ -1202,7 +1230,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const fbContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
           const routePath = endpointPath.replace(/^\//, '');
           await waitRateLimit('freekeys', key);
-          const upstreamRes = await forwardToDirect(key, fbBody, ft.base_url, routePath, 'application/json', fbContentType);
+          const upstreamRes = await forwardToDirect(key, fbBody, ft.base_url, routePath, 'application/json', fbContentType, undefined, sig);
           if (clientGone) return;
           const sc = upstreamRes.statusCode;
           if (sc >= 200 && sc < 300) {
@@ -1236,11 +1264,174 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
 
+// --- console management page & API ---
+const CONSOLE_HTML = `<!DOCTYPE html>
+<html lang="zh-TW">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>API Gateway Console</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/dracula.min.css">
+<style>
+*{margin:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px}
+.c{max-width:1000px;margin:0 auto}
+.header{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #333;margin-bottom:20px}
+.header h2{font-size:20px}
+.header button{padding:6px 16px;border-radius:6px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer;font-size:13px}
+.header button:hover{background:#333}
+.login{text-align:center;padding:60px 20px}
+.login h2{font-size:24px;margin-bottom:8px}
+.login p{margin:12px 0 24px;color:#888}
+.login input{padding:10px 14px;width:300px;font-size:16px;border-radius:6px;border:1px solid #333;background:#16213e;color:#eee;outline:none}
+.login input:focus{border-color:#0f3460}
+.login button,.editor button{padding:10px 24px;font-size:16px;border-radius:6px;border:none;cursor:pointer}
+.login button{background:#0f3460;color:#fff}
+.login button:hover{background:#1a5276}
+.hidden{display:none}
+.editor{margin-top:0}
+.editor h3{margin:20px 0 8px;display:flex;align-items:center;gap:12px;font-size:16px}
+.editor .btn-bar{display:flex;gap:8px;margin-top:8px}
+.editor button{background:#0f3460;color:#fff}
+.editor button:hover{background:#1a5276}
+.editor button.danger{background:#6c2020}
+.editor button.danger:hover{background:#8a2a2a}
+.status{font-size:14px;margin-top:16px;color:#888}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 24px;border-radius:8px;color:#fff;z-index:999;transition:opacity .3s;font-size:14px}
+.toast.ok{background:#27ae60}
+.toast.err{background:#e74c3c}
+.CodeMirror{height:360px;font-size:13px;border-radius:6px;border:1px solid #333}
+.CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
+.CodeMirror-cursor{border-color:#eee}
+.CodeMirror pre{font-family:Consolas,'Courier New',monospace}
+</style></head>
+<body>
+<div class="c">
+<div class="header hidden" id="header"><h2>API Gateway Console</h2><button onclick="logout()">登出</button></div>
+<div class="login" id="login">
+<h2>API Gateway Console</h2>
+<p>請輸入 Client Token 以管理設定檔</p>
+<input type="password" id="token" placeholder="Client Token" autofocus onkeydown="if(event.key==='Enter')auth()">
+<p><button onclick="auth()">登入</button></p>
+<p class="status" id="loginStatus"></p>
+</div>
+<div class="editor hidden" id="editor">
+<div><h3>Config <span class="status" style="color:#888;font-weight:400;font-size:13px">(儲存後伺服器將自動重啟)</span></h3>
+<textarea id="configText"></textarea>
+<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('config')">儲存 Config</button></div></div>
+<div><h3>Error Log</h3>
+<textarea id="errorText"></textarea>
+<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('error')">儲存 Error Log</button><button class="danger" onclick="clearError()">清空</button></div></div>
+</div>
+</div>
+<div id="toast"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
+<script>
+let _token='',_cmInit=false;let cmConfig,cmError;
+function logout(){_token='';if(cmConfig)cmConfig.setValue('');if(cmError)cmError.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
+function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
+async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
+if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
+try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){s('驗證失敗：token 不正確',1);return}
+document.getElementById('header').classList.remove('hidden');
+document.getElementById('login').classList.add('hidden');document.getElementById('editor').classList.remove('hidden');
+if(!_cmInit){_cmInit=true;
+const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
+cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
+cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cmConfig.refresh();cmError.refresh()}
+load();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
+async function load(){try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'')}catch(e){toast('載入錯誤: '+e.message,0)}}
+async function save(t){const cm=t==='config'?cmConfig:cmError;const c=cm.getValue()
+try{const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')setTimeout(()=>{s('伺服器重啟中...',1)},500)}catch(e){toast('儲存錯誤: '+e.message,0)}}
+async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
+function s(m,e){document.getElementById('loginStatus').textContent=m}
+function toast(m,ok){const t=document.getElementById('toast');t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
+</script></body></html>`;
+
+function checkConsoleAuth(req, res) {
+  if (!CLIENT_TOKEN) return true;
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ') || auth.slice(7) !== CLIENT_TOKEN) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'unauthorized' }));
+    return false;
+  }
+  return true;
+}
+
+function serveConsolePage(res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(CONSOLE_HTML);
+}
+
+function handleConsoleValidate(req, res, body, logId) {
+  log(`[${logId}] /api/console/validate`);
+  if (!checkConsoleAuth(req, res)) return;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+}
+
+function handleConsoleLoad(req, res, logId) {
+  log(`[${logId}] /api/console/load`);
+  if (!checkConsoleAuth(req, res)) return;
+  const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ config: read(CONFIG_PATH), error: read(getErrorLogPath()) }));
+}
+
+function handleConsoleSave(req, res, body, logId) {
+  log(`[${logId}] /api/console/save`);
+  if (!checkConsoleAuth(req, res)) return;
+  if (!body || !body.file || body.content === undefined) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'file and content required' }));
+    return;
+  }
+  if (body.file !== 'config' && body.file !== 'error') {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid file type' }));
+    return;
+  }
+  const target = body.file === 'config' ? CONFIG_PATH : getErrorLogPath();
+  log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
+  try {
+    if (body.file === 'config') {
+      try { JSON.parse(body.content); } catch {
+        try { parseJsonc(body.content); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid config content: ' + e.message }));
+          return;
+        }
+      }
+    } else if (body.file === 'error' && body.content.trim()) {
+      let lineNo = 0;
+      for (const rawLine of body.content.split('\n')) {
+        const l = rawLine.trim();
+        if (!l || l.startsWith('#')) continue;
+        lineNo++;
+        try { JSON.parse(l); } catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `error log line ${lineNo} is not valid JSON: ${e.message}` }));
+          return;
+        }
+      }
+    }
+    fs.writeFileSync(target, body.content, 'utf-8');
+    log(`[${logId}] saved ${path.basename(target)}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  } catch (e) {
+    log(`[${logId}] save error: ${e.message}`);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: e.message }));
+  }
+}
 function isJsonEndpoint(url) {
   return url.startsWith('/v1/chat/completions') ||
          url.startsWith('/v1/embeddings') ||
          url.startsWith('/v1/images/generations') ||
-         url.startsWith('/v1/audio/speech');
+         url.startsWith('/v1/audio/speech') ||
+         url === '/api/console/validate' ||
+         url === '/api/console/save';
 }
 
 let _activeRequests = 0;
@@ -1296,34 +1487,10 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // --- GET /health — NO upstream key consumption ---
+  // --- GET /health — pure liveness, no overhead ---
   if ((req.url === '/health' || req.url === '/v1/health') && req.method === 'GET') {
-    cleanupOldLogs();
-    fetchFreeKeys();
-    const uptime = formatUptime(process.uptime());
-    if (CLIENT_TOKEN) {
-      const auth = req.headers['authorization'];
-      if (!auth || !auth.startsWith('Bearer ')) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', uptime }));
-        return;
-      }
-      const t = auth.slice(7), tb = Buffer.from(t), cb = Buffer.from(CLIENT_TOKEN);
-      if (tb.length !== cb.length || !crypto.timingSafeEqual(tb, cb)) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', uptime }));
-        return;
-      }
-    }
-    const s = { status: 'ok', uptime, providers: {}, degraded: [] };
-    for (const [p] of keyPool) {
-      const healthy = getHealthyKeys(p).length;
-      const total = PROVIDER_KEYS[p]?.length || 0;
-      s.providers[p] = { healthy, total };
-      if (healthy === 0 && total > 0) s.degraded.push(p);
-    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(s));
+    res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()) }));
     return;
   }
 
@@ -1344,6 +1511,16 @@ const server = http.createServer((req, res) => {
     });
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ object: 'list', data: modelList }));
+    return;
+  }
+
+  // --- GET /console — console page ---
+  if (req.url === '/console' && req.method === 'GET') {
+    serveConsolePage(res);
+    return;
+  }
+  if (req.url === '/api/console/load' && req.method === 'GET') {
+    handleConsoleLoad(req, res, logId);
     return;
   }
 
@@ -1386,6 +1563,10 @@ const server = http.createServer((req, res) => {
       } else if (req.url.startsWith('/v1/audio/transcriptions')) {
         // Multipart form-data — pass raw body + original Content-Type
         handleProxy(req, res, rawStr, logId, '/audio/transcriptions', false, req.headers['content-type']);
+      } else if (req.url === '/api/console/validate') {
+        handleConsoleValidate(req, res, json, logId);
+      } else if (req.url === '/api/console/save') {
+        handleConsoleSave(req, res, json, logId);
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'not found' } }));
@@ -1444,10 +1625,11 @@ Promise.allSettled(startup).then(() => server.listen(PORT, onListening));
 
 // --- graceful config reload ---
 const watchPaths = [CONFIG_PATH];
-// Only watch the alternate default filename when CONFIG_PATH is the default (not env override)
+// Watch both json/jsonc in the same directory as CONFIG_PATH (not env override, both may exist)
 if (!process.env.CONFIG_PATH) {
-  const altPath = path.join(__dirname, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
-  if (fs.existsSync(altPath)) watchPaths.push(altPath);
+  const dir = path.dirname(CONFIG_PATH);
+  const alt = path.join(dir, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
+  if (fs.existsSync(alt)) watchPaths.push(alt);
 }
 let reloadTimer = null;
 watchPaths.forEach(wp => {
