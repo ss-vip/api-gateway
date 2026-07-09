@@ -366,6 +366,7 @@ const PROVIDER_RPM = {
   'workers-ai': 30,     // 10K neurons/day — soft limit
   'agnes-ai': 20,       // 20 RPM
   'sea-lion': 10,       // 10 RPM per user
+  'kilo': 3,            // free :free models 200/hr/IP (~3.3/min); paid models have no gateway limit — raise via config rate_limit if only using paid
 };
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   const rpm = PROVIDER_RPM[p];
@@ -664,6 +665,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
   let usedModel = null;
+  let curProvider = null, curUpstream = null; // active upstream for leak-safe cleanup on client disconnect
   let clientGone = false;
   let retryRound = 0;
   let transientSkipped = false; // a target was skipped for a recoverable reason (concurrency/rate/TPM)
@@ -765,6 +767,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr, 'application/json', sig);
             usedProvider = provider;
             usedModel = upstreamModel;
+            curProvider = provider; curUpstream = upstreamRes;
             const sc = upstreamRes.statusCode;
 
             if (sc === 429 || sc >= 500) {
@@ -837,7 +840,11 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     let sseModel = usedModel;
     let committed = false; // any token already forwarded to client → cannot switch upstream transparently
     for (let r = 0; r < 3; r++) {
-      if (clientGone) break;
+      if (clientGone) {
+        if (curUpstream && !curUpstream.destroyed) curUpstream.destroy();
+        if (curProvider) { decActive(curProvider); curProvider = null; }
+        break;
+      }
       const needModelRewrite = sseModel !== clientModel;
       const pipe = needModelRewrite
         ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); committed = true; } catch {} }
@@ -877,6 +884,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           const base = DIRECT_PROVIDERS[sseProvider];
           const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
           sseUpstream = await (base ? forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig) : forwardToGateway(nk, b2, `/${sseProvider}/compat/chat/completions`, 'text/event-stream', undefined, sig));
+          curProvider = sseProvider; curUpstream = sseUpstream;
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
             log(`[${logId}] ◆ sse retry → [${sseProvider}/${sseModel}]`);
             releaseKey(sseProvider, nk);
@@ -1239,11 +1247,12 @@ function isJsonEndpoint(url) {
 
 let _activeRequests = 0;
 let _reqCount = 0;
+const MEM_LIMIT_MB = parseInt(process.env.MEM_LIMIT_MB || '420', 10);
 function _memGuard() {
   _reqCount++;
   if (_reqCount % 100 === 0) {
     const mem = process.memoryUsage().rss;
-    if (mem > 420 * 1024 * 1024) { elog(`[mem] RSS ${(mem/1024/1024).toFixed(0)}MB > 420MB — exiting`); process.exit(1); }
+    if (MEM_LIMIT_MB > 0 && mem > MEM_LIMIT_MB * 1024 * 1024) { elog(`[mem] RSS ${(mem/1024/1024).toFixed(0)}MB > ${MEM_LIMIT_MB}MB — exiting`); process.exit(1); }
   }
 }
 
@@ -1394,7 +1403,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: { message: 'not found' } }));
 });
 
-server.timeout = 30000;
+server.timeout = TIMEOUT_MS; // idle-socket cap; active SSE streams keep resetting it. App-level TIMEOUT_MS + upstream timeout already bound requests.
 server.keepAliveTimeout = 5000;
 
 server.on('error', (e) => {
@@ -1452,4 +1461,4 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('uncaughtException', (e) => { elog('[config] FATAL:', e.stack); process.exit(1); });
-process.on('unhandledRejection', (r) => { elog('[config] REJECTION:', r instanceof Error ? r.stack : r); process.exit(1); });
+process.on('unhandledRejection', (r) => { elog('[config] REJECTION:', r instanceof Error ? r.stack : r); });
