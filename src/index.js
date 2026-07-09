@@ -169,12 +169,12 @@ const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo',
 };
 
 // Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL + path prefix when adding new direct provider)
-const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-models': 'https://models.github.ai', nvidia: 'https://integrate.api.nvidia.com', gpt4free: 'https://g4f.space' };
-const DIRECT_PATH_PREFIX = { 'github-models': '/inference' };
+const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-models': 'https://models.github.ai', nvidia: 'https://integrate.api.nvidia.com', gpt4free: 'https://g4f.space', 'agnes-ai': 'https://apihub.agnes-ai.com', 'sea-lion': 'https://api.sea-lion.ai', 'kilo': 'https://api.kilo.ai/api/gateway' };
+const DIRECT_PATH_PREFIX = { 'github-models': '/inference', 'kilo': '/' };
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {
@@ -364,6 +364,8 @@ const PROVIDER_RPM = {
   deepseek: 30,         // conservative; actual: concurrency-based (500/2500)
   'google-ai-studio': 10, // free: 10 RPM (Flash), 15 RPM (Flash-Lite)
   'workers-ai': 30,     // 10K neurons/day — soft limit
+  'agnes-ai': 20,       // 20 RPM
+  'sea-lion': 10,       // 10 RPM per user
 };
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   const rpm = PROVIDER_RPM[p];

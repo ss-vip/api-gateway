@@ -49,7 +49,10 @@
     "llm7": [""],
     "github-models": [""],
     "nvidia": [""],
-    "gpt4free": [""]
+    "gpt4free": [""],
+    "agnes-ai": [""],
+    "sea-lion": [""],
+    "kilo": [""]
   },
 
   "tpm_limit": {
