@@ -664,11 +664,12 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let usedModel = null;
   let clientGone = false;
   let retryRound = 0;
+  let transientSkipped = false; // a target was skipped for a recoverable reason (concurrency/rate/TPM)
   let sseStarted = false;
   let sseRetryTargets = [];
   const ac = new AbortController();
   const sig = ac.signal;
-  req.on('close', () => { clientGone = true; });
+  res.on('close', () => { if (!res.writableEnded) clientGone = true; });
 
   if (isStream) {
     res.writeHead(200, {
@@ -680,13 +681,15 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     sseStarted = true;
   }
 
-  while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS && retryRound < 3) {
+  while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
     if (retryRound > 0) {
-      const wait = Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms for key recovery`);
+      // Recoverable skips (concurrency/rate/TPM) with no upstream reached: poll briefly for a free slot instead of giving up.
+      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
     }
     retryRound++;
+    transientSkipped = false;
     for (let ti = 0; ti < rotated.length; ti++) {
       const target = rotated[ti];
       if (upstreamRes) break;
@@ -711,14 +714,17 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const tpmLimit = TPM_LIMITS.get(provider);
         if (tpmLimit && totalEst > tpmLimit) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${totalEst} > TPM=${tpmLimit})`);
+          transientSkipped = true;
           continue;
         }
         if (isRateLimited(provider)) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`);
+          transientSkipped = true;
           continue;
         }
         if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
+          transientSkipped = true;
           continue;
         }
 
@@ -751,7 +757,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             await waitTpmLimit(provider, totalEst);
             if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
               log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
-              releaseKey(provider, usedKey); break;
+              releaseKey(provider, usedKey); transientSkipped = true; break;
             }
             addActive(provider);
             upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr, 'application/json', sig);
@@ -801,7 +807,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
       } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); errorLog({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
-    if (!upstreamRes && !lastErr) { log(`[${logId}] ◆ all targets skipped — no retry`); break; }
+    if (!upstreamRes && !lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent) — no retry`); break; }
   }
 
   if (!upstreamRes || !usedProvider) {
@@ -827,23 +833,29 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     let sseUpstream = upstreamRes;
     let sseProvider = usedProvider;
     let sseModel = usedModel;
+    let committed = false; // any token already forwarded to client → cannot switch upstream transparently
     for (let r = 0; r < 3; r++) {
       if (clientGone) break;
       const needModelRewrite = sseModel !== clientModel;
       const pipe = needModelRewrite
-        ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); } catch {} }
-        : (c) => { try { res.write(c); } catch {} };
+        ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); committed = true; } catch {} }
+        : (c) => { try { res.write(c); committed = true; } catch {} };
       try {
         await new Promise((resolve, reject) => {
           sseUpstream.on('data', pipe);
           sseUpstream.on('end', () => { decActive(sseProvider); resolve(); });
           sseUpstream.on('error', (e) => { decActive(sseProvider); reject(e); });
-          const onClose = () => { req.removeListener('close', onClose); if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); decActive(sseProvider); resolve(); };
-          req.on('close', onClose);
+          const onClose = () => { res.removeListener('close', onClose); if (res.writableEnded) return; if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); decActive(sseProvider); resolve(); };
+          res.on('close', onClose);
         });
         break; // stream ended cleanly
       } catch (e) {
-        log(`[${logId}] ◆ sse stream error (retry ${r+1}): ${e.message}`);
+        if (committed) {
+          // Tokens already sent to client — a transparent upstream switch would duplicate/garble output. End the stream instead.
+          log(`[${logId}] ◆ sse failed after tokens sent [${sseProvider}/${sseModel}]: ${e.message} — cannot fallback, ending stream`);
+          break;
+        }
+        log(`[${logId}] ◆ sse stream error before first token (retry ${r+1}): ${e.message}`);
         if (sseRetryTargets.length === 0) break;
         // Try next target
         const t = sseRetryTargets.shift();
@@ -926,7 +938,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   const ac = new AbortController();
   const sig = ac.signal;
   let pipeRes = null;
-  req.on('close', () => { clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
+  res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (pipeRes && !pipeRes.destroyed) pipeRes.destroy(); });
   const processResponse = async (upstreamRes, provider, upstreamModel, key) => {
     if (clientGone) { decActive(provider); releaseKey(provider, key); return 'done'; }
     const sc = upstreamRes.statusCode;
@@ -948,13 +960,15 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   };
 
   let retryRound = 0;
-  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && retryRound < 3) {
+  let transientSkipped = false; // a target was skipped for a recoverable reason (concurrency/rate/TPM)
+  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
     if (retryRound > 0) {
-      const wait = Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms for key recovery`);
+      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
     }
     retryRound++;
+    transientSkipped = false;
     for (const target of activeTargets) {
       const { provider, upstreamModel } = target;
       const directBase = DIRECT_PROVIDERS[provider];
@@ -967,10 +981,10 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       const pLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
       const pCtx = USER_MODEL_LIMITS.get(pLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
       if (proxyEst > pCtx) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
-      if (isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); continue; }
-      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); continue; }
+      if (isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); transientSkipped = true; continue; }
+      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); transientSkipped = true; continue; }
       const tpmLimit = TPM_LIMITS.get(provider);
-      if (tpmLimit && proxyEst > tpmLimit) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${proxyEst} > TPM=${tpmLimit})`); continue; }
+      if (tpmLimit && proxyEst > tpmLimit) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${proxyEst} > TPM=${tpmLimit})`); transientSkipped = true; continue; }
       const key = await selectKey(provider, !!directBase);
       if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
       if (lastErr) await sleep(Math.random() * 300);
@@ -1029,7 +1043,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
       }
     }
-    if (!lastErr) { log(`[${logId}] ◆ all targets skipped`); break; }
+    if (!lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent)`); break; }
   }
 
   if (!sig.aborted) ac.abort();
