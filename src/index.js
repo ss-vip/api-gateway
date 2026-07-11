@@ -152,18 +152,20 @@ if (CONFIG_PATH) {
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
-const ACCOUNT_ID   = process.env.ACCOUNT_ID   || cfg.account_id   || '';
-const GATEWAY_NAME = process.env.GATEWAY_NAME || cfg.gateway_name || '';
-const CF_CONFIGURED = !!(ACCOUNT_ID && GATEWAY_NAME);
-if (!CF_CONFIGURED) {
-  log('[config] ACCOUNT_ID / GATEWAY_NAME not set — running degraded (chat will 502)');
-}
-
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || cfg.client_token || '';
 
 const PROVIDER_KEYS = Object.fromEntries(
   Object.entries(cfg.providers || {}).filter(([k]) => !k.startsWith('_'))
 );
+
+// Normalize provider values → flat key arrays (support both ["key"] and {apiKeys:["key"],...})
+const _norm = {};
+for (const [p, v] of Object.entries(PROVIDER_KEYS)) {
+  if (Array.isArray(v)) _norm[p] = v;
+  else if (v && typeof v === 'object') _norm[p] = Array.isArray(v.apiKeys) ? v.apiKeys : [];
+  else _norm[p] = [];
+}
+for (const [p, ks] of Object.entries(_norm)) PROVIDER_KEYS[p] = ks;
 
 const ENV_MAP = {
   GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
@@ -172,9 +174,24 @@ const ENV_MAP = {
   POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo',
 };
 
-// Direct providers bypass Cloudflare AI Gateway (ponytail: add base URL + path prefix when adding new direct provider)
-const   DIRECT_PROVIDERS = { mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai', literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io', 'github-models': 'https://models.github.ai', nvidia: 'https://integrate.api.nvidia.com', gpt4free: 'https://g4f.space', 'agnes-ai': 'https://apihub.agnes-ai.com', 'sea-lion': 'https://api.sea-lion.ai', 'kilo': 'https://api.kilo.ai/api/gateway' };
-const DIRECT_PATH_PREFIX = { 'github-models': '/inference', 'kilo': '/' };
+// Direct upstream connection (no CF AI Gateway)
+const   DIRECT_PROVIDERS = {
+  mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai',
+  literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io',
+  'github-models': 'https://models.github.ai', nvidia: 'https://integrate.api.nvidia.com',
+  gpt4free: 'https://g4f.space', 'agnes-ai': 'https://apihub.agnes-ai.com',
+  'sea-lion': 'https://api.sea-lion.ai', kilo: 'https://api.kilo.ai',
+  openai: 'https://api.openai.com', cerebras: 'https://api.cerebras.ai',
+  deepseek: 'https://api.deepseek.com', xai: 'https://api.x.ai',
+  groq: 'https://api.groq.com', together: 'https://api.together.xyz',
+  openrouter: 'https://openrouter.ai', cohere: 'https://api.cohere.ai',
+  perplexity: 'https://api.perplexity.ai', huggingface: 'https://router.huggingface.co',
+};
+const DIRECT_PATH_PREFIX = {
+  'github-models': '/inference', kilo: '/api/gateway',
+  groq: '/openai/v1', openrouter: '/api/v1', cohere: '/compatibility/v1',
+  perplexity: '/v1/sonar',
+};
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {
@@ -217,8 +234,6 @@ const TIMEOUT_MS       = parseInt(process.env.TIMEOUT   || cfg.timeout         |
 const KEY_COOLDOWN_MS  = parseInt(process.env.KEY_COOLDOWN  || cfg.key_cooldown  || '30000', 10);
 const MAX_KEY_BACKOFF  = parseInt(process.env.MAX_KEY_BACKOFF || cfg.max_key_backoff || '300000', 10);
 const MAX_BODY_SIZE    = parseInt(process.env.MAX_BODY_SIZE || cfg.max_body_size || (10 * 1024 * 1024), 10); // 10MB
-const LOG_RETENTION_DAYS = parseInt(process.env.LOG_RETENTION_DAYS || cfg.log_retention_days || '0', 10);
-const CF_API_TOKEN = process.env.CF_API_TOKEN || cfg.cf_api_token || '';
 
 // --- key pool ---
 const keyPool = new Map();
@@ -483,8 +498,6 @@ function sanitizeMessages(messages) {
   });
 }
 
-// CF AI Gateway Issue #547: Gemini translation layer rejects assistant messages
-// with content:null + tool_calls in multi-turn conversations. Normalize to "".
 function normalizeContent(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map(msg => {
@@ -492,32 +505,6 @@ function normalizeContent(messages) {
       return { ...msg, content: '' };
     }
     return msg;
-  });
-}
-
-// --- gateway proxy ---
-
-function forwardToGateway(apiKey, bodyStr, routePath, accept, contentType, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) { reject(new Error('aborted')); return; }
-    const opts = {
-      hostname: 'gateway.ai.cloudflare.com',
-      port: 443,
-      path: `/v1/${ACCOUNT_ID}/${GATEWAY_NAME}${routePath}`,
-      method: 'POST',
-      headers: {
-        'Content-Type': contentType || 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Accept': accept || 'application/json',
-      },
-      timeout: TIMEOUT_MS,
-    };
-    const req = https.request(opts, resolve);
-    req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
-    req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
-    if (signal) signal.addEventListener('abort', () => { req.destroy(); reject(new Error('aborted')); }, { once: true });
-    req.write(bodyStr);
-    req.end();
   });
 }
 
@@ -548,43 +535,6 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
     req.write(bodyStr);
     req.end();
   });
-}
-
-// --- log cleanup ---
-let lastLogCleanup = 0;
-let cleanupAuthFailed = false;
-
-function cleanupOldLogs() {
-  if (LOG_RETENTION_DAYS <= 0 || !CF_API_TOKEN || !CF_CONFIGURED) return;
-  const now = Date.now();
-  if (now - lastLogCleanup < 3600000) return;
-  const cutoff = new Date(now - LOG_RETENTION_DAYS * 86400000).toISOString();
-  const filter = JSON.stringify([{ key: 'created_at', operator: 'lt', value: cutoff }]);
-  const req = https.request({
-    hostname: 'api.cloudflare.com',
-    path: `/client/v4/accounts/${ACCOUNT_ID}/ai-gateway/gateways/${GATEWAY_NAME}/logs?filters=${encodeURIComponent(filter)}`,
-    method: 'DELETE',
-    headers: { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
-    timeout: 10000,
-  }, (res) => {
-    let body = '';
-    res.on('data', c => body += c);
-    res.on('end', () => {
-      const ok = res.statusCode >= 200 && res.statusCode < 300;
-      if (ok) { lastLogCleanup = now; return; }
-      if (res.statusCode === 401) {
-        if (!cleanupAuthFailed) {
-          cleanupAuthFailed = true;
-          elog(`[cleanup] 401 — cf_api_token missing AI Gateway Edit permission, disable log_retention_days or fix token`);
-        }
-        return;
-      }
-      elog(`[cleanup] ${res.statusCode} ${body.slice(0, 200)}`);
-    });
-  });
-  req.on('error', (e) => elog(`[cleanup] ${e.message}`));
-  req.on('timeout', () => { req.destroy(); elog(`[cleanup] request timed out`); });
-  req.end();
 }
 
 // --- payload validation ---
@@ -650,7 +600,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   let activeTargets = targets.filter(t => {
     if (!PROVIDERS_WITH_KEYS.has(t.provider)) return false;
-    if (!CF_CONFIGURED && !DIRECT_PROVIDERS[t.provider]) return false;
+    if (!DIRECT_PROVIDERS[t.provider]) return false;
     return true;
   });
   if (activeTargets.length === 0) {
@@ -737,8 +687,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           continue;
         }
 
-        const isDirect = DIRECT_PROVIDERS[provider];
-        const bodyObj = { ...bodyTemplate, model: isDirect ? upstreamModel : `${provider}/${upstreamModel}` };
+        const bodyObj = { ...bodyTemplate, model: upstreamModel };
         const maxCap = PROVIDER_MAX_TOKENS[provider];
         if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
         const banned = PROVIDER_BANNED_FIELDS[provider];
@@ -769,7 +718,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               releaseKey(provider, usedKey); transientSkipped = true; break;
             }
             addActive(provider);
-            upstreamRes = isDirect ? await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig) : await forwardToGateway(usedKey, bodyStr, '/compat/chat/completions', acceptHdr, 'application/json', sig);
+            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig);
             usedProvider = provider;
             usedModel = upstreamModel;
             curProvider = provider; curUpstream = upstreamRes;
@@ -877,7 +826,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         sseModel = t.upstreamModel;
         const nk = await selectKey(sseProvider);
         if (!nk) { log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] no key`); continue; }
-        const bodyObj2 = { ...bodyTemplate, model: DIRECT_PROVIDERS[sseProvider] ? sseModel : `${sseProvider}/${sseModel}` };
+        const bodyObj2 = { ...bodyTemplate, model: sseModel };
         const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
         if (banned2) for (const f of banned2) delete bodyObj2[f];
         if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
@@ -888,7 +837,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           addActive(sseProvider);
           const base = DIRECT_PROVIDERS[sseProvider];
           const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
-          sseUpstream = await (base ? forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig) : forwardToGateway(nk, b2, `/${sseProvider}/compat/chat/completions`, 'text/event-stream', undefined, sig));
+          sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig);
           curProvider = sseProvider; curUpstream = sseUpstream;
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
             log(`[${logId}] ◆ sse retry → [${sseProvider}/${sseModel}]`);
@@ -936,7 +885,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   const activeTargets = targets.filter(t => {
     if (!PROVIDERS_WITH_KEYS.has(t.provider)) return false;
-    if (!CF_CONFIGURED && !DIRECT_PROVIDERS[t.provider]) return false;
+    if (!DIRECT_PROVIDERS[t.provider]) return false;
     return true;
   });
   if (activeTargets.length === 0) {
@@ -1032,32 +981,6 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           continue;
         }
       }
-
-      const routePath = `/${provider}${endpointPath}`;
-      if (jsonBody !== false) {
-        const gwBody = { ...bodyJson, model: upstreamModel };
-        const banned = PROVIDER_BANNED_FIELDS[provider];
-        if (banned) for (const f of banned) delete gwBody[f];
-        if (Array.isArray(gwBody.tools)) gwBody.tools = gwBody.tools.map(t => { const c = { ...t }; delete c.strict; return c; });
-        bodyStr = JSON.stringify(gwBody);
-      } else {
-        bodyStr = bodyJson;
-      }
-      upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
-
-      try {
-        addActive(provider);
-        const upstreamRes = await forwardToGateway(key, bodyStr, routePath, 'application/json', upstreamContentType, sig);
-        if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
-        continue;
-      } catch (e) {
-        decActive(provider);
-        markKeyError(provider, key);
-        releaseKey(provider, key);
-        log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
-        errorLog({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
-        lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
-      }
     }
     if (!lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent)`); break; }
   }
@@ -1146,7 +1069,7 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 </div>
 </div>
 <div id="toast"></div>
-<div class="overlay hidden" id="overlay"><div class="spinner"></div><p>伺服器重啟中，請稍候...</p></div>
+<div class="overlay hidden" id="overlay"><div class="spinner"></div><p id="overlayMsg">載入中...</p></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
@@ -1171,7 +1094,7 @@ function s(m,e){document.getElementById('loginStatus').textContent=m}
 function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
 function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
 function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
-async function waitForServer(){for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay()}
+async function waitForServer(){document.getElementById('overlayMsg').textContent='伺服器重啟中，請稍候...';showOverlay();for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();document.getElementById('overlayMsg').textContent='載入中...';toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay();document.getElementById('overlayMsg').textContent='載入中...'}
 </script></body></html>`;
 
 function checkConsoleAuth(req, res) {
@@ -1334,7 +1257,6 @@ const server = http.createServer((req, res) => {
 
   // --- GET /health — pure liveness, no overhead ---
   if (isHealth && req.method === 'GET') {
-    cleanupOldLogs();
     res.writeHead(200, { 'Content-Type' : 'application/json' });
     res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()), active: _activeRequests }));
     return;
@@ -1450,7 +1372,7 @@ server.on('error', (e) => {
 
 const onListening = () => {
   Object.keys(PROVIDER_KEYS).forEach(initProvider);
-  log(`[config] started port=${PORT} account=${ACCOUNT_ID || '(degraded)'} gateway=${GATEWAY_NAME || '(degraded)'}`);
+  log(`[config] started port=${PORT} — direct upstream mode`);
   const summary = Object.entries(PROVIDER_KEYS).map(([p, ks]) => `${p}:${ks.length}`).join(' ');
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);

@@ -1,6 +1,6 @@
 # API Gateway
 
-Client → Proxy (Node) → [Cloudflare AI Gateway | 直接 Provider]。  
+Client → Proxy (Node) → 上游 Provider。
 多 Key 輪詢、故障轉移、Model 別名路由、SSE 串流。
 
 ## 功能
@@ -18,7 +18,7 @@ Client → Proxy (Node) → [Cloudflare AI Gateway | 直接 Provider]。
 ## 快速開始
 
 ```bash
-cp src/config.example.json src/config.json   # 填入 ACCOUNT_ID, GATEWAY_NAME, API keys
+cp src/config.example.json src/config.json   # 填入 Client Token 與 API keys
 npm start
 ```
 
@@ -54,7 +54,6 @@ curl http://localhost:3000/v1/chat/completions \
 
 ```bash
 curl http://localhost:3000/health
-# 帶 token 時可觸發 CF log 清理（需設定 log_retention_days）
 ```
 
 ## PM2 部署
@@ -68,3 +67,7 @@ pm2 save && pm2 startup
 ## 設定
 
 所有欄位說明請參閱 `src/config.example.json`。支援 `config.json` / `config.jsonc`（含 `//` 與 `/* */` 註解），值可由同名環境變數覆寫。
+
+## 支援的 Provider
+
+openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、github-models、nvidia、gpt4free、agnes-ai、sea-lion、kilo。

@@ -1,7 +1,5 @@
 {
   "_note": "複製為 config.json。所有值可由同名環境變數覆寫",
-  "account_id": "your-cloudflare-account-id",
-  "gateway_name": "your-ai-gateway-name",
   "client_token": "optional-auth-bearer-token",
 
   "timezone": "Asia/Taipei",
@@ -17,10 +15,6 @@
     "retention_days": 7,
     "path": "./error.json"
   },
-
-  "_cf_log_note": "(選用) 設 >0 天數，訪問 /health 時會調用 Cloudflare API 清理舊 log",
-  "log_retention_days": 0,
-  "cf_api_token": "your-cloudflare-api-token-with-ai-gateway-permission",
 
   "providers": {
     "_note": "只填入有 key 的 provider，未使用的可刪除或留空",
