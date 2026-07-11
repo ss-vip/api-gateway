@@ -70,4 +70,6 @@ pm2 save && pm2 startup
 
 ## 支援的 Provider
 
-openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、github-models、nvidia、gpt4free、agnes-ai、sea-lion、kilo。
+相容 OpenAI Chat Completions API：
+
+openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、github-models、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel

@@ -127,6 +127,22 @@ function errorLog({ logId, provider, model, key, status, body }) {
   }
 }
 
+function getSuccessLogPath() {
+  const ec = cfg.error_log;
+  if (ec?.path) return path.join(path.dirname(ec.path), 'success.json');
+  const j = path.join(__dirname, 'success.json');
+  if (fs.existsSync(j)) return j;
+  const jc = path.join(__dirname, 'success.jsonc');
+  return fs.existsSync(jc) ? jc : j;
+}
+function successLog({ logId, provider, model, key, latency, tokens }) {
+  const ec = cfg.error_log;
+  if (ec?.enabled === false) return;
+  const p = getSuccessLogPath();
+  const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', latency: Math.round(latency || 0), tokens: tokens || 0 });
+  fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[successLog] write ${p}: ${err.message}`); });
+}
+
 // --- config loading (JSONC with comments support) ---
 function _findConfig() {
   const dirs = [__dirname, process.cwd()];
@@ -158,23 +174,24 @@ const PROVIDER_KEYS = Object.fromEntries(
   Object.entries(cfg.providers || {}).filter(([k]) => !k.startsWith('_'))
 );
 
-// Normalize provider values → flat key arrays (support both ["key"] and {apiKeys:["key"],...})
+// Normalize provider values → flat key arrays (support ["key"], "key", or {apiKeys:["key"],...})
 const _norm = {};
 for (const [p, v] of Object.entries(PROVIDER_KEYS)) {
   if (Array.isArray(v)) _norm[p] = v;
+  else if (typeof v === 'string') _norm[p] = [v];
   else if (v && typeof v === 'object') _norm[p] = Array.isArray(v.apiKeys) ? v.apiKeys : [];
   else _norm[p] = [];
 }
 for (const [p, ks] of Object.entries(_norm)) PROVIDER_KEYS[p] = ks;
 
 const ENV_MAP = {
-  GEMINI_KEYS:'google-ai-studio', MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
-  OPENAI_KEYS:'openai', ANTHROPIC_KEYS:'anthropic', DEEPSEEK_KEYS:'deepseek',
+  MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
+  OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
   POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo',
 };
 
-// Direct upstream connection (no CF AI Gateway)
+// Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
 const   DIRECT_PROVIDERS = {
   mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai',
   literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io',
@@ -186,12 +203,16 @@ const   DIRECT_PROVIDERS = {
   groq: 'https://api.groq.com', together: 'https://api.together.xyz',
   openrouter: 'https://openrouter.ai', cohere: 'https://api.cohere.ai',
   perplexity: 'https://api.perplexity.ai', huggingface: 'https://router.huggingface.co',
+  // --- Bearer-compatible additions ---
+  replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
 };
 const DIRECT_PATH_PREFIX = {
   'github-models': '/inference', kilo: '/api/gateway',
   groq: '/openai/v1', openrouter: '/api/v1', cohere: '/compatibility/v1',
   perplexity: '/v1/sonar',
 };
+// GitHub Models API version (hardcoded by GitHub, bump when they publish a new one)
+const GITHUB_API_VERSION = cfg.github_api_version || process.env.GITHUB_API_VERSION || '2026-03-10';
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {
@@ -267,7 +288,7 @@ function markKeyError(p, key) {
   s.errorCount++;
 }
 
-function markKeySuccess(p, key) {
+function markKeySuccess(p, key, latency) {
   const s = keyPool.get(p)?.get(key);
   if (!s) return;
   if (s.errorCount > 0) {
@@ -275,6 +296,8 @@ function markKeySuccess(p, key) {
     if (s.errorCount === 0) s.degradedUntil = 0;
   }
   s.successCount++;
+  s.lastSuccess = Date.now();
+  if (latency != null) s.lastLatency = Math.round(latency);
 }
 
 const keyInFlight = new Map(); // key -> timestamp
@@ -364,7 +387,7 @@ const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k
 const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
 // ponytail: known provider RPM (account-level), auto-calc per-key interval when not manually set
 // ponytail: known free-plan RPM per provider, auto-calc per-key rate_limit = 60000 / (rpm / numKeys)
-// Manual rate_limit in config overrides auto-calculation. Missing providers = no auto-limit (set manually if needed).
+// Keys are per-account, so each key's limit is independent. Manual rate_limit in config overrides auto-calc.
 const PROVIDER_RPM = {
   'github-models': 15,  // 10–15 RPM
   literouter: 1,        // per-key ~1 RPM (5 keys → ~5 RPM)
@@ -377,11 +400,20 @@ const PROVIDER_RPM = {
   groq: 30,             // free tier: 30 RPM (org-level, per-model)
   cerebras: 5,          // free tier: 5 RPM (gpt-oss-120b), others up to 30
   deepseek: 30,         // conservative; actual: concurrency-based (500/2500)
-  'google-ai-studio': 10, // free: 10 RPM (Flash), 15 RPM (Flash-Lite)
   'workers-ai': 30,     // 10K neurons/day — soft limit
   'agnes-ai': 20,       // 20 RPM
   'sea-lion': 10,       // 10 RPM per user
   'kilo': 3,            // free :free models 200/hr/IP (~3.3/min); paid models have no gateway limit — raise via config rate_limit if only using paid
+  // --- added: providers previously without auto-limit (tune via config rate_limit if needed) ---
+  openai: 60,           // paid tiers high; free tier 3 RPM — conservative middle
+  xai: 60,             // grok: decent free RPM, higher paid
+  together: 60,         // varies by model, free ~60 RPM
+  cohere: 60,          // command-r-plus, reasonable
+  perplexity: 20,       // sonar online: ~20 RPM
+  huggingface: 30,      // router, varies by model
+  replicate: 60,        // prediction API, not strictly RPM-limited
+  baseten: 60,         // inference, safe middle
+  parallel: 60,         // speed/base, safe middle
 };
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   const rpm = PROVIDER_RPM[p];
@@ -391,9 +423,12 @@ for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
 }
 const _keyLastUsed = new Map(); // provider → Map(key → last timestamp)
 let _rlDate = new Date().toDateString();
+function _rlMaybeReset() {
+  const today = new Date().toDateString();
+  if (today !== _rlDate) { _rlDate = today; _keyLastUsed.clear(); }
+}
 async function waitRateLimit(provider, key) {
-  const now = new Date().toDateString();
-  if (now !== _rlDate) { _rlDate = now; _keyLastUsed.clear(); }
+  _rlMaybeReset();
   const interval = RATE_LIMITS.get(provider);
   if (!interval) return;
   if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
@@ -403,6 +438,9 @@ async function waitRateLimit(provider, key) {
   byProv.set(key, Date.now());
 }
 function isRateLimited(provider) {
+  _rlMaybeReset();
+  // No healthy key available (all in error-cooldown) → effectively limited
+  if (getHealthyKeys(provider).length === 0) return true;
   const interval = RATE_LIMITS.get(provider);
   if (!interval) return false;
   const byProv = _keyLastUsed.get(provider);
@@ -438,7 +476,7 @@ async function waitTpmLimit(provider, key, tokens) {
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
-  const aliasProv = ({ 'google-ai-studio': 'google', 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
+  const aliasProv = ({ 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
   const key = `${aliasProv}/${t.model || alias}`.toLowerCase();
   return USER_MODEL_LIMITS.get(key) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
 }
@@ -493,16 +531,6 @@ function sanitizeMessages(messages) {
       delete clean.reasoning_content;
       delete clean.reasoning;
       return clean;
-    }
-    return msg;
-  });
-}
-
-function normalizeContent(messages) {
-  if (!Array.isArray(messages)) return messages;
-  return messages.map(msg => {
-    if (msg && typeof msg === 'object' && msg.content === null && Array.isArray(msg.tool_calls)) {
-      return { ...msg, content: '' };
     }
     return msg;
   });
@@ -623,6 +651,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   delete bodyTemplate.model;
 
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
+  const skippedProviders = new Set(); // providers that returned non-429 non-200 this request → skip channel
   let usedModel = null;
   let curProvider = null, curUpstream = null; // active upstream for leak-safe cleanup on client disconnect
   let clientGone = false;
@@ -655,6 +684,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     transientSkipped = false;
     for (let ti = 0; ti < rotated.length; ti++) {
       const target = rotated[ti];
+      if (skippedProviders.has(target.provider)) continue;
       if (upstreamRes) break;
       try {
         const provider = target.provider;
@@ -697,9 +727,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           if (!supportsReasoningContent(provider, upstreamModel)) {
             bodyObj.messages = sanitizeMessages(bodyObj.messages);
           }
-          if (provider === 'google-ai-studio') {
-            bodyObj.messages = normalizeContent(bodyObj.messages);
-          }
         }
         const bodyStr = JSON.stringify(bodyObj);
 
@@ -711,14 +738,15 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-            const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+            const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': GITHUB_API_VERSION } : undefined;
             await waitTpmLimit(provider, usedKey, totalEst);
             if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
               log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
               releaseKey(provider, usedKey); transientSkipped = true; break;
             }
             addActive(provider);
-            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions', acceptHdr, 'application/json', ghHdrs, sig);
+            const chatPath = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
+            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', ghHdrs, sig);
             usedProvider = provider;
             usedModel = upstreamModel;
             curProvider = provider; curUpstream = upstreamRes;
@@ -744,12 +772,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${body.slice(0, 100)}`);
               errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
+              if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
               upstreamRes = null;
               break;
             }
 
             releaseKey(provider, usedKey);
-            markKeySuccess(provider, usedKey);
+            markKeySuccess(provider, usedKey, (Date.now()-t0)/1000);
+            successLog({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
             log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
             break;
@@ -822,6 +852,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (sseRetryTargets.length === 0) break;
         // Try next target
         const t = sseRetryTargets.shift();
+        if (skippedProviders.has(t.provider)) continue;
         sseProvider = t.provider;
         sseModel = t.upstreamModel;
         const nk = await selectKey(sseProvider);
@@ -896,6 +927,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   let lastErr = null;
+  const skippedProviders = new Set(); // providers that returned non-429 non-200 this request → skip channel
   let clientGone = false;
   let bodyStr = '';
   let upstreamContentType = '';
@@ -907,7 +939,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     if (clientGone) { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); decActive(provider); releaseKey(provider, key); return 'done'; }
     const sc = upstreamRes.statusCode;
     if (sc >= 200 && sc < 300) {
-      decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key);
+      decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, (Date.now()-t0)/1000);
+      successLog({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
       log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
       const ctype = upstreamRes.headers['content-type'] || 'application/json';
@@ -921,6 +954,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
     errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
+    if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
     return 'retry';
   };
 
@@ -936,6 +970,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     transientSkipped = false;
     for (const target of activeTargets) {
       const { provider, upstreamModel } = target;
+      if (skippedProviders.has(provider)) continue;
       const directBase = DIRECT_PROVIDERS[provider];
       let proxyEst = 0;
       if (jsonBody !== false && bodyJson) {
@@ -966,7 +1001,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         }
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
-          const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': '2026-03-10' } : undefined;
+          const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': GITHUB_API_VERSION } : undefined;
           addActive(provider);
           const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs, sig);
           if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
@@ -1087,7 +1122,7 @@ cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
 cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cmConfig.refresh();cmError.refresh()}
 load();refreshStatus();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
 async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'');hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
-async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
+async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
 async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmError;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
 async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
@@ -1135,7 +1170,17 @@ function handleConsoleStatus(req, res, logId) {
   const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
   const now = Date.now();
   const providers = {};
-  for (const [p, m] of keyPool) providers[p] = { keys: m.size, degraded: [...m.values()].filter(s => s.degradedUntil > now).length };
+  for (const [p, m] of keyPool) {
+    const vals = [...m.values()];
+    const lastSuccess = vals.reduce((mx, s) => Math.max(mx, s.lastSuccess), 0);
+    const lat = vals.filter(s => s.lastLatency > 0).map(s => s.lastLatency);
+    providers[p] = {
+      keys: m.size,
+      degraded: vals.filter(s => s.degradedUntil > now).length,
+      last_success: lastSuccess ? Math.round((now - lastSuccess) / 1000) + 's' : 'never',
+      latency_ms: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : 0,
+    };
+  }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024), uptime: formatUptime(process.uptime()), keys: totalKeys, providers }));
 }

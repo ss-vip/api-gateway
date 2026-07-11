@@ -17,13 +17,8 @@
   },
 
   "providers": {
-    "_note": "只填入有 key 的 provider，未使用的可刪除或留空",
+    "_note": "只填入有 key 的 provider，未使用的可刪除或留空。支援清單與限制見 README",
     "openai": [""],
-    "anthropic": [""],
-    "google-ai-studio": [""],
-    "google-vertex-ai": [""],
-    "azure-openai": [""],
-    "aws-bedrock": [""],
     "mistral": [""],
     "cerebras": [""],
     "deepseek": [""],
@@ -37,7 +32,6 @@
     "huggingface": [""],
     "baseten": [""],
     "parallel": [""],
-    "workers-ai": [""],
     "pollinations": [""],
     "literouter": [""],
     "llm7": [""],
