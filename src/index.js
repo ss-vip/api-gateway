@@ -85,68 +85,59 @@ function _errMsg(body) {
   // Fallback: strip newlines, limit length
   return clean.replace(/\n/g, ' ').slice(0, 500);
 }
-function getErrorLogPath() {
-  const ec = cfg.error_log;
+function getLogPath() {
+  const ec = cfg.log;
   if (ec?.path) return ec.path;
-  const j = path.join(__dirname, 'error.json');
-  if (fs.existsSync(j)) return j;
-  const jc = path.join(__dirname, 'error.jsonc');
-  return fs.existsSync(jc) ? jc : j;
+  return path.join(__dirname, 'log.json');
 }
-let _errLogCount = 0, _errCleaning = false, _lastCleanup = 0;
-function _cleanupErrorLog() {
-  if (_errCleaning) return;
-  const ec = cfg.error_log;
+let _logWriteCount = 0, _logCleaning = new Set(), _lastCleanup = 0;
+const stats = { success: 0, error: 0, latSum: 0, latN: 0 };
+function _cleanupLog(p, cutoffOverride) {
+  if (_logCleaning.has(p)) return;
+  const ec = cfg.log;
   if (ec?.enabled === false) return;
-  const p = getErrorLogPath();
   if (!fs.existsSync(p)) return;
-  _errCleaning = true;
-  const days = (ec?.retention_days || 7);
-  const cutoff = Date.now() - days * 86400000;
+  _logCleaning.add(p);
+  const cutoff = cutoffOverride || (Date.now() - (ec?.retention_days || 7) * 86400000);
   const old = p + '.old';
   fs.rename(p, old, (err) => {
-    if (err) { _errCleaning = false; return; }
+    if (err) { _logCleaning.delete(p); return; }
     fs.readFile(old, 'utf8', (_, c) => {
       fs.unlink(old, () => {});
-      if (!c) { _errCleaning = false; _lastCleanup = Date.now(); return; }
+      if (!c) { _logCleaning.delete(p); _lastCleanup = Date.now(); return; }
       const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
       if (kept.length > 0) {
         const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
         kept.unshift(header);
-        fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[errorLog] cleanup write: ${e2.message}`); _errCleaning = false; _lastCleanup = Date.now(); });
+        fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[log] cleanup write: ${e2.message}`); _logCleaning.delete(p); _lastCleanup = Date.now(); });
       } else {
-        _errCleaning = false; _lastCleanup = Date.now();
+        _logCleaning.delete(p); _lastCleanup = Date.now();
       }
     });
   });
 }
-function errorLog({ logId, provider, model, key, status, body }) {
-  const ec = cfg.error_log;
+function _triggerCleanup() { _cleanupLog(getLogPath()); }
+function logEvent({ logId, provider, model, key, status, latency, tokens, body }) {
+  const ec = cfg.log;
   if (ec?.enabled === false) return;
-  const p = getErrorLogPath();
-  const msg = _errMsg(body);
-  const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', status, error: msg });
-  fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
-  _errLogCount = (_errLogCount + 1) % 1000000007;
-  if (_errLogCount % 50 === 1) _cleanupErrorLog();
-}
-
-function getSuccessLogPath() {
-  const ec = cfg.error_log;
-  if (ec?.path) return path.join(path.dirname(ec.path), 'success.json');
-  const j = path.join(__dirname, 'success.json');
-  if (fs.existsSync(j)) return j;
-  const jc = path.join(__dirname, 'success.jsonc');
-  return fs.existsSync(jc) ? jc : j;
-}
-function successLog({ logId, provider, model, key, latency, tokens }) {
-  const ec = cfg.error_log;
-  if (ec?.enabled === false) return;
-  const p = getSuccessLogPath();
-  const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', latency: Math.round(latency || 0), tokens: tokens || 0 });
-  fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[successLog] write ${p}: ${err.message}`); });
+  const p = getLogPath();
+  const entry = { ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-' };
+  if (body !== undefined) {
+    entry.status = status || 0;
+    entry.error = _errMsg(body);
+    entry.type = 'error';
+  } else {
+    entry.latency = Math.round(latency || 0);
+    entry.tokens = tokens || 0;
+    entry.type = 'success';
+  }
+  fs.appendFile(p, JSON.stringify(entry) + '\n', (err) => { if (err) elog(`[log] write ${p}: ${err.message}`); });
+  if (entry.type === 'error') stats.error++;
+  else { stats.success++; if (latency) { stats.latSum += latency; stats.latN++; } }
+  _logWriteCount = (_logWriteCount + 1) % 1000000007;
+  if (_logWriteCount % 50 === 1) _triggerCleanup();
 }
 
 // --- config loading (JSONC with comments support) ---
@@ -180,13 +171,17 @@ const PROVIDER_KEYS = Object.fromEntries(
   Object.entries(cfg.providers || {}).filter(([k]) => !k.startsWith('_'))
 );
 
-// Normalize provider values → flat key arrays (support ["key"], "key", or {apiKeys:["key"],...})
+// Normalize provider values → flat key arrays + optional metadata (support ["key"], "key", or {apiKeys, baseUrl, pathPrefix, rpm})
 const _norm = {};
+const provMeta = {};
 for (const [p, v] of Object.entries(PROVIDER_KEYS)) {
-  if (Array.isArray(v)) _norm[p] = v;
-  else if (typeof v === 'string') _norm[p] = [v];
-  else if (v && typeof v === 'object') _norm[p] = Array.isArray(v.apiKeys) ? v.apiKeys : [];
-  else _norm[p] = [];
+  if (Array.isArray(v)) { _norm[p] = v; }
+  else if (typeof v === 'string') { _norm[p] = [v]; }
+  else if (v && typeof v === 'object') {
+    _norm[p] = Array.isArray(v.apiKeys) ? v.apiKeys : [];
+    if (v.baseUrl || v.pathPrefix || v.rpm != null) provMeta[p] = { baseUrl: v.baseUrl, pathPrefix: v.pathPrefix, rpm: v.rpm };
+  }
+  else { _norm[p] = []; }
 }
 for (const [p, ks] of Object.entries(_norm)) PROVIDER_KEYS[p] = ks;
 
@@ -212,11 +207,20 @@ const   DIRECT_PROVIDERS = {
   // --- Bearer-compatible additions ---
   replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
 };
+// Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
+for (const [p, m] of Object.entries(provMeta)) {
+  if (m.baseUrl && /^https?:\/\//i.test(m.baseUrl)) DIRECT_PROVIDERS[p] = m.baseUrl.replace(/\/+$/, '');
+  else if (m.baseUrl) elog(`[config] provider "${p}" has invalid baseUrl (ignored): ${m.baseUrl}`);
+}
 const DIRECT_PATH_PREFIX = {
   'github-models': '/inference', kilo: '/api/gateway',
   groq: '/openai/v1', openrouter: '/api/v1', cohere: '/compatibility/v1',
   perplexity: '/v1/sonar',
 };
+// Overlay config-defined path prefixes (manual providers)
+for (const [p, m] of Object.entries(provMeta)) {
+  if (m.pathPrefix) DIRECT_PATH_PREFIX[p] = m.pathPrefix;
+}
 // GitHub Models API version (hardcoded by GitHub, bump when they publish a new one)
 const GITHUB_API_VERSION = cfg.github_api_version || process.env.GITHUB_API_VERSION || '2026-03-10';
 
@@ -421,9 +425,13 @@ const PROVIDER_RPM = {
   baseten: 60,         // inference, safe middle
   parallel: 60,         // speed/base, safe middle
 };
+// Conservative default for manual (config-defined) providers that have no RPM source, so they are never unthrottled (ban risk)
+const DEFAULT_MANUAL_RPM = 10;
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
-  const rpm = PROVIDER_RPM[p];
-  if (rpm && keys.length > 0 && !RATE_LIMITS.has(p)) {
+  if (keys.length === 0) continue;
+  const manual = provMeta[p] && provMeta[p].baseUrl;
+  const rpm = PROVIDER_RPM[p] || (provMeta[p] && provMeta[p].rpm) || (manual ? DEFAULT_MANUAL_RPM : undefined);
+  if (rpm && !RATE_LIMITS.has(p)) {
     RATE_LIMITS.set(p, Math.max(100, Math.round(60000 / (rpm / keys.length))));
   }
 }
@@ -740,7 +748,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           if (upstreamRes) break;
           if (attempt > 0) await sleep(Math.random() * 300);
           usedKey = await selectKey(provider);
-          if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); errorLog({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
+          if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); logEvent({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
@@ -764,7 +772,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
               log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
-              errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
+              logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               upstreamRes = null;
               continue;
@@ -776,7 +784,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
               log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${body.slice(0, 100)}`);
-              errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
+              logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
               upstreamRes = null;
@@ -785,7 +793,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
             releaseKey(provider, usedKey);
             markKeySuccess(provider, usedKey, Date.now()-t0);
-            successLog({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
+            logEvent({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
             log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
             break;
@@ -795,12 +803,12 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             markKeyError(provider, usedKey);
             releaseKey(provider, usedKey);
             log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
-            errorLog({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
+            logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
             lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
             upstreamRes = null;
           }
         }
-      } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); errorLog({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
+      } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
     if (!upstreamRes && !lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent) — no retry`); break; }
   }
@@ -809,7 +817,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
     const errCode = lastErr?.status || 502;
     log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-    errorLog({ logId, provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
+    logEvent({ logId, provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
     if (sseStarted) {
       const sseErr = { error: { message: `all failed: ${errMsg}`, type: 'proxy_error' } };
       try { res.write(`data: ${JSON.stringify(sseErr)}\n\n`); } catch {}
@@ -946,7 +954,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     const sc = upstreamRes.statusCode;
     if (sc >= 200 && sc < 300) {
       decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
-      successLog({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
+      logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
       log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
       const ctype = upstreamRes.headers['content-type'] || 'application/json';
@@ -958,7 +966,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
     const body = await collectBody(upstreamRes);
     log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
-    errorLog({ logId, provider, model: upstreamModel, key, status: sc, body });
+    logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
     if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
     return 'retry';
@@ -1017,7 +1025,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           markKeyError(provider, key);
           releaseKey(provider, key);
           log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
-          errorLog({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
+          logEvent({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
           lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
           continue;
         }
@@ -1027,11 +1035,11 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   if (!sig.aborted) ac.abort();
-  if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; errorLog({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
+  if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; logEvent({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
 
   const errCode = lastErr?.status || 502;
   log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-  errorLog({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: (lastErr?.body || '').slice(0,200) });
+  logEvent({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: (lastErr?.body || '').slice(0,200) });
   res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
@@ -1070,7 +1078,7 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 24px;border-radius:8px;color:#fff;z-index:999;transition:opacity .3s;font-size:14px}
 .toast.ok{background:#27ae60}
 .toast.err{background:#e74c3c}
-.CodeMirror{height:360px;font-size:13px;border-radius:6px;border:1px solid #333}
+.CodeMirror{min-height:200px;resize:both;overflow:hidden;font-size:13px;border-radius:6px;border:1px solid #333}
 .CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
 .CodeMirror-cursor{border-color:#eee}
 .CodeMirror pre{font-family:Consolas,'Courier New',monospace}
@@ -1079,9 +1087,12 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 .st th{color:#888;font-weight:400}
 .degraded{color:#e74c3c;font-weight:700}
 .st-info{color:#888;font-size:12px;margin-top:4px}
-.CodeMirror-vscrollbar::-webkit-scrollbar,.CodeMirror-hscrollbar::-webkit-scrollbar,textarea::-webkit-scrollbar{width:8px;height:8px}
-.CodeMirror-vscrollbar::-webkit-scrollbar-thumb,.CodeMirror-hscrollbar::-webkit-scrollbar-thumb,textarea::-webkit-scrollbar-thumb{background:#555;border-radius:4px}
-.CodeMirror-vscrollbar::-webkit-scrollbar-track,.CodeMirror-hscrollbar::-webkit-scrollbar-track,textarea::-webkit-scrollbar-track{background:#1e1e1e}
+div[class*=scrollbar]{background:#1e1e1e!important}
+div[class*=scrollbar-inner]{background:#555!important;border-radius:4px!important}
+div[class*=scrollbar-filler],div[class*=gutter-filler]{background:#1e1e1e!important}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:#1e1e1e}
+::-webkit-scrollbar-thumb{background:#555;border-radius:4px}
 .overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center}
 .overlay.hidden{display:none}
 .overlay .spinner{width:40px;height:40px;border:4px solid #444;border-top-color:#0f3460;border-radius:50%;animation:spin .8s linear infinite}
@@ -1100,13 +1111,14 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 </div>
 <div class="editor hidden" id="editor">
 <div><h3>Status <button onclick="refreshStatus()" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
-<div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div></div>
-<div><h3>Config <span class="status" style="color:#888;font-weight:400;font-size:13px">(儲存後伺服器將自動重啟)</span></h3>
+<div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div>
+<div id="statsPanel" style="font-size:13px;color:#aaa;padding:4px 0"></div></div>
+<div><h3>Config <span style="color:#888;font-weight:400;font-size:13px;margin:0">(儲存後伺服器將自動重啟)</span></h3>
 <textarea id="configText"></textarea>
 <div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('config')">儲存 Config</button></div></div>
-<div><h3>Error Log</h3>
-<textarea id="errorText"></textarea>
-<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('error')">儲存 Error Log</button><button class="danger" onclick="clearError()">清空</button></div></div>
+<div><h3>Log</h3>
+<textarea id="logText"></textarea>
+<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('log')">儲存</button><button class="danger" onclick="clearLog()">清空</button></div></div>
 </div>
 </div>
 <div id="toast"></div>
@@ -1114,8 +1126,9 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
-let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmError;
-function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmError)cmError.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
+let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmLog;
+if(_token)showOverlay();
+function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
 function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
 async function auth(){if(!_token)_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
 if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
@@ -1126,12 +1139,13 @@ document.getElementById('login').classList.add('hidden');document.getElementById
 if(!_cmInit){_cmInit=true;
 const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
 cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
-cmError=CodeMirror.fromTextArea(document.getElementById('errorText'),o);}else{cmConfig.refresh();cmError.refresh()}
+cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConfig.refresh();cmLog.refresh()}
 load();refreshStatus();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmError.setValue(d.error||'');hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
-async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
-async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmError;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
-async function clearError(){cmError.setValue('');toast('已清空，請按儲存寫入檔案',1)}
+async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmLog.setValue(d.log||'');hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
+async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
+const _sp=document.getElementById('statsPanel');if(_sp&&d.success_total!==undefined)_sp.innerHTML='成功 '+d.success_total+' / 失敗 '+(d.error_total||0)+' / 平均延遲 '+(d.avg_latency_ms||'-')+'ms / 錯誤率 '+(d.error_rate||'0%');hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
+async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
+async function clearLog(){cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
 function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
 function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
@@ -1168,7 +1182,7 @@ function handleConsoleLoad(req, res, logId) {
   if (!checkConsoleAuth(req, res)) return;
   const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ config: read(CONFIG_PATH), error: read(getErrorLogPath()) }));
+  res.end(JSON.stringify({ config: read(CONFIG_PATH), log: read(getLogPath()) }));
 }
 
 function handleConsoleStatus(req, res, logId) {
@@ -1189,8 +1203,15 @@ function handleConsoleStatus(req, res, logId) {
       latency_ms: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : 0,
     };
   }
+  const totalReq = stats.success + stats.error;
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024), uptime: formatUptime(process.uptime()), keys: totalKeys, providers }));
+  res.end(JSON.stringify({
+    active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+    uptime: formatUptime(process.uptime()), keys: totalKeys, providers,
+    success_total: stats.success, error_total: stats.error,
+    avg_latency_ms: stats.latN ? Math.round(stats.latSum / stats.latN) : 0,
+    error_rate: totalReq ? (stats.error / totalReq * 100).toFixed(1) + '%' : '0%',
+  }));
 }
 
 function handleConsoleSave(req, res, body, logId) {
@@ -1201,12 +1222,12 @@ function handleConsoleSave(req, res, body, logId) {
     res.end(JSON.stringify({ error: 'file and content required' }));
     return;
   }
-  if (body.file !== 'config' && body.file !== 'error') {
+  if (body.file !== 'config' && body.file !== 'error' && body.file !== 'success') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'invalid file type' }));
     return;
   }
-  const target = body.file === 'config' ? CONFIG_PATH : getErrorLogPath();
+  const target = body.file === 'config' ? CONFIG_PATH : getLogPath();
   log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
   try {
     if (body.file === 'config') {
@@ -1217,7 +1238,7 @@ function handleConsoleSave(req, res, body, logId) {
           return;
         }
       }
-    } else if (body.file === 'error' && body.content.trim()) {
+    } else if ((body.file === 'error' || body.file === 'success') && body.content.trim()) {
       let lineNo = 0;
       for (const rawLine of body.content.split('\n')) {
         const l = rawLine.trim();
@@ -1310,7 +1331,7 @@ const server = http.createServer((req, res) => {
 
   // --- GET /health — liveness; also drives hourly error-log retention cleanup (throttled, fire-and-forget) ---
   if (isHealth && req.method === 'GET') {
-    if (Date.now() - _lastCleanup > 3600 * 1000) _cleanupErrorLog();
+    if (Date.now() - _lastCleanup > 3600 * 1000) { _triggerCleanup(); }
     res.writeHead(200, { 'Content-Type' : 'application/json' });
     res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()), active: _activeRequests }));
     return;
@@ -1430,9 +1451,16 @@ const onListening = () => {
   const summary = Object.entries(PROVIDER_KEYS).map(([p, ks]) => `${p}:${ks.length}`).join(' ');
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
-  const elCfg = cfg.error_log;
-  const defErrPath = './error.json';
-  if (elCfg?.enabled !== false) log(`[config] error_log=${elCfg?.path || defErrPath} retention=${elCfg?.retention_days || 7}d`);
+  const elCfg = cfg.log;
+  if (elCfg?.enabled !== false) log(`[config] log=${getLogPath()} retention=${elCfg?.retention_days || 7}d`);
+  // seed stats from persisted logs (count only, latency resets on restart)
+  try {
+    const _lines = p => { try { return fs.readFileSync(p, 'utf8').split('\n').filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
+    const all = _lines(getLogPath()).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    stats.success = all.filter(e => e.type === 'success').length;
+    stats.error = all.filter(e => e.type === 'error').length;
+    if (stats.success || stats.error) log(`[config] seeded stats: success=${stats.success} error=${stats.error}`);
+  } catch (e) { elog(`[config] seed stats: ${e.message}`); }
 };
 server.listen(PORT, onListening);
 

@@ -9,11 +9,11 @@
   "max_key_backoff": 300000,
   "max_body_size": 10485760,
 
-  "error_log": {
-    "_note": "(選用) 啟用錯誤回應日誌，自動刪除超過 retention_days 的舊資料",
+  "log": {
+    "_note": "(選用) 啟用回應日誌，自動刪除超過 retention_days 的舊資料",
     "enabled": true,
     "retention_days": 7,
-    "path": "./error.json"
+    "path": "./log.json"
   },
 
   "providers": {
@@ -40,7 +40,15 @@
     "gpt4free": [""],
     "agnes-ai": [""],
     "sea-lion": [""],
-    "kilo": [""]
+    "kilo": [""],
+
+    "_custom_provider_example": "下方為自定 provider 範例（OpenAI-compatible 端點，免改程式碼）。取消註解並填入即可",
+    "my-proxy": {
+      "apiKeys": [""],
+      "baseUrl": "https://my-host.example.com",
+      "pathPrefix": "/v1",
+      "rpm": 20
+    }
   },
 
   "tpm_limit": {
