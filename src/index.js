@@ -93,7 +93,35 @@ function getErrorLogPath() {
   const jc = path.join(__dirname, 'error.jsonc');
   return fs.existsSync(jc) ? jc : j;
 }
-let _errLogCount = 0, _errCleaning = false;
+let _errLogCount = 0, _errCleaning = false, _lastCleanup = 0;
+function _cleanupErrorLog() {
+  if (_errCleaning) return;
+  const ec = cfg.error_log;
+  if (ec?.enabled === false) return;
+  const p = getErrorLogPath();
+  if (!fs.existsSync(p)) return;
+  _errCleaning = true;
+  const days = (ec?.retention_days || 7);
+  const cutoff = Date.now() - days * 86400000;
+  const old = p + '.old';
+  fs.rename(p, old, (err) => {
+    if (err) { _errCleaning = false; return; }
+    fs.readFile(old, 'utf8', (_, c) => {
+      fs.unlink(old, () => {});
+      if (!c) { _errCleaning = false; _lastCleanup = Date.now(); return; }
+      const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
+        try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
+      });
+      if (kept.length > 0) {
+        const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
+        kept.unshift(header);
+        fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[errorLog] cleanup write: ${e2.message}`); _errCleaning = false; _lastCleanup = Date.now(); });
+      } else {
+        _errCleaning = false; _lastCleanup = Date.now();
+      }
+    });
+  });
+}
 function errorLog({ logId, provider, model, key, status, body }) {
   const ec = cfg.error_log;
   if (ec?.enabled === false) return;
@@ -102,29 +130,7 @@ function errorLog({ logId, provider, model, key, status, body }) {
   const entry = JSON.stringify({ ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-', status, error: msg });
   fs.appendFile(p, entry + '\n', (err) => { if (err) elog(`[errorLog] write ${p}: ${err.message}`); });
   _errLogCount = (_errLogCount + 1) % 1000000007;
-  if (_errLogCount % 50 === 1 && !_errCleaning) {
-    _errCleaning = true;
-    const days = (ec?.retention_days || 7);
-    const cutoff = Date.now() - days * 86400000;
-    const old = p + '.old';
-    fs.rename(p, old, (err) => {
-      if (err) { _errCleaning = false; return; }
-      fs.readFile(old, 'utf8', (_, c) => {
-        fs.unlink(old, () => {});
-        if (!c) { _errCleaning = false; return; }
-        const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
-          try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
-        });
-        if (kept.length > 0) {
-          const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
-          kept.unshift(header);
-          fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[errorLog] cleanup write: ${e2.message}`); _errCleaning = false; });
-        } else {
-          _errCleaning = false;
-        }
-      });
-    });
-  }
+  if (_errLogCount % 50 === 1) _cleanupErrorLog();
 }
 
 function getSuccessLogPath() {
@@ -263,7 +269,7 @@ function initProvider(p) {
   if (!keyPool.has(p)) {
     keyPool.set(p, new Map());
     for (const k of (PROVIDER_KEYS[p] || [])) {
-      keyPool.get(p).set(k, { degradedUntil: 0, errorCount: 0, successCount: 0 });
+      keyPool.get(p).set(k, { degradedUntil: 0, errorCount: 0, successCount: 0, lastSuccess: 0, lastLatency: 0 });
     }
   }
 }
@@ -778,7 +784,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             }
 
             releaseKey(provider, usedKey);
-            markKeySuccess(provider, usedKey, (Date.now()-t0)/1000);
+            markKeySuccess(provider, usedKey, Date.now()-t0);
             successLog({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
             log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
@@ -939,7 +945,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     if (clientGone) { if (upstreamRes && !upstreamRes.destroyed) upstreamRes.destroy(); decActive(provider); releaseKey(provider, key); return 'done'; }
     const sc = upstreamRes.statusCode;
     if (sc >= 200 && sc < 300) {
-      decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, (Date.now()-t0)/1000);
+      decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
       successLog({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
       log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
@@ -1108,12 +1114,13 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
-let _token='',_cmInit=false;let cmConfig,cmError;
-function logout(){_token='';if(cmConfig)cmConfig.setValue('');if(cmError)cmError.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
+let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmError;
+function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmError)cmError.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
 function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
-async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
+async function auth(){if(!_token)_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
 if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
-try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){s('驗證失敗：token 不正確',1);return}
+try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){localStorage.removeItem('gw_token');s('驗證失敗：token 不正確',1);return}
+localStorage.setItem('gw_token',_token);
 document.getElementById('header').classList.remove('hidden');
 document.getElementById('login').classList.add('hidden');document.getElementById('editor').classList.remove('hidden');
 if(!_cmInit){_cmInit=true;
@@ -1130,6 +1137,7 @@ function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1
 function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
 function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
 async function waitForServer(){document.getElementById('overlayMsg').textContent='伺服器重啟中，請稍候...';showOverlay();for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();document.getElementById('overlayMsg').textContent='載入中...';toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay();document.getElementById('overlayMsg').textContent='載入中...'}
+if(_token)auth();
 </script></body></html>`;
 
 function checkConsoleAuth(req, res) {
@@ -1172,7 +1180,7 @@ function handleConsoleStatus(req, res, logId) {
   const providers = {};
   for (const [p, m] of keyPool) {
     const vals = [...m.values()];
-    const lastSuccess = vals.reduce((mx, s) => Math.max(mx, s.lastSuccess), 0);
+    const lastSuccess = vals.reduce((mx, s) => Math.max(mx, s.lastSuccess || 0), 0);
     const lat = vals.filter(s => s.lastLatency > 0).map(s => s.lastLatency);
     providers[p] = {
       keys: m.size,
@@ -1300,8 +1308,9 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // --- GET /health — pure liveness, no overhead ---
+  // --- GET /health — liveness; also drives hourly error-log retention cleanup (throttled, fire-and-forget) ---
   if (isHealth && req.method === 'GET') {
+    if (Date.now() - _lastCleanup > 3600 * 1000) _cleanupErrorLog();
     res.writeHead(200, { 'Content-Type' : 'application/json' });
     res.end(JSON.stringify({ status: 'ok', uptime: formatUptime(process.uptime()), active: _activeRequests }));
     return;
