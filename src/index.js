@@ -66,6 +66,17 @@ function _jsonValid(s) {
     catch (e2) { return { ok: false, error: e1.message }; }
   }
 }
+function _ndjsonValid(s) {
+  if (!s) return { ok: true };
+  let lineNo = 0;
+  for (const rawLine of s.split('\n')) {
+    const l = rawLine.trim();
+    if (!l) continue;
+    lineNo++;
+    try { JSON.parse(l); } catch (e) { return { ok: false, error: `line ${lineNo}: ${e.message}` }; }
+  }
+  return { ok: true };
+}
 
 // --- error log file ---
 function _errMsg(body) {
@@ -1200,7 +1211,7 @@ function handleConsoleLoad(req, res, logId) {
   if (!checkConsoleAuth(req, res)) return;
   const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
   const cfgContent = read(CONFIG_PATH), logContent = read(getLogPath());
-  const cfgVal = _jsonValid(cfgContent), logVal = _jsonValid(logContent);
+  const cfgVal = _jsonValid(cfgContent), logVal = _ndjsonValid(logContent);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     config: cfgContent, config_valid: cfgVal.ok, config_error: cfgVal.error || null,
