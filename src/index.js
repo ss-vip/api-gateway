@@ -58,6 +58,14 @@ function parseJsonc(str) {
   const t = clean.trim();
   return t ? JSON.parse(t) : null;
 }
+function _jsonValid(s) {
+  if (!s) return { ok: true };
+  try { JSON.parse(s); return { ok: true }; }
+  catch (e1) {
+    try { return { ok: true, parsed: parseJsonc(s) }; }
+    catch (e2) { return { ok: false, error: e1.message }; }
+  }
+}
 
 // --- error log file ---
 function _errMsg(body) {
@@ -105,12 +113,10 @@ function _cleanupLog(p, cutoffOverride) {
     fs.readFile(old, 'utf8', (_, c) => {
       fs.unlink(old, () => {});
       if (!c) { _logCleaning.delete(p); _lastCleanup = Date.now(); return; }
-      const kept = c.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).filter(l => {
+      const kept = c.split('\n').filter(l => l.trim()).filter(l => {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
       if (kept.length > 0) {
-        const header = '# ' + path.basename(p) + ' — auto-generated, each line is JSON';
-        kept.unshift(header);
         fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[log] cleanup write: ${e2.message}`); _logCleaning.delete(p); _lastCleanup = Date.now(); });
       } else {
         _logCleaning.delete(p); _lastCleanup = Date.now();
@@ -1141,9 +1147,9 @@ const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,l
 cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
 cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConfig.refresh();cmLog.refresh()}
 load();refreshStatus();}catch(e){_token='';hideOverlay();s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
+async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();let msg='已讀取';if(d.config_valid===false)msg+=', config 格式錯誤：'+(d.config_error||'?');if(d.log_valid===false)msg+=', log 格式錯誤：'+(d.log_error||'?');hideOverlay();toast(msg,1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
 function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const lines=_rawLog.split('\\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0}catch{}return 1});cmLog.setValue(out.join('\\n'))}
-async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
+async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();const pCount=Object.keys(d.providers||{}).length;let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers||{}))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';if(!pCount)h+='<tr><td colspan="5" style="color:#888;text-align:center">尚無 provider 資料（尚未有請求或 config 未載入）</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
 const _sp=document.getElementById('statsPanel');if(_sp&&d.success_total!==undefined)_sp.innerHTML='成功 '+d.success_total+' / 失敗 '+(d.error_total||0)+' / 平均延遲 '+(d.avg_latency_ms||'-')+'ms / 錯誤率 '+(d.error_rate||'0%');hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
 async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
 async function clearLog(){_rawLog='';cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
@@ -1193,8 +1199,13 @@ function handleConsoleLoad(req, res, logId) {
   log(`[${logId}] /api/console/load`);
   if (!checkConsoleAuth(req, res)) return;
   const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
+  const cfgContent = read(CONFIG_PATH), logContent = read(getLogPath());
+  const cfgVal = _jsonValid(cfgContent), logVal = _jsonValid(logContent);
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ config: read(CONFIG_PATH), log: read(getLogPath()) }));
+  res.end(JSON.stringify({
+    config: cfgContent, config_valid: cfgVal.ok, config_error: cfgVal.error || null,
+    log: logContent, log_valid: logVal.ok, log_error: logVal.error || null,
+  }));
 }
 
 function handleConsoleStatus(req, res, logId) {
@@ -1234,7 +1245,7 @@ function handleConsoleSave(req, res, body, logId) {
     res.end(JSON.stringify({ error: 'file and content required' }));
     return;
   }
-  if (body.file !== 'config' && body.file !== 'error' && body.file !== 'success') {
+  if (body.file !== 'config' && body.file !== 'log') {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'invalid file type' }));
     return;
@@ -1243,14 +1254,13 @@ function handleConsoleSave(req, res, body, logId) {
   log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
   try {
     if (body.file === 'config') {
-      try { JSON.parse(body.content); } catch {
-        try { parseJsonc(body.content); } catch (e) {
-          res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid config content: ' + e.message }));
-          return;
-        }
+      const v = _jsonValid(body.content);
+      if (!v.ok) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid config content: ' + v.error }));
+        return;
       }
-    } else if ((body.file === 'error' || body.file === 'success') && body.content.trim()) {
+    } else if (body.content.trim()) {
       let lineNo = 0;
       for (const rawLine of body.content.split('\n')) {
         const l = rawLine.trim();
@@ -1258,7 +1268,7 @@ function handleConsoleSave(req, res, body, logId) {
         lineNo++;
         try { JSON.parse(l); } catch (e) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `error log line ${lineNo} is not valid JSON: ${e.message}` }));
+          res.end(JSON.stringify({ error: `log line ${lineNo} is not valid JSON: ${e.message}` }));
           return;
         }
       }
