@@ -1101,24 +1101,24 @@ div[class*=scrollbar-filler],div[class*=gutter-filler]{background:#1e1e1e!import
 </style></head>
 <body>
 <div class="c">
-<div class="header hidden" id="header"><h2>API Gateway Console</h2><button onclick="logout()">登出</button></div>
+<div class="header hidden" id="header"><h2>API Gateway Console</h2><button id="logoutBtn">登出</button></div>
 <div class="login" id="login">
 <h2>API Gateway Console</h2>
 <p>請輸入 Client Token 以管理設定檔</p>
-<input type="password" id="token" placeholder="Client Token" autofocus onkeydown="if(event.key==='Enter')auth()">
-<p><button onclick="auth()">登入</button></p>
+<input type="password" id="token" placeholder="Client Token" autofocus>
+<p><button id="loginBtn">登入</button></p>
 <p class="status" id="loginStatus"></p>
 </div>
 <div class="editor hidden" id="editor">
-<div><h3>Status <button onclick="refreshStatus()" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
+<div><h3>Status <button id="refreshBtn" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
 <div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div>
 <div id="statsPanel" style="font-size:13px;color:#aaa;padding:4px 0"></div></div>
 <div><h3>Config <span style="color:#888;font-weight:400;font-size:13px;margin:0">(儲存後伺服器將自動重啟)</span></h3>
 <textarea id="configText"></textarea>
-<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('config')">儲存 Config</button></div></div>
-<div><h3>Log</h3>
+<div class="btn-bar"><button id="configLoadBtn">讀取</button><button id="configSaveBtn">儲存 Config</button></div></div>
+<div><h3>Log <label style="display:inline-flex;align-items:center;gap:4px;font-weight:400;font-size:13px;margin-left:10px;cursor:pointer"><input type="checkbox" id="filterSuccess" checked> Success</label> <label style="display:inline-flex;align-items:center;gap:4px;font-weight:400;font-size:13px;cursor:pointer"><input type="checkbox" id="filterError" checked> Error</label></h3>
 <textarea id="logText"></textarea>
-<div class="btn-bar"><button onclick="load()">讀取</button><button onclick="save('log')">儲存</button><button class="danger" onclick="clearLog()">清空</button></div></div>
+<div class="btn-bar"><button id="logLoadBtn">讀取</button><button id="logSaveBtn">儲存</button><button class="danger" id="logClearBtn">清空</button></div></div>
 </div>
 </div>
 <div id="toast"></div>
@@ -1126,13 +1126,13 @@ div[class*=scrollbar-filler],div[class*=gutter-filler]{background:#1e1e1e!import
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
-let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmLog;
+let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmLog,_rawLog='';
 if(_token)showOverlay();
-function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
+function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');_rawLog='';document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
 function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
-async function auth(){if(!_token)_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
+async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
 if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
-try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){localStorage.removeItem('gw_token');s('驗證失敗：token 不正確',1);return}
+try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){localStorage.removeItem('gw_token');_token='';hideOverlay();s('驗證失敗：token 不正確',1);return}
 localStorage.setItem('gw_token',_token);
 document.getElementById('header').classList.remove('hidden');
 document.getElementById('login').classList.add('hidden');document.getElementById('editor').classList.remove('hidden');
@@ -1140,18 +1140,30 @@ if(!_cmInit){_cmInit=true;
 const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
 cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
 cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConfig.refresh();cmLog.refresh()}
-load();refreshStatus();}catch(e){s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');cmLog.setValue(d.log||'');hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
+load();refreshStatus();}catch(e){_token='';hideOverlay();s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
+async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();hideOverlay();toast('已讀取',1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
+function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const lines=_rawLog.split('\\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0}catch{}return 1});cmLog.setValue(out.join('\\n'))}
 async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
 const _sp=document.getElementById('statsPanel');if(_sp&&d.success_total!==undefined)_sp.innerHTML='成功 '+d.success_total+' / 失敗 '+(d.error_total||0)+' / 平均延遲 '+(d.avg_latency_ms||'-')+'ms / 錯誤率 '+(d.error_rate||'0%');hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
 async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
-async function clearLog(){cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
+async function clearLog(){_rawLog='';cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
 function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
 function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
 function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
 async function waitForServer(){document.getElementById('overlayMsg').textContent='伺服器重啟中，請稍候...';showOverlay();for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();document.getElementById('overlayMsg').textContent='載入中...';toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay();document.getElementById('overlayMsg').textContent='載入中...'}
-if(_token)auth();
+document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')auth()});
+document.getElementById('loginBtn').addEventListener('click',auth);
+document.getElementById('logoutBtn').addEventListener('click',logout);
+document.getElementById('refreshBtn').addEventListener('click',refreshStatus);
+document.getElementById('configLoadBtn').addEventListener('click',load);
+document.getElementById('configSaveBtn').addEventListener('click',()=>save('config'));
+document.getElementById('logLoadBtn').addEventListener('click',load);
+document.getElementById('logSaveBtn').addEventListener('click',()=>save('log'));
+document.getElementById('logClearBtn').addEventListener('click',clearLog);
+document.getElementById('filterSuccess').addEventListener('change',applyLogFilter);
+document.getElementById('filterError').addEventListener('change',applyLogFilter);
+if(_token){document.getElementById('token').value=_token;auth();}
 </script></body></html>`;
 
 function checkConsoleAuth(req, res) {
