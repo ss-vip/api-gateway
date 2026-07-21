@@ -223,6 +223,7 @@ const   DIRECT_PROVIDERS = {
   perplexity: 'https://api.perplexity.ai', huggingface: 'https://router.huggingface.co',
   // --- Bearer-compatible additions ---
   replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
+  opencode: 'https://opencode.ai/zen/v1',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
@@ -232,7 +233,7 @@ for (const [p, m] of Object.entries(provMeta)) {
 const DIRECT_PATH_PREFIX = {
   'github-models': '/inference', kilo: '/api/gateway',
   groq: '/openai/v1', openrouter: '/api/v1', cohere: '/compatibility/v1',
-  perplexity: '/v1/sonar',
+  perplexity: '/v1/sonar', opencode: '',
 };
 // Overlay config-defined path prefixes (manual providers)
 for (const [p, m] of Object.entries(provMeta)) {

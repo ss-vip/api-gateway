@@ -19,6 +19,7 @@
   "providers": {
     "_note": "只填入有 key 的 provider，未使用的可刪除或留空。支援清單與限制見 README",
     "openai": [""],
+    "opencode": [""],
     "mistral": [""],
     "cerebras": [""],
     "deepseek": [""],
