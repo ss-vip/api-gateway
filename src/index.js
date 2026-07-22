@@ -82,8 +82,9 @@ function _ndjsonValid(s) {
 function _errMsg(body) {
   if (!body) return '-';
   const raw = typeof body === 'string' ? body : body.toString();
-  if (raw.length > 10000) return raw.replace(/\n/g, ' ').slice(0, 10000);
-  const clean = raw.replace(/^\ufeff/, '').trim();
+  const clean = raw.replace(/^\ufeff/, '').trim().replace(/\n/g, ' ');
+  if (/^</i.test(clean)) return 'upstream returned HTML (' + Buffer.byteLength(raw) + ' bytes)';
+  if (clean.length > 2000) return clean.slice(0, 2000) + '... (' + raw.length + ' chars)';
   // Try to extract a clean error message from JSON
   try {
     const p = JSON.parse(clean);
@@ -607,13 +608,13 @@ function validateChatBody(body) {
     if (!msg || typeof msg !== 'object') return `messages[${i}] must be an object`;
     if (typeof msg.role !== 'string' || !msg.role) return `messages[${i}].role is required`;
     if (msg.role === 'assistant') {
-      if ((msg.content === undefined || msg.content === null) && (!msg.tool_calls || !Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0))
+      if ((!msg.content || msg.content === '') && (!msg.tool_calls || !Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0))
         return `messages[${i}].content or tool_calls required for assistant`;
     } else if (msg.role === 'tool') {
       if (!msg.tool_call_id) return `messages[${i}].tool_call_id required`;
-      if (msg.content === undefined || msg.content === null) return `messages[${i}].content is required for tool message`;
+      if (!msg.content && msg.content !== '') return `messages[${i}].content is required for tool message`;
     } else {
-      if (msg.content === undefined || msg.content === null) return `messages[${i}].content is required`;
+      if (!msg.content && msg.content !== '') return `messages[${i}].content is required`;
     }
   }
   return null;
