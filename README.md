@@ -45,7 +45,6 @@ curl http://localhost:3000/v1/chat/completions \
 {
   "models": {
     "openai": [
-      { "provider": "google-ai-studio", "model": "gemini-2.5-flash" },
       { "provider": "mistral",          "model": "mistral-small-latest" },
       { "provider": "cerebras",         "model": "gpt-oss-120b" }
     ]

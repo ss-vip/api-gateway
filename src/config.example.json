@@ -71,8 +71,6 @@
 
   "models": {
     "openai": [
-      { "provider": "google-ai-studio", "model": "gemini-2.0-flash" },
-      { "provider": "google-ai-studio", "model": "gemini-2.5-flash" },
       { "provider": "mistral", "model": "mistral-large-latest" },
       { "provider": "cerebras", "model": "llama3.1-70b" },
       { "provider": "deepseek", "model": "deepseek-chat" },

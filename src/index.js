@@ -179,7 +179,8 @@ if (CONFIG_PATH) {
     elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
   }
 } else {
-  elog(`[config] no config.json or config.jsonc found in ${__dirname} or ${process.cwd()}`);
+  elog(`[config] no config.json or config.jsonc found in ${__dirname} or ${process.cwd()} — exiting`);
+  process.exit(1);
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
@@ -252,6 +253,7 @@ const PROVIDER_BANNED_FIELDS = {
 };
 const PROVIDER_MAX_TOKENS = { groq: 8192 };
 
+// Env vars REPLACE (not append) config keys for the same provider.
 for (const [ev, p] of Object.entries(ENV_MAP)) {
   const v = process.env[ev];
   if (v) PROVIDER_KEYS[p] = v.split(',').map(s => s.trim()).filter(Boolean);
@@ -382,6 +384,7 @@ function releaseKey(p, key) {
 // --- low-level helpers ---
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const logKey = (k) => k ? `...${k.slice(-4)}` : '-';
+const _safeSlice = (str, len) => { const s = String(str).slice(0, len); const lc = s.charCodeAt(s.length - 1); return (lc >= 0xD800 && lc <= 0xDFFF) ? s.slice(0, -1) : s; };
 
 let _ridSeq = 0;
 function rid() {
@@ -429,7 +432,6 @@ const PROVIDER_RPM = {
   groq: 30,             // free tier: 30 RPM (org-level, per-model)
   cerebras: 5,          // free tier: 5 RPM (gpt-oss-120b), others up to 30
   deepseek: 30,         // conservative; actual: concurrency-based (500/2500)
-  'workers-ai': 30,     // 10K neurons/day — soft limit
   'agnes-ai': 20,       // 20 RPM
   'sea-lion': 10,       // 10 RPM per user
   'kilo': 3,            // free :free models 200/hr/IP (~3.3/min); paid models have no gateway limit — raise via config rate_limit if only using paid
@@ -455,11 +457,7 @@ for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   }
 }
 const _keyLastUsed = new Map(); // provider → Map(key → last timestamp)
-let _rlDate = new Date().toDateString();
-function _rlMaybeReset() {
-  const today = new Date().toDateString();
-  if (today !== _rlDate) { _rlDate = today; _keyLastUsed.clear(); }
-}
+function _rlMaybeReset() {}
 async function waitRateLimit(provider, key) {
   _rlMaybeReset();
   const interval = RATE_LIMITS.get(provider);
@@ -487,7 +485,13 @@ function isRateLimited(provider) {
 }
 const TPM_LIMITS = new Map(Object.entries(cfg.tpm_limit || {}).map(([k, v]) => [k, v]));
 const _tpmLog = new Map(); // provider → Map(key → [{ts, tokens}])
-function _tpmClean(entries) { const cutoff = Date.now() - 60000; let i = 0, removed = 0; while (i < entries.length && entries[i].ts < cutoff) { removed += entries[i].tokens; i++; } if (i > 0) entries.splice(0, i); if (entries.length > 1000) { const excess = entries.length - 1000; for (let j = 0; j < excess; j++) removed += entries[j].tokens; entries.splice(0, excess); } return removed; }
+function _tpmClean(entries) {
+  const cutoff = Date.now() - 60000; let i = 0;
+  while (i < entries.length && entries[i].ts < cutoff) i++;
+  if (i > 0) entries.splice(0, i);
+  if (entries.length > 1000) entries.splice(0, entries.length - 1000);
+}
+function _tpmSum(entries) { return entries.reduce((s, e) => s + e.tokens, 0); }
 async function waitTpmLimit(provider, key, tokens) {
   const limit = TPM_LIMITS.get(provider);
   if (!limit || !tokens) return;
@@ -495,21 +499,21 @@ async function waitTpmLimit(provider, key, tokens) {
   const byProv = _tpmLog.get(provider);
   if (!byProv.has(key)) byProv.set(key, []);
   const entries = byProv.get(key);
-  let sum = entries.reduce((s, e) => s + e.tokens, 0);
-  sum -= _tpmClean(entries);
+  _tpmClean(entries);
+  let sum = _tpmSum(entries);
   while (sum + tokens > limit) {
     if (!entries.length) break;
     const wait = entries[0].ts + 60000 - Date.now() + 50;
-    if (wait <= 0) { sum -= _tpmClean(entries); continue; }
+    if (wait <= 0) { _tpmClean(entries); sum = _tpmSum(entries); continue; }
     await new Promise(r => setTimeout(r, wait));
-    sum -= _tpmClean(entries);
+    _tpmClean(entries); sum = _tpmSum(entries);
   }
   entries.push({ ts: Date.now(), tokens });
 }
 function getAliasLimit(alias) {
   const t = resolveModel(alias)?.[0];
   if (!t) return 999999;
-  const aliasProv = ({ 'workers-ai': 'cloudflare-workers-ai' })[t.provider] || t.provider;
+  const aliasProv = t.provider;
   const key = `${aliasProv}/${t.model || alias}`.toLowerCase();
   return USER_MODEL_LIMITS.get(key) || PROVIDER_DEFAULT_LIMITS[t.provider] || 999999;
 }
@@ -665,9 +669,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return true;
   });
   if (activeTargets.length === 0) {
-    log(`[${logId}] ← 400  no keys for ${clientModel}`);
+    log(`[${logId}] ← 400  no keys for ${clientModel || '(no model)'}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: `no keys available for model '${clientModel}'`, type: 'no_keys' } }));
+    res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
     return;
   }
 
@@ -733,12 +737,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
           continue;
         }
-        const tpmLimit = TPM_LIMITS.get(provider);
-        if (tpmLimit && totalEst > tpmLimit) {
-          log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${totalEst} > TPM=${tpmLimit})`);
-          transientSkipped = true;
-          continue;
-        }
         if (isRateLimited(provider)) {
           log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`);
           transientSkipped = true;
@@ -802,7 +800,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               markKeyError(provider, usedKey);
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
-              log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${body.slice(0, 100)}`);
+              log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
@@ -833,7 +831,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 
   if (!upstreamRes || !usedProvider) {
-    const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0, 300) : JSON.stringify(lastErr.body).slice(0, 300)) : 'no upstream';
+    const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
     const errCode = lastErr?.status || 502;
     log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
     logEvent({ logId, provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
@@ -867,11 +865,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); committed = true; } catch {} }
         : (c) => { try { res.write(c); committed = true; } catch {} };
       try {
+        let sseDone = false;
+        const _sseDec = () => { if (!sseDone) { sseDone = true; decActive(sseProvider); } };
         await new Promise((resolve, reject) => {
           sseUpstream.on('data', pipe);
-          sseUpstream.on('end', () => { decActive(sseProvider); resolve(); });
-          sseUpstream.on('error', (e) => { decActive(sseProvider); reject(e); });
-          const onClose = () => { res.removeListener('close', onClose); if (res.writableEnded) return; if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); decActive(sseProvider); resolve(); };
+          sseUpstream.on('end', () => { _sseDec(); resolve(); });
+          sseUpstream.on('error', (e) => { _sseDec(); reject(e); });
+          const onClose = () => { res.removeListener('close', onClose); if (res.writableEnded) return; if (!sig.aborted) ac.abort(); if (sseUpstream && !sseUpstream.destroyed) sseUpstream.destroy(); _sseDec(); resolve(); };
           res.on('close', onClose);
         });
         break; // stream ended cleanly
@@ -886,6 +886,8 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         // Try next target
         const t = sseRetryTargets.shift();
         if (skippedProviders.has(t.provider)) continue;
+        if (isRateLimited(t.provider)) continue;
+        if ((_providerActive.get(t.provider) || 0) >= PROVIDER_MAX_CONCURRENT) continue;
         sseProvider = t.provider;
         sseModel = t.upstreamModel;
         const nk = await selectKey(sseProvider);
@@ -938,11 +940,11 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     }
   }
 
-  const clientModel = bodyJson?.model || 'unknown';
-  let targets = resolveModel(clientModel);
+  const clientModel = jsonBody !== false ? (bodyJson?.model || '') : '';
+  let targets = clientModel ? resolveModel(clientModel) : null;
   if (!targets) {
-    targets = [{ provider: 'openai', upstreamModel: clientModel }];
-    log(`[${logId}] ◆ ${clientModel}  ${endpointPath}  (default openai)`);
+    targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
+    log(`[${logId}] ◆ ${clientModel || '(raw body)'} ${endpointPath}  (→ openai)`);
   } else {
     log(`[${logId}] ◆ ${clientModel}  ${endpointPath}`);
   }
@@ -953,7 +955,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     return true;
   });
   if (activeTargets.length === 0) {
-    log(`[${logId}] ← 400  no keys for ${clientModel}`);
+    log(`[${logId}] ← 400  no keys for ${clientModel || '(no model)'}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
     return;
@@ -984,7 +986,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     }
     decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
     const body = await collectBody(upstreamRes);
-    log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${body.slice(0,100)}`);
+    log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
     if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
@@ -1001,7 +1003,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     }
     retryRound++;
     transientSkipped = false;
-    for (const target of activeTargets) {
+    const rotatedTargets = rotateTargets(activeTargets, clientModel);
+    for (const target of rotatedTargets) {
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
       const directBase = DIRECT_PROVIDERS[provider];
@@ -1016,8 +1019,6 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       if (proxyEst > pCtx) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
       if (isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); transientSkipped = true; continue; }
-      const tpmLimit = TPM_LIMITS.get(provider);
-      if (tpmLimit && proxyEst > tpmLimit) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (total=${proxyEst} > TPM=${tpmLimit})`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
       if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
       if (lastErr) await sleep(Math.random() * 300);
@@ -1058,132 +1059,13 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   const errCode = lastErr?.status || 502;
   log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-  logEvent({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: (lastErr?.body || '').slice(0,200) });
+  logEvent({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: _safeSlice(lastErr?.body || '', 200) });
   res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
 
 // --- console management page & API ---
-const CONSOLE_HTML = `<!DOCTYPE html>
-<html lang="zh-TW">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>API Gateway Console</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/dracula.min.css">
-<style>
-*{margin:0;box-sizing:border-box}
-body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px}
-.c{max-width:1000px;margin:0 auto}
-.header{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #333;margin-bottom:20px}
-.header h2{font-size:20px}
-.header button{padding:6px 16px;border-radius:6px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer;font-size:13px}
-.header button:hover{background:#333}
-.login{text-align:center;padding:60px 20px}
-.login h2{font-size:24px;margin-bottom:8px}
-.login p{margin:12px 0 24px;color:#888}
-.login input{padding:10px 14px;width:300px;font-size:16px;border-radius:6px;border:1px solid #333;background:#16213e;color:#eee;outline:none}
-.login input:focus{border-color:#0f3460}
-.login button,.editor button{padding:10px 24px;font-size:16px;border-radius:6px;border:none;cursor:pointer}
-.login button{background:#0f3460;color:#fff}
-.login button:hover{background:#1a5276}
-.hidden{display:none}
-.editor{margin-top:0}
-.editor h3{margin:20px 0 8px;display:flex;align-items:center;gap:12px;font-size:16px}
-.editor .btn-bar{display:flex;gap:8px;margin-top:8px}
-.editor button{background:#0f3460;color:#fff}
-.editor button:hover{background:#1a5276}
-.editor button.danger{background:#6c2020}
-.editor button.danger:hover{background:#8a2a2a}
-.status{font-size:14px;margin-top:16px;color:#888}
-.toast{position:fixed;bottom:24px;right:24px;padding:12px 24px;border-radius:8px;color:#fff;z-index:999;transition:opacity .3s;font-size:14px}
-.toast.ok{background:#27ae60}
-.toast.err{background:#e74c3c}
-.CodeMirror{min-height:200px;resize:both;overflow:hidden;font-size:13px;border-radius:6px;border:1px solid #333}
-.CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
-.CodeMirror-cursor{border-color:#eee}
-.CodeMirror pre{font-family:Consolas,'Courier New',monospace}
-.st{width:100%;border-collapse:collapse;font-size:13px;margin:4px 0}
-.st th,.st td{text-align:left;padding:3px 8px;border-bottom:1px solid #333}
-.st th{color:#888;font-weight:400}
-.degraded{color:#e74c3c;font-weight:700}
-.st-info{color:#888;font-size:12px;margin-top:4px}
-div[class*=scrollbar]{background:#1e1e1e!important}
-div[class*=scrollbar-inner]{background:#555!important;border-radius:4px!important}
-div[class*=scrollbar-filler],div[class*=gutter-filler]{background:#1e1e1e!important}
-::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-track{background:#1e1e1e}
-::-webkit-scrollbar-thumb{background:#555;border-radius:4px}
-.overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.overlay.hidden{display:none}
-.overlay .spinner{width:40px;height:40px;border:4px solid #444;border-top-color:#0f3460;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.overlay p{margin-top:16px;color:#aaa;font-size:14px}
-</style></head>
-<body>
-<div class="c">
-<div class="header hidden" id="header"><h2>API Gateway Console</h2><button id="logoutBtn">登出</button></div>
-<div class="login" id="login">
-<h2>API Gateway Console</h2>
-<p>請輸入 Client Token 以管理設定檔</p>
-<input type="password" id="token" placeholder="Client Token" autofocus>
-<p><button id="loginBtn">登入</button></p>
-<p class="status" id="loginStatus"></p>
-</div>
-<div class="editor hidden" id="editor">
-<div><h3>Status <button id="refreshBtn" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
-<div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div>
-<div id="statsPanel" style="font-size:13px;color:#aaa;padding:4px 0"></div></div>
-<div><h3>Config <span style="color:#888;font-weight:400;font-size:13px;margin:0">(儲存後伺服器將自動重啟)</span></h3>
-<textarea id="configText"></textarea>
-<div class="btn-bar"><button id="configLoadBtn">讀取</button><button id="configSaveBtn">儲存 Config</button></div></div>
-<div><h3>Log <label style="display:inline-flex;align-items:center;gap:4px;font-weight:400;font-size:13px;margin-left:10px;cursor:pointer"><input type="checkbox" id="filterSuccess" checked> Success</label> <label style="display:inline-flex;align-items:center;gap:4px;font-weight:400;font-size:13px;cursor:pointer"><input type="checkbox" id="filterError" checked> Error</label></h3>
-<textarea id="logText"></textarea>
-<div class="btn-bar"><button id="logLoadBtn">讀取</button><button id="logSaveBtn">儲存</button><button class="danger" id="logClearBtn">清空</button></div></div>
-</div>
-</div>
-<div id="toast"></div>
-<div class="overlay hidden" id="overlay"><div class="spinner"></div><p id="overlayMsg">載入中...</p></div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
-<script>
-let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmLog,_rawLog='';
-if(_token)showOverlay();
-function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');_rawLog='';document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
-function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
-async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
-if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
-try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){localStorage.removeItem('gw_token');_token='';hideOverlay();s('驗證失敗：token 不正確',1);return}
-localStorage.setItem('gw_token',_token);
-document.getElementById('header').classList.remove('hidden');
-document.getElementById('login').classList.add('hidden');document.getElementById('editor').classList.remove('hidden');
-if(!_cmInit){_cmInit=true;
-const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
-cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
-cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConfig.refresh();cmLog.refresh()}
-load();refreshStatus();}catch(e){_token='';hideOverlay();s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();let msg='已讀取';if(d.config_valid===false)msg+=', config 格式錯誤：'+(d.config_error||'?');if(d.log_valid===false)msg+=', log 格式錯誤：'+(d.log_error||'?');hideOverlay();toast(msg,1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
-function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const lines=_rawLog.split('\\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0}catch{}return 1});cmLog.setValue(out.join('\\n'))}
-async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();const pCount=Object.keys(d.providers||{}).length;let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers||{}))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';if(!pCount)h+='<tr><td colspan="5" style="color:#888;text-align:center">尚無 provider 資料（尚未有請求或 config 未載入）</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
-const _sp=document.getElementById('statsPanel');if(_sp&&d.success_total!==undefined)_sp.innerHTML='成功 '+d.success_total+' / 失敗 '+(d.error_total||0)+' / 平均延遲 '+(d.avg_latency_ms||'-')+'ms / 錯誤率 '+(d.error_rate||'0%');hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
-async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
-async function clearLog(){_rawLog='';cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
-function s(m,e){document.getElementById('loginStatus').textContent=m}
-function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
-function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
-function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
-async function waitForServer(){document.getElementById('overlayMsg').textContent='伺服器重啟中，請稍候...';showOverlay();for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();document.getElementById('overlayMsg').textContent='載入中...';toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay();document.getElementById('overlayMsg').textContent='載入中...'}
-document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')auth()});
-document.getElementById('loginBtn').addEventListener('click',auth);
-document.getElementById('logoutBtn').addEventListener('click',logout);
-document.getElementById('refreshBtn').addEventListener('click',refreshStatus);
-document.getElementById('configLoadBtn').addEventListener('click',load);
-document.getElementById('configSaveBtn').addEventListener('click',()=>save('config'));
-document.getElementById('logLoadBtn').addEventListener('click',load);
-document.getElementById('logSaveBtn').addEventListener('click',()=>save('log'));
-document.getElementById('logClearBtn').addEventListener('click',clearLog);
-document.getElementById('filterSuccess').addEventListener('change',applyLogFilter);
-document.getElementById('filterError').addEventListener('change',applyLogFilter);
-if(_token){document.getElementById('token').value=_token;auth();}
-</script></body></html>`;
+const CONSOLE_HTML = fs.readFileSync(path.join(__dirname, 'console.html'), 'utf-8');
 
 function checkConsoleAuth(req, res) {
   if (!CLIENT_TOKEN) return true;
