@@ -14,8 +14,8 @@ const _ts = () => {
   const p = (v) => String(v).padStart(2, '0');
   return `${n.getFullYear()}-${p(n.getMonth()+1)}-${p(n.getDate())} ${p(n.getHours())}:${p(n.getMinutes())}:${p(n.getSeconds())}`;
 };
-function log(...a) { console.log(a[0]==='─' ? '─'.repeat(60) : `[${_ts()}]`, ...a); }
-function elog(...a) { console.error(a[0]==='─' ? '─'.repeat(60) : `[${_ts()}]`, ...a); }
+function log(...a) { a[0]==='─' ? console.log('─'.repeat(60)) : console.log(`[${_ts()}]`, ...a); }
+function elog(...a) { a[0]==='─' ? console.error('─'.repeat(60)) : console.error(`[${_ts()}]`, ...a); }
 
 // --- JSONC parser (strip comments + trailing commas before JSON.parse) ---
 function parseJsonc(str) {
@@ -623,6 +623,7 @@ function validateChatBody(body) {
 
 async function handleChatCompletion(req, res, bodyJson, logId) {
   const t0 = Date.now();
+  log('─');
   const validationErr = validateChatBody(bodyJson);
   if (validationErr) {
     log(`[${logId}] ← 400  ${validationErr}`);
@@ -927,6 +928,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
 async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, contentType) {
   const t0 = Date.now();
+  log('─');
   if (jsonBody !== false) {
     if (!bodyJson || typeof bodyJson !== 'object') {
       log(`[${logId}] ← 400  invalid request body`);
@@ -1079,14 +1081,14 @@ function serveConsolePage(res) {
 }
 
 function handleConsoleValidate(req, res, body, logId) {
-  log(`[${logId}] /api/console/validate`);
+  log('─'); log(`[${logId}] /api/console/validate`);
   if (!checkConsoleAuth(req, res)) return;
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ok: true }));
 }
 
 function handleConsoleLoad(req, res, logId) {
-  log(`[${logId}] /api/console/load`);
+  log('─'); log(`[${logId}] /api/console/load`);
   if (!checkConsoleAuth(req, res)) return;
   const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
   const cfgContent = read(CONFIG_PATH), logContent = read(getLogPath());
@@ -1099,7 +1101,7 @@ function handleConsoleLoad(req, res, logId) {
 }
 
 function handleConsoleStatus(req, res, logId) {
-  log(`[${logId}] /api/console/status`);
+  log('─'); log(`[${logId}] /api/console/status`);
   if (!checkConsoleAuth(req, res)) return;
   const mem = process.memoryUsage();
   const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
@@ -1128,7 +1130,7 @@ function handleConsoleStatus(req, res, logId) {
 }
 
 function handleConsoleSave(req, res, body, logId) {
-  log(`[${logId}] /api/console/save`);
+  log('─'); log(`[${logId}] /api/console/save`);
   if (!checkConsoleAuth(req, res)) return;
   if (!body || !body.file || body.content === undefined) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -1197,7 +1199,6 @@ const server = http.createServer((req, res) => {
   const logId = rid();
   _activeRequests++;
   _memGuard();
-  log('─');
   req.on('error', () => {});
   res.on('error', () => {});
 

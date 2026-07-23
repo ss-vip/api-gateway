@@ -1,111 +1,90 @@
 <!DOCTYPE html>
-<html lang="zh-TW">
+<html lang="zh-TW" data-bs-theme="dark">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>API Gateway Console</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/dracula.min.css">
 <style>
-*{margin:0;box-sizing:border-box}
-body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px}
-.c{max-width:1000px;margin:0 auto}
-.header{display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid #333;margin-bottom:20px}
-.header h2{font-size:20px}
-.header button{padding:6px 16px;border-radius:6px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer;font-size:13px}
-.header button:hover{background:#333}
-.login{text-align:center;padding:60px 20px}
-.login h2{font-size:24px;margin-bottom:8px}
-.login p{margin:12px 0 24px;color:#888}
-.login input{padding:10px 14px;width:300px;font-size:16px;border-radius:6px;border:1px solid #333;background:#16213e;color:#eee;outline:none;max-width:100%}
-.login input:focus{border-color:#0f3460}
-.login button,.editor button{padding:10px 24px;font-size:16px;border-radius:6px;border:none;cursor:pointer}
-.login button{background:#0f3460;color:#fff}
-.login button:hover{background:#1a5276}
-.hidden{display:none}
-.editor{margin-top:0}
-.editor hr{border:none;border-top:1px solid #333;margin:5px 0}
-.editor h3{margin:12px 0 8px;display:flex;align-items:center;gap:8px;font-size:16px;flex-wrap:wrap}
-.editor .btn-bar{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
-.editor button{background:#0f3460;color:#fff}
-.editor button:hover{background:#1a5276}
-.editor button.danger{background:#6c2020}
-.editor button.danger:hover{background:#8a2a2a}
-.editor .f-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.editor .f-row label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;font-size:13px}
-.editor .f-row input[type=date]{font-size:12px;padding:2px 6px;border-radius:4px;border:1px solid #555;background:#16213e;color:#eee;outline:none}
-.editor .f-row button{font-size:12px;padding:2px 10px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer}
-.editor .f-row button:hover{background:#333}
-.status{font-size:14px;margin-top:16px;color:#888}
-.toast{position:fixed;bottom:24px;right:24px;padding:12px 24px;border-radius:8px;color:#fff;z-index:999;transition:opacity .3s;font-size:14px}
-.toast.ok{background:#27ae60}
-.toast.err{background:#e74c3c}
-.CodeMirror{min-height:200px;resize:both;overflow:hidden;font-size:13px;border-radius:6px;border:1px solid #333}
-.CodeMirror-gutters{background:#16213e;border-right:1px solid #333}
-.CodeMirror-cursor{border-color:#eee}
+.CodeMirror{min-height:200px;resize:both;overflow:hidden;font-size:13px;border-radius:6px;border:1px solid var(--bs-border-color)}
+.CodeMirror-gutters{background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}
+.CodeMirror-cursor{border-color:var(--bs-body-color)}
 .CodeMirror pre{font-family:Consolas,'Courier New',monospace}
-.st{width:100%;border-collapse:collapse;font-size:13px;margin:4px 0}
-.st th,.st td{text-align:left;padding:3px 8px;border-bottom:1px solid #333}
-.st th{color:#888;font-weight:400}
-.degraded{color:#e74c3c;font-weight:700}
-.st-info{color:#888;font-size:12px;margin-top:4px}
-div[class*=scrollbar]{background:#1e1e1e!important}
-div[class*=scrollbar-inner]{background:#555!important;border-radius:4px!important}
-div[class*=scrollbar-filler],div[class*=gutter-filler]{background:#1e1e1e!important}
+div[class*=scrollbar]{background:var(--bs-body-bg)!important}
+div[class*=scrollbar-inner]{background:var(--bs-secondary-bg)!important;border-radius:4px!important}
+div[class*=scrollbar-filler],div[class*=gutter-filler]{background:var(--bs-body-bg)!important}
 ::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-track{background:#1e1e1e}
-::-webkit-scrollbar-thumb{background:#555;border-radius:4px}
-.overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:1000;display:flex;flex-direction:column;align-items:center;justify-content:center}
-.overlay.hidden{display:none}
-.overlay .spinner{width:40px;height:40px;border:4px solid #444;border-top-color:#0f3460;border-radius:50%;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.overlay p{margin-top:16px;color:#aaa;font-size:14px}
+::-webkit-scrollbar-track{background:var(--bs-body-bg)}
+::-webkit-scrollbar-thumb{background:var(--bs-secondary-bg);border-radius:4px}
 </style></head>
 <body>
-<div class="c">
-<div class="header hidden" id="header"><h2>API Gateway Console</h2><button id="logoutBtn">登出</button></div>
-<div class="login" id="login">
-<h2>API Gateway Console</h2>
-<p>請輸入 Client Token 以管理設定檔</p>
-<input type="password" id="token" placeholder="Client Token" autofocus>
-<p><button id="loginBtn">登入</button></p>
-<p class="status" id="loginStatus"></p>
+<div class="container py-3">
+<nav class="d-none d-flex justify-content-between align-items-center py-2 border-bottom mb-4" id="header">
+<h2 class="fs-5 m-0">API Gateway Console</h2>
+<div class="d-flex gap-2">
+<button class="btn btn-outline-secondary btn-sm px-2" id="themeBtn" title="切換明暗">🌙</button>
+<button class="btn btn-outline-secondary btn-sm" id="logoutBtn">登出</button>
 </div>
-<div class="editor hidden" id="editor">
-<div><h3>Status <button id="refreshBtn" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
-<div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div>
-<div id="statsPanel" style="font-size:13px;color:#aaa;padding:4px 0"></div></div>
-<hr>
-<div><h3>Config <span style="color:#888;font-weight:400;font-size:13px;margin:0">(儲存後伺服器將自動重啟)</span></h3>
+</nav>
+<div class="row justify-content-center" id="login">
+<div class="col-12 col-sm-8 col-md-5 col-lg-4">
+<div class="card shadow-sm">
+<div class="card-body text-center p-4">
+<h2 class="card-title fs-4 mb-2">API Gateway Console</h2>
+<p class="text-secondary mb-4">請輸入 Client Token 以管理設定檔</p>
+<input type="password" class="form-control mb-3" id="token" placeholder="Client Token" autofocus>
+<button class="btn btn-primary w-100 mb-3" id="loginBtn">登入</button>
+<p class="text-secondary small mb-0" id="loginStatus"></p>
+</div>
+</div>
+</div>
+</div>
+<div class="d-none" id="editor">
+<div class="mb-4">
+<h3 class="fs-6 d-flex align-items-center gap-2 flex-wrap mb-2">Status <button class="btn btn-outline-secondary btn-sm" id="refreshBtn">更新</button></h3>
+<div id="statusPanel" class="text-secondary small py-1">載入中...</div>
+<div id="statsPanel" class="text-secondary small py-1"></div>
+</div>
+<hr class="my-3">
+<div class="mb-4">
+<h3 class="fs-6 mb-2">Config <span class="text-secondary fw-normal small">(儲存後伺服器將自動重啟)</span></h3>
 <textarea id="configText"></textarea>
-<div class="btn-bar"><button id="configLoadBtn">讀取</button><button id="configSaveBtn">儲存 Config</button></div></div>
-<hr>
-<div><h3>Log</h3>
-<div class="f-row">
-<label><input type="checkbox" id="filterSuccess" checked> Success</label>
-<label><input type="checkbox" id="filterError" checked> Error</label>
-<span>日期</span>
-<input type="date" id="filterDateFrom">
-<span>~</span>
-<input type="date" id="filterDateTo">
-<button id="filterTodayBtn">今天</button>
+<div class="d-flex gap-2 flex-wrap mt-2"><button class="btn btn-primary btn-sm" id="configLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="configSaveBtn">儲存 Config</button></div>
+</div>
+<hr class="my-3">
+<div class="mb-4">
+<h3 class="fs-6 mb-2">Log</h3>
+<div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+<div class="form-check form-check-inline mb-0"><input class="form-check-input" type="checkbox" id="filterSuccess" checked><label class="form-check-label small" for="filterSuccess">Success</label></div>
+<div class="form-check form-check-inline mb-0"><input class="form-check-input" type="checkbox" id="filterError" checked><label class="form-check-label small" for="filterError">Error</label></div>
+<span class="small text-secondary">日期</span>
+<input type="date" class="form-control form-control-sm" id="filterDateFrom" style="width:auto">
+<span class="small text-secondary">~</span>
+<input type="date" class="form-control form-control-sm" id="filterDateTo" style="width:auto">
+<button class="btn btn-outline-secondary btn-sm" id="filterTodayBtn">今天</button>
+<button class="btn btn-outline-secondary btn-sm" id="filterAllBtn">全部</button>
 </div>
 <textarea id="logText"></textarea>
-<div class="btn-bar"><button id="logLoadBtn">讀取</button><button id="logSaveBtn">儲存</button><button class="danger" id="logClearBtn">清空</button></div></div>
+<div class="d-flex gap-2 flex-wrap mt-2"><button class="btn btn-primary btn-sm" id="logLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="logSaveBtn">儲存</button><button class="btn btn-danger btn-sm" id="logClearBtn">清空</button></div>
 </div>
 </div>
-<div id="toast"></div>
-<div class="overlay hidden" id="overlay"><div class="spinner"></div><p id="overlayMsg">載入中...</p></div>
+</div>
+<div class="toast-container position-fixed bottom-0 end-0 p-3" id="toast"></div>
+<div class="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center d-none" style="background:rgba(0,0,0,.6);z-index:1050" id="overlay"><div class="spinner-border text-primary" role="status"></div><p class="mt-3 text-secondary" id="overlayMsg">載入中...</p></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
 let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmLog,_rawLog='';
+(function(){const t=localStorage.getItem('bsTheme');if(t){document.documentElement.setAttribute('data-bs-theme',t);const b=document.getElementById('themeBtn');if(b)b.textContent=t==='dark'?'🌙':'☀️'}})();
 if(_token)showOverlay();
-function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');_rawLog='';document.getElementById('login').classList.remove('hidden');document.getElementById('editor').classList.add('hidden');document.getElementById('header').classList.add('hidden');document.getElementById('token').value='';s('',0)}
+function toggleTheme(){const h=document.documentElement;const t=h.getAttribute('data-bs-theme')==='dark'?'light':'dark';h.setAttribute('data-bs-theme',t);localStorage.setItem('bsTheme',t);document.getElementById('themeBtn').textContent=t==='dark'?'🌙':'☀️'}
+function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');_rawLog='';document.getElementById('login').classList.remove('d-none');document.getElementById('editor').classList.add('d-none');document.getElementById('header').classList.add('d-none');document.getElementById('token').value='';s('',0)}
 function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
 async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
 if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
 try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){localStorage.removeItem('gw_token');_token='';hideOverlay();s('驗證失敗：token 不正確',1);return}
 localStorage.setItem('gw_token',_token);
-document.getElementById('header').classList.remove('hidden');
-document.getElementById('login').classList.add('hidden');document.getElementById('editor').classList.remove('hidden');
+document.getElementById('header').classList.remove('d-none');
+document.getElementById('login').classList.add('d-none');document.getElementById('editor').classList.remove('d-none');
 if(!_cmInit){_cmInit=true;
 const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
 cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
@@ -113,15 +92,16 @@ cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConf
 load();refreshStatus();}catch(e){_token='';hideOverlay();s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
 async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();let msg='已讀取';if(d.config_valid===false)msg+=', config 格式錯誤：'+(d.config_error||'?');if(d.log_valid===false)msg+=', log 格式錯誤：'+(d.log_error||'?');hideOverlay();toast(msg,1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
 function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const df=document.getElementById('filterDateFrom').value,dt=document.getElementById('filterDateTo').value;const lines=_rawLog.split('\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0;if(df||dt){const d=(o.ts||'').slice(0,10);if(df&&d<df)return 0;if(dt&&d>dt)return 0}}catch{}return 1});cmLog.setValue(out.join('\n'))}
-async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();const pCount=Object.keys(d.providers||{}).length;let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers||{}))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';if(!pCount)h+='<tr><td colspan="5" style="color:#888;text-align:center">尚無 provider 資料（尚未有請求或 config 未載入）</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
+async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();const pCount=Object.keys(d.providers||{}).length;let h='<div class="table-responsive"><table class="table table-sm table-borderless table-hover table-striped align-middle mb-1"><thead><tr class="text-secondary small"><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr></thead><tbody>';for(const[p,v]of Object.entries(d.providers||{}))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td class="'+(v.degraded?'text-danger fw-bold':'')+'">'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';if(!pCount)h+='<tr><td colspan="5" class="text-secondary text-center py-3">尚無 provider 資料（尚未有請求或 config 未載入）</td></tr>';h+='</tbody></table></div><div class="text-secondary small">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
 const _sp=document.getElementById('statsPanel');if(_sp&&d.success_total!==undefined)_sp.innerHTML='成功 '+d.success_total+' / 失敗 '+(d.error_total||0)+' / 平均延遲 '+(d.avg_latency_ms||'-')+'ms / 錯誤率 '+(d.error_rate||'0%');hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
 async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
 async function clearLog(){_rawLog='';cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
-function toast(m,ok){const t=document.getElementById('toast');t.style.opacity='1';t.textContent=m;t.className='toast '+(ok?'ok':'err');clearTimeout(t._t);t._t=setTimeout(()=>t.style.opacity='0',4000)}
-function showOverlay(){document.getElementById('overlay').classList.remove('hidden')}
-function hideOverlay(){document.getElementById('overlay').classList.add('hidden')}
+function toast(m,ok){const t=document.getElementById('toast');const e=document.createElement('div');e.className='toast align-items-center text-bg-'+(ok?'success':'danger')+' border-0 show';e.innerHTML='<div class="d-flex"><div class="toast-body">'+m+'</div></div>';t.appendChild(e);setTimeout(()=>{e.classList.remove('show');setTimeout(()=>e.remove(),300)},4000)}
+function showOverlay(){document.getElementById('overlay').classList.remove('d-none')}
+function hideOverlay(){document.getElementById('overlay').classList.add('d-none')}
 async function waitForServer(){document.getElementById('overlayMsg').textContent='伺服器重啟中，請稍候...';showOverlay();for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();document.getElementById('overlayMsg').textContent='載入中...';toast('伺服器已重新啟動',1);return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay();document.getElementById('overlayMsg').textContent='載入中...'}
+document.getElementById('themeBtn').addEventListener('click',toggleTheme);
 document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')auth()});
 document.getElementById('loginBtn').addEventListener('click',auth);
 document.getElementById('logoutBtn').addEventListener('click',logout);
@@ -136,5 +116,6 @@ document.getElementById('filterError').addEventListener('change',applyLogFilter)
 document.getElementById('filterDateFrom').addEventListener('change',applyLogFilter);
 document.getElementById('filterDateTo').addEventListener('change',applyLogFilter);
 document.getElementById('filterTodayBtn').addEventListener('click',()=>{const t=new Date();const d=t.getFullYear()+'-'+String(t.getMonth()+1).padStart(2,'0')+'-'+String(t.getDate()).padStart(2,'0');document.getElementById('filterDateFrom').value=d;document.getElementById('filterDateTo').value=d;applyLogFilter()});
+document.getElementById('filterAllBtn').addEventListener('click',()=>{document.getElementById('filterDateFrom').value='';document.getElementById('filterDateTo').value='';applyLogFilter()});
 if(_token){document.getElementById('token').value=_token;auth();}
 </script></body></html>
