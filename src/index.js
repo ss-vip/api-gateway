@@ -62,7 +62,7 @@ function _jsonValid(s) {
   if (!s) return { ok: true };
   try { JSON.parse(s); return { ok: true }; }
   catch (e1) {
-    try { return { ok: true, parsed: parseJsonc(s) }; }
+    try { const r = parseJsonc(s); return r !== null ? { ok: true } : { ok: false, error: e1.message }; }
     catch (e2) { return { ok: false, error: e1.message }; }
   }
 }
@@ -400,7 +400,7 @@ function rewriteModelInSse(chunk, toModel) {
   if (!toModel) return chunk;
   const s = chunk.toString();
   if (/^\s*data:\s*\{[^}]*"error"\s*:/.test(s)) return s;
-  return s.replace(/"model"\s*:\s*"[^"]+"/g, `"model":"${toModel}"`);
+  return s.replace(/([{,]\s*)"model"\s*:\s*"[^"]+"/g, `$1"model":"${toModel}"`);
 }
 
 function collectBody(res) {
@@ -774,7 +774,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             }
             addActive(provider);
             const chatPath = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
-            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', ghHdrs, sig);
+            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', undefined, sig);
             usedProvider = provider;
             usedModel = upstreamModel;
             curProvider = provider; curUpstream = upstreamRes;
@@ -1080,7 +1080,7 @@ function serveConsolePage(res) {
   res.end(CONSOLE_HTML);
 }
 
-function handleConsoleValidate(req, res, body, logId) {
+function handleConsoleValidate(req, res, logId) {
   log('─'); log(`[${logId}] /api/console/validate`);
   if (!checkConsoleAuth(req, res)) return;
   res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1146,11 +1146,21 @@ function handleConsoleSave(req, res, body, logId) {
   log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
   try {
     if (body.file === 'config') {
-      const v = _jsonValid(body.content);
-      if (!v.ok) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'invalid config content: ' + v.error }));
-        return;
+      const isJsonc = CONFIG_PATH.endsWith('.jsonc');
+      if (isJsonc) {
+        const v = _jsonValid(body.content);
+        if (!v.ok) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid config content: ' + v.error }));
+          return;
+        }
+      } else {
+        try { JSON.parse(body.content); }
+        catch (e) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'config is .json but content is not valid JSON: ' + e.message }));
+          return;
+        }
       }
     } else if (body.content.trim()) {
       let lineNo = 0;
@@ -1325,7 +1335,7 @@ const server = http.createServer((req, res) => {
         // Multipart form-data — pass raw body + original Content-Type
         handleProxy(req, res, rawStr, logId, '/audio/transcriptions', false, req.headers['content-type']);
       } else if (req.url === '/api/console/validate') {
-        handleConsoleValidate(req, res, json, logId);
+        handleConsoleValidate(req, res, logId);
       } else if (req.url === '/api/console/save') {
         handleConsoleSave(req, res, json, logId);
       } else {
