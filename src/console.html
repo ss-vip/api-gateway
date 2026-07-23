@@ -14,19 +14,25 @@ body{font-family:system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px
 .login{text-align:center;padding:60px 20px}
 .login h2{font-size:24px;margin-bottom:8px}
 .login p{margin:12px 0 24px;color:#888}
-.login input{padding:10px 14px;width:300px;font-size:16px;border-radius:6px;border:1px solid #333;background:#16213e;color:#eee;outline:none}
+.login input{padding:10px 14px;width:300px;font-size:16px;border-radius:6px;border:1px solid #333;background:#16213e;color:#eee;outline:none;max-width:100%}
 .login input:focus{border-color:#0f3460}
 .login button,.editor button{padding:10px 24px;font-size:16px;border-radius:6px;border:none;cursor:pointer}
 .login button{background:#0f3460;color:#fff}
 .login button:hover{background:#1a5276}
 .hidden{display:none}
 .editor{margin-top:0}
-.editor h3{margin:20px 0 8px;display:flex;align-items:center;gap:12px;font-size:16px}
-.editor .btn-bar{display:flex;gap:8px;margin-top:8px}
+.editor hr{border:none;border-top:1px solid #333;margin:5px 0}
+.editor h3{margin:12px 0 8px;display:flex;align-items:center;gap:8px;font-size:16px;flex-wrap:wrap}
+.editor .btn-bar{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}
 .editor button{background:#0f3460;color:#fff}
 .editor button:hover{background:#1a5276}
 .editor button.danger{background:#6c2020}
 .editor button.danger:hover{background:#8a2a2a}
+.editor .f-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.editor .f-row label{display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;font-size:13px}
+.editor .f-row input[type=date]{font-size:12px;padding:2px 6px;border-radius:4px;border:1px solid #555;background:#16213e;color:#eee;outline:none}
+.editor .f-row button{font-size:12px;padding:2px 10px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer}
+.editor .f-row button:hover{background:#333}
 .status{font-size:14px;margin-top:16px;color:#888}
 .toast{position:fixed;bottom:24px;right:24px;padding:12px 24px;border-radius:8px;color:#fff;z-index:999;transition:opacity .3s;font-size:14px}
 .toast.ok{background:#27ae60}
@@ -66,10 +72,21 @@ div[class*=scrollbar-filler],div[class*=gutter-filler]{background:#1e1e1e!import
 <div><h3>Status <button id="refreshBtn" style="font-size:12px;padding:2px 10px;margin-left:8px;border-radius:4px;border:1px solid #555;background:transparent;color:#eee;cursor:pointer">更新</button></h3>
 <div id="statusPanel" style="font-size:13px;color:#aaa;padding:4px 0">載入中...</div>
 <div id="statsPanel" style="font-size:13px;color:#aaa;padding:4px 0"></div></div>
+<hr>
 <div><h3>Config <span style="color:#888;font-weight:400;font-size:13px;margin:0">(儲存後伺服器將自動重啟)</span></h3>
 <textarea id="configText"></textarea>
 <div class="btn-bar"><button id="configLoadBtn">讀取</button><button id="configSaveBtn">儲存 Config</button></div></div>
-<div><h3>Log <label style="display:inline-flex;align-items:center;gap:4px;font-weight:400;font-size:13px;margin-left:10px;cursor:pointer"><input type="checkbox" id="filterSuccess" checked> Success</label> <label style="display:inline-flex;align-items:center;gap:4px;font-weight:400;font-size:13px;cursor:pointer"><input type="checkbox" id="filterError" checked> Error</label></h3>
+<hr>
+<div><h3>Log</h3>
+<div class="f-row">
+<label><input type="checkbox" id="filterSuccess" checked> Success</label>
+<label><input type="checkbox" id="filterError" checked> Error</label>
+<span>日期</span>
+<input type="date" id="filterDateFrom">
+<span>~</span>
+<input type="date" id="filterDateTo">
+<button id="filterTodayBtn">今天</button>
+</div>
 <textarea id="logText"></textarea>
 <div class="btn-bar"><button id="logLoadBtn">讀取</button><button id="logSaveBtn">儲存</button><button class="danger" id="logClearBtn">清空</button></div></div>
 </div>
@@ -95,7 +112,7 @@ cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
 cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConfig.refresh();cmLog.refresh()}
 load();refreshStatus();}catch(e){_token='';hideOverlay();s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
 async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();let msg='已讀取';if(d.config_valid===false)msg+=', config 格式錯誤：'+(d.config_error||'?');if(d.log_valid===false)msg+=', log 格式錯誤：'+(d.log_error||'?');hideOverlay();toast(msg,1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
-function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const lines=_rawLog.split('\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0}catch{}return 1});cmLog.setValue(out.join('\n'))}
+function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const df=document.getElementById('filterDateFrom').value,dt=document.getElementById('filterDateTo').value;const lines=_rawLog.split('\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0;if(df||dt){const d=(o.ts||'').slice(0,10);if(df&&d<df)return 0;if(dt&&d>dt)return 0}}catch{}return 1});cmLog.setValue(out.join('\n'))}
 async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();const pCount=Object.keys(d.providers||{}).length;let h='<table class="st"><tr><th>Provider</th><th>Keys</th><th>Degraded</th><th>Last OK</th><th>Latency</th></tr>';for(const[p,v]of Object.entries(d.providers||{}))h+='<tr><td>'+p+'</td><td>'+v.keys+'</td><td'+(v.degraded?' class="degraded"':'')+'>'+(v.degraded||'-')+'</td><td>'+v.last_success+'</td><td>'+(v.latency_ms||'-')+'ms</td></tr>';if(!pCount)h+='<tr><td colspan="5" style="color:#888;text-align:center">尚無 provider 資料（尚未有請求或 config 未載入）</td></tr>';h+='</table><div class="st-info">RSS '+d.rss_mb+'MB / Heap '+d.heap_mb+'MB / Active '+d.active+' / Uptime '+d.uptime+'</div>';document.getElementById('statusPanel').innerHTML=h;
 const _sp=document.getElementById('statsPanel');if(_sp&&d.success_total!==undefined)_sp.innerHTML='成功 '+d.success_total+' / 失敗 '+(d.error_total||0)+' / 平均延遲 '+(d.avg_latency_ms||'-')+'ms / 錯誤率 '+(d.error_rate||'0%');hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
 async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
@@ -116,5 +133,8 @@ document.getElementById('logSaveBtn').addEventListener('click',()=>save('log'));
 document.getElementById('logClearBtn').addEventListener('click',clearLog);
 document.getElementById('filterSuccess').addEventListener('change',applyLogFilter);
 document.getElementById('filterError').addEventListener('change',applyLogFilter);
+document.getElementById('filterDateFrom').addEventListener('change',applyLogFilter);
+document.getElementById('filterDateTo').addEventListener('change',applyLogFilter);
+document.getElementById('filterTodayBtn').addEventListener('click',()=>{const t=new Date();const d=t.getFullYear()+'-'+String(t.getMonth()+1).padStart(2,'0')+'-'+String(t.getDate()).padStart(2,'0');document.getElementById('filterDateFrom').value=d;document.getElementById('filterDateTo').value=d;applyLogFilter()});
 if(_token){document.getElementById('token').value=_token;auth();}
 </script></body></html>

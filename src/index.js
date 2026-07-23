@@ -14,8 +14,8 @@ const _ts = () => {
   const p = (v) => String(v).padStart(2, '0');
   return `${n.getFullYear()}-${p(n.getMonth()+1)}-${p(n.getDate())} ${p(n.getHours())}:${p(n.getMinutes())}:${p(n.getSeconds())}`;
 };
-function log(...a) { console.log(`[${_ts()}]`, ...a); }
-function elog(...a) { console.error(`[${_ts()}]`, ...a); }
+function log(...a) { console.log(a[0]==='─' ? '─'.repeat(60) : `[${_ts()}]`, ...a); }
+function elog(...a) { console.error(a[0]==='─' ? '─'.repeat(60) : `[${_ts()}]`, ...a); }
 
 // --- JSONC parser (strip comments + trailing commas before JSON.parse) ---
 function parseJsonc(str) {
@@ -208,14 +208,14 @@ const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', GITHUB_MODELS_KEYS:'github-models', COPILOT_KEYS:'github-models', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
 const   DIRECT_PROVIDERS = {
   mistral: 'https://api.mistral.ai', pollinations: 'https://gen.pollinations.ai',
   literouter: 'https://api.literouter.com', llm7: 'https://api.llm7.io',
-  'github-models': 'https://models.github.ai', nvidia: 'https://integrate.api.nvidia.com',
+  nvidia: 'https://integrate.api.nvidia.com',
   gpt4free: 'https://g4f.space', 'agnes-ai': 'https://apihub.agnes-ai.com',
   'sea-lion': 'https://api.sea-lion.ai', kilo: 'https://api.kilo.ai',
   openai: 'https://api.openai.com', cerebras: 'https://api.cerebras.ai',
@@ -233,7 +233,7 @@ for (const [p, m] of Object.entries(provMeta)) {
   else if (m.baseUrl) elog(`[config] provider "${p}" has invalid baseUrl (ignored): ${m.baseUrl}`);
 }
 const DIRECT_PATH_PREFIX = {
-  'github-models': '/inference', kilo: '/api/gateway',
+  kilo: '/api/gateway',
   groq: '/openai/v1', openrouter: '/api/v1', cohere: '/compatibility/v1',
   perplexity: '/v1/sonar',
 };
@@ -241,8 +241,6 @@ const DIRECT_PATH_PREFIX = {
 for (const [p, m] of Object.entries(provMeta)) {
   if (m.pathPrefix) DIRECT_PATH_PREFIX[p] = m.pathPrefix;
 }
-// GitHub Models API version (hardcoded by GitHub, bump when they publish a new one)
-const GITHUB_API_VERSION = cfg.github_api_version || process.env.GITHUB_API_VERSION || '2026-03-10';
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {
@@ -414,14 +412,13 @@ function collectBody(res) {
 }
 
 // --- token-based alias routing ---
-const PROVIDER_DEFAULT_LIMITS = { 'github-models': 8000 };
+const PROVIDER_DEFAULT_LIMITS = {};
 const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k, v]) => [k.toLowerCase(), v]));
 const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
 // ponytail: known provider RPM (account-level), auto-calc per-key interval when not manually set
 // ponytail: known free-plan RPM per provider, auto-calc per-key rate_limit = 60000 / (rpm / numKeys)
 // Keys are per-account, so each key's limit is independent. Manual rate_limit in config overrides auto-calc.
 const PROVIDER_RPM = {
-  'github-models': 15,  // 10–15 RPM
   literouter: 1,        // per-key ~1 RPM (5 keys → ~5 RPM)
   pollinations: 60,     // no published limits
   gpt4free: 60,         // no published limits
@@ -769,7 +766,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
-            const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': GITHUB_API_VERSION } : undefined;
             await waitTpmLimit(provider, usedKey, totalEst);
             if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
               log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
@@ -1035,9 +1031,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         }
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
-          const ghHdrs = provider === 'github-models' ? { 'X-GitHub-Api-Version': GITHUB_API_VERSION } : undefined;
           addActive(provider);
-          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, ghHdrs, sig);
+          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, undefined, sig);
           if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
           continue;
         } catch (e) {
@@ -1202,6 +1197,7 @@ const server = http.createServer((req, res) => {
   const logId = rid();
   _activeRequests++;
   _memGuard();
+  log('─');
   req.on('error', () => {});
   res.on('error', () => {});
 

@@ -74,7 +74,7 @@ pm2 save && pm2 startup
 
 相容 OpenAI Chat Completions API：
 
-openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、github-models、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel
+openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel
 
 ## 手動新增 Provider
 
