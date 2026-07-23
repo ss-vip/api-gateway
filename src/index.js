@@ -548,6 +548,20 @@ function estimateTokens(messages) {
 
 // --- context sanitization ---
 const REASONING_PROVIDERS = new Set(['deepseek']);
+const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
+
+function normalizeMessageOrder(messages) {
+  if (!Array.isArray(messages) || messages.length < 2) return messages;
+  const out = [];
+  for (let i = 0; i < messages.length; i++) {
+    const prev = out[out.length - 1];
+    if (prev && prev.role === 'tool' && messages[i].role === 'user') {
+      out.push({ role: 'assistant', content: '' });
+    }
+    out.push(messages[i]);
+  }
+  return out;
+}
 
 function supportsReasoningContent(provider, model) {
   if (REASONING_PROVIDERS.has(provider)) {
@@ -756,6 +770,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           if (!supportsReasoningContent(provider, upstreamModel)) {
             bodyObj.messages = sanitizeMessages(bodyObj.messages);
           }
+          if (STRICT_ORDER_PROVIDERS.has(provider)) bodyObj.messages = normalizeMessageOrder(bodyObj.messages);
         }
         const bodyStr = JSON.stringify(bodyObj);
 
@@ -893,6 +908,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
         if (banned2) for (const f of banned2) delete bodyObj2[f];
         if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
+        if (STRICT_ORDER_PROVIDERS.has(sseProvider) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = normalizeMessageOrder(bodyObj2.messages);
         const maxCap2 = PROVIDER_MAX_TOKENS[sseProvider];
         if (maxCap2 && (bodyObj2.max_tokens || 4096) > maxCap2) bodyObj2.max_tokens = maxCap2;
         const b2 = JSON.stringify(bodyObj2);
