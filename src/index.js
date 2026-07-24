@@ -599,7 +599,7 @@ function normalizeMessageOrder(messages) {
   for (let i = 0; i < messages.length; i++) {
     const prev = out[out.length - 1];
     if (prev && prev.role === 'tool' && messages[i].role === 'user') {
-      out.push({ role: 'assistant', content: '' });
+      out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
     }
     out.push(messages[i]);
   }
@@ -829,6 +829,8 @@ function sanitizeMessages(messages) {
 function _hasNonTextContent(msgs) {
   return Array.isArray(msgs) && msgs.some(m => Array.isArray(m.content) && m.content.some(c => c?.type && c.type !== 'text'));
 }
+// ponytail: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
+const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal) {
   return new Promise((resolve, reject) => {
