@@ -7,10 +7,11 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 
 // --- timestamped logger ---
-const _ts = () => {
-  const n = new Date();
+const _ts = (ts) => {
+  const n = ts ? new Date(ts) : new Date();
   const p = (v) => String(v).padStart(2, '0');
   return `${n.getFullYear()}-${p(n.getMonth()+1)}-${p(n.getDate())} ${p(n.getHours())}:${p(n.getMinutes())}:${p(n.getSeconds())}`;
 };
@@ -339,6 +340,21 @@ function markKeySuccess(p, key, latency) {
   s.successCount++;
   s.lastSuccess = Date.now();
   if (latency != null) s.lastLatency = Math.round(latency);
+  // clear 401 flag on success
+  const _k = `${p}:${key}`;
+  if (_recent401.has(_k)) {
+    const e = _recent401.get(_k);
+    if (e.retryAfter && Date.now() > e.retryAfter) _recent401.delete(_k);
+  }
+}
+
+// ponytail: track 401 errors per key; cleared on next success or after 1h
+const _recent401 = new Map();
+function markKey401(p, key, model) {
+  const _k = `${p}:${key}`;
+  _recent401.set(_k, { provider: p, key, model, ts: Date.now(), retryAfter: Date.now() + 3600000 });
+  // stale cleanup
+  for (const [k, v] of _recent401) if (Date.now() > v.retryAfter) _recent401.delete(k);
 }
 
 const keyInFlight = new Map(); // key -> timestamp
@@ -668,6 +684,7 @@ async function handleTTS(req, res, bodyJson, logId) {
         }
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
         lastErr = { status: sc, body: await collectBody(up) };
+        if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
@@ -791,6 +808,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
         }
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
         lastErr = { status: sc, body: await collectBody(up) };
+        if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
@@ -1069,6 +1087,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
+              if (sc === 401) markKey401(provider, usedKey, upstreamModel);
               upstreamRes = null;
               break;
             }
@@ -1257,6 +1276,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
+    if (sc === 401) markKey401(provider, key, upstreamModel);
     if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
     return 'retry';
   };
@@ -1391,11 +1411,12 @@ function handleConsoleStatus(req, res, logId) {
   const totalReq = stats.success + stats.error;
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+    active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), totalmem_mb: Math.round(os.totalmem() / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
     uptime: formatUptime(process.uptime()), keys: totalKeys, providers,
     success_total: stats.success, error_total: stats.error,
     avg_latency_ms: stats.latN ? Math.round(stats.latSum / stats.latN) : 0,
     error_rate: totalReq ? (stats.error / totalReq * 100).toFixed(1) + '%' : '0%',
+    recent401: [..._recent401.values()].map(e => ({ provider: e.provider, model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
   }));
 }
 
