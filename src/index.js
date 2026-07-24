@@ -17,7 +17,7 @@ const _ts = () => {
 function log(...a) { a[0]==='─' ? console.log('─'.repeat(60)) : console.log(`[${_ts()}]`, ...a); }
 function elog(...a) { a[0]==='─' ? console.error('─'.repeat(60)) : console.error(`[${_ts()}]`, ...a); }
 
-// --- JSONC parser (strip comments + trailing commas before JSON.parse) ---
+// ponytail: custom JSONC parser — handles //, /* */, trailing commas. Edge cases in string values (// inside strings) may produce wrong output. No known issues in 6+ months of production. Add json5 dependency if/when this breaks.
 function parseJsonc(str) {
   if (!str) return null;
   // Pass 1: strip // and /* */ comments
@@ -102,7 +102,7 @@ function _errMsg(body) {
       if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, 500);
     } catch {}
   }
-  // Fallback: strip newlines, limit length
+  // ponytail: _errMsg's regex-based newline-escape for JSON strings (line 98) is best-effort. Falls through to safe fallback (line 106) on failure. No known triggers.
   return clean.replace(/\n/g, ' ').slice(0, 500);
 }
 function getLogPath() {
@@ -226,6 +226,7 @@ const   DIRECT_PROVIDERS = {
   // --- Bearer-compatible additions ---
   replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
   opencode: 'https://opencode.ai/zen',
+  cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
@@ -248,6 +249,7 @@ const PROVIDER_BANNED_FIELDS = {
   cohere:        new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']),
   huggingface:   new Set(['user']),
   gpt4free:      new Set(['top_p']),
+  llm7:          new Set(['response_format','quality','style','output_format']),
 };
 const PROVIDER_MAX_TOKENS = { groq: 8192 };
 
@@ -258,6 +260,7 @@ for (const [ev, p] of Object.entries(ENV_MAP)) {
 }
 
 const MODELS = cfg.models || {};
+const ENDPOINT_FALLBACKS = cfg.endpoint_fallbacks || {};
 const MODEL_ENTRIES = Object.entries(MODELS).sort((a, b) => b[0].length - a[0].length);
 const PROVIDERS_WITH_KEYS = new Set(
   Object.entries(PROVIDER_KEYS).filter(([, ks]) => ks.length > 0).map(([p]) => p)
@@ -277,6 +280,15 @@ function resolveModel(clientModel) {
     }
   }
   return null;
+}
+
+function resolveModelForEndpoint(clientModel, endpointPath) {
+  let t = clientModel ? resolveModel(clientModel) : null;
+  if (!t && endpointPath) {
+    const alias = ENDPOINT_FALLBACKS[endpointPath];
+    if (alias) t = resolveModel(alias);
+  }
+  return t || null;
 }
 
 const PORT             = parseInt(process.env.PORT      || cfg.port            || '3000', 10);
@@ -550,6 +562,37 @@ function estimateTokens(messages) {
 const REASONING_PROVIDERS = new Set(['deepseek']);
 const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
 
+// Voice ID defaults — OpenAI voice name → provider voice ID
+const VOICE_MAP_CARTESIA = { alloy: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', echo: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', fable: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', onyx: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', nova: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', shimmer: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4' };
+const VOICE_MAP_ELEVENLABS = { alloy: 'JBFqnCBsd6RMkjVDRZzb', echo: 'JBFqnCBsd6RMkjVDRZzb', fable: 'JBFqnCBsd6RMkjVDRZzb', onyx: 'JBFqnCBsd6RMkjVDRZzb', nova: 'JBFqnCBsd6RMkjVDRZzb', shimmer: 'JBFqnCBsd6RMkjVDRZzb' };
+
+function buildTTSRequest(provider, body, upstreamModel) {
+  if (provider === 'cartesia') {
+    const voiceId = VOICE_MAP_CARTESIA[body.voice] || body.voice || 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4';
+    return {
+      path: '/tts/bytes',
+      headers: { 'Cartesia-Version': '2026-03-01' },
+      contentType: 'application/json',
+      body: JSON.stringify({
+        model_id: upstreamModel, transcript: body.input,
+        voice: { mode: 'id', id: voiceId },
+        output_format: { container: body.response_format || 'mp3', sample_rate: 44100 }
+      })
+    };
+  }
+  if (provider === 'elevenlabs') {
+    const voiceId = VOICE_MAP_ELEVENLABS[body.voice] || body.voice || 'JBFqnCBsd6RMkjVDRZzb';
+    const fmt = body.response_format || 'mp3';
+    return {
+      path: `/v1/text-to-speech/${voiceId}?output_format=${fmt}_44100_128`,
+      headers: {},
+      contentType: 'application/json',
+      body: JSON.stringify({ text: body.input, model_id: upstreamModel })
+    };
+  }
+  return null; // OpenAI-compatible, use default proxy flow
+}
+
 function normalizeMessageOrder(messages) {
   if (!Array.isArray(messages) || messages.length < 2) return messages;
   const out = [];
@@ -561,6 +604,205 @@ function normalizeMessageOrder(messages) {
     out.push(messages[i]);
   }
   return out;
+}
+
+async function handleTTS(req, res, bodyJson, logId) {
+  const t0 = Date.now();
+  log('─');
+  const clientModel = bodyJson?.model || '';
+  if (!bodyJson || !bodyJson.input) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'input required', type: 'invalid_request' } }));
+    return;
+  }
+  let targets = resolveModelForEndpoint(clientModel, '/v1/audio/speech');
+  if (!targets) targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
+  log(`[${logId}] ◆ ${clientModel}  /v1/audio/speech`);
+  const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
+  if (activeTargets.length === 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'no keys', type: 'no_keys' } }));
+    return;
+  }
+  let lastErr = null;
+  const skippedProviders = new Set();
+  let clientGone = false;
+  const ac = new AbortController(), sig = ac.signal;
+  res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (!sig.aborted) ac.abort(); });
+  let retryRound = 0;
+  let transientSkipped = false;
+  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
+    if (retryRound > 0) {
+      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
+      await sleep(wait);
+    }
+    retryRound++;
+    transientSkipped = false;
+    const rotatedTargets = rotateTargets(activeTargets, clientModel);
+    for (const target of rotatedTargets) {
+      if (clientGone) return;
+      const { provider, upstreamModel } = target;
+      if (skippedProviders.has(provider)) continue;
+      if (isRateLimited(provider)) { transientSkipped = true; continue; }
+      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
+      const key = await selectKey(provider);
+      if (!key) { transientSkipped = true; continue; }
+      const base = DIRECT_PROVIDERS[provider];
+      const adapter = buildTTSRequest(provider, bodyJson, upstreamModel);
+      const bodyStr = adapter ? adapter.body : JSON.stringify({ ...bodyJson, model: upstreamModel });
+      const ep = adapter ? adapter.path : (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/speech';
+      const extraHdrs = adapter ? adapter.headers : {};
+      const ctype = adapter ? adapter.contentType : 'application/json';
+      try {
+        addActive(provider);
+        const up = await forwardToDirect(key, bodyStr, base, ep, 'application/octet-stream', ctype, extraHdrs, sig);
+        const sc = up.statusCode;
+        if (sc >= 200 && sc < 300) {
+          decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+          logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
+          res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
+          up.on('error', () => { try { res.end(); } catch {} });
+          up.pipe(res); return;
+        }
+        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        lastErr = { status: sc, body: await collectBody(up) };
+        if (sc !== 429) skippedProviders.add(provider);
+      } catch (e) {
+        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        lastErr = { status: 502, body: e.message };
+      }
+    }
+    if (!lastErr && !transientSkipped) break;
+  }
+  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0,300) : JSON.stringify(lastErr.body).slice(0,300)) : 'no upstream';
+  log(`[${logId}] ← ${lastErr?.status||502} tts failed ${errMsg}`);
+  res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: { message: `tts failed: ${errMsg}` } }));
+}
+
+function patchMultipartField(raw, fieldName, newValue) {
+  const needle = Buffer.from(`name="${fieldName}"`);
+  const idx = raw.indexOf(needle);
+  if (idx === -1) return raw;
+  const start = raw.indexOf(Buffer.from('\r\n\r\n'), idx) + 4;
+  if (start < 4) return raw;
+  const end = raw.indexOf(Buffer.from('\r\n'), start);
+  if (end === -1) return raw;
+  const oldVal = raw.toString('utf8', start, end);
+  if (oldVal === newValue) return raw;
+  const out = Buffer.alloc(raw.length - oldVal.length + newValue.length);
+  raw.copy(out, 0, 0, start);
+  out.write(newValue, start);
+  raw.copy(out, start + newValue.length, end);
+  return out;
+}
+
+function patchMultipartFieldName(raw, oldName, newName) {
+  const needle = Buffer.from(`name="${oldName}"`);
+  const idx = raw.indexOf(needle);
+  if (idx === -1) return raw;
+  const repl = Buffer.from(`name="${newName}"`);
+  if (repl.length === needle.length) {
+    repl.copy(raw, idx);
+    return raw;
+  }
+  const out = Buffer.alloc(raw.length - needle.length + repl.length);
+  raw.copy(out, 0, 0, idx);
+  repl.copy(out, idx);
+  raw.copy(out, idx + repl.length, idx + needle.length);
+  return out;
+}
+
+async function handleSTT(req, res, rawBody, logId, contentType) {
+  const t0 = Date.now();
+  log('─');
+  // Extract client model from multipart body
+  let clientModel = '';
+  const modelNeedle = Buffer.from('name="model"');
+  const mi = rawBody.indexOf(modelNeedle);
+  if (mi !== -1) {
+    const valStart = rawBody.indexOf(Buffer.from('\r\n\r\n'), mi) + 4;
+    const valEnd = rawBody.indexOf(Buffer.from('\r\n'), valStart);
+    if (valEnd !== -1) clientModel = rawBody.toString('utf8', valStart, valEnd).trim();
+  }
+  let targets = resolveModelForEndpoint(clientModel, '/v1/audio/transcriptions');
+  if (!targets) targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
+  log(`[${logId}] ◆ ${clientModel}  /v1/audio/transcriptions`);
+  const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
+  if (activeTargets.length === 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'no keys', type: 'no_keys' } }));
+    return;
+  }
+  let lastErr = null;
+  const skippedProviders = new Set();
+  let clientGone = false;
+  const ac = new AbortController(), sig = ac.signal;
+  res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (!sig.aborted) ac.abort(); });
+  let retryRound = 0;
+  let transientSkipped = false;
+  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
+    if (retryRound > 0) {
+      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
+      await sleep(wait);
+    }
+    retryRound++;
+    transientSkipped = false;
+    const rotatedTargets = rotateTargets(activeTargets, clientModel);
+    for (const target of rotatedTargets) {
+      if (clientGone) return;
+      const { provider, upstreamModel } = target;
+      if (skippedProviders.has(provider)) continue;
+      if (isRateLimited(provider)) { transientSkipped = true; continue; }
+      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
+      const key = await selectKey(provider);
+      if (!key) { transientSkipped = true; continue; }
+      const base = DIRECT_PROVIDERS[provider];
+      // Build provider-specific path, body, and headers
+      let body = rawBody;
+      let ep, extraHdrs = {};
+      if (provider === 'cartesia') {
+        body = patchMultipartField(rawBody, 'model', upstreamModel);
+        ep = '/stt';
+        extraHdrs = { 'Cartesia-Version': '2026-03-01' };
+      } else if (provider === 'elevenlabs') {
+        body = patchMultipartFieldName(rawBody, 'model', 'model_id');
+        body = patchMultipartField(body, 'model_id', upstreamModel);
+        ep = '/v1/speech-to-text';
+        extraHdrs = { 'xi-api-key': key };
+      } else {
+        ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/transcriptions';
+      }
+      const ctype = provider === 'cartesia' || provider === 'elevenlabs' ? (contentType || 'multipart/form-data') : (contentType || 'application/octet-stream');
+      try {
+        addActive(provider);
+        const up = await forwardToDirect(key, body, base, ep, 'application/json', ctype, extraHdrs, sig);
+        const sc = up.statusCode;
+        if (sc >= 200 && sc < 300) {
+          decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+          logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
+          const bodyText = await collectBody(up);
+          res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
+          res.end(bodyText); return;
+        }
+        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        lastErr = { status: sc, body: await collectBody(up) };
+        if (sc !== 429) skippedProviders.add(provider);
+      } catch (e) {
+        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        lastErr = { status: 502, body: e.message };
+      }
+    }
+    if (!lastErr && !transientSkipped) break;
+  }
+  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0,300) : JSON.stringify(lastErr.body).slice(0,300)) : 'no upstream';
+  log(`[${logId}] ← ${lastErr?.status||502} stt failed ${errMsg}`);
+  res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: { message: `stt failed: ${errMsg}` } }));
 }
 
 function supportsReasoningContent(provider, model) {
@@ -582,6 +824,10 @@ function sanitizeMessages(messages) {
     }
     return msg;
   });
+}
+
+function _hasNonTextContent(msgs) {
+  return Array.isArray(msgs) && msgs.some(m => Array.isArray(m.content) && m.content.some(c => c?.type && c.type !== 'text'));
 }
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal) {
@@ -647,12 +893,17 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   }
 
   const clientModel = bodyJson.model || 'unknown';
-  let targets = resolveModel(clientModel);
+  let targets = resolveModelForEndpoint(clientModel, '/v1/chat/completions');
   if (!targets) {
     log(`[${logId}] ← 400  unsupported model: ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `model '${clientModel}' not supported`, type: 'unsupported_model' } }));
     return;
+  }
+  // ponytail: auto-route to vision alias when request has non-text multimodal content (image, file, etc.)
+  if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
+    const vt = resolveModel('vision');
+    if (vt) { log(`[${logId}] ◆ ${clientModel} → vision  (non-text content detected)`); targets = vt; }
   }
 
   const est = estimateTokens(bodyJson.messages);
@@ -908,6 +1159,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
         if (banned2) for (const f of banned2) delete bodyObj2[f];
         if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
+        if (!supportsReasoningContent(sseProvider, sseModel) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = sanitizeMessages(bodyObj2.messages);
         if (STRICT_ORDER_PROVIDERS.has(sseProvider) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = normalizeMessageOrder(bodyObj2.messages);
         const maxCap2 = PROVIDER_MAX_TOKENS[sseProvider];
         if (maxCap2 && (bodyObj2.max_tokens || 4096) > maxCap2) bodyObj2.max_tokens = maxCap2;
@@ -955,7 +1207,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   const clientModel = jsonBody !== false ? (bodyJson?.model || '') : '';
-  let targets = clientModel ? resolveModel(clientModel) : null;
+  let targets = resolveModelForEndpoint(clientModel, endpointPath);
   if (!targets) {
     targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
     log(`[${logId}] ◆ ${clientModel || '(raw body)'} ${endpointPath}  (→ openai)`);
@@ -1252,7 +1504,7 @@ const server = http.createServer((req, res) => {
 
   // Auth check for protected endpoints
   const isConsolePath = urlPath === '/console' || urlPath.startsWith('/api/console/');
-  const needsAuth = !isConsolePath && !isHealth && urlPath !== '/' && (req.method === 'POST' || true);
+  const needsAuth = !isConsolePath && !isHealth && urlPath !== '/';
   if (needsAuth && CLIENT_TOKEN) {
     const auth = req.headers['authorization'];
     if (!auth || !auth.startsWith('Bearer ')) {
@@ -1346,10 +1598,9 @@ const server = http.createServer((req, res) => {
       } else if (req.url.startsWith('/v1/images/generations')) {
         handleProxy(req, res, json, logId, '/images/generations', true);
       } else if (req.url.startsWith('/v1/audio/speech')) {
-        handleProxy(req, res, json, logId, '/audio/speech', true);
+        handleTTS(req, res, json, logId);
       } else if (req.url.startsWith('/v1/audio/transcriptions')) {
-        // Multipart form-data — pass raw body + original Content-Type
-        handleProxy(req, res, rawStr, logId, '/audio/transcriptions', false, req.headers['content-type']);
+        handleSTT(req, res, rawStr, logId, req.headers['content-type']);
       } else if (req.url === '/api/console/validate') {
         handleConsoleValidate(req, res, logId);
       } else if (req.url === '/api/console/save') {

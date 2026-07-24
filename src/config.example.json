@@ -1,6 +1,6 @@
 {
   "_note": "複製為 config.json。所有值可由同名環境變數覆寫",
-  "client_token": "optional-auth-bearer-token",
+  "client_token": "sk-your-secret-token",
 
   "timezone": "Asia/Taipei",
   "port": 3000,
@@ -18,72 +18,101 @@
 
   "providers": {
     "_note": "只填入有 key 的 provider，未使用的可刪除或留空。支援清單與限制見 README",
-    "openai": [""],
-    "opencode": [""],
-    "mistral": [""],
-    "cerebras": [""],
-    "deepseek": [""],
-    "xai": [""],
-    "groq": [""],
-    "openrouter": [""],
-    "together": [""],
-    "perplexity": [""],
-    "cohere": [""],
-    "replicate": [""],
-    "huggingface": [""],
-    "baseten": [""],
-    "parallel": [""],
-    "pollinations": [""],
-    "literouter": [""],
-    "llm7": [""],
-    "nvidia": [""],
-    "gpt4free": [""],
-    "agnes-ai": [""],
-    "sea-lion": [""],
-    "kilo": [""],
 
-    "_custom_provider_example": "下方為自定 provider 範例（OpenAI-compatible 端點，免改程式碼）。取消註解並填入即可",
+    "openai": ["sk-..."],
+    "mistral": ["..."],
+    "cerebras": ["csk-..."],
+    "deepseek": ["sk-..."],
+    "xai": ["xai-..."],
+    "groq": ["gsk_..."],
+    "cohere": ["..."],
+    "nvidia": ["nvapi-..."],
+    "huggingface": ["hf_..."],
+    "pollinations": ["sk_..."],
+    "literouter": ["..."],
+    "llm7": ["..."],
+    "gpt4free": ["g4f_..."],
+    "opencode": ["sk-..."],
+    "kilo": ["eyJ..."],
+    "sea-lion": ["sk-...", "sk-..."],
+    "cartesia": ["sk_car_..."],
+    "elevenlabs": ["sk_..."],
+
+    "_custom_provider_example": "下方為自定 provider 範例",
     "my-proxy": {
-      "apiKeys": [""],
+      "apiKeys": ["sk-..."],
       "baseUrl": "https://my-host.example.com",
       "pathPrefix": "/v1",
       "rpm": 20
     }
   },
 
-  "tpm_limit": {
-    "_note": "每 key 每分鐘 token 限制",
-    "cerebras": 30000
-  },
-
   "rate_limit": {
     "_note": "每個 key 請求間隔: 毫秒。不在此清單的 provider 會依 key 數量與 PROVIDER_RPM 自動計算",
-    "cohere": 1000
+    "cohere": 1000,
+    "nvidia": 1000,
+    "gpt4free": 1000,
+    "opencode": 1000,
+    "sea-lion": 6000
+  },
+
+  "tpm_limit": {
+    "_note": "每 key 每分鐘 token 限制",
+    "groq": 8000,
+    "cerebras": 30000,
+    "mistral": 1000000
   },
 
   "model_limits": {
     "_note": "每次請求 token 上限: provider/model → max context",
-    "cerebras/gpt-oss-120b": 8192,
-    "mistral/mistral-large": 32000,
-    "nvidia/mistralai/mistral-small-4-119b-2603": 128000
+    "groq/qwen/qwen3.6-27b": 8000,
+    "cerebras/zai-glm-4.7": 8000,
+    "cohere/command-a-plus-05-2026": 128000,
+    "nvidia/mistralai/mistral-small-4-119b-2603": 128000,
+    "sea-lion/aisingapore/SEA-LION-ModernBERT-Embedding-600M": 8000
+  },
+
+  "endpoint_fallbacks": {
+    "_note": "client model 不在 models 中時，依端點路徑自動回退到對應的 model 別名",
+    "/v1/chat/completions": "openai",
+    "/v1/images/generations": "image",
+    "/v1/audio/speech": "tts",
+    "/v1/audio/transcriptions": "stt",
+    "/v1/embeddings": "embedding"
   },
 
   "models": {
+    "_note": "key = client 送的 model 名稱；value = provider/model 的 fallback 鏈，依序嘗試",
     "openai": [
-      { "provider": "mistral", "model": "mistral-large-latest" },
-      { "provider": "cerebras", "model": "llama3.1-70b" },
-      { "provider": "deepseek", "model": "deepseek-chat" },
-      { "provider": "openai", "model": "gpt-4o-mini" },
-      { "provider": "pollinations", "model": "mistral-small-3.2" },
-      { "provider": "literouter", "model": "owl-alpha:free:full-context" },
-      { "provider": "llm7", "model": "fast" }
+      { "provider": "mistral", "model": "mistral-small-latest" },
+      { "provider": "cerebras", "model": "zai-glm-4.7" },
+      { "provider": "opencode", "model": "deepseek-v4-flash-free" },
+      { "provider": "groq", "model": "qwen/qwen3.6-27b" },
+      { "provider": "kilo", "model": "kilo-auto/free" }
     ],
 
-    "text-embedding-3-small": "openai",
-    "text-embedding-3-large": "openai",
-    "dall-e-3": "openai",
-    "tts-1": "openai",
-    "tts-1-hd": "openai",
-    "whisper-1": "openai"
+    "vision": [
+      { "provider": "llm7", "model": "gpt-5.4-mini" },
+      { "provider": "opencode", "model": "deepseek-v4-flash-free" }
+    ],
+
+    "image": [
+      { "provider": "llm7", "model": "gpt-image-2" },
+      { "provider": "llm7", "model": "flux-kontext-max" }
+    ],
+
+    "tts": [
+      { "provider": "cartesia", "model": "sonic-3.5" },
+      { "provider": "elevenlabs", "model": "eleven_multilingual_v2" }
+    ],
+
+    "stt": [
+      { "provider": "cartesia", "model": "ink-whisper" },
+      { "provider": "elevenlabs", "model": "scribe" }
+    ],
+
+    "embedding": [
+      { "provider": "sea-lion", "model": "aisingapore/SEA-LION-ModernBERT-Embedding-600M" }
+    ]
   }
 }
