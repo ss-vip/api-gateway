@@ -78,7 +78,11 @@
     "/v1/images/generations": "image",
     "/v1/audio/speech": "tts",
     "/v1/audio/transcriptions": "stt",
-    "/v1/embeddings": "embedding"
+    "/v1/embeddings": "embedding",
+    "/v1/images/edits": "image",
+    "/v1/images/variations": "image",
+    "/v1/audio/translations": "stt",
+    "/v1/files": "llm7"
   },
 
   "models": {

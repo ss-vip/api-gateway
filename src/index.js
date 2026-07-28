@@ -180,8 +180,7 @@ if (CONFIG_PATH) {
     elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
   }
 } else {
-  elog(`[config] no config.json or config.jsonc found in ${__dirname} or ${process.cwd()} — exiting`);
-  process.exit(1);
+  elog(`[config] no config.json or config.jsonc found — running with env vars and defaults only`);
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
@@ -508,6 +507,31 @@ function isRateLimited(provider) {
   }
   return true;
 }
+
+// --- circuit breaker ---
+const _circuitBreaker = new Map();
+const CB_THRESHOLD = 5;
+const CB_COOLDOWN_MS = 30000;
+function _recordProviderFailure(provider) {
+  const entry = _circuitBreaker.get(provider) || { count: 0, openUntil: 0 };
+  entry.count++;
+  if (entry.count >= CB_THRESHOLD && !entry.openUntil) {
+    entry.openUntil = Date.now() + CB_COOLDOWN_MS;
+    log(`[circuit] ${provider} opened (${entry.count}/${CB_THRESHOLD} failures, cooldown ${CB_COOLDOWN_MS}ms)`);
+  }
+  _circuitBreaker.set(provider, entry);
+}
+function _recordProviderSuccess(provider) {
+  const before = _circuitBreaker.get(provider);
+  if (before) { log(`[circuit] ${provider} closed (after ${before.count} failures)`); _circuitBreaker.delete(provider); }
+}
+function _isCircuitOpen(provider) {
+  const entry = _circuitBreaker.get(provider);
+  if (!entry || !entry.openUntil) return false;
+  if (Date.now() >= entry.openUntil) { _circuitBreaker.delete(provider); return false; }
+  return true;
+}
+
 const TPM_LIMITS = new Map(Object.entries(cfg.tpm_limit || {}).map(([k, v]) => [k, v]));
 const _tpmLog = new Map(); // provider → Map(key → [{ts, tokens}])
 function _tpmClean(entries) {
@@ -775,6 +799,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       if (skippedProviders.has(provider)) continue;
       if (isRateLimited(provider)) { transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
+      if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
@@ -800,6 +825,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
         const sc = up.statusCode;
         if (sc >= 200 && sc < 300) {
           decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+          _recordProviderSuccess(provider);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
           log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
           const bodyText = await collectBody(up);
@@ -808,6 +834,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
         }
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
         lastErr = { status: sc, body: await collectBody(up) };
+        if (sc >= 500) _recordProviderFailure(provider);
         if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
@@ -850,7 +877,7 @@ function _hasNonTextContent(msgs) {
 // ponytail: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
 const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 
-function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal) {
+function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(new Error('aborted')); return; }
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
@@ -860,7 +887,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
       path: url.pathname + url.search,
-      method: 'POST',
+      method: method || 'POST',
       headers: {
         'Content-Type': contentType || 'application/json',
         'Authorization': `Bearer ${apiKey}`,
@@ -874,7 +901,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
     req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
     req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
     if (signal) signal.addEventListener('abort', () => { req.destroy(); reject(new Error('aborted')); }, { once: true });
-    req.write(bodyStr);
+    if (bodyStr != null && bodyStr !== '') req.write(bodyStr);
     req.end();
   });
 }
@@ -1030,6 +1057,11 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           transientSkipped = true;
           continue;
         }
+        if (_isCircuitOpen(provider)) {
+          log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`);
+          transientSkipped = true;
+          continue;
+        }
 
         const bodyObj = { ...bodyTemplate, model: upstreamModel };
         const maxCap = PROVIDER_MAX_TOKENS[provider];
@@ -1085,6 +1117,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               const body = await collectBody(upstreamRes);
               log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
+              if (sc >= 500) _recordProviderFailure(provider);
               lastErr = { status: sc, body };
               if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
               if (sc === 401) markKey401(provider, usedKey, upstreamModel);
@@ -1094,6 +1127,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
             releaseKey(provider, usedKey);
             markKeySuccess(provider, usedKey, Date.now()-t0);
+            _recordProviderSuccess(provider);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
             log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
@@ -1103,13 +1137,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             decActive(provider);
             markKeyError(provider, usedKey);
             releaseKey(provider, usedKey);
+            _recordProviderFailure(provider);
             log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
             lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
             upstreamRes = null;
           }
         }
-      } catch (e) { log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
+      } catch (e) { if (target?.provider) _recordProviderFailure(target.provider); log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
     if (!upstreamRes && !lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent) — no retry`); break; }
   }
@@ -1262,6 +1297,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     const sc = upstreamRes.statusCode;
     if (sc >= 200 && sc < 300) {
       decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+      _recordProviderSuccess(provider);
       logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
       log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
@@ -1276,6 +1312,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
+    if (sc >= 500) _recordProviderFailure(provider);
     if (sc === 401) markKey401(provider, key, upstreamModel);
     if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
     return 'retry';
@@ -1307,6 +1344,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       if (proxyEst > pCtx) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
       if (isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); transientSkipped = true; continue; }
+      if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
       if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
       if (lastErr) await sleep(Math.random() * 300);
@@ -1349,6 +1387,61 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   logEvent({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: _safeSlice(lastErr?.body || '', 200) });
   res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
+}
+
+async function handleFiles(req, res, rawBody, logId, contentType) {
+  const t0 = Date.now();
+  const method = (req.method || 'POST').toUpperCase();
+  log('─'); log(`[${logId}] ${method} /v1/files${req.url.replace(/^\/v1\/files\/?/i, '') ? '/' + req.url.replace(/^\/v1\/files\/?/i, '') : ''}`);
+  if (method === 'POST' && (!rawBody || rawBody.length === 0)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'empty body', type: 'invalid_request' } }));
+    return;
+  }
+  // Pin to upstream file path (extract sub-path like /:id or /:id/content)
+  const suffix = req.url.startsWith('/v1/files/') ? req.url.slice(10) : '';
+  let targets = resolveModelForEndpoint('', '/v1/files');
+  if (!targets) targets = [{ provider: 'openai', upstreamModel: '' }];
+  const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
+  if (activeTargets.length === 0) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'no provider available', type: 'no_keys' } }));
+    return;
+  }
+  let lastErr = null;
+  for (const { provider, upstreamModel } of activeTargets) {
+    if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}] skip (circuit breaker)`); lastErr = { status: 502, body: 'circuit open' }; continue; }
+    const key = getKey(provider);
+    if (!key) { lastErr = { status: 502, body: 'no key' }; continue; }
+    const base = DIRECT_PROVIDERS[provider];
+    if (!incActive(provider, key)) { lastErr = { status: 429 }; continue; }
+    const ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/files' + (suffix ? '/' + suffix : '');
+    try {
+      const up = await forwardToDirect(key, method === 'POST' ? rawBody : null, base.baseUrl, ep, 'application/json', method === 'POST' ? contentType : undefined, null, null, method);
+      const sc = up.statusCode;
+      if (sc >= 200 && sc < 300) {
+        decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+        _recordProviderSuccess(provider);
+        logEvent({ logId, provider, model: upstreamModel || 'files', key, latency: (Date.now()-t0)/1000 });
+        log(`[${logId}] ← ${sc} [${provider}/files] ${((Date.now()-t0)/1000).toFixed(1)}s`);
+        const ctype = up.headers['content-type'] || 'application/json';
+        res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
+        up.pipe(res); return;
+      }
+      decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+      lastErr = { status: sc, body: await collectBody(up) };
+      if (sc >= 500) _recordProviderFailure(provider);
+      log(`[${logId}] ← ${sc} [${provider}/files] ${_safeSlice(lastErr.body, 100)}`);
+      logEvent({ logId, provider, model: upstreamModel || 'files', key, status: sc, body: lastErr.body });
+      } catch (e) {
+        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        _recordProviderFailure(provider);
+        lastErr = { status: 502, body: e.message };
+      }
+  }
+  const code = lastErr?.status || 502;
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(typeof lastErr?.body === 'string' ? lastErr.body : JSON.stringify({ error: { message: 'file operation failed' } }));
 }
 
 // --- console management page & API ---
@@ -1433,11 +1526,16 @@ function handleConsoleSave(req, res, body, logId) {
     res.end(JSON.stringify({ error: 'invalid file type' }));
     return;
   }
-  const target = body.file === 'config' ? CONFIG_PATH : getLogPath();
+  const target = body.file === 'config' ? (CONFIG_PATH || path.join(__dirname, 'config.json')) : getLogPath();
+  if (!target) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'config file not found — set CONFIG_PATH env or create config.json' }));
+    return;
+  }
   log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
   try {
     if (body.file === 'config') {
-      const isJsonc = CONFIG_PATH.endsWith('.jsonc');
+      const isJsonc = CONFIG_PATH ? CONFIG_PATH.endsWith('.jsonc') : false;
       if (isJsonc) {
         const v = _jsonValid(body.content);
         if (!v.ok) {
@@ -1504,7 +1602,7 @@ const server = http.createServer((req, res) => {
   res.on('error', () => {});
 
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PATCH');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
   res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
   res.setHeader('Access-Control-Max-Age', '86400');
 
@@ -1586,6 +1684,12 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // --- GET/DELETE /v1/files* ---
+  if ((req.method === 'GET' || req.method === 'DELETE') && req.url.startsWith('/v1/files')) {
+    handleFiles(req, res, null, logId, null);
+    return;
+  }
+
   // --- POST endpoints: collect body ---
   if (req.method === 'POST') {
     const chunks = [];
@@ -1624,6 +1728,14 @@ const server = http.createServer((req, res) => {
         handleTTS(req, res, json, logId);
       } else if (req.url.startsWith('/v1/audio/transcriptions')) {
         handleSTT(req, res, rawStr, logId, req.headers['content-type']);
+      } else if (req.url.startsWith('/v1/audio/translations')) {
+        handleProxy(req, res, rawStr, logId, '/audio/translations', false, req.headers['content-type']);
+      } else if (req.url.startsWith('/v1/images/edits')) {
+        handleProxy(req, res, rawStr, logId, '/images/edits', false, req.headers['content-type']);
+      } else if (req.url.startsWith('/v1/images/variations')) {
+        handleProxy(req, res, rawStr, logId, '/images/variations', false, req.headers['content-type']);
+      } else if (req.url.startsWith('/v1/files')) {
+        handleFiles(req, res, rawStr, logId, req.headers['content-type']);
       } else if (req.url === '/api/console/validate') {
         handleConsoleValidate(req, res, logId);
       } else if (req.url === '/api/console/save') {
@@ -1679,12 +1791,15 @@ const onListening = () => {
 server.listen(PORT, onListening);
 
 // --- graceful config reload ---
-const watchPaths = [CONFIG_PATH];
-// Watch both json/jsonc in the same directory as CONFIG_PATH (not env override, both may exist)
-if (!process.env.CONFIG_PATH) {
-  const dir = path.dirname(CONFIG_PATH);
-  const alt = path.join(dir, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
-  if (fs.existsSync(alt)) watchPaths.push(alt);
+const watchPaths = [];
+if (CONFIG_PATH) {
+  watchPaths.push(CONFIG_PATH);
+  // Watch both json/jsonc in the same directory as CONFIG_PATH (not env override, both may exist)
+  if (!process.env.CONFIG_PATH) {
+    const dir = path.dirname(CONFIG_PATH);
+    const alt = path.join(dir, CONFIG_PATH.endsWith('.jsonc') ? 'config.json' : 'config.jsonc');
+    if (fs.existsSync(alt)) watchPaths.push(alt);
+  }
 }
 let reloadTimer = null;
 watchPaths.forEach(wp => {

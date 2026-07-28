@@ -11,8 +11,9 @@ Client → Proxy (Node) → 上游 Provider。
 - **Model 別名路由** — 依 context window 自動選擇最適合的別名
 - **端點自動派生** — `endpoint_defaults` 讓單一 model 名稱自動對應各端點的 model 別名
 - **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
-- **非 Chat 端點** — embeddings、images/generations、audio/speech、audio/transcriptions
+- **非 Chat 端點** — embeddings、images/generations、images/edits、images/variations、audio/speech、audio/transcriptions、audio/translations、files
 - **請求頻率限制** — 可設定 RPM（rate_limit）與 TPM（tpm_limit）
+- **Circuit Breaker** — 連續 5 次 5xx 自動跳過該 provider 30 秒，成功後立即關閉
 - **管理後台** — `GET /console` 使用 client-token 登入，可檢視/編輯 config、Log
 - **運行儀表板** — `/console` 的 Status 顯示各 provider 健康度，並彙總成功/失敗次數、平均延遲、錯誤率
 - **配置檔熱重啟** — 修改 config 檔 1 秒後自動重啟
@@ -60,18 +61,23 @@ Client 送任何不在 `models` 中的 model 名稱（例如 `"openai"`），Gat
 ```json
 {
   "endpoint_fallbacks": {
-    "/v1/chat/completions":     "gpt-4o",
-    "/v1/images/generations":  "dall-e-3",
-    "/v1/audio/speech":       "tts-1",
-    "/v1/audio/transcriptions": "whisper-1",
-    "/v1/embeddings":         "text-embedding-3-small"
+    "/v1/chat/completions":      "gpt-4o",
+    "/v1/images/generations":    "dall-e-3",
+    "/v1/images/edits":          "dall-e-3",
+    "/v1/images/variations":     "dall-e-3",
+    "/v1/audio/speech":          "tts-1",
+    "/v1/audio/transcriptions":  "whisper-1",
+    "/v1/audio/translations":    "whisper-1",
+    "/v1/embeddings":            "text-embedding-3-small",
+    "/v1/files":                 "file-store"
   },
   "models": {
     "gpt-4o":        [{ "provider": "llm7", "model": "gpt-5.5" }],
     "dall-e-3":      [{ "provider": "llm7", "model": "gpt-image-2" }],
     "tts-1":         [{ "provider": "pollinations", "model": "universal-2" }],
     "whisper-1":     [{ "provider": "pollinations", "model": "whisper" }],
-    "text-embedding-3-small": [{ "provider": "pollinations", "model": "openai-3-small" }]
+    "text-embedding-3-small": [{ "provider": "pollinations", "model": "openai-3-small" }],
+    "file-store":    [{ "provider": "llm7", "model": "" }]
   }
 }
 ```
@@ -98,21 +104,59 @@ client 只認得一個 model 名稱，gateway 依端點決定實際路由。如�
 
 Client 端不需要知道哪些 provider 支援 vision，只要附圖，Gateway 自動優先調用支援 vision 的 provider，失敗則 fallback 到一般 chat chain。
 
+## 圖像編輯與變體
+
+`/v1/images/edits`（編輯）與 `/v1/images/variations`（變體）為 multipart 端點，raw body 直接 forward 到上游。model 由 multipart body 中的 `model` 欄位決定，未指定時透過 `endpoint_fallbacks` 指定 model 別名：
+
+```json
+"/v1/images/edits": "image",
+"/v1/images/variations": "image"
+```
+
+model 別名與 `images/generations` 共用同一 `image` 鏈即可。
+
+## Files API
+
+`/v1/files` 支援：
+
+| Method | 路徑 | 用途 |
+|--------|------|------|
+| `GET` | `/v1/files` | 列出檔案 |
+| `GET` | `/v1/files/:id` | 查詢檔案 |
+| `GET` | `/v1/files/:id/content` | 下載檔案內容 |
+| `POST` | `/v1/files` | 上傳檔案（multipart） |
+| `DELETE` | `/v1/files/:id` | 刪除檔案 |
+
+需在 `endpoint_fallbacks` 指定檔案儲存的上游 provider：
+
+```json
+"/v1/files": "llm7"
+```
+
+## 執行環境
+
+| Runtime | 支援 | 啟動方式 |
+|---------|------|---------|
+| Node.js 18+ | ✅ | `npm start` 或 `node src/index.js` |
+| Bun | ✅ | `npm run bun` 或 `bun run src/index.js` |
+
+## PM2 部署
+
+```bash
+npm install -g pm2
+pm2 start src/index.js --name api-gateway --node-args="--max-old-space-size=192" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
+pm2 save && pm2 startup
+```
+
 ## 健康檢查
 
 ```bash
 curl http://localhost:3000/health
 ```
 
-## PM2 部署
-
-```bash
-npm install -g pm2
-pm2 start index.js --name api-gateway --node-args="--max-old-space-size=192" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
-pm2 save && pm2 startup
-```
-
 ## 設定
+
+訪問 `/console` 路由可進入直接編寫 config.json 設定檔。
 
 所有欄位說明請參閱 `src/config.example.json`。支援 `config.json` / `config.jsonc`（含 `//` 與 `/* */` 註解），值可由同名環境變數覆寫。
 
@@ -142,9 +186,9 @@ openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、co
 
 client 送標準 OpenAI TTS 請求即可，Gateway 依 `model` 別名自動轉發。
 
-### STT (Speech-to-Text)
+### STT (Speech-to-Text) / Translation
 
-`/v1/audio/transcriptions` 端點同樣支援 Cartesia 與 ElevenLabs，自動處理 multipart 欄位名稱與模型值轉換。
+`/v1/audio/transcriptions` 與 `/v1/audio/translations` 端點同樣支援 Cartesia 與 ElevenLabs，自動處理 multipart 欄位名稱與模型值轉換。transcriptions 輸出原始語言文字，translations 固定輸出英文（OpenAI 規格）。
 
 ```jsonc
 "models": {
