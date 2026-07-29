@@ -164,7 +164,7 @@ curl http://localhost:3000/health
 
 相容 OpenAI Chat Completions API：
 
-openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、cartesia、elevenlabs
+openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、cartesia、elevenlabs、morph
 
 ### TTS (Text-to-Speech)
 

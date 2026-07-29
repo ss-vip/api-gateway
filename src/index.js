@@ -227,6 +227,7 @@ const   DIRECT_PROVIDERS = {
   replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
   opencode: 'https://opencode.ai/zen',
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
+  morph: 'https://api.morphllm.com',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
@@ -466,9 +467,10 @@ const PROVIDER_RPM = {
   cohere: 60,          // command-r-plus, reasonable
   perplexity: 20,       // sonar online: ~20 RPM
   huggingface: 30,      // router, varies by model
-  replicate: 60,        // prediction API, not strictly RPM-limited
+   replicate: 60,        // prediction API, not strictly RPM-limited
   baseten: 60,         // inference, safe middle
   parallel: 60,         // speed/base, safe middle
+  morph: 30,            // YC-backed, conservative
 };
 // Conservative default for manual (config-defined) providers that have no RPM source, so they are never unthrottled (ban risk)
 const DEFAULT_MANUAL_RPM = 10;

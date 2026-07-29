@@ -37,6 +37,7 @@
     "sea-lion": ["sk-...", "sk-..."],
     "cartesia": ["sk_car_..."],
     "elevenlabs": ["sk_..."],
+    "morph": ["sk-..."],
 
     "_custom_provider_example": "下方為自定 provider 範例",
     "my-proxy": {
