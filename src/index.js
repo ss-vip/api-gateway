@@ -112,7 +112,44 @@ function getLogPath() {
   return path.join(__dirname, 'log.json');
 }
 let _logWriteCount = 0, _logCleaning = new Set(), _lastCleanup = 0;
-const stats = { success: 0, error: 0, latSum: 0, latN: 0 };
+const stats = { success: 0, error: 0, latSum: 0, latN: 0, httpCodes: {} };
+const _sseClients = new Set();
+let _sseTimer = null;
+function _pushSSE(event, data) {
+  if (_sseClients.size === 0) return;
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const c of _sseClients) {
+    try { c.write(msg); } catch { _sseClients.delete(c); }
+  }
+}
+function _buildStatusJSON() {
+  const mem = process.memoryUsage();
+  const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
+  const now = Date.now();
+  const providers = {};
+  for (const [p, m] of keyPool) {
+    const vals = [...m.values()];
+    const lastSuccess = vals.reduce((mx, s) => Math.max(mx, s.lastSuccess || 0), 0);
+    const lat = vals.filter(s => s.lastLatency > 0).map(s => s.lastLatency);
+    providers[p] = {
+      keys: m.size,
+      degraded: vals.filter(s => s.degradedUntil > now).length,
+      last_success: lastSuccess ? Math.round((now - lastSuccess) / 1000) + 's' : 'never',
+      latency_ms: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : 0,
+      cbOpen: _isCircuitOpen(p),
+    };
+  }
+  const totalReq = stats.success + stats.error;
+  return {
+    active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), totalmem_mb: Math.round(os.totalmem() / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+    uptime: formatUptime(process.uptime()), keys: totalKeys, providers,
+    success_total: stats.success, error_total: stats.error,
+    avg_latency_ms: stats.latN ? Math.round(stats.latSum / stats.latN) : 0,
+    error_rate: totalReq ? (stats.error / totalReq * 100).toFixed(1) + '%' : '0%',
+    http_codes: { ...stats.httpCodes },
+    recent401: [..._recent401.values()].map(e => ({ provider: e.provider, model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
+  };
+}
 function _cleanupLog(p, cutoffOverride) {
   if (_logCleaning.has(p)) return;
   const ec = cfg.log;
@@ -153,8 +190,9 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
     entry.type = 'success';
   }
   fs.appendFile(p, JSON.stringify(entry) + '\n', (err) => { if (err) elog(`[log] write ${p}: ${err.message}`); });
-  if (entry.type === 'error') stats.error++;
-  else { stats.success++; if (latency) { stats.latSum += latency; stats.latN++; } }
+  if (entry.type === 'error') { stats.error++; if (status) stats.httpCodes[status] = (stats.httpCodes[status] || 0) + 1; }
+  else { stats.success++; stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1; if (latency) { stats.latSum += latency; stats.latN++; } }
+  _pushSSE('log', entry);
   _logWriteCount = (_logWriteCount + 1) % 1000000007;
   if (_logWriteCount % 50 === 1) _triggerCleanup();
 }
@@ -1488,31 +1526,8 @@ function handleConsoleLoad(req, res, logId) {
 function handleConsoleStatus(req, res, logId) {
   log('─'); log(`[${logId}] /api/console/status`);
   if (!checkConsoleAuth(req, res)) return;
-  const mem = process.memoryUsage();
-  const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
-  const now = Date.now();
-  const providers = {};
-  for (const [p, m] of keyPool) {
-    const vals = [...m.values()];
-    const lastSuccess = vals.reduce((mx, s) => Math.max(mx, s.lastSuccess || 0), 0);
-    const lat = vals.filter(s => s.lastLatency > 0).map(s => s.lastLatency);
-    providers[p] = {
-      keys: m.size,
-      degraded: vals.filter(s => s.degradedUntil > now).length,
-      last_success: lastSuccess ? Math.round((now - lastSuccess) / 1000) + 's' : 'never',
-      latency_ms: lat.length ? Math.round(lat.reduce((a, b) => a + b, 0) / lat.length) : 0,
-    };
-  }
-  const totalReq = stats.success + stats.error;
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), totalmem_mb: Math.round(os.totalmem() / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
-    uptime: formatUptime(process.uptime()), keys: totalKeys, providers,
-    success_total: stats.success, error_total: stats.error,
-    avg_latency_ms: stats.latN ? Math.round(stats.latSum / stats.latN) : 0,
-    error_rate: totalReq ? (stats.error / totalReq * 100).toFixed(1) + '%' : '0%',
-    recent401: [..._recent401.values()].map(e => ({ provider: e.provider, model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
-  }));
+  res.end(JSON.stringify(_buildStatusJSON()));
 }
 
 function handleConsoleSave(req, res, body, logId) {
@@ -1576,13 +1591,102 @@ function handleConsoleSave(req, res, body, logId) {
     res.end(JSON.stringify({ error: e.message }));
   }
 }
+function handleConsoleStream(req, res, logId) {
+  log('─'); log(`[${logId}] /api/console/stream`);
+  // EventSource cannot set custom headers — accept token via ?token= query param
+  const qToken = new URL(req.url, 'http://x').searchParams.get('token');
+  if (qToken && (!CLIENT_TOKEN || qToken === CLIENT_TOKEN)) {
+    // token from query param is valid, skip header check
+  } else if (!checkConsoleAuth(req, res)) { return; }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write('retry: 2000\n\n');
+  _sseClients.add(res);
+  _ensureSSETimer();
+  // push initial status
+  res.write(`event: status\ndata: ${JSON.stringify(_buildStatusJSON())}\n\n`);
+  req.on('close', () => { _sseClients.delete(res); });
+}
+function handleConsoleRetry401(req, res, body, logId) {
+  log('─'); log(`[${logId}] /api/console/retry401`);
+  if (!checkConsoleAuth(req, res)) return;
+  _recent401.clear();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+}
+async function handleConsoleProbe(req, res, body, logId) {
+  log('─'); log(`[${logId}] /api/console/probe`);
+  if (!checkConsoleAuth(req, res)) return;
+  const { provider } = body || {};
+  if (!provider || !DIRECT_PROVIDERS[provider]) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid provider' }));
+    return;
+  }
+  const url = (DIRECT_PROVIDERS[provider] || '').replace(/\/+$/, '');
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 8000);
+    const r = await fetch(url, { signal: controller.signal, method: 'GET' });
+    clearTimeout(t);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, status: r.status, latency: 'live' }));
+  } catch (e) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, status: 0, error: e.message }));
+  }
+}
+function _ensureSSETimer() {
+  if (_sseTimer) return;
+  _sseTimer = setInterval(() => {
+    if (_sseClients.size === 0) return;
+    _pushSSE('status', _buildStatusJSON());
+  }, 3000).unref();
+}
+function handleConsoleProviderDetail(req, res, logId, url) {
+  log('─'); log(`[${logId}] /api/console/provider-detail`);
+  if (!checkConsoleAuth(req, res)) return;
+  const p = new URL(url, 'http://x').searchParams.get('provider');
+  if (!p || !keyPool.has(p)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'invalid provider' }));
+    return;
+  }
+  const now = Date.now();
+  const keys = [];
+  for (const [k, v] of keyPool.get(p)) {
+    keys.push({
+      key: logKey(k),
+      latency_ms: v.lastLatency,
+      successCount: v.successCount,
+      errorCount: v.errorCount,
+      degraded: now < v.degradedUntil,
+      lastSuccess: v.lastSuccess ? Math.round((now - v.lastSuccess) / 1000) + 's' : 'never',
+    });
+  }
+  const cbEntry = _circuitBreaker.get(p);
+  const cbOpen = cbEntry ? _isCircuitOpen(p) : false;
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    provider: p,
+    keys,
+    circuitBreaker: { open: cbOpen, count: cbEntry ? cbEntry.count : 0, openSince: cbEntry ? cbEntry.openSince : 0 },
+    recent401: [..._recent401.values()].filter(e => e.provider === p).map(e => ({ model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
+  }));
+}
 function isJsonEndpoint(url) {
   return url.startsWith('/v1/chat/completions') ||
          url.startsWith('/v1/embeddings') ||
          url.startsWith('/v1/images/generations') ||
          url.startsWith('/v1/audio/speech') ||
-          url === '/api/console/validate' ||
-          url === '/api/console/save';
+           url === '/api/console/validate' ||
+           url === '/api/console/save' ||
+           url === '/api/console/retry401' ||
+           url === '/api/console/probe';
 }
 
 let _activeRequests = 0;
@@ -1685,6 +1789,15 @@ const server = http.createServer((req, res) => {
     handleConsoleStatus(req, res, logId);
     return;
   }
+  // use startsWith because EventSource passes ?token=xxx query param
+  if (req.url.startsWith('/api/console/stream') && req.method === 'GET') {
+    handleConsoleStream(req, res, logId);
+    return;
+  }
+  if (req.url.startsWith('/api/console/provider-detail') && req.method === 'GET') {
+    handleConsoleProviderDetail(req, res, logId, req.url);
+    return;
+  }
 
   // --- GET/DELETE /v1/files* ---
   if ((req.method === 'GET' || req.method === 'DELETE') && req.url.startsWith('/v1/files')) {
@@ -1742,6 +1855,10 @@ const server = http.createServer((req, res) => {
         handleConsoleValidate(req, res, logId);
       } else if (req.url === '/api/console/save') {
         handleConsoleSave(req, res, json, logId);
+      } else if (req.url === '/api/console/retry401') {
+        handleConsoleRetry401(req, res, json, logId);
+      } else if (req.url === '/api/console/probe') {
+        handleConsoleProbe(req, res, json, logId);
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'not found' } }));
@@ -1785,6 +1902,11 @@ const onListening = () => {
   try {
     const _lines = p => { try { return fs.readFileSync(p, 'utf8').split('\n').filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
     const all = _lines(getLogPath()).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    stats.httpCodes = {};
+    for (const e of all) {
+      if (e.type === 'success') stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1;
+      else if (e.status) stats.httpCodes[e.status] = (stats.httpCodes[e.status] || 0) + 1;
+    }
     stats.success = all.filter(e => e.type === 'success').length;
     stats.error = all.filter(e => e.type === 'error').length;
     if (stats.success || stats.error) log(`[config] seeded stats: success=${stats.success} error=${stats.error}`);

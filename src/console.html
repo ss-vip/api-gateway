@@ -2,38 +2,41 @@
 <html lang="zh-TW" data-bs-theme="dark">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>API Gateway Console</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.10.0/font/bootstrap-icons.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/css/bootstrap.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.3/js/bootstrap.bundle.min.js"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/dracula.min.css">
 <style>
-.CodeMirror{min-height:200px;resize:both;overflow:hidden;font-size:13px;border-radius:6px;border:1px solid var(--bs-border-color)}
+.CodeMirror{min-height:180px;resize:both;overflow:hidden;font-size:13px;border-radius:6px;border:1px solid var(--bs-border-color)}
 .CodeMirror-gutters{background:var(--bs-tertiary-bg);border-right:1px solid var(--bs-border-color)}
-.CodeMirror-cursor{border-color:var(--bs-body-color)}
 .CodeMirror pre{font-family:Consolas,'Courier New',monospace}
-div[class*=scrollbar]{background:var(--bs-body-bg)!important}
-div[class*=scrollbar-inner]{background:var(--bs-secondary-bg)!important;border-radius:4px!important}
-div[class*=scrollbar-filler],div[class*=gutter-filler]{background:var(--bs-body-bg)!important}
 ::-webkit-scrollbar{width:8px;height:8px}
-::-webkit-scrollbar-track{background:var(--bs-body-bg)}
-::-webkit-scrollbar-thumb{background:var(--bs-secondary-bg);border-radius:4px}
-#gotop{position:fixed;bottom:24px;right:24px;width:44px;height:44px;border-radius:50%;display:none;z-index:1060;opacity:.85;transition:opacity .2s;padding:0;line-height:1}
-#gotop:hover{opacity:1}
+::-webkit-scrollbar-track{background:#000;border:1px solid #333}
+::-webkit-scrollbar-thumb{background:#888;border-radius:4px;border:1px solid #000}
+.CodeMirror-resize-handle{width:14px;height:14px;position:absolute;bottom:0;right:0;cursor:se-resize;background:#000;border:solid #888;border-width:0 2px 2px 0}
+.toast .toast-body,.toast .toast-body *{color:#fff!important}
+#gotop{position:fixed;bottom:24px;right:24px;width:44px;height:44px;border-radius:50%;display:none;z-index:1060;background:rgba(128,128,128,0.5);border:none;color:#fff;backdrop-filter:blur(4px)}
+#gotop:hover{background:rgba(128,128,128,0.7)}
+.chart-box{position:relative;height:160px}
+.offcanvas{--bs-offcanvas-width:480px}
 </style></head>
-<body>
-<div class="container py-3">
-<nav class="d-none d-flex justify-content-between align-items-center py-2 border-bottom mb-4" id="header">
-<h2 class="fs-5 m-0">API Gateway Console</h2>
-<div class="d-flex gap-2">
-<button class="btn btn-outline-secondary btn-sm px-2" id="themeBtn" title="切換明暗"><i class="bi bi-moon-fill"></i></button>
+<body class="bg-body-tertiary">
+<div class="container-fluid p-3">
+<nav class="d-none d-flex justify-content-between align-items-center py-2 px-3 bg-body border-bottom rounded mb-3 shadow-sm" id="header">
+<h2 class="fs-5 m-0"><i class="bi bi-shield-check"></i> API Gateway</h2>
+<div class="d-flex gap-2 align-items-center">
+<button class="btn btn-outline-secondary btn-sm px-2" id="themeBtn" title="切換主題"><i class="bi bi-moon-fill"></i></button>
+<button class="btn btn-outline-secondary btn-sm" id="refreshBtn" title="重新整理"><i class="bi bi-arrow-clockwise"></i></button>
+<button class="btn btn-outline-warning btn-sm d-none" id="retry401Btn" title="重試所有 401"><i class="bi bi-exclamation-triangle"></i> <span id="retry401Badge">0</span></button>
 <button class="btn btn-outline-secondary btn-sm" id="logoutBtn">登出</button>
 </div>
 </nav>
 <div class="row justify-content-center" id="login">
 <div class="col-12 col-sm-8 col-md-5 col-lg-4">
-<div class="card shadow-sm">
+<div class="card shadow">
 <div class="card-body text-center p-4">
-<h2 class="card-title fs-4 mb-2">API Gateway Console</h2>
+<h2 class="card-title fs-4 mb-2"><i class="bi bi-shield-check"></i> API Gateway</h2>
 <p class="text-secondary mb-4">請輸入 Client Token 以管理設定檔</p>
 <input type="password" class="form-control mb-3" id="token" placeholder="Client Token" autofocus>
 <button class="btn btn-primary w-100 mb-3" id="loginBtn">登入</button>
@@ -43,97 +46,151 @@ div[class*=scrollbar-filler],div[class*=gutter-filler]{background:var(--bs-body-
 </div>
 </div>
 <div class="d-none" id="editor">
-<div class="mb-4">
-<h3 class="fs-6 d-flex align-items-center gap-2 flex-wrap mb-2">Status <button class="btn btn-outline-secondary btn-sm" id="refreshBtn">更新</button></h3>
-<div class="accordion" id="statusAccordion">
-<div class="accordion-item"><h2 class="accordion-header"><button class="accordion-button" type="button" data-bs-toggle="collapse" data-bs-target="#collapseSys">即時資訊</button></h2>
-<div id="collapseSys" class="accordion-collapse collapse show"><div class="accordion-body py-2 px-3" id="sysPanel">載入中...</div></div></div>
-<div class="accordion-item"><h2 class="accordion-header"><button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapseProv">Providers</button></h2>
-<div id="collapseProv" class="accordion-collapse collapse"><div class="accordion-body py-2" id="provPanel">載入中...</div></div></div>
+<div class="row g-3 mb-3">
+<div class="col-6">
+<div class="card h-100 border-success"><div class="card-body py-2 px-3">
+<div class="d-flex justify-content-between"><span class="small text-secondary"><i class="bi bi-graph-up-arrow"></i> 轉發成功率</span><span class="small text-secondary" id="avgLat">—ms</span></div>
+<div class="d-flex justify-content-between small mt-1"><span id="okCount">0</span><span id="errCount">0</span><span class="fw-bold" id="srPct">0%</span></div>
+<div class="progress mt-1" style="height:12px"><div class="progress-bar bg-success" id="srBarOk" style="width:0%"></div><div class="progress-bar bg-danger" id="srBarErr" style="width:0%"></div></div>
+</div></div>
+</div>
+<div class="col-3"><div class="card h-100"><div class="card-body py-2 px-3">
+<span class="small text-secondary"><i class="bi bi-activity"></i> HTTP 狀態碼</span>
+<div class="chart-box mt-1" style="height:65px"><canvas id="chartHttpCodes"></canvas></div>
+</div></div>
+</div>
+<div class="col-2">
+<div class="card border-info h-100"><div class="card-body py-2 px-3 text-center">
+<span class="small text-secondary"><i class="bi bi-cpu"></i> 記憶體</span>
+<div class="fs-5 fw-bold mt-1" id="rssVal">— <small class="fs-6 fw-normal text-secondary">MB</small></div>
+<div class="small text-secondary mt-1">Active <span id="activeReq">0</span> · <span id="uptimeVal">—</span></div>
+</div></div>
+</div>
+<div class="col-1">
+<div class="card h-100"><div class="card-body py-2 px-3 text-center">
+<span class="small text-secondary"><i class="bi bi-key"></i> 金鑰</span>
+<div class="fs-5 fw-bold mt-1" id="keyCount">—</div>
+<div class="small text-secondary mt-1">Providers <span id="provCount">0</span></div>
+</div></div>
 </div>
 </div>
-<hr class="my-3">
-<div class="mb-4">
-<h3 class="fs-6 mb-2">Config <span class="text-secondary fw-normal small">(儲存後伺服器將自動重啟)</span></h3>
+<div class="row g-3 mb-3">
+<div class="col-12 col-md-6"><div class="card"><div class="card-body py-2 px-3"><span class="small text-secondary"><i class="bi bi-bar-chart"></i> Provider 延遲 (ms)</span><div class="chart-box" style="height:140px"><canvas id="chartLatency"></canvas></div></div></div></div>
+<div class="col-12 col-md-6"><div class="card"><div class="card-body py-2 px-3"><span class="small text-secondary"><i class="bi bi-bar-chart"></i> Provider 金鑰數</span><div class="chart-box" style="height:140px"><canvas id="chartKeys"></canvas></div></div></div></div>
+</div>
+<div class="card mb-3"><div class="card-body py-2 px-3">
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+<span class="small text-secondary fw-bold"><i class="bi bi-hdd-stack"></i> Providers</span>
+<div class="d-flex gap-2 align-items-center flex-wrap">
+<input type="text" class="form-control form-control-sm" id="provFilter" placeholder="篩選 provider..." style="width:180px">
+<select class="form-select form-select-sm" id="provSort" style="width:auto">
+<option value="name">名稱</option><option value="latency">延遲</option><option value="degraded">錯誤</option>
+</select>
+<small class="text-secondary" id="provCountLabel"></small>
+<button class="btn btn-outline-secondary btn-sm" id="provToggle" title="收折 Providers 表格"><i class="bi bi-chevron-up"></i></button>
+</div>
+</div>
+<div class="collapse show" id="provCollapse"><div class="table-responsive"><table class="table table-sm table-hover mb-0" id="provTable"><thead><tr><th>Provider</th><th>Keys</th><th>延遲</th><th>錯誤</th><th>上次成功</th><th>探測</th></tr></thead><tbody id="provBody"></tbody></table></div></div>
+</div></div>
+<div class="row g-3 mb-3">
+<div class="col-12"><div class="card"><div class="card-body py-2 px-3">
+<h3 class="fs-6 mb-2">Config <span class="text-secondary fw-normal small">(儲存後將自動重啟)</span></h3>
 <textarea id="configText"></textarea>
-<div class="d-flex gap-2 flex-wrap mt-2"><button class="btn btn-primary btn-sm" id="configLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="configSaveBtn">儲存 Config</button></div>
-</div>
-<hr class="my-3">
-<div class="mb-4">
+<div class="d-flex gap-2 flex-wrap mt-2"><button class="btn btn-primary btn-sm" id="configLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="configSaveBtn">儲存</button></div>
+</div></div></div>
+<div class="col-12"><div class="card"><div class="card-body py-2 px-3">
 <h3 class="fs-6 mb-2">Log <span class="text-secondary fw-normal small" id="retentionLabel"></span></h3>
-<div class="d-flex align-items-center gap-2 flex-wrap mb-2">
+<textarea id="logText"></textarea>
+<div class="d-flex align-items-center gap-2 flex-wrap mt-2">
 <div class="form-check form-check-inline mb-0"><input class="form-check-input" type="checkbox" id="filterSuccess" checked><label class="form-check-label small" for="filterSuccess">Success</label></div>
 <div class="form-check form-check-inline mb-0"><input class="form-check-input" type="checkbox" id="filterError" checked><label class="form-check-label small" for="filterError">Error</label></div>
-<span class="small text-secondary">日期</span>
 <input type="date" class="form-control form-control-sm" id="filterDateFrom" style="width:auto">
 <span class="small text-secondary">~</span>
 <input type="date" class="form-control form-control-sm" id="filterDateTo" style="width:auto">
 <button class="btn btn-outline-secondary btn-sm" id="filterTodayBtn">今天</button>
 <button class="btn btn-outline-secondary btn-sm" id="filterAllBtn">全部</button>
+<button class="btn btn-primary btn-sm" id="logLoadBtn">讀取</button>
+<button class="btn btn-primary btn-sm" id="logSaveBtn">儲存</button>
+<button class="btn btn-danger btn-sm" id="logClearBtn">清空</button>
 </div>
-<textarea id="logText"></textarea>
-<div class="d-flex gap-2 flex-wrap mt-2"><button class="btn btn-primary btn-sm" id="logLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="logSaveBtn">儲存</button><button class="btn btn-danger btn-sm" id="logClearBtn">清空</button></div>
+</div></div></div>
 </div>
 </div>
 </div>
-<footer class="text-center text-secondary small py-3 mt-3 border-top"><a href="https://github.com/ss-vip/api-gateway" target="_blank" rel="noopener noreferrer" class="text-secondary text-decoration-none"><i class="bi bi-github"></i> Github</a></footer>
+<footer class="text-center text-secondary small py-3 border-top mt-3"><a href="https://github.com/ss-vip/api-gateway" target="_blank" rel="noopener noreferrer" class="text-secondary text-decoration-none"><i class="bi bi-github"></i> Github</a></footer>
 <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toast"></div>
-<button class="btn btn-outline-secondary" id="gotop" title="回到頂部"><i class="bi bi-arrow-up"></i></button>
-<div class="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center d-none" style="background:rgba(0,0,0,.6);z-index:1050" id="overlay"><div class="spinner-border text-primary" role="status"></div><p class="mt-3 text-secondary" id="overlayMsg">載入中...</p></div>
+<button class="btn btn-outline-secondary" id="gotop"><i class="bi bi-arrow-up"></i></button>
+<div class="position-fixed top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center d-none" style="background:rgba(0,0,0,.6);z-index:1050" id="overlay"><div class="spinner-border text-primary"></div><p class="mt-3 text-secondary" id="overlayMsg">載入中...</p></div>
+<div class="offcanvas offcanvas-end" tabindex="-1" id="detailPanel"><div class="offcanvas-header"><h5 class="offcanvas-title" id="detailTitle">Provider</h5><button type="button" class="btn-close" data-bs-dismiss="offcanvas"></button></div>
+<div class="offcanvas-body" id="detailBody"><p class="text-secondary small">選擇一個 provider 檢視詳細資料</p></div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
 <script>
-let _token=localStorage.getItem('gw_token')||'',_cmInit=false;let cmConfig,cmLog,_rawLog='';
+let _token=localStorage.getItem('gw_token')||'',_cmInit=false,cmConfig,cmLog,_rawLog='',_evtSource=null,_lastStatus=null;
+let _charts={httpCodes:null,latency:null,keys:null};
 (function(){const t=localStorage.getItem('bsTheme');if(t){document.documentElement.setAttribute('data-bs-theme',t);const b=document.getElementById('themeBtn');if(b)b.innerHTML=t==='dark'?'<i class="bi bi-moon-fill"></i>':'<i class="bi bi-sun-fill"></i>'}})();
 if(_token)showOverlay();
-function toggleTheme(){const h=document.documentElement;const t=h.getAttribute('data-bs-theme')==='dark'?'light':'dark';h.setAttribute('data-bs-theme',t);localStorage.setItem('bsTheme',t);document.getElementById('themeBtn').innerHTML=t==='dark'?'<i class="bi bi-moon-fill"></i>':'<i class="bi bi-sun-fill"></i>'}
-function logout(){_token='';localStorage.removeItem('gw_token');if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');_rawLog='';document.getElementById('login').classList.remove('d-none');document.getElementById('editor').classList.add('d-none');document.getElementById('header').classList.add('d-none');document.getElementById('token').value='';s('',0)}
+function toggleTheme(){const h=document.documentElement;const t=h.getAttribute('data-bs-theme')==='dark'?'light':'dark';h.setAttribute('data-bs-theme',t);localStorage.setItem('bsTheme',t);document.getElementById('themeBtn').innerHTML=t==='dark'?'<i class="bi bi-moon-fill"></i>':'<i class="bi bi-sun-fill"></i>';destroyCharts();if(_lastStatus)renderCharts(_lastStatus)}
+function logout(){_token='';localStorage.removeItem('gw_token');closeSSE();if(cmConfig)cmConfig.setValue('');if(cmLog)cmLog.setValue('');_rawLog='';document.getElementById('login').classList.remove('d-none');document.getElementById('editor').classList.add('d-none');document.getElementById('header').classList.add('d-none');document.getElementById('token').value='';s('',0)}
 function isAscii(v){for(let i=0;i<v.length;i++){if(v.charCodeAt(i)>127)return false}return true}
 async function auth(){_token=document.getElementById('token').value;if(!_token){s('請輸入 token',1);return}
-if(!isAscii(_token)){s('Token 含有非 ASCII 字元，請檢查',1);return}
+if(!isAscii(_token)){s('Token 含有非 ASCII 字元',1);return}
 try{const r=await fetch('/api/console/validate',{method:'POST',headers:{'Authorization':'Bearer '+_token}});if(!r.ok){localStorage.removeItem('gw_token');_token='';hideOverlay();s('驗證失敗：token 不正確',1);return}
-localStorage.setItem('gw_token',_token);
-document.getElementById('header').classList.remove('d-none');
-document.getElementById('login').classList.add('d-none');document.getElementById('editor').classList.remove('d-none');
-if(!_cmInit){_cmInit=true;
-const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};
-cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);
-cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o);}else{cmConfig.refresh();cmLog.refresh()}
-load();refreshStatus();}catch(e){_token='';hideOverlay();s('連線錯誤，請檢查伺服器是否在線',1);toast(e.message,0)}}
-async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();let msg='已讀取';if(d.config_valid===false)msg+=', config 格式錯誤：'+(d.config_error||'?');if(d.log_valid===false)msg+=', log 格式錯誤：'+(d.log_error||'?');
-// parse retention from config
-try{const c=JSON.parse(d.config);const rd=c?.log?.retention_days;document.getElementById('retentionLabel').textContent=rd?'保留 '+rd+' 天記錄':'';}catch{}
+localStorage.setItem('gw_token',_token);document.getElementById('header').classList.remove('d-none');document.getElementById('login').classList.add('d-none');document.getElementById('editor').classList.remove('d-none');
+if(!_cmInit){_cmInit=true;const o={mode:'application/json',theme:'dracula',lineNumbers:true,indentUnit:2,lineWrapping:false};cmConfig=CodeMirror.fromTextArea(document.getElementById('configText'),o);cmLog=CodeMirror.fromTextArea(document.getElementById('logText'),o)}else{cmConfig.refresh();cmLog.refresh()}
+load();openSSE()}catch(e){_token='';hideOverlay();s('連線錯誤',1);toast(e.message,0)}}
+async function load(){showOverlay();try{const r=await fetch('/api/console/load',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();toast('載入失敗',0);return}const d=await r.json();cmConfig.setValue(d.config||'');_rawLog=d.log||'';applyLogFilter();let msg='已讀取';if(d.config_valid===false)msg+=', config 格式錯誤：'+(d.config_error||'?');if(d.log_valid===false)msg+=', log 格式錯誤：'+(d.log_error||'?')
+try{const c=JSON.parse(d.config);const rd=c?.log?.retention_days;document.getElementById('retentionLabel').textContent=rd?'保留 '+rd+' 天記錄':''}catch{}
 hideOverlay();toast(msg,1)}catch(e){hideOverlay();toast('載入錯誤: '+e.message,0)}}
 function applyLogFilter(){const s=document.getElementById('filterSuccess').checked,e=document.getElementById('filterError').checked;const df=document.getElementById('filterDateFrom').value,dt=document.getElementById('filterDateTo').value;const lines=_rawLog.split('\n'),out=lines.filter(l=>{const t=l.trim();if(!t||t.startsWith('#'))return 1;try{const o=JSON.parse(t);if(o.type==='success'&&!s)return 0;if(o.type==='error'&&!e)return 0;if(df||dt){const d=(o.ts||'').slice(0,10);if(df&&d<df)return 0;if(dt&&d>dt)return 0}}catch{}return 1});cmLog.setValue(out.join('\n'))}
-async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();
-const total=d.success_total+(d.error_total||0);const sr=total?((d.success_total/total)*100).toFixed(1):'0.0';const er=total?((d.error_total/total)*100).toFixed(1):'0.0';
-let sys='<div class="row g-2">';
-// success rate card with latency + animated progress bar
-sys+='<div class="col-12 col-md-8"><div class="card border-success h-100"><div class="card-body py-2 px-3"><div class="row align-items-center"><div class="col"><span class="small text-secondary">轉發成功率</span></div><div class="col-auto"><span class="small text-secondary">平均延遲 <strong>'+(d.avg_latency_ms||'-')+'</strong>ms</span></div></div><div class="d-flex justify-content-between small mt-1"><span>成功 '+d.success_total+'</span><span>失敗 '+(d.error_total||0)+'</span><span class="fw-bold">'+sr+'%</span></div><div class="progress mt-1" style="height:14px"><div class="progress-bar progress-bar-striped progress-bar-animated bg-success" style="width:'+sr+'%">'+sr+'%</div><div class="progress-bar progress-bar-striped progress-bar-animated bg-danger" style="width:'+er+'%">'+er+'%</div></div></div></div></div>';
-// resource card (compact, RAM only)
-sys+='<div class="col-12 col-md-4"><div class="card border-info h-100"><div class="card-body py-2 px-3 d-flex flex-column align-items-center justify-content-center"><span class="small text-secondary">硬體資源</span><span class="fs-4 fw-bold mt-1">'+(d.rss_mb||'-')+'<small class="fs-6 fw-normal text-secondary">MB</small></span><div class="small text-secondary mt-1">Active '+d.active+' / '+d.uptime+'</div></div></div></div>';
-// 401 errors card (always shown)
-const e401=d.recent401||[];
-sys+='<div class="col-12"><div class="card border-warning"><div class="card-body py-2 px-3"><span class="small text-warning"><i class="bi bi-exclamation-triangle-fill"></i> 持續的 401 錯誤'+(e401.length?' <span class="badge bg-warning text-dark">'+e401.length+'</span>':'')+'</span><textarea class="form-control form-control-sm mt-1 font-monospace" rows="'+(e401.length||1)+'" readonly style="resize:none;font-size:12px;background:var(--bs-tertiary-bg);border-color:var(--bs-border-color)">'+(e401.length?e401.map(e=>'['+e.ts+'] '+e.provider+' / '+(e.model||'-')+' / '+e.key).join('\n'):'無')+'</textarea></div></div></div>';
-sys+='</div>';
-document.getElementById('sysPanel').innerHTML=sys;
-// provider cards
-const pEntries=Object.entries(d.providers||{});
-let prov='';
-if(pEntries.length){prov='<div class="row g-2">';
-for(const[p,v]of pEntries){const allD=v.keys>0&&v.degraded>=v.keys;const someD=v.degraded>0;const border=allD?'border-danger':someD?'border-warning':'border-success';prov+='<div class="col-6 col-md-4 col-lg-3"><div class="card card-body py-2 px-3 border-2 '+border+'"><div class="d-flex justify-content-between align-items-center"><strong class="small text-truncate">'+p+'</strong><span class="badge bg-secondary ms-1">'+v.keys+' keys</span></div><div class="d-flex gap-2 mt-1 small">'+((v.degraded?'<span class="text-danger fw-bold" title="錯誤次數"><i class="bi bi-exclamation-triangle-fill"></i> '+v.degraded+'</span>':'<span class="text-secondary" title="錯誤次數"><i class="bi bi-check-circle-fill text-success"></i> 0</span>')+'<span class="text-warning" title="平均回應時間(毫秒)"><i class="bi bi-lightning-fill"></i> '+(v.latency_ms||'-')+'ms</span><span class="text-secondary" title="最後調用時間"><i class="bi bi-clock"></i> '+v.last_success+'</span>')+'</div></div></div>';}
-prov+='</div>';}else{prov='<span class="text-secondary small">尚無 provider 資料</span>';}
-document.getElementById('provPanel').innerHTML=prov;
-hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
-async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
-async function clearLog(){_rawLog='';cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
+function destroyCharts(){for(const k of Object.keys(_charts)){if(_charts[k]){_charts[k].destroy();_charts[k]=null}}}
+function renderCharts(d){destroyCharts();const isDark=document.documentElement.getAttribute('data-bs-theme')==='dark';const tc=isDark?'rgba(255,255,255,0.7)':'rgba(0,0,0,0.7)';const bc=isDark?'rgba(255,255,255,0.08)':'rgba(0,0,0,0.06)'
+const provs=Object.entries(d.providers||{});const pNames=provs.map(p=>p[0]);const pLats=provs.map(p=>p[1].latency_ms||0);const pKeys=provs.map(p=>p[1].keys||0)
+const hc=d.http_codes||{};const hcLabels=['200','401','其他'];const hcData=[hc[200]||0,hc[401]||0,Object.entries(hc).filter(([k])=>k!=200&&k!=401).reduce((s,[,v])=>s+v,0)]
+_charts.httpCodes=new Chart(document.getElementById('chartHttpCodes'),{type:'doughnut',data:{labels:hcLabels,datasets:[{data:hcData,backgroundColor:['#198754','#ffc107','#dc3545'],borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){return ctx.label+': '+ctx.parsed}}}},cutout:'50%'}})
+_charts.latency=new Chart(document.getElementById('chartLatency'),{type:'bar',data:{labels:pNames,datasets:[{label:'延遲 (ms)',data:pLats,backgroundColor:isDark?'rgba(13,110,253,0.7)':'rgba(13,110,253,0.5)',borderColor:isDark?'#0d6efd':'#0d6efd',borderWidth:1}]},options:{responsive:true,maintainAspectRatio:false,indexAxis:'y',plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,grid:{color:bc},ticks:{color:tc}},y:{grid:{color:bc},ticks:{color:tc}}}}})
+_charts.keys=new Chart(document.getElementById('chartKeys'),{type:'bar',data:{labels:pNames,datasets:[{label:'金鑰',data:pKeys,backgroundColor:isDark?'rgba(111,66,193,0.7)':'rgba(111,66,193,0.5)',borderColor:isDark?'#6f42c1':'#6f42c1',borderWidth:1}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{color:bc},ticks:{color:tc}},y:{beginAtZero:true,grid:{color:bc},ticks:{color:tc}}}}})}
+function renderProviderTable(d){const body=document.getElementById('provBody');const e401=d.recent401||[];const retryBtn=document.getElementById('retry401Btn');if(e401.length){retryBtn.classList.remove('d-none');document.getElementById('retry401Badge').textContent=e401.length}else{retryBtn.classList.add('d-none')}
+const filter=document.getElementById('provFilter').value.toLowerCase();const sort=document.getElementById('provSort').value;let entries=Object.entries(d.providers||{}).filter(([p])=>p.toLowerCase().includes(filter))
+entries.sort((a,b)=>{const [pa,va]=a,[pb,vb]=b;if(sort==='latency')return(va.latency_ms||0)-(vb.latency_ms||0);if(sort==='degraded')return(vb.degraded||0)-(va.degraded||0);return pa.localeCompare(pb)})
+document.getElementById('provCountLabel').textContent=entries.length+'/'+Object.keys(d.providers||{}).length
+if(!entries.length){body.innerHTML='<tr><td colspan="6" class="text-secondary text-center small">無符合 provider</td></tr>';return}
+body.innerHTML=entries.map(([p,v])=>{
+return'<tr class="prov-row" data-provider="'+p+'" style="cursor:pointer"><td><strong class="small">'+p+'</strong></td><td><span class="badge border border-info text-info">'+v.keys+(v.degraded?' <span class="text-white-50">('+v.degraded+' degraded)</span>':'')+'</span></td><td class="small">'+(v.latency_ms||'-')+'ms</td><td class="small">'+(v.degraded?'<span class="text-danger">'+v.degraded+'</span>':'<span class="text-secondary">0</span>')+'</td><td class="small text-secondary">'+v.last_success+'</td><td><button class="btn btn-outline-info btn-sm probe-btn py-0 px-1" data-provider="'+p+'" title="探測"><i class="bi bi-activity"></i></button></td></tr>'
+}).join('')
+document.querySelectorAll('.prov-row').forEach(el=>{el.addEventListener('click',function(e){if(e.target.closest('.probe-btn'))return;showProviderDetail(this.dataset.provider)})})
+document.querySelectorAll('.probe-btn').forEach(el=>{el.addEventListener('click',async function(e){e.stopPropagation();const p=this.dataset.provider;this.disabled=true;this.innerHTML='<span class="spinner-border spinner-border-sm"></span>';try{const r=await fetch('/api/console/probe',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({provider:p})});const d=await r.json();toast(p+' 探測結果: '+(d.ok?'✅ 可連通':'❌ 不連通 ('+(d.error||d.status)+')'),d.ok)}catch(e){toast(p+' 探測失敗: '+e.message,0)}finally{this.disabled=false;this.innerHTML='<i class="bi bi-activity"></i>'}})})
+}
+
+let _detailOffcanvas=null;async function showProviderDetail(provider){if(!_detailOffcanvas)_detailOffcanvas=new bootstrap.Offcanvas(document.getElementById('detailPanel'));document.getElementById('detailTitle').textContent=provider;document.getElementById('detailBody').innerHTML='<div class="text-center"><div class="spinner-border spinner-border-sm text-primary"></div></div>';_detailOffcanvas.show()
+try{const r=await fetch('/api/console/provider-detail?provider='+encodeURIComponent(provider),{headers:{'Authorization':'Bearer '+_token}});if(!r.ok)throw new Error(await r.text());const d=await r.json()
+let html='<button class="btn btn-outline-info btn-sm probe-btn mb-3" data-provider="'+provider+'"><i class="bi bi-activity"></i> 探測</button>'
+if(d.keys.length){html+='<table class="table table-sm"><thead><tr><th>Key</th><th>延遲</th><th>成功</th><th>錯誤</th><th>狀態</th><th>上次</th></tr></thead><tbody>'
+for(const k of d.keys){const st=k.degraded?'<span class="text-warning">Degraded</span>':'<span class="text-success">Healthy</span>';html+='<tr><td class="font-monospace small">'+k.key+'</td><td>'+k.latency_ms+'ms</td><td>'+k.successCount+'</td><td>'+k.errorCount+'</td><td>'+st+'</td><td class="small text-secondary">'+k.lastSuccess+'</td></tr>'}
+html+='</tbody></table>'}else{html+='<p class="text-secondary small">無金鑰資料</p>'}
+if(d.recent401.length){html+='<h6 class="mt-3 text-warning"><i class="bi bi-exclamation-triangle-fill"></i> 401 錯誤</h6><textarea class="form-control form-control-sm font-monospace" rows="'+d.recent401.length+'" readonly style="font-size:12px;background:var(--bs-tertiary-bg);resize:none">'+d.recent401.map(e=>'['+e.ts+'] '+e.model+' / '+e.key).join('\n')+'</textarea>'}else{html+='<p class="text-secondary small mt-2"><i class="bi bi-check-circle text-success"></i> 無 401 錯誤</p>'}
+document.getElementById('detailBody').innerHTML=html
+document.querySelector('#detailBody .probe-btn')?.addEventListener('click',async function(){const p=this.dataset.provider;this.disabled=true;this.innerHTML='<span class="spinner-border spinner-border-sm"></span>';try{const r=await fetch('/api/console/probe',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({provider:p})});const d=await r.json();toast(p+' 探測: '+(d.ok?'✅ 可連通':'❌ 不連通'),d.ok)}catch(e){toast(p+' 探測失敗',0)}finally{this.disabled=false;this.innerHTML='<i class="bi bi-activity"></i> 探測'}})
+}catch(e){document.getElementById('detailBody').innerHTML='<p class="text-danger">載入失敗: '+e.message+'</p>'}}
+function updateStatusUI(d){_lastStatus=d
+const total=d.success_total+(d.error_total||0);const sr=total?((d.success_total/total)*100).toFixed(1):'0';const er=total?((d.error_total/total)*100).toFixed(1):'0'
+document.getElementById('okCount').textContent='✓ '+d.success_total;document.getElementById('errCount').textContent='✗ '+(d.error_total||0);document.getElementById('srPct').textContent=sr+'%';document.getElementById('avgLat').textContent=(d.avg_latency_ms||'—')+'ms'
+document.getElementById('srBarOk').style.width=sr+'%';document.getElementById('srBarErr').style.width=er+'%'
+document.getElementById('rssVal').innerHTML=d.rss_mb+' <small class="fs-6 fw-normal text-secondary">MB</small>';document.getElementById('activeReq').textContent=d.active;document.getElementById('uptimeVal').textContent=d.uptime;document.getElementById('keyCount').textContent=d.keys;document.getElementById('provCount').textContent=Object.keys(d.providers||{}).length
+renderCharts(d);renderProviderTable(d)}
+function openSSE(){closeSSE();_evtSource=new EventSource('/api/console/stream?token='+encodeURIComponent(_token))
+_evtSource.addEventListener('status',function(e){try{const d=JSON.parse(e.data);updateStatusUI(d)}catch{}})
+_evtSource.onerror=function(){/* EventSource auto-reconnects by default */}}
+function closeSSE(){if(_evtSource){_evtSource.close();_evtSource=null}}
+async function retryAll401(){showOverlay();try{const r=await fetch('/api/console/retry401',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:'{}'});const d=await r.json();hideOverlay();if(r.ok&&d.ok)toast('已清除所有 401 記錄',1);else toast('操作失敗',0)}catch(e){hideOverlay();toast('操作失敗',0)}}
 function s(m,e){document.getElementById('loginStatus').textContent=m}
-function toast(m,ok){const t=document.getElementById('toast');t.innerHTML='';const e=document.createElement('div');e.className='toast align-items-center text-bg-'+(ok?'success':'danger')+' border-0 show';e.innerHTML='<div class="d-flex"><div class="toast-body">'+m+'</div></div>';t.appendChild(e);setTimeout(()=>{e.classList.remove('show');setTimeout(()=>e.remove(),300)},4000)}
+function toast(m,ok){const t=document.getElementById('toast');t.innerHTML='';const e=document.createElement('div');e.className='toast align-items-center text-white border-0 show bg-'+(ok?'success':'danger');e.innerHTML='<div class="d-flex"><div class="toast-body">'+m+'</div></div>';t.appendChild(e);setTimeout(()=>{e.classList.remove('show');setTimeout(()=>e.remove(),300)},4000)}
 function showOverlay(){document.getElementById('overlay').classList.remove('d-none')}
 function hideOverlay(){document.getElementById('overlay').classList.add('d-none')}
 async function waitForServer(){document.getElementById('overlayMsg').textContent='伺服器重啟中，請稍候...';showOverlay();for(let w=1500;w<=30000;w=Math.min(w*1.5,10000)){await new Promise(r=>setTimeout(r,w+Math.random()*500));try{const r=await fetch('/health',{signal:AbortSignal.timeout(5000)});if(r.ok){hideOverlay();document.getElementById('overlayMsg').textContent='載入中...';toast('伺服器已重新啟動',1);load();return}}catch{}}toast('伺服器重啟逾時，請重新整理頁面',0);hideOverlay();document.getElementById('overlayMsg').textContent='載入中...'}
-
-// gotop
+async function refreshStatus(){showOverlay();try{const r=await fetch('/api/console/status',{headers:{'Authorization':'Bearer '+_token}});if(!r.ok){hideOverlay();return}const d=await r.json();updateStatusUI(d);hideOverlay();toast('已更新資訊',1)}catch(e){hideOverlay();toast('更新失敗',0)}}
+async function save(t){showOverlay();try{const cm=t==='config'?cmConfig:cmLog;const c=cm.getValue();const r=await fetch('/api/console/save',{method:'POST',headers:{'Authorization':'Bearer '+_token,'Content-Type':'application/json'},body:JSON.stringify({file:t,content:c})});if(!r.ok){const d=await r.json().catch(()=>{});hideOverlay();toast('儲存失敗: '+(d?.error||r.status),0);return};toast('已儲存',1);if(t==='config')waitForServer();else hideOverlay()}catch(e){hideOverlay();toast('儲存錯誤: '+e.message,0)}}
+function clearLog(){_rawLog='';cmLog.setValue('');toast('已清空，請按儲存寫入檔案',1)}
 const _gt=document.getElementById('gotop');
 window.addEventListener('scroll',()=>{_gt.style.display=window.scrollY>300?'block':'none'});
 _gt.addEventListener('click',()=>window.scrollTo({top:0,behavior:'smooth'}));
@@ -142,6 +199,7 @@ document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Ente
 document.getElementById('loginBtn').addEventListener('click',auth);
 document.getElementById('logoutBtn').addEventListener('click',logout);
 document.getElementById('refreshBtn').addEventListener('click',refreshStatus);
+document.getElementById('retry401Btn').addEventListener('click',retryAll401);
 document.getElementById('configLoadBtn').addEventListener('click',load);
 document.getElementById('configSaveBtn').addEventListener('click',()=>save('config'));
 document.getElementById('logLoadBtn').addEventListener('click',load);
@@ -153,5 +211,8 @@ document.getElementById('filterDateFrom').addEventListener('change',applyLogFilt
 document.getElementById('filterDateTo').addEventListener('change',applyLogFilter);
 document.getElementById('filterTodayBtn').addEventListener('click',()=>{const t=new Date();const d=t.getFullYear()+'-'+String(t.getMonth()+1).padStart(2,'0')+'-'+String(t.getDate()).padStart(2,'0');document.getElementById('filterDateFrom').value=d;document.getElementById('filterDateTo').value=d;applyLogFilter()});
 document.getElementById('filterAllBtn').addEventListener('click',()=>{document.getElementById('filterDateFrom').value='';document.getElementById('filterDateTo').value='';applyLogFilter()});
+document.getElementById('provFilter').addEventListener('input',()=>{if(_lastStatus)renderProviderTable(_lastStatus)});
+document.getElementById('provSort').addEventListener('change',()=>{if(_lastStatus)renderProviderTable(_lastStatus)});
+document.getElementById('provToggle').addEventListener('click',function(){document.getElementById('provCollapse').classList.toggle('show');this.querySelector('i').className=document.getElementById('provCollapse').classList.contains('show')?'bi bi-chevron-up':'bi bi-chevron-down'});
 if(_token){document.getElementById('token').value=_token;auth();}
 </script></body></html>

@@ -1,5 +1,7 @@
 # API Gateway
 
+[![GitHub Pages](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=github)](https://ss-vip.github.io/api-gateway/)
+
 Client → Proxy (Node) → 上游 Provider。
 多 Key 輪詢、故障轉移、Model 別名路由、SSE 串流。
 
