@@ -1,8 +1,0 @@
-title: API Gateway
-description: AI API Gateway — Multi-Key Polling, Failover, Model Alias Routing, SSE Streaming
-theme: jekyll-theme-cayman
-show_downloads: true
-google_analytics:
-github:
-  is_project_page: true
-  repository_url: https://github.com/ss-vip/api-gateway

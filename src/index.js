@@ -150,12 +150,15 @@ function _buildStatusJSON() {
     recent401: [..._recent401.values()].map(e => ({ provider: e.provider, model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
   };
 }
+const MAX_LOG_LINES = 10000;
+const MAX_CLEANUP_BYTES = 50 * 1024 * 1024;
 function _cleanupLog(p, cutoffOverride) {
   if (_logCleaning.has(p)) return;
   const ec = cfg.log;
   if (ec?.enabled === false) return;
   if (!fs.existsSync(p)) return;
   _logCleaning.add(p);
+  try { if (fs.statSync(p).size > MAX_CLEANUP_BYTES) { elog(`[log] cleanup skip: ${path.basename(p)} > ${MAX_CLEANUP_BYTES/1024/1024}MB`); _logCleaning.delete(p); return; } } catch {}
   const cutoff = cutoffOverride || (Date.now() - (ec?.retention_days || 7) * 86400000);
   const old = p + '.old';
   fs.rename(p, old, (err) => {
@@ -197,6 +200,20 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
   if (_logWriteCount % 50 === 1) _triggerCleanup();
 }
 
+function _reseedStats() {
+  try {
+    const _lines = p => { try { const all = fs.readFileSync(p, 'utf8').split('\n'); return all.slice(-MAX_LOG_LINES).filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
+    const all = _lines(getLogPath()).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    stats.httpCodes = {};
+    for (const e of all) {
+      if (e.type === 'success') stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1;
+      else if (e.status) stats.httpCodes[e.status] = (stats.httpCodes[e.status] || 0) + 1;
+    }
+    stats.success = all.filter(e => e.type === 'success').length;
+    stats.error = all.filter(e => e.type === 'error').length;
+    if (stats.success || stats.error) log(`[stats] reseeded: success=${stats.success} error=${stats.error}`);
+  } catch (e) { elog(`[stats] reseed error: ${e.message}`); }
+}
 // --- config loading (JSONC with comments support) ---
 function _findConfig() {
   const dirs = [__dirname, process.cwd()];
@@ -505,7 +522,7 @@ const PROVIDER_RPM = {
   cohere: 60,          // command-r-plus, reasonable
   perplexity: 20,       // sonar online: ~20 RPM
   huggingface: 30,      // router, varies by model
-   replicate: 60,        // prediction API, not strictly RPM-limited
+  replicate: 60,        // prediction API, not strictly RPM-limited
   baseten: 60,         // inference, safe middle
   parallel: 60,         // speed/base, safe middle
   morph: 30,            // YC-backed, conservative
@@ -673,6 +690,19 @@ function buildTTSRequest(provider, body, upstreamModel) {
   return null; // OpenAI-compatible, use default proxy flow
 }
 
+function _sanitizeToolIds(msg) {
+  const m = { ...msg };
+  const validId = /^[a-zA-Z0-9]{9}$/;
+  if (m.role === 'tool' && m.tool_call_id && !validId.test(m.tool_call_id))
+    m.tool_call_id = (Math.random().toString(36).slice(2)+'000000000').slice(0,9);
+  if (m.role === 'assistant' && Array.isArray(m.tool_calls))
+    m.tool_calls = m.tool_calls.map(tc => {
+      if (tc.id && !validId.test(tc.id))
+        return { ...tc, id: (Math.random().toString(36).slice(2)+'000000000').slice(0,9) };
+      return tc;
+    });
+  return m;
+}
 function normalizeMessageOrder(messages) {
   if (!Array.isArray(messages) || messages.length < 2) return messages;
   const out = [];
@@ -681,7 +711,7 @@ function normalizeMessageOrder(messages) {
     if (prev && prev.role === 'tool' && messages[i].role === 'user') {
       out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
     }
-    out.push(messages[i]);
+    out.push(_sanitizeToolIds(messages[i]));
   }
   return out;
 }
@@ -1457,7 +1487,7 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
     if (!incActive(provider, key)) { lastErr = { status: 429 }; continue; }
     const ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/files' + (suffix ? '/' + suffix : '');
     try {
-      const up = await forwardToDirect(key, method === 'POST' ? rawBody : null, base.baseUrl, ep, 'application/json', method === 'POST' ? contentType : undefined, null, null, method);
+      const up = await forwardToDirect(key, method === 'POST' ? rawBody : null, base, ep, 'application/json', method === 'POST' ? contentType : undefined, null, null, method);
       const sc = up.statusCode;
       if (sc >= 200 && sc < 300) {
         decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
@@ -1513,8 +1543,9 @@ function handleConsoleValidate(req, res, logId) {
 function handleConsoleLoad(req, res, logId) {
   log('─'); log(`[${logId}] /api/console/load`);
   if (!checkConsoleAuth(req, res)) return;
-  const read = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
-  const cfgContent = read(CONFIG_PATH), logContent = read(getLogPath());
+  const readAll = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
+  const readTail = (p) => { try { const lines = fs.readFileSync(p, 'utf-8').split('\n'); return lines.slice(-MAX_LOG_LINES).join('\n'); } catch { return ''; } };
+  const cfgContent = readAll(CONFIG_PATH), logContent = readTail(getLogPath());
   const cfgVal = _jsonValid(cfgContent), logVal = _ndjsonValid(logContent);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
@@ -1544,11 +1575,6 @@ function handleConsoleSave(req, res, body, logId) {
     return;
   }
   const target = body.file === 'config' ? (CONFIG_PATH || path.join(__dirname, 'config.json')) : getLogPath();
-  if (!target) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'config file not found — set CONFIG_PATH env or create config.json' }));
-    return;
-  }
   log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
   try {
     if (body.file === 'config') {
@@ -1583,8 +1609,16 @@ function handleConsoleSave(req, res, body, logId) {
     }
     fs.writeFileSync(target, body.content, 'utf-8');
     log(`[${logId}] saved ${path.basename(target)}`);
+    if (body.file === 'log') { stats.latSum = 0; stats.latN = 0; _reseedStats(); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    if (body.file === 'config' && !CONFIG_PATH) {
+      setTimeout(() => {
+        log(`[config] first config file created — restarting...`);
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(1), 15000).unref();
+      }, 500).unref();
+    }
   } catch (e) {
     log(`[${logId}] save error: ${e.message}`);
     res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -1899,18 +1933,7 @@ const onListening = () => {
   const elCfg = cfg.log;
   if (elCfg?.enabled !== false) log(`[config] log=${getLogPath()} retention=${elCfg?.retention_days || 7}d`);
   // seed stats from persisted logs (count only, latency resets on restart)
-  try {
-    const _lines = p => { try { return fs.readFileSync(p, 'utf8').split('\n').filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
-    const all = _lines(getLogPath()).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    stats.httpCodes = {};
-    for (const e of all) {
-      if (e.type === 'success') stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1;
-      else if (e.status) stats.httpCodes[e.status] = (stats.httpCodes[e.status] || 0) + 1;
-    }
-    stats.success = all.filter(e => e.type === 'success').length;
-    stats.error = all.filter(e => e.type === 'error').length;
-    if (stats.success || stats.error) log(`[config] seeded stats: success=${stats.success} error=${stats.error}`);
-  } catch (e) { elog(`[config] seed stats: ${e.message}`); }
+  _reseedStats();
 };
 server.listen(PORT, onListening);
 

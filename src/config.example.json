@@ -69,7 +69,7 @@
     "groq/qwen/qwen3.6-27b": 8000,
     "cerebras/zai-glm-4.7": 8000,
     "cohere/command-a-plus-05-2026": 128000,
-    "nvidia/mistralai/mistral-small-4-119b-2603": 128000,
+    "nvidia/mistralai/mistral-medium-3.5-128b": 128000,
     "sea-lion/aisingapore/SEA-LION-ModernBERT-Embedding-600M": 8000
   },
 

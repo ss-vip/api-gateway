@@ -1,9 +1,6 @@
 # API Gateway
 
-[![GitHub Pages](https://img.shields.io/badge/docs-GitHub%20Pages-blue?logo=github)](https://ss-vip.github.io/api-gateway/)
-
-Client → Proxy (Node) → 上游 Provider。
-多 Key 輪詢、故障轉移、Model 別名路由、SSE 串流。
+輕量的 LLM API 聚合工具，採用 OpenAI 格式路由，具有多 Key 輪詢、故障轉移、Model 別名對應、SSE 串流功能。
 
 ## 功能
 
@@ -22,12 +19,114 @@ Client → Proxy (Node) → 上游 Provider。
 
 > `log.json` 預設保留 7 天（檔名可由 `log.path` 指定），清理機制由 `/health` 每小時清理，並在每寫入 50 筆時觸發，避免資料無限增長。
 
+---
+
+## 執行環境
+
+| Runtime | 支援 | 啟動方式 |
+|---------|------|---------|
+| Node.js 18+ | ✅ | `npm start` 或 `node src/index.js` |
+| Bun | ✅ | `npm run bun` 或 `bun run src/index.js` |
+
 ## 快速開始
 
 ```bash
 cp src/config.example.json src/config.json   # 填入 Client Token 與 API keys
 npm start
 ```
+Client Token 非必要但是建議使用，將會是用戶端 API 調用的 header auth 以及 /console 頁面的登入密碼。
+
+## PM2 部署 (選用)
+
+```bash
+npm install -g pm2
+pm2 start src/index.js --name api-gateway --node-args="--max-old-space-size=192" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
+pm2 save && pm2 startup
+```
+
+## 健康檢查
+
+具有 log 清理機制，建議排程 5 分鐘訪問一次。
+
+```bash
+curl http://localhost:3000/health
+```
+
+---
+
+## 設定
+
+手動編輯 config.json 或訪問 `/console` 路由可進入直接編寫 config.json 設定檔，存檔將會自動重啟生效。
+
+所有欄位說明請參閱 `src/config.example.json`。支援 `config.json` / `config.jsonc`（含 `//` 與 `/* */` 註解），各參數值可由同名稱環境變數覆寫。
+
+## 支援的 Provider
+
+相容 OpenAI Chat Completions API：
+
+openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、cartesia、elevenlabs、morph
+
+### TTS (Text-to-Speech)
+
+`/v1/audio/speech` 端點內建 **Cartesia** 與 **ElevenLabs** 的格式轉換。非 OpenAI 相容的 TTS provider 無需手動適配，Gateway 會自動將 OpenAI 請求轉成目標 provider 格式：
+
+```jsonc
+// config.json
+"providers": {
+  "cartesia": ["sk_car_..."],
+  "elevenlabs": ["xi-api-key..."]
+},
+"models": {
+  "tts-1": [
+    { "provider": "cartesia", "model": "sonic-3.5" },
+    { "provider": "elevenlabs", "model": "eleven_multilingual_v2" }
+  ]
+}
+```
+
+client 送標準 OpenAI TTS 請求即可，Gateway 依 `model` 別名自動轉發。
+
+### STT (Speech-to-Text) / Translation
+
+`/v1/audio/transcriptions` 與 `/v1/audio/translations` 端點同樣支援 Cartesia 與 ElevenLabs，自動處理 multipart 欄位名稱與模型值轉換。transcriptions 輸出原始語言文字，translations 固定輸出英文（OpenAI 規格）。
+
+```jsonc
+"models": {
+  "tts-1": [
+    { "provider": "cartesia", "model": "sonic-3.5" },
+    { "provider": "elevenlabs", "model": "eleven_multilingual_v2" }
+  ],
+  "whisper-1": [
+    { "provider": "cartesia", "model": "ink-whisper" },
+    { "provider": "elevenlabs", "model": "scribe" }
+  ]
+}
+```
+
+## 手動新增 Provider
+
+任何 **OpenAI-compatible** 的 `/chat/completions` 端點，都能直接在 `config.json` 的 `providers` 以物件形式加入：
+
+```jsonc
+"providers": {
+  "my-proxy": {
+    "apiKeys": ["sk-xxxx"],    // 必填：至少一把 key（keyless 端點尚不支援）
+    "baseUrl": "https://xxx",  // 必填：target url，僅接受 http/https，否則啟動時跳過並告警
+    "pathPrefix": "/v1",       // 選填：端點路徑前綴，預設 /v1（最終為 baseUrl + pathPrefix + /chat/completions）
+    "rpm": 20                  // 選填：每把 key 的帳號級 RPM；省略時套用保守預設 10，避免無限速被 ban
+  }
+}
+```
+
+再於 `models` 把別名指向它即可：
+
+```jsonc
+"models": {
+  "my-model": [{ "provider": "my-proxy", "model": "upstream-model-name" }]
+}
+```
+
+---
 
 ## API 使用
 
@@ -134,98 +233,3 @@ model 別名與 `images/generations` 共用同一 `image` 鏈即可。
 ```json
 "/v1/files": "llm7"
 ```
-
-## 執行環境
-
-| Runtime | 支援 | 啟動方式 |
-|---------|------|---------|
-| Node.js 18+ | ✅ | `npm start` 或 `node src/index.js` |
-| Bun | ✅ | `npm run bun` 或 `bun run src/index.js` |
-
-## PM2 部署
-
-```bash
-npm install -g pm2
-pm2 start src/index.js --name api-gateway --node-args="--max-old-space-size=192" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
-pm2 save && pm2 startup
-```
-
-## 健康檢查
-
-```bash
-curl http://localhost:3000/health
-```
-
-## 設定
-
-訪問 `/console` 路由可進入直接編寫 config.json 設定檔。
-
-所有欄位說明請參閱 `src/config.example.json`。支援 `config.json` / `config.jsonc`（含 `//` 與 `/* */` 註解），值可由同名環境變數覆寫。
-
-## 支援的 Provider
-
-相容 OpenAI Chat Completions API：
-
-openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、cartesia、elevenlabs、morph
-
-### TTS (Text-to-Speech)
-
-`/v1/audio/speech` 端點內建 **Cartesia** 與 **ElevenLabs** 的格式轉換。非 OpenAI 相容的 TTS provider 無需手動適配，Gateway 會自動將 OpenAI 請求轉成目標 provider 格式：
-
-```jsonc
-// config.json
-"providers": {
-  "cartesia": ["sk_car_..."],
-  "elevenlabs": ["xi-api-key..."]
-},
-"models": {
-  "tts-1": [
-    { "provider": "cartesia", "model": "sonic-3.5" },
-    { "provider": "elevenlabs", "model": "eleven_multilingual_v2" }
-  ]
-}
-```
-
-client 送標準 OpenAI TTS 請求即可，Gateway 依 `model` 別名自動轉發。
-
-### STT (Speech-to-Text) / Translation
-
-`/v1/audio/transcriptions` 與 `/v1/audio/translations` 端點同樣支援 Cartesia 與 ElevenLabs，自動處理 multipart 欄位名稱與模型值轉換。transcriptions 輸出原始語言文字，translations 固定輸出英文（OpenAI 規格）。
-
-```jsonc
-"models": {
-  "tts-1": [
-    { "provider": "cartesia", "model": "sonic-3.5" },
-    { "provider": "elevenlabs", "model": "eleven_multilingual_v2" }
-  ],
-  "whisper-1": [
-    { "provider": "cartesia", "model": "ink-whisper" },
-    { "provider": "elevenlabs", "model": "scribe" }
-  ]
-}
-```
-
-## 手動新增 Provider
-
-任何 **OpenAI-compatible** 的 `/chat/completions` 端點，都能直接在 `config.json` 的 `providers` 以物件形式加入：
-
-```jsonc
-"providers": {
-  "my-proxy": {
-    "apiKeys": ["sk-xxxx"],    // 必填：至少一把 key（keyless 端點尚不支援）
-    "baseUrl": "https://xxx",  // 必填：target url，僅接受 http/https，否則啟動時跳過並告警
-    "pathPrefix": "/v1",       // 選填：端點路徑前綴，預設 /v1（最終為 baseUrl + pathPrefix + /chat/completions）
-    "rpm": 20                  // 選填：每把 key 的帳號級 RPM；省略時套用保守預設 10，避免無限速被 ban
-  }
-}
-```
-
-再於 `models` 把別名指向它即可：
-
-```jsonc
-"models": {
-  "my-model": [{ "provider": "my-proxy", "model": "upstream-model-name" }]
-}
-```
-
-- 透過 `/console` 的 Config 編輯器也能直接增刪，存檔後 server 自動重啟生效。
