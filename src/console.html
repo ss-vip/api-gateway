@@ -7,58 +7,24 @@
   <link rel="icon" type="image/svg+xml"
     href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%23ffc107' viewBox='0 0 16 16'%3E%3Cpath d='M5.52.359A.5.5 0 0 1 6 0h4a.5.5 0 0 1 .474.658L8.694 6H12.5a.5.5 0 0 1 .395.807l-7 9a.5.5 0 0 1-.873-.454L6.823 9.5H3.5a.5.5 0 0 1-.48-.641l2.5-8.5zM6.374 1 4.168 8.5H7.5a.5.5 0 0 1 .478.647L6.78 13.04 11.478 7H8a.5.5 0 0 1-.474-.658L9.306 1H6.374z'/%3E%3C/svg%3E">
   <title>API Gateway Console</title>
-  <link rel="stylesheet"
-    href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.10.0/font/bootstrap-icons.min.css">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/theme/dracula.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.21/lib/codemirror.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.21/theme/monokai.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.21/theme/eclipse.min.css">
   <style>
     .CodeMirror {
       min-height: 180px;
       resize: both;
-      overflow: hidden;
       font-size: 13px;
       border-radius: 6px;
       border: 1px solid var(--bs-border-color)
     }
 
-    .CodeMirror-gutters {
-      background: var(--bs-tertiary-bg);
-      border-right: 1px solid var(--bs-border-color)
-    }
-
     .CodeMirror pre {
       font-family: Consolas, 'Courier New', monospace
-    }
-
-    ::-webkit-scrollbar {
-      width: 8px;
-      height: 8px
-    }
-
-    ::-webkit-scrollbar-track {
-      background: #000;
-      border: 1px solid #333
-    }
-
-    ::-webkit-scrollbar-thumb {
-      background: #888;
-      border-radius: 4px;
-      border: 1px solid #000
-    }
-
-    .CodeMirror-resize-handle {
-      width: 14px;
-      height: 14px;
-      position: absolute;
-      bottom: 0;
-      right: 0;
-      cursor: se-resize;
-      background: #000;
-      border: solid #888;
-      border-width: 0 2px 2px 0
     }
 
     .toast .toast-body,
@@ -287,15 +253,17 @@
       <p class="text-secondary small">選擇一個 provider 檢視詳細資料</p>
     </div>
   </div>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/javascript/javascript.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.21/lib/codemirror.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.21/mode/javascript/javascript.min.js"></script>
   <script>
     let _token = localStorage.getItem('gw_token') || '', _cmInit = false, cmConfig, cmLog, _rawLog = '', _evtSource = null, _lastStatus = null;
     let _charts = { httpCodes: null, latency: null, keys: null };
     const DEFAULT_CONFIG = JSON.stringify({ client_token: '', port: 3000, timeout: 600000, key_cooldown: 30000, max_key_backoff: 300000, max_body_size: 10485760, log: { enabled: true, retention_days: 7, path: './log.json' }, providers: {}, rate_limit: {}, tpm_limit: {}, model_limits: {}, endpoint_fallbacks: {}, models: {} }, null, 2);
     (function () { const t = localStorage.getItem('bsTheme'); if (t) { document.documentElement.setAttribute('data-bs-theme', t); const b = document.getElementById('themeBtn'); if (b) b.innerHTML = t === 'dark' ? '<i class="bi bi-moon-fill"></i>' : '<i class="bi bi-sun-fill"></i>' } })();
     if (_token) showOverlay();
-    function toggleTheme() { const h = document.documentElement; const t = h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'; h.setAttribute('data-bs-theme', t); localStorage.setItem('bsTheme', t); document.getElementById('themeBtn').innerHTML = t === 'dark' ? '<i class="bi bi-moon-fill"></i>' : '<i class="bi bi-sun-fill"></i>'; if (_lastStatus) renderCharts(_lastStatus) }
+    function _cmTheme() { return document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'monokai' : 'eclipse' }
+    function _setCmTheme() { const t = _cmTheme(); if (cmConfig) cmConfig.setOption('theme', t); if (cmLog) cmLog.setOption('theme', t) }
+    function toggleTheme() { const h = document.documentElement; const t = h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark'; h.setAttribute('data-bs-theme', t); localStorage.setItem('bsTheme', t); document.getElementById('themeBtn').innerHTML = t === 'dark' ? '<i class="bi bi-moon-fill"></i>' : '<i class="bi bi-sun-fill"></i>'; _setCmTheme(); if (_lastStatus) renderCharts(_lastStatus) }
     function logout() { _token = ''; localStorage.removeItem('gw_token'); closeSSE(); if (cmConfig) cmConfig.setValue(''); if (cmLog) cmLog.setValue(''); _rawLog = ''; document.getElementById('login').classList.remove('d-none'); document.getElementById('editor').classList.add('d-none'); document.getElementById('header').classList.add('d-none'); document.getElementById('token').value = ''; s('', 0) }
     function isAscii(v) { for (let i = 0; i < v.length; i++) { if (v.charCodeAt(i) > 127) return false } return true }
     async function auth() {
@@ -304,7 +272,7 @@
       try {
         const r = await fetch('/api/console/validate', { method: 'POST', headers: { 'Authorization': 'Bearer ' + _token } }); if (!r.ok) { localStorage.removeItem('gw_token'); _token = ''; hideOverlay(); s('驗證失敗：token 不正確', 1); return }
         localStorage.setItem('gw_token', _token); document.getElementById('header').classList.remove('d-none'); document.getElementById('login').classList.add('d-none'); document.getElementById('editor').classList.remove('d-none');
-        if (!_cmInit) { _cmInit = true; const o = { mode: 'application/json', theme: 'dracula', lineNumbers: true, indentUnit: 2, lineWrapping: false }; cmConfig = CodeMirror.fromTextArea(document.getElementById('configText'), o); cmLog = CodeMirror.fromTextArea(document.getElementById('logText'), o) } else { cmConfig.refresh(); cmLog.refresh() }
+        if (!_cmInit) { _cmInit = true; const o = { mode: 'application/json', theme: _cmTheme(), lineNumbers: true, indentUnit: 2, lineWrapping: false }; cmConfig = CodeMirror.fromTextArea(document.getElementById('configText'), o); cmLog = CodeMirror.fromTextArea(document.getElementById('logText'), o) } else { cmConfig.refresh(); cmLog.refresh() }
         load(); openSSE()
       } catch (e) { _token = ''; hideOverlay(); s('連線錯誤', 1); toast(e.message, 0) }
     }
@@ -402,7 +370,7 @@
     document.getElementById('provFilter').addEventListener('input', () => { if (_lastStatus) renderProviderTable(_lastStatus) });
     document.getElementById('provSort').addEventListener('change', () => { if (_lastStatus) renderProviderTable(_lastStatus) });
     document.getElementById('provToggle').addEventListener('click', function () { document.getElementById('provCollapse').classList.toggle('show'); this.querySelector('i').className = document.getElementById('provCollapse').classList.contains('show') ? 'bi bi-chevron-up' : 'bi bi-chevron-down' });
-    if (_token) { document.getElementById('token').value = _token; auth(); } else { (async () => { try { const r = await fetch('/api/console/validate', { method: 'POST' }); if (r.ok) { _token = ''; localStorage.removeItem('gw_token'); document.getElementById('header').classList.remove('d-none'); document.getElementById('login').classList.add('d-none'); document.getElementById('editor').classList.remove('d-none'); if (!_cmInit) { _cmInit = true; const o = { mode: 'application/json', theme: 'dracula', lineNumbers: true, indentUnit: 2, lineWrapping: false }; cmConfig = CodeMirror.fromTextArea(document.getElementById('configText'), o); cmLog = CodeMirror.fromTextArea(document.getElementById('logText'), o) } else { cmConfig.refresh(); cmLog.refresh() } load(); openSSE() } } catch { } })() }
+    if (_token) { document.getElementById('token').value = _token; auth(); } else { (async () => { try { const r = await fetch('/api/console/validate', { method: 'POST' }); if (r.ok) { _token = ''; localStorage.removeItem('gw_token'); document.getElementById('header').classList.remove('d-none'); document.getElementById('login').classList.add('d-none'); document.getElementById('editor').classList.remove('d-none'); if (!_cmInit) { _cmInit = true; const o = { mode: 'application/json', theme: _cmTheme(), lineNumbers: true, indentUnit: 2, lineWrapping: false }; cmConfig = CodeMirror.fromTextArea(document.getElementById('configText'), o); cmLog = CodeMirror.fromTextArea(document.getElementById('logText'), o) } else { cmConfig.refresh(); cmLog.refresh() } load(); openSSE() } } catch { } })() }
   </script>
 </body>
 
