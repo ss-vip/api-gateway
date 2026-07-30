@@ -1,7 +1,7 @@
 {
   "name": "api-gateway",
   "version": "1.0.0",
-  "description": "AI API Gateway — Cloudflare AI Gateway Multi-Key Polling Proxy",
+  "description": "A lightweight OpenAI-compatible API gateway featuring multi-key polling, failover, multi-provider routing, custom route mapping, key management, and a simple dashboard. Built entirely on Node.js with zero dependencies, frameworks, or databases.",
   "main": "src/index.js",
   "scripts": {
     "start": "node --max-old-space-size=192 src/index.js",

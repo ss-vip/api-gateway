@@ -27,6 +27,10 @@
       font-family: Consolas, 'Courier New', monospace
     }
 
+    .CodeMirror-scrollbar-filler {
+      background: var(--bs-tertiary-bg)
+    }
+
     .toast .toast-body,
     .toast .toast-body * {
       color: #fff !important
@@ -201,7 +205,7 @@
                   class="text-secondary fw-normal small">(儲存後將自動重啟)</span></h3>
               <textarea id="configText"></textarea>
               <div class="d-flex gap-2 flex-wrap mt-2"><button class="btn btn-primary btn-sm"
-                  id="configLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="configSaveBtn">儲存</button>
+                  id="configLoadBtn">讀取</button><button class="btn btn-primary btn-sm" id="configSaveBtn">儲存</button><button class="btn btn-outline-secondary btn-sm" id="configDlBtn"><i class="bi bi-download"></i></button>
               </div>
             </div>
           </div>
@@ -290,10 +294,11 @@
     function renderCharts(d) {
       destroyCharts(); const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark'; const tc = isDark ? 'rgba(255,255,255,0.7)' : 'rgba(0,0,0,0.7)'; const bc = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)'
       const provs = Object.entries(d.providers || {}); const pNames = provs.map(p => p[0]); const pLats = provs.map(p => p[1].latency_ms || 0); const pKeys = provs.map(p => p[1].keys || 0)
+      const provsLat = [...provs].sort((a, b) => (b[1].latency_ms || 0) - (a[1].latency_ms || 0)).slice(0, 5); const pLNames = provsLat.map(p => p[0]); const pLLats = provsLat.map(p => p[1].latency_ms || 0)
       const hc = d.http_codes || {}; const hcLabels = [], hcData = [], hcColors = []; const hc200 = hc['200'] || 0, hc401 = hc['401'] || 0; let hcOther = 0; for (const [k, v] of Object.entries(hc)) { const n = Number(k); if (n === 200 || n === 401) continue; hcOther += v }; if (hc200) { hcLabels.push('200'); hcData.push(hc200); hcColors.push('#198754') } if (hc401) { hcLabels.push('401'); hcData.push(hc401); hcColors.push('#ffc107') } if (hcOther) { hcLabels.push('其他'); hcData.push(hcOther); hcColors.push('#dc3545') }
       _charts.httpCodes = new Chart(document.getElementById('chartHttpCodes'), { type: 'doughnut', data: { labels: hcLabels, datasets: [{ data: hcData, backgroundColor: hcColors, borderWidth: 0 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: function (ctx) { return ctx.label + ': ' + ctx.parsed + ' (' + Math.round(ctx.parsed / (ctx.dataset.data.reduce((a, b) => a + b, 0) || 1) * 100) + '%)' } } } }, cutout: '50%' } })
       const legendItems = [['200', '#198754'], ['401', '#ffc107'], ['其他', '#dc3545']]; document.getElementById('httpCodeLegend').innerHTML = legendItems.map(([l, c]) => '<span class="d-inline-flex align-items-center gap-1 px-1" style="white-space:nowrap"><span class="rounded-circle d-inline-block" style="width:8px;height:8px;background:' + c + '"></span>' + l + '</span>').join('')
-      _charts.latency = new Chart(document.getElementById('chartLatency'), { type: 'bar', data: { labels: pNames, datasets: [{ label: '延遲 (ms)', data: pLats, backgroundColor: isDark ? 'rgba(13,110,253,0.7)' : 'rgba(13,110,253,0.5)', borderColor: isDark ? '#0d6efd' : '#0d6efd', borderWidth: 1 }] }, options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, grid: { color: bc }, ticks: { color: tc } }, y: { grid: { color: bc }, ticks: { color: tc } } } } })
+      _charts.latency = new Chart(document.getElementById('chartLatency'), { type: 'bar', data: { labels: pLNames, datasets: [{ label: '延遲 (ms)', data: pLLats, backgroundColor: isDark ? 'rgba(13,110,253,0.7)' : 'rgba(13,110,253,0.5)', borderColor: isDark ? '#0d6efd' : '#0d6efd', borderWidth: 1 }] }, options: { responsive: true, maintainAspectRatio: false, indexAxis: 'y', plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, grid: { color: bc }, ticks: { color: tc } }, y: { grid: { color: bc }, ticks: { color: tc } } } } })
       _charts.keys = new Chart(document.getElementById('chartKeys'), { type: 'bar', data: { labels: pNames, datasets: [{ label: '金鑰', data: pKeys, backgroundColor: isDark ? 'rgba(111,66,193,0.7)' : 'rgba(111,66,193,0.5)', borderColor: isDark ? '#6f42c1' : '#6f42c1', borderWidth: 1 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { color: bc }, ticks: { color: tc } }, y: { beginAtZero: true, grid: { color: bc }, ticks: { color: tc } } } } })
     }
     function renderProviderTable(d) {
@@ -358,6 +363,7 @@
     document.getElementById('retry401Btn').addEventListener('click', retryAll401);
     document.getElementById('configLoadBtn').addEventListener('click', load);
     document.getElementById('configSaveBtn').addEventListener('click', () => save('config'));
+    document.getElementById('configDlBtn').addEventListener('click', () => { const b = new Blob([cmConfig.getValue()], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-config.json'; a.click(); URL.revokeObjectURL(a.href) });
     document.getElementById('logLoadBtn').addEventListener('click', load);
     document.getElementById('logSaveBtn').addEventListener('click', () => save('log'));
     document.getElementById('logClearBtn').addEventListener('click', clearLog);

@@ -66,11 +66,11 @@
       Your <span style="color:var(--accent)">API Gateway</span>
       <span class="block text-[var(--text-secondary)]">Lightweight &amp; Fast</span>
     </h1>
-    <p class="hero-sub mx-auto mb-8">
-      輕量的 OpenAI 格式 API 閘道，支援多 key 輪詢、故障轉移、多供應商路由、可自由配置路由對應、金鑰管理與簡易的儀表板。使用 node.js 環境即可建置，不需要套件、框架、資料庫。
-    </p>
-    <p class="hero-sub mx-auto mb-8">
-      A lightweight OpenAI-compatible API gateway featuring multi-key polling, failover, multi-provider routing, custom route mapping, key management, and a simple dashboard. Built entirely on Node.js with zero dependencies, frameworks, or databases.
+        <p class="hero-sub mx-auto mb-8">
+          輕量的 OpenAI 格式 API 閘道，支援多 key 輪詢、故障轉移、多供應商路由、可自由配置路由對應、金鑰管理與簡易的儀表板。Node.js 原生執行，無需第三方套件或資料庫。
+        </p>
+        <p class="hero-sub mx-auto mb-8">
+          A lightweight OpenAI-compatible API gateway featuring multi-key polling, failover, multi-provider routing, custom route mapping, key management, and a simple dashboard. Runs on bare Node.js with zero dependencies.
     </p>
     <div class="flex gap-4 flex-wrap justify-center">
       <a href="https://github.com/ss-vip/api-gateway/archive/refs/heads/main.zip" target="_blank" rel="noopener" class="btn-primary">
@@ -104,7 +104,7 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
         </div>
         <h3 class="text-lg font-semibold mb-2">Multi-Provider Routing</h3>
-        <p class="text-sm" style="color:var(--text-secondary)">Route to OpenAI, DeepSeek, Google, or any OpenAI-compatible provider from a single endpoint.</p>
+        <p class="text-sm" style="color:var(--text-secondary)">Route to OpenAI, DeepSeek, Mistral, Groq, or any OpenAI-compatible provider from a single endpoint.</p>
       </div>
       <div class="feature-card">
         <div class="w-10 h-10 rounded-lg flex items-center justify-center mb-4 text-lg" style="background:var(--purple-1);color:var(--accent)">
@@ -172,11 +172,13 @@
 {
   <span class="keyword">"port"</span>: 3000,
   <span class="keyword">"providers"</span>: {
-    <span class="string">"openai"</span>: {
-      <span class="keyword">"baseUrl"</span>: <span class="string">"https://api.openai.com"</span>,
-      <span class="keyword">"apiKey"</span>: <span class="string">"sk-..."</span>,
-      <span class="keyword">"models"</span>: [<span class="string">"gpt-4"</span>, <span class="string">"gpt-3.5-turbo"</span>]
+    <span class="keyword">"openai"</span>: {
+      <span class="keyword">"apiKeys"</span>: [<span class="string">"sk-...KeyA", "sk-...KeyB"</span>],
+      <span class="keyword">"baseUrl"</span>: <span class="string">"https://api.openai.com"</span>
     }
+  },
+  <span class="keyword">"models"</span>: {
+    <span class="string">"gpt-4"</span>: <span class="string">"openai"</span>
   }
 }</pre>
         </div>
@@ -200,7 +202,7 @@
           What providers are supported?
           <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
         </button>
-        <div class="faq-answer">OpenClaw, OpenCode, Open-Design, and any OpenAI-compatible endpoint. Add custom providers via the config file — no code changes needed.</div>
+        <div class="faq-answer">OpenAI, DeepSeek, Mistral, and any OpenAI-compatible endpoint. Add custom providers via the config file — no code changes needed.</div>
       </div>
       <div class="faq-item">
         <button class="faq-question">
@@ -237,7 +239,7 @@
 
   <footer class="site-footer">
     <div class="max-w-[1100px] mx-auto">
-      <p class="mt-1"><a href="https://github.com/PaulleDemon/awesome-landing-pages/tree/main/src/saas/SaaS-AI" target="_blank">This pages Template</a></p>
+      <p class="mt-1"><a href="https://github.com/PaulleDemon/awesome-landing-pages/tree/main/src/saas/SaaS-AI" target="_blank">Page template</a></p>
     </div>
   </footer>
 
