@@ -119,7 +119,7 @@ body {
 }
 .hero-sub {
   font-size: clamp(1rem, 2vw, 1.2rem);
-  color: var(--text-secondary); max-width: 600px;
+  color: var(--text-secondary); max-width: 800px;
 }
 
 .console-screenshot {

@@ -1615,8 +1615,7 @@ function handleConsoleSave(req, res, body, logId) {
     if (body.file === 'config' && !CONFIG_PATH) {
       setTimeout(() => {
         log(`[config] first config file created — restarting...`);
-        server.close(() => process.exit(0));
-        setTimeout(() => process.exit(1), 15000).unref();
+        _gracefulRestart();
       }, 500).unref();
     }
   } catch (e) {
@@ -1955,12 +1954,22 @@ watchPaths.forEach(wp => {
       reloadTimer = setTimeout(() => {
         reloadTimer = null;
         log(`[config] change detected — graceful restart...`);
-        server.close(() => process.exit(0));
-        setTimeout(() => process.exit(1), 15000).unref();
+        _gracefulRestart();
       }, 1000).unref();
     }
   });
 });
+
+// --- graceful restart ---
+function _gracefulRestart() {
+  if (_activeRequests <= 0) { log(`[config] no active requests — immediate restart`); process.exit(0); }
+  log(`[config] waiting for ${_activeRequests} active request(s)...`);
+  server.close(() => process.exit(0));
+  const drain = setInterval(() => {
+    if (_activeRequests <= 0) { clearInterval(drain); log(`[config] drained — restart`); process.exit(0); }
+  }, 1000).unref();
+  setTimeout(() => process.exit(1), 15000).unref();
+}
 
 // --- shutdown handlers ---
 function shutdown(signal) {
