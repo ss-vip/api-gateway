@@ -515,7 +515,7 @@ const PROVIDER_RPM = {
   'agnes-ai': 20,       // 20 RPM
   'sea-lion': 10,       // 10 RPM per user
   'kilo': 3,            // free :free models 200/hr/IP (~3.3/min); paid models have no gateway limit — raise via config rate_limit if only using paid
-  // --- added: providers previously without auto-limit (tune via config rate_limit if needed) ---
+  // Providers without published RPM — conservative defaults; tune via config rate_limit if needed
   openai: 60,           // paid tiers high; free tier 3 RPM — conservative middle
   xai: 60,             // grok: decent free RPM, higher paid
   together: 60,         // varies by model, free ~60 RPM
@@ -656,7 +656,7 @@ function estimateTokens(messages) {
 
 
 // --- context sanitization ---
-const REASONING_PROVIDERS = new Set(['deepseek']);
+const REASONING_PROVIDERS = new Set(['deepseek', 'opencode']);
 const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
 
 // Voice ID defaults — OpenAI voice name → provider voice ID
@@ -690,28 +690,31 @@ function buildTTSRequest(provider, body, upstreamModel) {
   return null; // OpenAI-compatible, use default proxy flow
 }
 
-function _sanitizeToolIds(msg) {
+function _sanitizeToolIds(msg, idMap) {
   const m = { ...msg };
   const validId = /^[a-zA-Z0-9]{9}$/;
-  if (m.role === 'tool' && m.tool_call_id && !validId.test(m.tool_call_id))
-    m.tool_call_id = (Math.random().toString(36).slice(2)+'000000000').slice(0,9);
+  const remap = (id) => {
+    if (!id || validId.test(id)) return id;
+    if (idMap.has(id)) return idMap.get(id);
+    const nid = (Math.random().toString(36).slice(2)+'000000000').slice(0,9);
+    idMap.set(id, nid);
+    return nid;
+  };
+  if (m.role === 'tool' && m.tool_call_id) m.tool_call_id = remap(m.tool_call_id);
   if (m.role === 'assistant' && Array.isArray(m.tool_calls))
-    m.tool_calls = m.tool_calls.map(tc => {
-      if (tc.id && !validId.test(tc.id))
-        return { ...tc, id: (Math.random().toString(36).slice(2)+'000000000').slice(0,9) };
-      return tc;
-    });
+    m.tool_calls = m.tool_calls.map(tc => tc.id ? { ...tc, id: remap(tc.id) } : tc);
   return m;
 }
 function normalizeMessageOrder(messages) {
   if (!Array.isArray(messages) || messages.length < 2) return messages;
+  const idMap = new Map();
   const out = [];
   for (let i = 0; i < messages.length; i++) {
     const prev = out[out.length - 1];
     if (prev && prev.role === 'tool' && messages[i].role === 'user') {
       out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
     }
-    out.push(_sanitizeToolIds(messages[i]));
+    out.push(_sanitizeToolIds(messages[i], idMap));
   }
   return out;
 }
@@ -756,6 +759,7 @@ async function handleTTS(req, res, bodyJson, logId) {
       if (skippedProviders.has(provider)) continue;
       if (isRateLimited(provider)) { transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
+      if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
@@ -770,6 +774,7 @@ async function handleTTS(req, res, bodyJson, logId) {
         const sc = up.statusCode;
         if (sc >= 200 && sc < 300) {
           decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+          _recordProviderSuccess(provider);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
           log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
           res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
@@ -778,16 +783,18 @@ async function handleTTS(req, res, bodyJson, logId) {
         }
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
         lastErr = { status: sc, body: await collectBody(up) };
+        if (sc >= 500) _recordProviderFailure(provider);
         if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        _recordProviderFailure(provider);
         lastErr = { status: 502, body: e.message };
       }
     }
     if (!lastErr && !transientSkipped) break;
   }
-  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0,300) : JSON.stringify(lastErr.body).slice(0,300)) : 'no upstream';
+  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
   log(`[${logId}] ← ${lastErr?.status||502} tts failed ${errMsg}`);
   res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `tts failed: ${errMsg}` } }));
@@ -914,7 +921,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
     }
     if (!lastErr && !transientSkipped) break;
   }
-  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body.slice(0,300) : JSON.stringify(lastErr.body).slice(0,300)) : 'no upstream';
+  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
   log(`[${logId}] ← ${lastErr?.status||502} stt failed ${errMsg}`);
   res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `stt failed: ${errMsg}` } }));
@@ -923,7 +930,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
 function supportsReasoningContent(provider, model) {
   if (REASONING_PROVIDERS.has(provider)) {
     const m = (model || '').toLowerCase();
-    return m.includes('reasoner') || m.includes('r1');
+    return m.includes('reasoner') || m.includes('r1') || m.includes('deepseek');
   }
   return false;
 }
@@ -1333,7 +1340,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   }
 
   const clientModel = jsonBody !== false ? (bodyJson?.model || '') : '';
-  let targets = resolveModelForEndpoint(clientModel, endpointPath);
+  // endpointPath has no /v1 prefix; config endpoint_fallbacks keys are /v1/...
+  let targets = resolveModelForEndpoint(clientModel, '/v1' + endpointPath);
   if (!targets) {
     targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
     log(`[${logId}] ◆ ${clientModel || '(raw body)'} ${endpointPath}  (→ openai)`);
@@ -1481,10 +1489,11 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
   let lastErr = null;
   for (const { provider, upstreamModel } of activeTargets) {
     if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}] skip (circuit breaker)`); lastErr = { status: 502, body: 'circuit open' }; continue; }
-    const key = getKey(provider);
+    const key = await selectKey(provider);
     if (!key) { lastErr = { status: 502, body: 'no key' }; continue; }
     const base = DIRECT_PROVIDERS[provider];
-    if (!incActive(provider, key)) { lastErr = { status: 429 }; continue; }
+    if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { releaseKey(provider, key); lastErr = { status: 429 }; continue; }
+    addActive(provider);
     const ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/files' + (suffix ? '/' + suffix : '');
     try {
       const up = await forwardToDirect(key, method === 'POST' ? rawBody : null, base, ep, 'application/json', method === 'POST' ? contentType : undefined, null, null, method);
