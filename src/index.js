@@ -318,6 +318,7 @@ const PROVIDER_BANNED_FIELDS = {
   huggingface:   new Set(['user']),
   gpt4free:      new Set(['top_p']),
   llm7:          new Set(['response_format','quality','style','output_format']),
+  nvidia:        new Set(['parallel_tool_calls']),
 };
 const PROVIDER_MAX_TOKENS = { groq: 8192 };
 
@@ -726,7 +727,7 @@ function estimateTokens(messages) {
 
 
 // --- context sanitization ---
-const REASONING_PROVIDERS = new Set(['deepseek', 'opencode']);
+const REASONING_PROVIDERS = new Set(['deepseek', 'opencode', 'nvidia']);
 const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
 
 // Voice ID defaults — OpenAI voice name → provider voice ID
@@ -781,10 +782,14 @@ function normalizeMessageOrder(messages) {
   const out = [];
   for (let i = 0; i < messages.length; i++) {
     const prev = out[out.length - 1];
-    if (prev && prev.role === 'tool' && messages[i].role === 'user') {
-      out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
-    }
-    out.push(_sanitizeToolIds(messages[i], idMap));
+  if (prev && prev.role === 'tool' && messages[i].role === 'user') {
+    out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
+  }
+  const msg = _sanitizeToolIds(messages[i], idMap);
+  if (msg.role === 'assistant' && !msg.content && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+    throw new Error('400 assistant message requires content or tool_calls');
+  }
+  out.push(msg);
   }
   return out;
 }
@@ -1012,8 +1017,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
 
 function supportsReasoningContent(provider, model) {
   if (REASONING_PROVIDERS.has(provider)) {
-    const m = (model || '').toLowerCase();
-    return m.includes('reasoner') || m.includes('r1') || m.includes('deepseek');
+    return true;
   }
   return false;
 }
@@ -1023,6 +1027,7 @@ function sanitizeMessages(messages) {
   return messages.map(msg => {
     if (msg && typeof msg === 'object' && msg.role === 'assistant') {
       const clean = { ...msg };
+      if (!clean.content && clean.reasoning_content) clean.content = clean.reasoning_content;
       delete clean.reasoning_content;
       delete clean.reasoning;
       return clean;
@@ -1071,16 +1076,24 @@ function validateChatBody(body) {
   if (!body || typeof body !== 'object') return 'invalid request body';
   if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) return 'messages must be a non-empty array';
   if (!body.model || typeof body.model !== 'string') return 'model is required';
+  const hasNonEmptyContent = (msg) => {
+    if (typeof msg.content === 'string') return msg.content !== '';
+    if (Array.isArray(msg.content)) {
+      return msg.content.some(block => block && block.type === 'text' && block.text && block.text.trim() !== '');
+    }
+    return false;
+  };
   for (let i = 0; i < body.messages.length; i++) {
     const msg = body.messages[i];
     if (!msg || typeof msg !== 'object') return `messages[${i}] must be an object`;
     if (typeof msg.role !== 'string' || !msg.role) return `messages[${i}].role is required`;
     if (msg.role === 'assistant') {
-      if ((!msg.content || msg.content === '') && (!msg.tool_calls || !Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0))
+      const hasContent = hasNonEmptyContent(msg) || (msg.reasoning_content && msg.reasoning_content !== '');
+      if (!hasContent && (!msg.tool_calls || !Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0))
         return `messages[${i}].content or tool_calls required for assistant`;
     } else if (msg.role === 'tool') {
       if (!msg.tool_call_id) return `messages[${i}].tool_call_id required`;
-      if (!msg.content && msg.content !== '') return `messages[${i}].content is required for tool message`;
+      if (msg.content === undefined) msg.content = '';
     } else {
       if (!msg.content && msg.content !== '') return `messages[${i}].content is required`;
     }
@@ -1230,12 +1243,25 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const banned = PROVIDER_BANNED_FIELDS[provider];
         if (banned) for (const f of banned) delete bodyObj[f];
         if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
-        if (Array.isArray(bodyObj.messages)) {
-          if (!supportsReasoningContent(provider, upstreamModel)) {
-            bodyObj.messages = sanitizeMessages(bodyObj.messages);
-          }
-          if (STRICT_ORDER_PROVIDERS.has(provider)) bodyObj.messages = normalizeMessageOrder(bodyObj.messages);
-        }
+         if (Array.isArray(bodyObj.messages)) {
+           if (!supportsReasoningContent(provider, upstreamModel)) {
+             bodyObj.messages = sanitizeMessages(bodyObj.messages);
+           }
+           if (STRICT_ORDER_PROVIDERS.has(provider)) {
+             try {
+               bodyObj.messages = normalizeMessageOrder(bodyObj.messages);
+             } catch (e) {
+               if (e.message.startsWith('400 ')) {
+                 decActive(provider);
+                 log(`[${logId}] ← 400 [${provider}/${upstreamModel}] ${e.message.substring(4)}`);
+                 res.writeHead(400, { 'Content-Type': 'application/json' });
+                 res.end(JSON.stringify({ error: { message: e.message.substring(4), type: 'invalid_request' } }));
+                 return;
+               }
+               throw e;
+             }
+           }
+         }
         const bodyStr = JSON.stringify(bodyObj);
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
