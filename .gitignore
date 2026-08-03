@@ -6,5 +6,7 @@ dist
 .wrangler
 .env
 wrangler.toml
-temp
 .codegraph
+temp
+config.json
+log.json

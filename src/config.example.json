@@ -8,6 +8,13 @@
   "key_cooldown": 30000,
   "max_key_backoff": 300000,
   "max_body_size": 10485760,
+  "quota_backoff": 3600000,
+
+  "model_lockout": {
+    "_note": "(選用) 同一 provider/model 連續失敗達 threshold 次後暫時停用 (cooldown 毫秒)，避免一直打到壞 model / 塞車的 tier",
+    "threshold": 3,
+    "cooldown": 60000
+  },
 
   "log": {
     "_note": "(選用) 啟用回應日誌，自動刪除超過 retention_days 的舊資料",

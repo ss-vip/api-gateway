@@ -9,6 +9,10 @@ const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
 
+// shared keep-alive agents — Node 18 globalAgent defaults keepAlive off (TLS handshake per request); pin it on for all runtimes
+const _httpAgent = new http.Agent({ keepAlive: true });
+const _httpsAgent = new https.Agent({ keepAlive: true });
+
 // --- timestamped logger ---
 const _ts = (ts) => {
   const n = ts ? new Date(ts) : new Date();
@@ -127,7 +131,14 @@ function _buildStatusJSON() {
   const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
   const now = Date.now();
   const providers = {};
-  for (const [p, m] of keyPool) {
+  // report every configured provider, including idle ones with no traffic yet
+  const provSet = new Set([...PROVIDERS_WITH_KEYS, ...keyPool.keys()]);
+  for (const p of provSet) {
+    const m = keyPool.get(p);
+    if (!m) {
+      providers[p] = { keys: (PROVIDER_KEYS[p] || []).length, degraded: 0, last_success: 'never', latency_ms: 0, cbOpen: false };
+      continue;
+    }
     const vals = [...m.values()];
     const lastSuccess = vals.reduce((mx, s) => Math.max(mx, s.lastSuccess || 0), 0);
     const lat = vals.filter(s => s.lastLatency > 0).map(s => s.lastLatency);
@@ -197,7 +208,8 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
   else { stats.success++; stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1; if (latency) { stats.latSum += latency; stats.latN++; } }
   _pushSSE('log', entry);
   _logWriteCount = (_logWriteCount + 1) % 1000000007;
-  if (_logWriteCount % 50 === 1) _triggerCleanup();
+  // cleanup rewrites the whole log (O(file size)) — throttle: every 200 writes, only if >10 min since last cleanup
+  if (_logWriteCount % 200 === 1 && Date.now() - _lastCleanup > 600000) _triggerCleanup();
 }
 
 function _reseedStats() {
@@ -347,11 +359,20 @@ function resolveModelForEndpoint(clientModel, endpointPath) {
   return t || null;
 }
 
-const PORT             = parseInt(process.env.PORT      || cfg.port            || '3000', 10);
-const TIMEOUT_MS       = parseInt(process.env.TIMEOUT   || cfg.timeout         || '600000', 10);
-const KEY_COOLDOWN_MS  = parseInt(process.env.KEY_COOLDOWN  || cfg.key_cooldown  || '30000', 10);
-const MAX_KEY_BACKOFF  = parseInt(process.env.MAX_KEY_BACKOFF || cfg.max_key_backoff || '300000', 10);
-const MAX_BODY_SIZE    = parseInt(process.env.MAX_BODY_SIZE || cfg.max_body_size || (10 * 1024 * 1024), 10); // 10MB
+// env overrides config (empty env falls through); 0 is a valid value, unlike `x || default`
+const _cfgNum = (envV, cfgV, dflt) => {
+  const pick = (v) => { const n = parseInt(v, 10); if (isNaN(n)) { elog(`[config] non-numeric value ${JSON.stringify(v)} — using default ${dflt}`); return dflt; } return n; };
+  if (envV !== undefined && envV !== '') return pick(envV);
+  if (cfgV !== undefined && cfgV !== null && cfgV !== '') return pick(cfgV);
+  if (cfgV !== undefined) elog(`[config] empty value for numeric field — using default ${dflt}`);
+  return dflt;
+};
+const PORT             = _cfgNum(process.env.PORT, cfg.port, 3000);
+const TIMEOUT_MS       = _cfgNum(process.env.TIMEOUT, cfg.timeout, 600000);
+const KEY_COOLDOWN_MS  = _cfgNum(process.env.KEY_COOLDOWN, cfg.key_cooldown, 30000);
+const MAX_KEY_BACKOFF  = _cfgNum(process.env.MAX_KEY_BACKOFF, cfg.max_key_backoff, 300000);
+const MAX_BODY_SIZE    = _cfgNum(process.env.MAX_BODY_SIZE, cfg.max_body_size, 10 * 1024 * 1024); // 10MB
+const QUOTA_BACKOFF_MS = _cfgNum(process.env.QUOTA_BACKOFF, cfg.quota_backoff, 3600000); // quota/credit exhausted → long key cooldown
 
 // --- key pool ---
 const keyPool = new Map();
@@ -368,13 +389,13 @@ function initProvider(p) {
 function getHealthyKeys(p) {
   initProvider(p);
   const now = Date.now();
-  return [...keyPool.get(p).entries()]
-    .filter(([, s]) => {
-      if (now < s.degradedUntil) return false;
-      if (s.degradedUntil > 0 && now >= s.degradedUntil) { s.degradedUntil = 0; s.errorCount = 0; }
-      return true;
-    })
-    .map(([k]) => k);
+  const out = [];
+  for (const [k, s] of keyPool.get(p)) {
+    if (now < s.degradedUntil) continue;
+    if (s.degradedUntil > 0 && now >= s.degradedUntil) { s.degradedUntil = 0; s.errorCount = 0; }
+    out.push(k);
+  }
+  return out;
 }
 
 function markKeyError(p, key) {
@@ -383,6 +404,26 @@ function markKeyError(p, key) {
   if (!s) return;
   s.degradedUntil = Date.now() + Math.min(KEY_COOLDOWN_MS * Math.pow(2, s.errorCount), MAX_KEY_BACKOFF);
   s.errorCount++;
+}
+
+// Quota/credit exhaustion does not recover in seconds — degrade the key for a long window.
+const QUOTA_RE = /quota|insufficient|credit|billing|subscription|free[_ ]usage[_ ]exceeded/i;
+function _isQuotaError(status, body) {
+  if (status !== 429 && status !== 403) return false;
+  const s = typeof body === 'string' ? body : JSON.stringify(body || '');
+  return QUOTA_RE.test(s);
+}
+function markKeyQuotaExhausted(p, key) {
+  initProvider(p);
+  const st = keyPool.get(p)?.get(key);
+  if (!st) return;
+  st.degradedUntil = Date.now() + QUOTA_BACKOFF_MS;
+  st.errorCount = Math.max(st.errorCount, 8);
+  log(`[quota] ${p} key ${logKey(key)} degraded ${QUOTA_BACKOFF_MS}ms (quota/credit exhausted)`);
+}
+function _markKeyFailed(p, key, status, body) {
+  if (_isQuotaError(status, body)) markKeyQuotaExhausted(p, key);
+  else markKeyError(p, key);
 }
 
 function markKeySuccess(p, key, latency) {
@@ -436,7 +477,7 @@ async function selectKey(p) {
   const healthy = getHealthyKeys(p);
   if (healthy.length === 0) return null;
   const now = Date.now();
-  // Periodic full-scan cleanup (every 50 calls) for orphaned entries
+  // full-scan cleanup: every 50 selects, purge in-flight entries stuck longer than 5 min
   _flightCleanTick = (_flightCleanTick + 1) % 50;
   if (_flightCleanTick === 0) for (const [k, ts] of keyInFlight) if (now - ts > 300000) keyInFlight.delete(k);
   // Lazy cleanup: purge stale entries when encountered in healthy list
@@ -454,7 +495,7 @@ async function selectKey(p) {
     await waitRateLimit(p, key);
     return key;
   }
-  // All keys in-flight — return null instead of double-booking a key
+  // every key is already in-flight — no free key to hand out
   return null;
 }
 
@@ -586,6 +627,35 @@ function _isCircuitOpen(provider) {
   const entry = _circuitBreaker.get(provider);
   if (!entry || !entry.openUntil) return false;
   if (Date.now() >= entry.openUntil) { _circuitBreaker.delete(provider); return false; }
+  return true;
+}
+
+// --- model lockout (per-provider/model circuit: a broken model ID or saturated free tier) ---
+const MODEL_LOCKOUT_THRESHOLD = cfg.model_lockout?.threshold ?? 3;
+const MODEL_LOCKOUT_MS = cfg.model_lockout?.cooldown ?? 60000;
+const _modelFails = new Map(); // "provider/model" → { count, until }
+function _modelKey(provider, model) { return `${provider}/${model}`; }
+function _recordModelFailure(provider, model) {
+  if (!model) return;
+  const k = _modelKey(provider, model);
+  const e = _modelFails.get(k) || { count: 0, until: 0 };
+  e.count++;
+  if (e.count >= MODEL_LOCKOUT_THRESHOLD && !e.until) {
+    e.until = Date.now() + MODEL_LOCKOUT_MS;
+    log(`[lockout] ${k} locked (${e.count}/${MODEL_LOCKOUT_THRESHOLD} failures, cooldown ${MODEL_LOCKOUT_MS}ms)`);
+  }
+  _modelFails.set(k, e);
+}
+function _recordModelSuccess(provider, model) {
+  if (!model) return;
+  const k = _modelKey(provider, model);
+  const before = _modelFails.get(k);
+  if (before) { log(`[lockout] ${k} cleared (after ${before.count} failures)`); _modelFails.delete(k); }
+}
+function _isModelLocked(provider, model) {
+  const e = _modelFails.get(_modelKey(provider, model));
+  if (!e || !e.until) return false;
+  if (Date.now() >= e.until) { _modelFails.delete(_modelKey(provider, model)); return false; }
   return true;
 }
 
@@ -757,6 +827,7 @@ async function handleTTS(req, res, bodyJson, logId) {
       if (clientGone) return;
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
+      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
       if (isRateLimited(provider)) { transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
       if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
@@ -775,20 +846,25 @@ async function handleTTS(req, res, bodyJson, logId) {
         if (sc >= 200 && sc < 300) {
           decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
           _recordProviderSuccess(provider);
+          _recordModelSuccess(provider, upstreamModel);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
           log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
           res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
           up.on('error', () => { try { res.end(); } catch {} });
           up.pipe(res); return;
         }
-        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
-        lastErr = { status: sc, body: await collectBody(up) };
+        decActive(provider); releaseKey(provider, key);
+        const fileBody = await collectBody(up);
+        _markKeyFailed(provider, key, sc, fileBody);
+        lastErr = { status: sc, body: fileBody };
         if (sc >= 500) _recordProviderFailure(provider);
+        if (sc !== 429) _recordModelFailure(provider, upstreamModel);
         if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
         _recordProviderFailure(provider);
+        _recordModelFailure(provider, upstreamModel);
         lastErr = { status: 502, body: e.message };
       }
     }
@@ -874,6 +950,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       if (clientGone) return;
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
+      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
       if (isRateLimited(provider)) { transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
       if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
@@ -903,19 +980,25 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
         if (sc >= 200 && sc < 300) {
           decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
           _recordProviderSuccess(provider);
+          _recordModelSuccess(provider, upstreamModel);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
           log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
           const bodyText = await collectBody(up);
           res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
           res.end(bodyText); return;
         }
-        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
-        lastErr = { status: sc, body: await collectBody(up) };
+        decActive(provider); releaseKey(provider, key);
+        const sttBody = await collectBody(up);
+        _markKeyFailed(provider, key, sc, sttBody);
+        lastErr = { status: sc, body: sttBody };
         if (sc >= 500) _recordProviderFailure(provider);
+        if (sc !== 429) _recordModelFailure(provider, upstreamModel);
         if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        _recordProviderFailure(provider);
+        _recordModelFailure(provider, upstreamModel);
         lastErr = { status: 502, body: e.message };
       }
     }
@@ -974,7 +1057,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
       timeout: TIMEOUT_MS,
     };
     const mod = isHttps ? https : http;
-    const req = mod.request(opts, resolve);
+    const req = mod.request({ ...opts, agent: isHttps ? _httpsAgent : _httpAgent }, resolve);
     req.on('error', (e) => reject(e.name === 'AbortError' ? new Error('aborted') : e));
     req.on('timeout', () => { req.destroy(); reject(new Error('upstream timeout')); });
     if (signal) signal.addEventListener('abort', () => { req.destroy(); reject(new Error('aborted')); }, { once: true });
@@ -1077,7 +1160,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
   const skippedProviders = new Set(); // providers that returned non-429 non-200 this request → skip channel
   let usedModel = null;
-  let curProvider = null, curUpstream = null; // active upstream for leak-safe cleanup on client disconnect
+  let curProvider = null, curUpstream = null, curKey = null; // active upstream for leak-safe cleanup on client disconnect
   let clientGone = false;
   let retryRound = 0;
   let transientSkipped = false; // a target was skipped for a recoverable reason (concurrency/rate/TPM)
@@ -1099,7 +1182,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
     if (retryRound > 0) {
-      // Recoverable skips (concurrency/rate/TPM) with no upstream reached: poll briefly for a free slot instead of giving up.
+      // all targets transiently skipped (concurrency/rate/TPM) and nothing reached an upstream: poll for a free slot before the next round
       const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
       log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
@@ -1109,6 +1192,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     for (let ti = 0; ti < rotated.length; ti++) {
       const target = rotated[ti];
       if (skippedProviders.has(target.provider)) continue;
+      if (_isModelLocked(target.provider, target.upstreamModel)) { log(`[${logId}] → [${target.provider}/${target.upstreamModel}] skip (model lockout)`); continue; }
       if (upstreamRes) break;
       try {
         const provider = target.provider;
@@ -1172,14 +1256,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', undefined, sig);
             usedProvider = provider;
             usedModel = upstreamModel;
-            curProvider = provider; curUpstream = upstreamRes;
+            curProvider = provider; curUpstream = upstreamRes; curKey = usedKey;
             const sc = upstreamRes.statusCode;
 
             if (sc === 429) {
               decActive(provider);
-              markKeyError(provider, usedKey);
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
+              _markKeyFailed(provider, usedKey, sc, body);
               log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
@@ -1189,12 +1273,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
             if (sc >= 400) {
               decActive(provider);
-              markKeyError(provider, usedKey);
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
+              _markKeyFailed(provider, usedKey, sc, body);
               log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               if (sc >= 500) _recordProviderFailure(provider);
+              _recordModelFailure(provider, upstreamModel);
               lastErr = { status: sc, body };
               if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
               if (sc === 401) markKey401(provider, usedKey, upstreamModel);
@@ -1205,6 +1290,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             releaseKey(provider, usedKey);
             markKeySuccess(provider, usedKey, Date.now()-t0);
             _recordProviderSuccess(provider);
+            _recordModelSuccess(provider, upstreamModel);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
             log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
@@ -1215,13 +1301,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             markKeyError(provider, usedKey);
             releaseKey(provider, usedKey);
             _recordProviderFailure(provider);
+            _recordModelFailure(provider, upstreamModel);
             log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
             lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
             upstreamRes = null;
           }
         }
-      } catch (e) { if (target?.provider) _recordProviderFailure(target.provider); log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
+      } catch (e) { if (target?.provider) { _recordProviderFailure(target.provider); if (target?.upstreamModel) _recordModelFailure(target.provider, target.upstreamModel); } log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
     if (!upstreamRes && !lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent) — no retry`); break; }
   }
@@ -1256,6 +1343,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (curProvider) { decActive(curProvider); curProvider = null; }
         break;
       }
+      if (!sseUpstream) break; // no stream to pipe (last retry failed)
       const needModelRewrite = sseModel !== clientModel;
       const pipe = needModelRewrite
         ? (c) => { try { res.write(rewriteModelInSse(c, clientModel)); committed = true; } catch {} }
@@ -1277,11 +1365,18 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           log(`[${logId}] ◆ sse failed after tokens sent [${sseProvider}/${sseModel}]: ${e.message} — cannot fallback, ending stream`);
           break;
         }
+        if (curKey) {
+          markKeyError(sseProvider, curKey);
+          _recordProviderFailure(sseProvider);
+          _recordModelFailure(sseProvider, sseModel);
+          curKey = null;
+        }
         log(`[${logId}] ◆ sse stream error before first token (retry ${r+1}): ${e.message}`);
         if (sseRetryTargets.length === 0) break;
         // Try next target
         const t = sseRetryTargets.shift();
         if (skippedProviders.has(t.provider)) continue;
+        if (_isModelLocked(t.provider, t.upstreamModel)) continue;
         if (isRateLimited(t.provider)) continue;
         if ((_providerActive.get(t.provider) || 0) >= PROVIDER_MAX_CONCURRENT) continue;
         sseProvider = t.provider;
@@ -1302,7 +1397,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           const base = DIRECT_PROVIDERS[sseProvider];
           const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
           sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig);
-          curProvider = sseProvider; curUpstream = sseUpstream;
+          curProvider = sseProvider; curUpstream = sseUpstream; curKey = nk;
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
             log(`[${logId}] ◆ sse retry → [${sseProvider}/${sseModel}]`);
             releaseKey(sseProvider, nk);
@@ -1310,8 +1405,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           }
           decActive(sseProvider);
           releaseKey(sseProvider, nk);
-          log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${sseUpstream.statusCode}`);
-        } catch (e2) { decActive(sseProvider); releaseKey(sseProvider, nk); log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${e2.message}`); }
+          const sseErrBody = await collectBody(sseUpstream);
+          _markKeyFailed(sseProvider, nk, sseUpstream.statusCode, sseErrBody);
+          if (sseUpstream.statusCode >= 500) _recordProviderFailure(sseProvider);
+          if (sseUpstream.statusCode !== 429) _recordModelFailure(sseProvider, sseModel);
+          log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${sseUpstream.statusCode} ${_safeSlice(sseErrBody, 100)}`);
+          sseUpstream = null; curKey = null; // don't pipe the error response; try remaining targets
+        } catch (e2) { decActive(sseProvider); markKeyError(sseProvider, nk); releaseKey(sseProvider, nk); _recordProviderFailure(sseProvider); _recordModelFailure(sseProvider, sseModel); log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${e2.message}`); }
       }
     }
     try { res.end(); } catch {}
@@ -1376,6 +1476,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     if (sc >= 200 && sc < 300) {
       decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
       _recordProviderSuccess(provider);
+      _recordModelSuccess(provider, upstreamModel);
       logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
       log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
@@ -1385,12 +1486,14 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       upstreamRes.pipe(res);
       return 'done';
     }
-    decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+    decActive(provider); releaseKey(provider, key);
     const body = await collectBody(upstreamRes);
+    _markKeyFailed(provider, key, sc, body);
     log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
     if (sc >= 500) _recordProviderFailure(provider);
+    if (sc !== 429) _recordModelFailure(provider, upstreamModel);
     if (sc === 401) markKey401(provider, key, upstreamModel);
     if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
     return 'retry';
@@ -1410,6 +1513,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     for (const target of rotatedTargets) {
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
+      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
       const directBase = DIRECT_PROVIDERS[provider];
       let proxyEst = 0;
       if (jsonBody !== false && bodyJson) {
@@ -1447,6 +1551,8 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           decActive(provider);
           markKeyError(provider, key);
           releaseKey(provider, key);
+          _recordProviderFailure(provider);
+          _recordModelFailure(provider, upstreamModel);
           log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
           logEvent({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
           lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
@@ -1507,8 +1613,10 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
         res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
         up.pipe(res); return;
       }
-      decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
-      lastErr = { status: sc, body: await collectBody(up) };
+        decActive(provider); releaseKey(provider, key);
+        const fileBody = await collectBody(up);
+        _markKeyFailed(provider, key, sc, fileBody);
+        lastErr = { status: sc, body: fileBody };
       if (sc >= 500) _recordProviderFailure(provider);
       log(`[${logId}] ← ${sc} [${provider}/files] ${_safeSlice(lastErr.body, 100)}`);
       logEvent({ logId, provider, model: upstreamModel || 'files', key, status: sc, body: lastErr.body });
@@ -1693,11 +1801,12 @@ function handleConsoleProviderDetail(req, res, logId, url) {
   log('─'); log(`[${logId}] /api/console/provider-detail`);
   if (!checkConsoleAuth(req, res)) return;
   const p = new URL(url, 'http://x').searchParams.get('provider');
-  if (!p || !keyPool.has(p)) {
+  if (!p || (!keyPool.has(p) && !PROVIDERS_WITH_KEYS.has(p))) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'invalid provider' }));
     return;
   }
+  if (!keyPool.has(p)) initProvider(p);
   const now = Date.now();
   const keys = [];
   for (const [k, v] of keyPool.get(p)) {
@@ -1923,7 +2032,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: { message: 'not found' } }));
 });
 
-server.timeout = TIMEOUT_MS; // idle-socket cap; active SSE streams keep resetting it. App-level TIMEOUT_MS + upstream timeout already bound requests.
+server.timeout = TIMEOUT_MS + 30000; // idle-socket cap; must exceed max silent hold (retry waits sleep up to 30s past TIMEOUT_MS) or node RSTs held-open connections. App-level TIMEOUT_MS + upstream timeout bound requests.
 server.keepAliveTimeout = 5000;
 
 server.on('error', (e) => {

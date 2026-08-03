@@ -283,7 +283,7 @@
     async function load() {
       showOverlay(); try {
         const r = await fetch('/api/console/load', { headers: { 'Authorization': 'Bearer ' + _token } }); if (!r.ok) { hideOverlay(); toast('載入失敗', 0); return } const d = await r.json(); cmConfig.setValue(d.config || DEFAULT_CONFIG); _rawLog = d.log || ''; applyLogFilter(); let msg = '已讀取'; if (d.config_valid === false) msg += ', config 格式錯誤：' + (d.config_error || '?'); if (d.log_valid === false) msg += ', log 格式錯誤：' + (d.log_error || '?')
-        try { const c = JSON.parse(d.config); const rd = c?.log?.retention_days; document.getElementById('retentionLabel').textContent = rd ? '保留 ' + rd + ' 天記錄' : '' } catch { }
+        try { const c = JSON.parse(d.config); const ec = c?.log || {}; document.getElementById('retentionLabel').textContent = ec.enabled === false ? '日誌已停用' : '保留 ' + (ec.retention_days || 7) + ' 天記錄' } catch { }
         hideOverlay(); toast(msg, 1); _refreshStatusLight()
       } catch (e) { hideOverlay(); toast('載入錯誤: ' + e.message, 0) }
     }
@@ -306,7 +306,7 @@
       const filter = document.getElementById('provFilter').value.toLowerCase(); const sort = document.getElementById('provSort').value; let entries = Object.entries(d.providers || {}).filter(([p]) => p.toLowerCase().includes(filter))
       entries.sort((a, b) => { const [pa, va] = a, [pb, vb] = b; if (sort === 'latency') return (va.latency_ms || 0) - (vb.latency_ms || 0); if (sort === 'degraded') return (vb.degraded || 0) - (va.degraded || 0); return pa.localeCompare(pb) })
       document.getElementById('provCountLabel').textContent = entries.length + '/' + Object.keys(d.providers || {}).length
-      if (!entries.length) { body.innerHTML = '<tr><td colspan="6" class="text-secondary text-center small">無符合 provider</td></tr>'; return }
+      if (!entries.length) { body.innerHTML = Object.keys(d.providers || {}).length === 0 ? '<tr><td colspan="6" class="text-secondary text-center small">尚未設定任何 provider，請在 Config 中設定</td></tr>' : '<tr><td colspan="6" class="text-secondary text-center small">無符合 provider</td></tr>'; return }
       body.innerHTML = entries.map(([p, v]) => {
         return '<tr class="prov-row" data-provider="' + p + '" style="cursor:pointer"><td><strong class="small">' + p + '</strong></td><td><span class="badge border border-info text-info">' + v.keys + (v.degraded ? ' <span class="text-info-emphasis">(' + v.degraded + ' degraded)</span>' : '') + '</span></td><td class="small text-info">' + (v.latency_ms || '-') + 'ms</td><td class="small">' + (v.degraded ? '<span class="text-danger fw-medium">' + v.degraded + '</span>' : '<span class="text-secondary">0</span>') + '</td><td class="small text-secondary">' + v.last_success + '</td><td><button class="btn btn-outline-info btn-sm probe-btn py-0 px-1" data-provider="' + p + '" title="探測"><i class="bi bi-activity"></i></button></td></tr>'
       }).join('')
@@ -332,9 +332,9 @@
     function updateStatusUI(d) {
       _lastStatus = d
       const total = (d.success_total || 0) + (d.error_total || 0); const sr = total ? ((d.success_total / total) * 100).toFixed(1) : '0'; const er = total ? ((d.error_total / total) * 100).toFixed(1) : '0'
-      document.getElementById('okCount').innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> ' + d.success_total + ' 正確'; document.getElementById('errCount').innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i> ' + (d.error_total || 0) + ' 錯誤'
+      document.getElementById('okCount').innerHTML = '<i class="bi bi-check-circle-fill text-success"></i> ' + (d.success_total || 0) + ' 正確'; document.getElementById('errCount').innerHTML = '<i class="bi bi-x-circle-fill text-danger"></i> ' + (d.error_total || 0) + ' 錯誤'
       document.getElementById('srBarOk').style.width = sr + '%'; document.getElementById('srBarErr').style.width = er + '%'
-      document.getElementById('rssVal').innerHTML = '<span class="text-info">' + d.rss_mb + '</span> <small class="fs-6 fw-normal text-secondary">MB</small>'; document.getElementById('activeReq').textContent = d.active; document.getElementById('uptimeVal').textContent = d.uptime; document.getElementById('keyCount').innerHTML = '<span class="text-warning">' + d.keys + '</span>'; document.getElementById('provCount').textContent = Object.keys(d.providers || {}).length
+      document.getElementById('rssVal').innerHTML = '<span class="text-info">' + d.rss_mb + '</span> <small class="fs-6 fw-normal text-secondary">MB</small>'; document.getElementById('activeReq').textContent = d.active; document.getElementById('uptimeVal').textContent = d.uptime;       document.getElementById('keyCount').innerHTML = '<span class="text-warning">' + (d.keys || 0) + '</span>'; document.getElementById('provCount').textContent = Object.keys(d.providers || {}).length
       renderCharts(d); renderProviderTable(d)
     }
     function openSSE() {

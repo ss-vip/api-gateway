@@ -13,11 +13,13 @@
 - **非 Chat 端點** — embeddings、images/generations、images/edits、images/variations、audio/speech、audio/transcriptions、audio/translations、files
 - **請求頻率限制** — 可設定 RPM（rate_limit）與 TPM（tpm_limit）
 - **Circuit Breaker** — 連續 5 次 5xx 自動跳過該 provider 30 秒，成功後立即關閉
+- **Model Lockout** — 同一 provider/model 連續失敗達 threshold（預設 3）次後暫時停用，避免一直打到壞 model 或塞車的 tier
+- **Quota 額度降級** — 429/403 且訊息含 quota/credit/billing 特徵時，該 key 長期降級（預設 1 小時，`quota_backoff` 可設），不讓短 cooldown 後又去打額度耗盡的 key
 - **管理後台** — `GET /console` 使用 client-token 登入，可檢視/編輯 config、Log
 - **運行儀表板** — `/console` 的 Status 顯示各 provider 健康度，並彙總成功/失敗次數、平均延遲、錯誤率
 - **配置檔熱重啟** — 修改 config 檔 1 秒後自動重啟
 
-> `log.json` 預設保留 7 天（檔名可由 `log.path` 指定），清理機制由 `/health` 每小時清理，並在每寫入 50 筆時觸發，避免資料無限增長。
+> `log.json` 預設保留 7 天（檔名可由 `log.path` 指定），清理機制由 `/health` 每小時清理，並在每寫入 200 筆（且距上次清理超過 10 分鐘）時觸發，避免資料無限增長。
 
 ---
 
@@ -64,7 +66,10 @@ curl http://localhost:3000/health
 
 相容 OpenAI Chat Completions API：
 
-openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、cartesia、elevenlabs、morph
+| 類型 | Provider |
+|------|----------|
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph |
+| TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 ### TTS (Text-to-Speech)
 
