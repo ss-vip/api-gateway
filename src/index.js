@@ -89,13 +89,13 @@ function _errMsg(body) {
   const raw = typeof body === 'string' ? body : body.toString();
   const clean = raw.replace(/^\ufeff/, '').trim().replace(/\n/g, ' ');
   if (/^</i.test(clean)) return 'upstream returned HTML (' + Buffer.byteLength(raw) + ' bytes)';
-  if (clean.length > 2000) return clean.slice(0, 2000) + '... (' + raw.length + ' chars)';
+  if (clean.length > LOG_BODY_MAX) return clean.slice(0, LOG_BODY_MAX) + '... (' + raw.length + ' chars)';
   // Try to extract a clean error message from JSON
   try {
     const p = JSON.parse(clean);
     const r = Array.isArray(p) ? p[0] : p;
     const msg = r?.error?.message || r?.error?.type || r?.message;
-    if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, 500);
+    if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
   } catch {
     // Raw newlines inside JSON string values make parse fail.
     // Escape literal newlines inside strings, then retry parse.
@@ -104,11 +104,11 @@ function _errMsg(body) {
       const p = JSON.parse(escaped);
       const r = Array.isArray(p) ? p[0] : p;
       const msg = r?.error?.message || r?.error?.type || r?.message;
-      if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, 500);
+      if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
     } catch {}
   }
   // ponytail: _errMsg's regex-based newline-escape for JSON strings (line 98) is best-effort. Falls through to safe fallback (line 106) on failure. No known triggers.
-  return clean.replace(/\n/g, ' ').slice(0, 500);
+  return clean.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
 }
 function getLogPath() {
   const ec = cfg.log;
@@ -169,7 +169,7 @@ function _cleanupLog(p, cutoffOverride) {
   if (ec?.enabled === false) return;
   if (!fs.existsSync(p)) return;
   _logCleaning.add(p);
-  try { if (fs.statSync(p).size > MAX_CLEANUP_BYTES) { elog(`[log] cleanup skip: ${path.basename(p)} > ${MAX_CLEANUP_BYTES/1024/1024}MB`); _logCleaning.delete(p); return; } } catch {}
+  try { if (fs.statSync(p).size > MAX_CLEANUP_BYTES) { elog('─'); elog(`[log] cleanup skip: ${path.basename(p)} > ${MAX_CLEANUP_BYTES/1024/1024}MB`); _logCleaning.delete(p); return; } } catch {}
   const cutoff = cutoffOverride || (Date.now() - (ec?.retention_days || 7) * 86400000);
   const old = p + '.old';
   fs.rename(p, old, (err) => {
@@ -181,7 +181,7 @@ function _cleanupLog(p, cutoffOverride) {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
       if (kept.length > 0) {
-        fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) elog(`[log] cleanup write: ${e2.message}`); _logCleaning.delete(p); _lastCleanup = Date.now(); });
+        fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) { elog('─'); elog(`[log] cleanup write: ${e2.message}`); } _logCleaning.delete(p); _lastCleanup = Date.now(); });
       } else {
         _logCleaning.delete(p); _lastCleanup = Date.now();
       }
@@ -203,7 +203,7 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
     entry.tokens = tokens || 0;
     entry.type = 'success';
   }
-  fs.appendFile(p, JSON.stringify(entry) + '\n', (err) => { if (err) elog(`[log] write ${p}: ${err.message}`); });
+  fs.appendFile(p, JSON.stringify(entry) + '\n', (err) => { if (err) { elog('─'); elog(`[log] write ${p}: ${err.message}`); } });
   if (entry.type === 'error') { stats.error++; if (status) stats.httpCodes[status] = (stats.httpCodes[status] || 0) + 1; }
   else { stats.success++; stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1; if (latency) { stats.latSum += latency; stats.latN++; } }
   _pushSSE('log', entry);
@@ -223,8 +223,8 @@ function _reseedStats() {
     }
     stats.success = all.filter(e => e.type === 'success').length;
     stats.error = all.filter(e => e.type === 'error').length;
-    if (stats.success || stats.error) log(`[stats] reseeded: success=${stats.success} error=${stats.error}`);
-  } catch (e) { elog(`[stats] reseed error: ${e.message}`); }
+    if (stats.success || stats.error) { log('─'); log(`✅ [stats] reseeded: success=${stats.success} error=${stats.error}`); }
+  } catch (e) { elog('─'); elog(`[stats] reseed error: ${e.message}`); }
 }
 // --- config loading (JSONC with comments support) ---
 function _findConfig() {
@@ -244,10 +244,10 @@ if (CONFIG_PATH) {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
     cfg = CONFIG_PATH.endsWith('.jsonc') ? parseJsonc(raw) : JSON.parse(raw);
   } catch (e) {
-    elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
+    elog('─'); elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
   }
 } else {
-  elog(`[config] no config.json or config.jsonc found — running with env vars and defaults only`);
+  elog('─'); elog(`[config] no config.json or config.jsonc found — running with env vars and defaults only`);
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
@@ -299,7 +299,7 @@ const   DIRECT_PROVIDERS = {
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
   if (m.baseUrl && /^https?:\/\//i.test(m.baseUrl)) DIRECT_PROVIDERS[p] = m.baseUrl.replace(/\/+$/, '');
-  else if (m.baseUrl) elog(`[config] provider "${p}" has invalid baseUrl (ignored): ${m.baseUrl}`);
+  else if (m.baseUrl) { elog('─'); elog(`[config] provider "${p}" has invalid baseUrl (ignored): ${m.baseUrl}`); }
 }
 const DIRECT_PATH_PREFIX = {
   kilo: '/api/gateway',
@@ -362,10 +362,10 @@ function resolveModelForEndpoint(clientModel, endpointPath) {
 
 // env overrides config (empty env falls through); 0 is a valid value, unlike `x || default`
 const _cfgNum = (envV, cfgV, dflt) => {
-  const pick = (v) => { const n = parseInt(v, 10); if (isNaN(n)) { elog(`[config] non-numeric value ${JSON.stringify(v)} — using default ${dflt}`); return dflt; } return n; };
+  const pick = (v) => { const n = parseInt(v, 10); if (isNaN(n)) { elog('─'); elog(`[config] non-numeric value ${JSON.stringify(v)} — using default ${dflt}`); return dflt; } return n; };
   if (envV !== undefined && envV !== '') return pick(envV);
   if (cfgV !== undefined && cfgV !== null && cfgV !== '') return pick(cfgV);
-  if (cfgV !== undefined) elog(`[config] empty value for numeric field — using default ${dflt}`);
+  if (cfgV !== undefined) { elog('─'); elog(`[config] empty value for numeric field — using default ${dflt}`); }
   return dflt;
 };
 const PORT             = _cfgNum(process.env.PORT, cfg.port, 3000);
@@ -420,7 +420,7 @@ function markKeyQuotaExhausted(p, key) {
   if (!st) return;
   st.degradedUntil = Date.now() + QUOTA_BACKOFF_MS;
   st.errorCount = Math.max(st.errorCount, 8);
-  log(`[quota] ${p} key ${logKey(key)} degraded ${QUOTA_BACKOFF_MS}ms (quota/credit exhausted)`);
+    log('─'); log(`⚠️ [quota] ${p} key ${logKey(key)} degraded ${QUOTA_BACKOFF_MS}ms (quota/credit exhausted)`);
 }
 function _markKeyFailed(p, key, status, body) {
   if (_isQuotaError(status, body)) markKeyQuotaExhausted(p, key);
@@ -508,6 +508,8 @@ function releaseKey(p, key) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const logKey = (k) => k ? `...${k.slice(-4)}` : '-';
 const _safeSlice = (str, len) => { const s = String(str).slice(0, len); const lc = s.charCodeAt(s.length - 1); return (lc >= 0xD800 && lc <= 0xDFFF) ? s.slice(0, -1) : s; };
+const _statusIcon = (sc) => (sc === 200 ? '✅' : sc === 401 ? '⚠️' : '❌');
+const LOG_BODY_MAX = parseInt(process.env.LOG_BODY_MAX || '2000', 10);
 
 let _ridSeq = 0;
 function rid() {
@@ -616,13 +618,13 @@ function _recordProviderFailure(provider) {
   entry.count++;
   if (entry.count >= CB_THRESHOLD && !entry.openUntil) {
     entry.openUntil = Date.now() + CB_COOLDOWN_MS;
-    log(`[circuit] ${provider} opened (${entry.count}/${CB_THRESHOLD} failures, cooldown ${CB_COOLDOWN_MS}ms)`);
+    log('─'); log(`⚠️ [circuit] ${provider} opened (${entry.count}/${CB_THRESHOLD} failures, cooldown ${CB_COOLDOWN_MS}ms)`);
   }
   _circuitBreaker.set(provider, entry);
 }
 function _recordProviderSuccess(provider) {
   const before = _circuitBreaker.get(provider);
-  if (before) { log(`[circuit] ${provider} closed (after ${before.count} failures)`); _circuitBreaker.delete(provider); }
+  if (before) { log('─'); log(`✅ [circuit] ${provider} closed (after ${before.count} failures)`); _circuitBreaker.delete(provider); }
 }
 function _isCircuitOpen(provider) {
   const entry = _circuitBreaker.get(provider);
@@ -643,7 +645,7 @@ function _recordModelFailure(provider, model) {
   e.count++;
   if (e.count >= MODEL_LOCKOUT_THRESHOLD && !e.until) {
     e.until = Date.now() + MODEL_LOCKOUT_MS;
-    log(`[lockout] ${k} locked (${e.count}/${MODEL_LOCKOUT_THRESHOLD} failures, cooldown ${MODEL_LOCKOUT_MS}ms)`);
+    log('─'); log(`⚠️ [lockout] ${k} locked (${e.count}/${MODEL_LOCKOUT_THRESHOLD} failures, cooldown ${MODEL_LOCKOUT_MS}ms)`);
   }
   _modelFails.set(k, e);
 }
@@ -651,7 +653,7 @@ function _recordModelSuccess(provider, model) {
   if (!model) return;
   const k = _modelKey(provider, model);
   const before = _modelFails.get(k);
-  if (before) { log(`[lockout] ${k} cleared (after ${before.count} failures)`); _modelFails.delete(k); }
+  if (before) { log('─'); log(`✅ [lockout] ${k} cleared (after ${before.count} failures)`); _modelFails.delete(k); }
 }
 function _isModelLocked(provider, model) {
   const e = _modelFails.get(_modelKey(provider, model));
@@ -786,7 +788,7 @@ function normalizeMessageOrder(messages) {
     out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
   }
   const msg = _sanitizeToolIds(messages[i], idMap);
-  if (msg.role === 'assistant' && !msg.content && (!msg.tool_calls || msg.tool_calls.length === 0)) {
+  if (msg.role === 'assistant' && !msg.content && !msg.reasoning_content && (!msg.tool_calls || msg.tool_calls.length === 0)) {
     throw new Error('400 assistant message requires content or tool_calls');
   }
   out.push(msg);
@@ -805,7 +807,7 @@ async function handleTTS(req, res, bodyJson, logId) {
   }
   let targets = resolveModelForEndpoint(clientModel, '/v1/audio/speech');
   if (!targets) targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
-  log(`[${logId}] ◆ ${clientModel}  /v1/audio/speech`);
+  log(`[${logId}] ⚡ ${clientModel}  /v1/audio/speech`);
   const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
   if (activeTargets.length === 0) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -822,7 +824,7 @@ async function handleTTS(req, res, bodyJson, logId) {
   while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
     if (retryRound > 0) {
       const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
+      log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
       await sleep(wait);
     }
     retryRound++;
@@ -832,10 +834,10 @@ async function handleTTS(req, res, bodyJson, logId) {
       if (clientGone) return;
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
-      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
+      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
       if (isRateLimited(provider)) { transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
-      if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
+      if (_isCircuitOpen(provider)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
@@ -853,7 +855,7 @@ async function handleTTS(req, res, bodyJson, logId) {
           _recordProviderSuccess(provider);
           _recordModelSuccess(provider, upstreamModel);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
-          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
+          log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
           res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
           up.on('error', () => { try { res.end(); } catch {} });
           up.pipe(res); return;
@@ -876,7 +878,7 @@ async function handleTTS(req, res, bodyJson, logId) {
     if (!lastErr && !transientSkipped) break;
   }
   const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
-  log(`[${logId}] ← ${lastErr?.status||502} tts failed ${errMsg}`);
+  log(`[${logId}] ${_statusIcon(lastErr?.status || 502)} ${lastErr?.status||502} tts failed ${errMsg}`);
   res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `tts failed: ${errMsg}` } }));
 }
@@ -928,7 +930,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
   }
   let targets = resolveModelForEndpoint(clientModel, '/v1/audio/transcriptions');
   if (!targets) targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
-  log(`[${logId}] ◆ ${clientModel}  /v1/audio/transcriptions`);
+  log(`[${logId}] ⚡ ${clientModel}  /v1/audio/transcriptions`);
   const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
   if (activeTargets.length === 0) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -945,7 +947,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
   while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
     if (retryRound > 0) {
       const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
+      log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
       await sleep(wait);
     }
     retryRound++;
@@ -955,10 +957,10 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       if (clientGone) return;
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
-      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
+      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
       if (isRateLimited(provider)) { transientSkipped = true; continue; }
       if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
-      if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
+      if (_isCircuitOpen(provider)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
@@ -987,7 +989,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
           _recordProviderSuccess(provider);
           _recordModelSuccess(provider, upstreamModel);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
-          log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
+          log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
           const bodyText = await collectBody(up);
           res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
           res.end(bodyText); return;
@@ -1010,7 +1012,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
     if (!lastErr && !transientSkipped) break;
   }
   const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
-  log(`[${logId}] ← ${lastErr?.status||502} stt failed ${errMsg}`);
+  log(`[${logId}] ${_statusIcon(lastErr?.status || 502)} ${lastErr?.status||502} stt failed ${errMsg}`);
   res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `stt failed: ${errMsg}` } }));
 }
@@ -1038,6 +1040,31 @@ function sanitizeMessages(messages) {
 
 function _hasNonTextContent(msgs) {
   return Array.isArray(msgs) && msgs.some(m => Array.isArray(m.content) && m.content.some(c => c?.type && c.type !== 'text'));
+}
+
+// drop invalid image parts (empty/non-http/non-data image_url) before routing — they would 400 upstream or misfire vision auto-route
+function _dropInvalidImageParts(msgs) {
+  let dropped = 0;
+  if (Array.isArray(msgs)) {
+    for (const m of msgs) {
+      if (!Array.isArray(m.content)) continue;
+      const before = m.content.length;
+      m.content = m.content.filter(c => {
+        if (c?.type === 'image_url') {
+          const u = c.image_url?.url;
+          const ok = typeof u === 'string' && (u.trim().startsWith('data:') || /^https?:\/\//i.test(u));
+          if (!ok) return false;
+        }
+        return true;
+      });
+      dropped += before - m.content.length;
+      if (m.content.length === 0) {
+        if (m.tool_calls?.length) delete m.content; // assistant + tool_calls: content optional per OpenAI spec
+        else m.content = [{ type: 'text', text: '.' }]; // non-empty placeholder ('' is rejected, whitespace gets trimmed)
+      }
+    }
+  }
+  return dropped;
 }
 // ponytail: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
 const _NVIDIA_ASSISTANT_CONTENT = '.\n';
@@ -1106,16 +1133,18 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   log('─');
   const validationErr = validateChatBody(bodyJson);
   if (validationErr) {
-    log(`[${logId}] ← 400  ${validationErr}`);
+    log(`[${logId}] ❌ 400  ${validationErr}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: validationErr, type: 'invalid_request' } }));
     return;
   }
 
   const clientModel = bodyJson.model || 'unknown';
+  const dropped = _dropInvalidImageParts(bodyJson.messages);
+  if (dropped) log(`[${logId}] ➡️ dropped ${dropped} invalid image part(s)`);
   let targets = resolveModelForEndpoint(clientModel, '/v1/chat/completions');
   if (!targets) {
-    log(`[${logId}] ← 400  unsupported model: ${clientModel}`);
+    log(`[${logId}] ❌ 400  unsupported model: ${clientModel}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `model '${clientModel}' not supported`, type: 'unsupported_model' } }));
     return;
@@ -1123,7 +1152,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   // ponytail: auto-route to vision alias when request has non-text multimodal content (image, file, etc.)
   if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
     const vt = resolveModel('vision');
-    if (vt) { log(`[${logId}] ◆ ${clientModel} → vision  (non-text content detected)`); targets = vt; }
+    if (vt) { log(`[${logId}] ➡️ ${clientModel} → vision  (non-text content detected)`); targets = vt; }
   }
 
   const est = estimateTokens(bodyJson.messages);
@@ -1138,7 +1167,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const limit = getAliasLimit(alias);
         if (limit > 0 && totalEst > limit) continue;
         if (alias !== clientModel) {
-          log(`[${logId}] ◆ ${clientModel} → ${alias}  (prompt=${est}, max_out=${maxOut}, total=${totalEst}, ctx=${limit})`);
+          log(`[${logId}] ➡️ ${clientModel} → ${alias}  (prompt=${est}, max_out=${maxOut}, total=${totalEst}, ctx=${limit})`);
           targets = newTargets;
         }
         break;
@@ -1152,7 +1181,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     return true;
   });
   if (activeTargets.length === 0) {
-    log(`[${logId}] ← 400  no keys for ${clientModel || '(no model)'}`);
+    log(`[${logId}] ❌ 400  no keys for ${clientModel || '(no model)'}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
     return;
@@ -1160,11 +1189,14 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
   const isStream = bodyJson.stream !== false;
   const pkCount = Object.entries(PROVIDER_KEYS).reduce((s, [, ks]) => s + ks.length, 0);
-  log(`[${logId}] → ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}`);
+  log(`[${logId}] ⚡ ${clientModel}  msgs=${bodyJson.messages.length}  stream=${isStream}  keys=${pkCount}`);
 
   const rotated = rotateTargets(activeTargets, clientModel);
-  if (rotated.length > 1) {
-    log(`[${logId}] ◆ fallback chain: ${rotated.map(t => `[${t.provider}/${t.upstreamModel}]`).join(' > ')}`);
+  if (rotated.length) {
+    const shown = rotated.length > 1
+      ? `[${rotated[0].provider}/${rotated[0].upstreamModel}] > [${rotated[1].provider}/${rotated[1].upstreamModel}]`
+      : `[${rotated[0].provider}/${rotated[0].upstreamModel}]`;
+    log(`[${logId}] ➡️ fallback chain: ${shown}`);
   }
 
   const bodyTemplate = { ...bodyJson, stream: isStream };
@@ -1197,7 +1229,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     if (retryRound > 0) {
       // all targets transiently skipped (concurrency/rate/TPM) and nothing reached an upstream: poll for a free slot before the next round
       const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
+      log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
     }
     retryRound++;
@@ -1205,7 +1237,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     for (let ti = 0; ti < rotated.length; ti++) {
       const target = rotated[ti];
       if (skippedProviders.has(target.provider)) continue;
-      if (_isModelLocked(target.provider, target.upstreamModel)) { log(`[${logId}] → [${target.provider}/${target.upstreamModel}] skip (model lockout)`); continue; }
+      if (_isModelLocked(target.provider, target.upstreamModel)) { log(`[${logId}] ➡️ [${target.provider}/${target.upstreamModel}] skip (model lockout)`); continue; }
       if (upstreamRes) break;
       try {
         const provider = target.provider;
@@ -1218,21 +1250,21 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
         const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
         if (totalEst > targetCtx) {
-          log(`[${logId}] → [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
+          log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
           continue;
         }
         if (isRateLimited(provider)) {
-          log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`);
+          log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (rate limited)`);
           transientSkipped = true;
           continue;
         }
         if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
-          log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
+          log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
           transientSkipped = true;
           continue;
         }
         if (_isCircuitOpen(provider)) {
-          log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`);
+          log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (circuit breaker)`);
           transientSkipped = true;
           continue;
         }
@@ -1253,7 +1285,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
              } catch (e) {
                if (e.message.startsWith('400 ')) {
                  decActive(provider);
-                 log(`[${logId}] ← 400 [${provider}/${upstreamModel}] ${e.message.substring(4)}`);
+                 log(`[${logId}] ❌ 400 [${provider}/${upstreamModel}] ${e.message.substring(4)}`);
                  res.writeHead(400, { 'Content-Type': 'application/json' });
                  res.end(JSON.stringify({ error: { message: e.message.substring(4), type: 'invalid_request' } }));
                  return;
@@ -1268,13 +1300,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           if (upstreamRes) break;
           if (attempt > 0) await sleep(Math.random() * 300);
           usedKey = await selectKey(provider);
-          if (!usedKey) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); logEvent({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
+          if (!usedKey) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] no key available`); logEvent({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
           try {
             const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             await waitTpmLimit(provider, usedKey, totalEst);
             if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
-              log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
+              log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
               releaseKey(provider, usedKey); transientSkipped = true; break;
             }
             addActive(provider);
@@ -1290,7 +1322,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
               _markKeyFailed(provider, usedKey, sc, body);
-              log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
+              log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               upstreamRes = null;
@@ -1302,7 +1334,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
               _markKeyFailed(provider, usedKey, sc, body);
-              log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
+              log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               if (sc >= 500) _recordProviderFailure(provider);
               _recordModelFailure(provider, upstreamModel);
@@ -1318,7 +1350,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             _recordProviderSuccess(provider);
             _recordModelSuccess(provider, upstreamModel);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
-            log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)}`);
+            log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
             break;
 
@@ -1328,35 +1360,33 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             releaseKey(provider, usedKey);
             _recordProviderFailure(provider);
             _recordModelFailure(provider, upstreamModel);
-            log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
+            log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts} ${e.message}`);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: 502, body: e.message });
             lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
             upstreamRes = null;
           }
         }
-      } catch (e) { if (target?.provider) { _recordProviderFailure(target.provider); if (target?.upstreamModel) _recordModelFailure(target.provider, target.upstreamModel); } log(`[${logId}] ← 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
+      } catch (e) { if (target?.provider) { _recordProviderFailure(target.provider); if (target?.upstreamModel) _recordModelFailure(target.provider, target.upstreamModel); } log(`[${logId}] ❌ 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
-    if (!upstreamRes && !lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent) — no retry`); break; }
+    if (!upstreamRes && !lastErr && !transientSkipped) { log(`[${logId}] ➡️ all targets skipped (permanent) — no retry`); break; }
   }
 
   if (!upstreamRes || !usedProvider) {
-    const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
+    const errMsg = lastErr ? (typeof lastErr.body === 'string' ? lastErr.body : JSON.stringify(lastErr.body)) : 'no upstream';
     const errCode = lastErr?.status || 502;
-    log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-    logEvent({ logId, provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: errMsg });
+    log(`[${logId}] ${_statusIcon(errCode)} ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+    logEvent({ logId, provider: usedProvider || '-', model: usedModel || clientModel, key: usedKey || '-', status: errCode, body: lastErr?.body || errMsg });
+    const clientMsg = _safeSlice(errMsg, 300);
     if (sseStarted) {
-      const sseErr = { error: { message: `all failed: ${errMsg}`, type: 'proxy_error' } };
+      const sseErr = { error: { message: `all failed: ${clientMsg}`, type: 'proxy_error' } };
       try { res.write(`data: ${JSON.stringify(sseErr)}\n\n`); } catch {}
       try { res.write('data: [DONE]\n\n'); res.end(); } catch {}
     } else {
       res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `all failed: ${errMsg}` } }));
+      res.end(JSON.stringify({ error: { message: `all failed: ${clientMsg}` } }));
     }
     return;
   }
-
-  const dur = ((Date.now() - t0) / 1000).toFixed(1);
-  log(`[${logId}] ← 200 ${dur}s [${usedProvider}/${usedModel}]`);
 
   if (sseStarted) {
     let sseUpstream = upstreamRes;
@@ -1388,7 +1418,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
       } catch (e) {
         if (committed) {
           // Tokens already sent to client — a transparent upstream switch would duplicate/garble output. End the stream instead.
-          log(`[${logId}] ◆ sse failed after tokens sent [${sseProvider}/${sseModel}]: ${e.message} — cannot fallback, ending stream`);
+          log(`[${logId}] ❌ sse failed after tokens sent [${sseProvider}/${sseModel}]: ${e.message} — cannot fallback, ending stream`);
           break;
         }
         if (curKey) {
@@ -1397,7 +1427,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           _recordModelFailure(sseProvider, sseModel);
           curKey = null;
         }
-        log(`[${logId}] ◆ sse stream error before first token (retry ${r+1}): ${e.message}`);
+        log(`[${logId}] ➡️ sse stream error before first token (retry ${r+1}): ${e.message}`);
         if (sseRetryTargets.length === 0) break;
         // Try next target
         const t = sseRetryTargets.shift();
@@ -1408,7 +1438,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         sseProvider = t.provider;
         sseModel = t.upstreamModel;
         const nk = await selectKey(sseProvider);
-        if (!nk) { log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] no key`); continue; }
+        if (!nk) { log(`[${logId}] ➡️ sse retry [${sseProvider}/${sseModel}] no key`); continue; }
         const bodyObj2 = { ...bodyTemplate, model: sseModel };
         const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
         if (banned2) for (const f of banned2) delete bodyObj2[f];
@@ -1425,7 +1455,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig);
           curProvider = sseProvider; curUpstream = sseUpstream; curKey = nk;
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
-            log(`[${logId}] ◆ sse retry → [${sseProvider}/${sseModel}]`);
+            log(`[${logId}] ➡️ sse retry → [${sseProvider}/${sseModel}]`);
             releaseKey(sseProvider, nk);
             continue; // go back to pipe the new stream
           }
@@ -1435,9 +1465,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           _markKeyFailed(sseProvider, nk, sseUpstream.statusCode, sseErrBody);
           if (sseUpstream.statusCode >= 500) _recordProviderFailure(sseProvider);
           if (sseUpstream.statusCode !== 429) _recordModelFailure(sseProvider, sseModel);
-          log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${sseUpstream.statusCode} ${_safeSlice(sseErrBody, 100)}`);
+          log(`[${logId}] ➡️ sse retry [${sseProvider}/${sseModel}] ${sseUpstream.statusCode} ${_safeSlice(sseErrBody, 100)}`);
           sseUpstream = null; curKey = null; // don't pipe the error response; try remaining targets
-        } catch (e2) { decActive(sseProvider); markKeyError(sseProvider, nk); releaseKey(sseProvider, nk); _recordProviderFailure(sseProvider); _recordModelFailure(sseProvider, sseModel); log(`[${logId}] ◆ sse retry [${sseProvider}/${sseModel}] ${e2.message}`); }
+        } catch (e2) { decActive(sseProvider); markKeyError(sseProvider, nk); releaseKey(sseProvider, nk); _recordProviderFailure(sseProvider); _recordModelFailure(sseProvider, sseModel); log(`[${logId}] ➡️ sse retry [${sseProvider}/${sseModel}] ${e2.message}`); }
       }
     }
     try { res.end(); } catch {}
@@ -1458,7 +1488,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   log('─');
   if (jsonBody !== false) {
     if (!bodyJson || typeof bodyJson !== 'object') {
-      log(`[${logId}] ← 400  invalid request body`);
+      log(`[${logId}] ❌ 400  invalid request body`);
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: { message: 'invalid request body', type: 'invalid_request' } }));
       return;
@@ -1470,9 +1500,9 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   let targets = resolveModelForEndpoint(clientModel, '/v1' + endpointPath);
   if (!targets) {
     targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
-    log(`[${logId}] ◆ ${clientModel || '(raw body)'} ${endpointPath}  (→ openai)`);
+    log(`[${logId}] ⚡ ${clientModel || '(raw body)'} ${endpointPath}  (→ openai)`);
   } else {
-    log(`[${logId}] ◆ ${clientModel}  ${endpointPath}`);
+    log(`[${logId}] ⚡ ${clientModel}  ${endpointPath}`);
   }
 
   const activeTargets = targets.filter(t => {
@@ -1481,7 +1511,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     return true;
   });
   if (activeTargets.length === 0) {
-    log(`[${logId}] ← 400  no keys for ${clientModel || '(no model)'}`);
+    log(`[${logId}] ❌ 400  no keys for ${clientModel || '(no model)'}`);
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'no keys available', type: 'no_keys' } }));
     return;
@@ -1505,7 +1535,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       _recordModelSuccess(provider, upstreamModel);
       logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
-      log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${((Date.now()-t0)/1000).toFixed(1)}s`);
+      log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
       const ctype = upstreamRes.headers['content-type'] || 'application/json';
       res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
       pipeRes = upstreamRes; upstreamRes.on('error', () => { try { res.end(); } catch {} });
@@ -1515,7 +1545,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     decActive(provider); releaseKey(provider, key);
     const body = await collectBody(upstreamRes);
     _markKeyFailed(provider, key, sc, body);
-    log(`[${logId}] ← ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
+    log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
     if (sc >= 500) _recordProviderFailure(provider);
@@ -1530,7 +1560,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
   while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
     if (retryRound > 0) {
       const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
-      log(`[${logId}] ◆ retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
+      log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
     }
     retryRound++;
@@ -1539,7 +1569,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     for (const target of rotatedTargets) {
       const { provider, upstreamModel } = target;
       if (skippedProviders.has(provider)) continue;
-      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
+      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
       const directBase = DIRECT_PROVIDERS[provider];
       let proxyEst = 0;
       if (jsonBody !== false && bodyJson) {
@@ -1549,12 +1579,12 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       }
       const pLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
       const pCtx = USER_MODEL_LIMITS.get(pLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
-      if (proxyEst > pCtx) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
-      if (isRateLimited(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (rate limited)`); transientSkipped = true; continue; }
-      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); transientSkipped = true; continue; }
-      if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
+      if (proxyEst > pCtx) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (${proxyEst} > ${pCtx})`); continue; }
+      if (isRateLimited(provider)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (rate limited)`); transientSkipped = true; continue; }
+      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`); transientSkipped = true; continue; }
+      if (_isCircuitOpen(provider)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
       const key = await selectKey(provider);
-      if (!key) { log(`[${logId}] → [${provider}/${upstreamModel}] no key available`); continue; }
+      if (!key) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] no key available`); continue; }
       if (lastErr) await sleep(Math.random() * 300);
 
       if (directBase) {
@@ -1565,7 +1595,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           if (Array.isArray(proxyBody.tools)) proxyBody.tools = proxyBody.tools.map(t => { const c = { ...t }; delete c.strict; return c; });
           bodyStr = JSON.stringify(proxyBody);
         } else {
-          bodyStr = bodyJson;
+          bodyStr = upstreamModel ? patchMultipartField(bodyJson, 'model', upstreamModel) : bodyJson;
         }
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
@@ -1579,22 +1609,22 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           releaseKey(provider, key);
           _recordProviderFailure(provider);
           _recordModelFailure(provider, upstreamModel);
-          log(`[${logId}] ← 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
+          log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
           logEvent({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
           lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
           continue;
         }
       }
     }
-    if (!lastErr && !transientSkipped) { log(`[${logId}] ◆ all targets skipped (permanent)`); break; }
+    if (!lastErr && !transientSkipped) { log(`[${logId}] ➡️ all targets skipped (permanent)`); break; }
   }
 
   if (!sig.aborted) ac.abort();
   if (!lastErr) { lastErr = { status: 502, body: JSON.stringify({ error: { message: 'no key succeeded' } }) }; logEvent({ logId, provider: '-', model: clientModel, key: '-', status: 502, body: 'no key succeeded' }); }
 
   const errCode = lastErr?.status || 502;
-  log(`[${logId}] ← ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
-  logEvent({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: _safeSlice(lastErr?.body || '', 200) });
+  log(`[${logId}] ${_statusIcon(errCode)} ${errCode} all failed  ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  logEvent({ logId, provider: '-', model: clientModel, key: '-', status: errCode, body: lastErr?.body });
   res.writeHead(502, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `all upstream providers failed`, type: 'proxy_error' } }));
 }
@@ -1620,7 +1650,7 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
   }
   let lastErr = null;
   for (const { provider, upstreamModel } of activeTargets) {
-    if (_isCircuitOpen(provider)) { log(`[${logId}] → [${provider}] skip (circuit breaker)`); lastErr = { status: 502, body: 'circuit open' }; continue; }
+    if (_isCircuitOpen(provider)) { log(`[${logId}] ➡️ [${provider}] skip (circuit breaker)`); lastErr = { status: 502, body: 'circuit open' }; continue; }
     const key = await selectKey(provider);
     if (!key) { lastErr = { status: 502, body: 'no key' }; continue; }
     const base = DIRECT_PROVIDERS[provider];
@@ -1634,7 +1664,7 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
         decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
         _recordProviderSuccess(provider);
         logEvent({ logId, provider, model: upstreamModel || 'files', key, latency: (Date.now()-t0)/1000 });
-        log(`[${logId}] ← ${sc} [${provider}/files] ${((Date.now()-t0)/1000).toFixed(1)}s`);
+        log(`[${logId}] ✅ ${sc} [${provider}/files] (${((Date.now()-t0)/1000).toFixed(1)}s)`);
         const ctype = up.headers['content-type'] || 'application/json';
         res.writeHead(sc, { 'Content-Type': ctype, 'X-Request-Id': logId, 'X-Provider': provider });
         up.pipe(res); return;
@@ -1644,7 +1674,7 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
         _markKeyFailed(provider, key, sc, fileBody);
         lastErr = { status: sc, body: fileBody };
       if (sc >= 500) _recordProviderFailure(provider);
-      log(`[${logId}] ← ${sc} [${provider}/files] ${_safeSlice(lastErr.body, 100)}`);
+      log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/files] ${_safeSlice(lastErr.body, 100)}`);
       logEvent({ logId, provider, model: upstreamModel || 'files', key, status: sc, body: lastErr.body });
       } catch (e) {
         decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
@@ -1757,12 +1787,12 @@ function handleConsoleSave(req, res, body, logId) {
     res.end(JSON.stringify({ ok: true }));
     if (body.file === 'config' && !CONFIG_PATH) {
       setTimeout(() => {
-        log(`[config] first config file created — restarting...`);
+        log('─'); log(`🔄 [config] first config file created — restarting...`);
         _gracefulRestart();
       }, 500).unref();
     }
   } catch (e) {
-    log(`[${logId}] save error: ${e.message}`);
+    log('─'); log(`❌ [${logId}] save error: ${e.message}`);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
   }
@@ -1873,7 +1903,7 @@ function _memGuard() {
   _reqCount++;
   if (_reqCount % 100 === 0) {
     const mem = process.memoryUsage().rss;
-    if (MEM_LIMIT_MB > 0 && mem > MEM_LIMIT_MB * 1024 * 1024) { elog(`[mem] RSS ${(mem/1024/1024).toFixed(0)}MB > ${MEM_LIMIT_MB}MB — exiting`); process.exit(1); }
+    if (MEM_LIMIT_MB > 0 && mem > MEM_LIMIT_MB * 1024 * 1024) { elog('─'); elog(`🚨 [mem] RSS ${(mem/1024/1024).toFixed(0)}MB > ${MEM_LIMIT_MB}MB — exiting`); process.exit(1); }
   }
 }
 
@@ -2062,14 +2092,15 @@ server.timeout = TIMEOUT_MS + 30000; // idle-socket cap; must exceed max silent 
 server.keepAliveTimeout = 5000;
 
 server.on('error', (e) => {
-  elog(`[config] server error: ${e.message}`);
-  if (e.code === 'EADDRINUSE') elog(`[config] port ${PORT} is already in use`);
+  elog('─'); elog(`❌ [config] server error: ${e.message}`);
+  if (e.code === 'EADDRINUSE') { elog('─'); elog(`❌ [config] port ${PORT} is already in use`); }
   setTimeout(() => process.exit(1), 1000).unref();
 });
 
 const onListening = () => {
   Object.keys(PROVIDER_KEYS).forEach(initProvider);
-  log(`[config] started port=${PORT} — direct upstream mode`);
+  log('─');
+  log(`🚀 [config] started port=${PORT} — direct upstream mode`);
   const summary = Object.entries(PROVIDER_KEYS).map(([p, ks]) => `${p}:${ks.length}`).join(' ');
   log(`[config] keys ${summary}`);
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
@@ -2097,7 +2128,7 @@ watchPaths.forEach(wp => {
     if ((event === 'change' || event === 'rename') && !reloadTimer) {
       reloadTimer = setTimeout(() => {
         reloadTimer = null;
-        log(`[config] change detected — graceful restart...`);
+        log('─'); log(`🔄 [config] change detected — graceful restart...`);
         _gracefulRestart();
       }, 1000).unref();
     }
@@ -2106,17 +2137,18 @@ watchPaths.forEach(wp => {
 
 // --- graceful restart ---
 function _gracefulRestart() {
-  if (_activeRequests <= 0) { log(`[config] no active requests — immediate restart`); process.exit(0); }
-  log(`[config] waiting for ${_activeRequests} active request(s)...`);
+  if (_activeRequests <= 0) { log(`🔄 [config] no active requests — immediate restart`); process.exit(0); }
+  log(`🔄 [config] waiting for ${_activeRequests} active request(s)...`);
   server.close(() => process.exit(0));
   const drain = setInterval(() => {
-    if (_activeRequests <= 0) { clearInterval(drain); log(`[config] drained — restart`); process.exit(0); }
+    if (_activeRequests <= 0) { clearInterval(drain); log(`🔄 [config] drained — restart`); process.exit(0); }
   }, 1000).unref();
   setTimeout(() => process.exit(1), 15000).unref();
 }
 
 // --- shutdown handlers ---
 function shutdown(signal) {
+  log('─');
   log(`[config] ${signal} — closing...`);
   server.close(() => {
     if (_activeRequests <= 0) { log('[config] done'); process.exit(0); }
@@ -2124,10 +2156,10 @@ function shutdown(signal) {
       if (_activeRequests <= 0) { clearInterval(drain); log('[config] done'); process.exit(0); }
     }, 500).unref();
   });
-  setTimeout(() => { elog(`[config] force exit (${_activeRequests} active)`); process.exit(1); }, 10000).unref();
+  setTimeout(() => { elog('─'); elog(`[config] force exit (${_activeRequests} active)`); process.exit(1); }, 10000).unref();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('uncaughtException', (e) => { elog('[config] FATAL:', e.stack); process.exit(1); });
-process.on('unhandledRejection', (r) => { elog('[config] REJECTION:', r instanceof Error ? r.stack : r); });
+process.on('uncaughtException', (e) => { elog('─'); elog('[config] FATAL:', e.stack); process.exit(1); });
+process.on('unhandledRejection', (r) => { elog('─'); elog('[config] REJECTION:', r instanceof Error ? r.stack : r); });

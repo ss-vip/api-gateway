@@ -349,7 +349,6 @@
     function showOverlay() { document.getElementById('overlay').classList.remove('d-none') }
     function hideOverlay() { document.getElementById('overlay').classList.add('d-none') }
     async function waitForServer() { document.getElementById('overlayMsg').textContent = '伺服器重啟中，請稍候...'; showOverlay(); for (let w = 1500, i = 0; i < 10; i++, w = Math.min(w * 1.5, 10000)) { await new Promise(r => setTimeout(r, w + Math.random() * 500)); try { const r = await fetch('/health', { signal: AbortSignal.timeout(5000) }); if (r.ok) { hideOverlay(); document.getElementById('overlayMsg').textContent = '載入中...'; toast('伺服器已重新啟動', 1); load(); return } } catch { } } toast('伺服器重啟逾時，請重新整理頁面', 0); hideOverlay(); document.getElementById('overlayMsg').textContent = '載入中...' }
-    async function refreshStatus() { showOverlay(); try { const r = await fetch('/api/console/status', { headers: { 'Authorization': 'Bearer ' + _token } }); if (!r.ok) { hideOverlay(); return } const d = await r.json(); updateStatusUI(d); hideOverlay(); toast('已更新資訊', 1) } catch (e) { hideOverlay(); toast('更新失敗', 0) } }
     async function save(t) { showOverlay(); try { const c = t === 'config' ? cmConfig.getValue() : _mergeLogContent(); const r = await fetch('/api/console/save', { method: 'POST', headers: { 'Authorization': 'Bearer ' + _token, 'Content-Type': 'application/json' }, body: JSON.stringify({ file: t, content: c }) }); if (!r.ok) { const d = await r.json().catch(() => { }); hideOverlay(); toast('儲存失敗: ' + (d?.error || r.status), 0); return }; toast('已儲存', 1); if (t === 'config') waitForServer(); else { hideOverlay(); _refreshStatusLight(); } } catch (e) { hideOverlay(); toast('儲存錯誤: ' + e.message, 0) } }
     function clearLog() { _rawLog = ''; cmLog.setValue(''); toast('已清空，請按儲存寫入檔案', 1) }
     const _gt = document.getElementById('gotop');
@@ -359,7 +358,7 @@
     document.getElementById('token').addEventListener('keydown', e => { if (e.key === 'Enter') auth() });
     document.getElementById('loginBtn').addEventListener('click', auth);
     document.getElementById('logoutBtn').addEventListener('click', logout);
-    document.getElementById('refreshBtn').addEventListener('click', refreshStatus);
+    document.getElementById('refreshBtn').addEventListener('click', load);
     document.getElementById('retry401Btn').addEventListener('click', retryAll401);
     document.getElementById('configLoadBtn').addEventListener('click', load);
     document.getElementById('configSaveBtn').addEventListener('click', () => save('config'));
