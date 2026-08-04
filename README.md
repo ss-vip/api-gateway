@@ -68,7 +68,7 @@ curl http://localhost:3000/health
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 ### TTS (Text-to-Speech)
@@ -178,12 +178,17 @@ Client 送任何不在 `models` 中的 model 名稱（例如 `"openai"`），Gat
     "/v1/files":                 "file-store"
   },
   "models": {
-    "gpt-4o":        [{ "provider": "llm7", "model": "gpt-5.5" }],
-    "dall-e-3":      [{ "provider": "llm7", "model": "gpt-image-2" }],
-    "tts-1":         [{ "provider": "pollinations", "model": "universal-2" }],
-    "whisper-1":     [{ "provider": "pollinations", "model": "whisper" }],
-    "text-embedding-3-small": [{ "provider": "pollinations", "model": "openai-3-small" }],
-    "file-store":    [{ "provider": "llm7", "model": "" }]
+    "_note": "key = client 送的 model 名稱；value = provider/model 的 fallback 鏈，依序嘗試",
+    "gpt-4o": [
+      { "provider": "openrouter", "model": "nvidia/nemotron-3-ultra-550b-a55b:free" },
+      { "provider": "openrouter", "model": "google/gemma-4-31b-it:free" },
+      { "provider": "mistral", "model": "mistral-small-latest" }
+    ],
+    "dall-e-3":      [{ "provider": "together", "model": "black-forest-labs/FLUX.1-schnell-free" }],
+    "tts-1":         [{ "provider": "cartesia", "model": "sonic-3.5" }],
+    "whisper-1":     [{ "provider": "nvidia", "model": "canary-1" }],
+    "text-embedding-3-small": [{ "provider": "sea-lion", "model": "aisingapore/SEA-LION-ModernBERT-Embedding-600M" }],
+    "file-store":    [{ "provider": "nvidia", "model": "" }]
   }
 }
 ```
@@ -191,9 +196,9 @@ Client 送任何不在 `models` 中的 model 名稱（例如 `"openai"`），Gat
 流程範例：client 送 `model:"openai"` 到 `/v1/images/generations`
 - `resolveModel("openai")` → 不在 `models` 中，回傳 null
 - 查 `endpoint_fallbacks["/v1/images/generations"]` → `"dall-e-3"`
-- `resolveModel("dall-e-3")` → `[{ provider: "llm7", model: "gpt-image-2" }]`
+- `resolveModel("dall-e-3")` → `[{ provider: "together", model: "black-forest-labs/FLUX.1-schnell-free" }]`
 
-client 只認得一個 model 名稱，gateway 依端點決定實際路由。如果 client 送了 `models` 中已存在的 model（如 `gpt-5.5`），則直接命中，不走 defaults。
+client 只認得一個 model 名稱，gateway 依端點決定實際路由。如果 client 送了 `models` 中已存在的 model（如 `nvidia/nemotron-3-ultra-550b-a55b:free`），則直接命中，不走 defaults。
 
 ## 圖片辨識自動路由
 
@@ -202,8 +207,9 @@ client 只認得一個 model 名稱，gateway 依端點決定實際路由。如�
 ```json
 "models": {
   "vision": [
-    { "provider": "llm7", "model": "gpt-5.4-mini" },
-    { "provider": "opencode", "model": "deepseek-v4-flash-free" }
+    { "provider": "openrouter", "model": "google/gemma-4-31b-it:free" },
+    { "provider": "openrouter", "model": "nvidia/nemotron-nano-12b-v2-vl:free" },
+    { "provider": "mistral", "model": "mistral-small-latest" }
   ]
 }
 ```
@@ -236,5 +242,5 @@ model 別名與 `images/generations` 共用同一 `image` 鏈即可。
 需在 `endpoint_fallbacks` 指定檔案儲存的上游 provider：
 
 ```json
-"/v1/files": "llm7"
+"/v1/files": "nvidia"
 ```

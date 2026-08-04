@@ -45,6 +45,7 @@
     "cartesia": ["sk_car_..."],
     "elevenlabs": ["sk_..."],
     "morph": ["sk-..."],
+    "aihorde": ["..."],
 
     "_custom_provider_example": "下方為自定 provider 範例",
     "my-proxy": {
@@ -90,7 +91,7 @@
     "/v1/images/edits": "image",
     "/v1/images/variations": "image",
     "/v1/audio/translations": "stt",
-    "/v1/files": "llm7"
+    "/v1/files": "nvidia"
   },
 
   "models": {
@@ -104,13 +105,12 @@
     ],
 
     "vision": [
-      { "provider": "llm7", "model": "gpt-5.4-mini" },
-      { "provider": "opencode", "model": "deepseek-v4-flash-free" }
+      { "provider": "openrouter", "model": "google/gemma-4-31b-it:free" },
+      { "provider": "mistral", "model": "mistral-small-latest" }
     ],
 
     "image": [
-      { "provider": "llm7", "model": "gpt-image-2" },
-      { "provider": "llm7", "model": "flux-kontext-max" }
+      { "provider": "together", "model": "black-forest-labs/FLUX.1-schnell-free" }
     ],
 
     "tts": [
