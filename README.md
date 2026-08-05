@@ -1,6 +1,12 @@
-# API Gateway
+# ⚡ API Gateway
 
 輕量的 LLM API 聚合工具，採用 OpenAI 格式路由，具有多 Key 輪詢、故障轉移、Model 別名對應、SSE 串流功能。
+
+<p align="center">
+  <a href="https://skillicons.dev">
+    <img src="https://ss-vip.github.io/api-gateway/assets/console_page.png" width="90%" />
+  </a>
+</p>
 
 ## 功能
 
@@ -244,3 +250,11 @@ model 別名與 `images/generations` 共用同一 `image` 鏈即可。
 ```json
 "/v1/files": "nvidia"
 ```
+
+## Repobeats analytics
+
+<p align="center">
+  <a href="https://skillicons.dev">
+    <img src="https://repobeats.axiom.co/api/embed/5c642ec598f102ad85ea299cfaa9f01b812796ca.svg" width="90%" />
+  </a>
+</p>
