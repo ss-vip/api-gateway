@@ -22,7 +22,7 @@ const _ts = (ts) => {
 function log(...a) { a[0]==='─' ? console.log('─'.repeat(60)) : console.log(`[${_ts()}]`, ...a); }
 function elog(...a) { a[0]==='─' ? console.error('─'.repeat(60)) : console.error(`[${_ts()}]`, ...a); }
 
-// ponytail: custom JSONC parser — handles //, /* */, trailing commas. Edge cases in string values (// inside strings) may produce wrong output. No known issues in 6+ months of production. Add json5 dependency if/when this breaks.
+// note: custom JSONC parser — handles //, /* */, trailing commas. Edge cases in string values (// inside strings) may produce wrong output. No known issues in 6+ months of production. Add json5 dependency if/when this breaks.
 function parseJsonc(str) {
   if (!str) return null;
   // Pass 1: strip // and /* */ comments
@@ -83,6 +83,30 @@ function _ndjsonValid(s) {
   return { ok: true };
 }
 
+// note: best-effort autofix for truncated JSON — appends missing closing brackets in LIFO order.
+// Only succeeds when the fixed text parses; never touches mismatched/unknown-structure input.
+function _autoFixJson(s) {
+  if (!s) return null;
+  const stack = [];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') {
+      i++;
+      while (i < s.length) { if (s[i] === '\\') i++; else if (s[i] === '"') break; i++; }
+      continue;
+    }
+    if (c === '{' || c === '[') stack.push(c);
+    else if (c === '}' || c === ']') {
+      const open = stack.pop();
+      if (!open || (open === '{' && c !== '}') || (open === '[' && c !== ']')) return null;
+    }
+  }
+  if (!stack.length) return null;
+  let fixed = s;
+  for (let i = stack.length - 1; i >= 0; i--) fixed += stack[i] === '{' ? '}' : ']';
+  return parseJsonc(fixed) !== null ? fixed : null;
+}
+
 // --- error log file ---
 function _errMsg(body) {
   if (!body) return '-';
@@ -107,7 +131,7 @@ function _errMsg(body) {
       if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
     } catch {}
   }
-  // ponytail: _errMsg's regex-based newline-escape for JSON strings (line 98) is best-effort. Falls through to safe fallback (line 106) on failure. No known triggers.
+  // note: _errMsg's regex-based newline-escape for JSON strings (line 98) is best-effort. Falls through to safe fallback (line 106) on failure. No known triggers.
   return clean.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
 }
 function getLogPath() {
@@ -244,7 +268,14 @@ if (CONFIG_PATH) {
     const raw = fs.readFileSync(CONFIG_PATH, 'utf-8');
     cfg = CONFIG_PATH.endsWith('.jsonc') ? parseJsonc(raw) : JSON.parse(raw);
   } catch (e) {
-    elog('─'); elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
+    const fixed = _autoFixJson(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+    if (fixed !== null) {
+      elog('─'); elog(`[config] ${path.basename(CONFIG_PATH)} had missing closing brackets — auto-fixed and saved`);
+      try { fs.writeFileSync(CONFIG_PATH, fixed); } catch {}
+      cfg = parseJsonc(fixed);
+    } else {
+      elog('─'); elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
+    }
   }
 } else {
   elog('─'); elog(`[config] no config.json or config.jsonc found — running with env vars and defaults only`);
@@ -446,7 +477,7 @@ function markKeySuccess(p, key, latency) {
   }
 }
 
-// ponytail: track 401 errors per key; cleared on next success or after 1h
+// note: track 401 errors per key; cleared on next success or after 1h
 const _recent401 = new Map();
 function markKey401(p, key, model) {
   const _k = `${p}:${key}`;
@@ -543,8 +574,8 @@ function collectBody(res) {
 const PROVIDER_DEFAULT_LIMITS = {};
 const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k, v]) => [k.toLowerCase(), v]));
 const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
-// ponytail: known provider RPM (account-level), auto-calc per-key interval when not manually set
-// ponytail: known free-plan RPM per provider, auto-calc per-key rate_limit = 60000 / (rpm / numKeys)
+// note: known provider RPM (account-level), auto-calc per-key interval when not manually set
+// note: known free-plan RPM per provider, auto-calc per-key rate_limit = 60000 / (rpm / numKeys)
 // Keys are per-account, so each key's limit is independent. Manual rate_limit in config overrides auto-calc.
 const PROVIDER_RPM = {
   literouter: 1,        // per-key ~1 RPM (5 keys → ~5 RPM)
@@ -1067,7 +1098,7 @@ function _dropInvalidImageParts(msgs) {
   }
   return dropped;
 }
-// ponytail: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
+// note: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
 const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
@@ -1150,7 +1181,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     res.end(JSON.stringify({ error: { message: `model '${clientModel}' not supported`, type: 'unsupported_model' } }));
     return;
   }
-  // ponytail: auto-route to vision alias when request has non-text multimodal content (image, file, etc.)
+  // note: auto-route to vision alias when request has non-text multimodal content (image, file, etc.)
   if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
     const vt = resolveModel('vision');
     if (vt) { log(`[${logId}] ➡️ ${clientModel} → vision  (non-text content detected)`); targets = vt; }
@@ -1247,7 +1278,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
         if (lastErr) await sleep(Math.random() * 300);
 
-        // ponytail: skip targets whose context can't fit the request
+        // note: skip targets whose context can't fit the request
         const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
         const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
         if (totalEst > targetCtx) {
@@ -1721,10 +1752,27 @@ function handleConsoleLoad(req, res, logId) {
   const readTail = (p) => { try { const lines = fs.readFileSync(p, 'utf-8').split('\n'); return lines.slice(-MAX_LOG_LINES).join('\n'); } catch { return ''; } };
   const cfgContent = readAll(CONFIG_PATH), logContent = readTail(getLogPath());
   const cfgVal = _jsonValid(cfgContent), logVal = _ndjsonValid(logContent);
+  let cfgOut = cfgContent, cfgFixed = false;
+  if (!cfgVal.ok) {
+    const fixed = _autoFixJson(cfgContent);
+    if (fixed !== null) { cfgOut = fixed; cfgFixed = true; }
+  }
+  let logOut = logContent, logFixed = false;
+  if (!logVal.ok) {
+    const lines = logContent.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const t = lines[i].trim();
+      if (!t || t.startsWith('#')) continue;
+      if (_jsonValid(lines[i]).ok) continue;
+      const f = _autoFixJson(lines[i]);
+      if (f !== null) { lines[i] = f; logFixed = true; }
+    }
+    if (logFixed) logOut = lines.join('\n');
+  }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    config: cfgContent, config_valid: cfgVal.ok, config_error: cfgVal.error || null,
-    log: logContent, log_valid: logVal.ok, log_error: logVal.error || null,
+    config: cfgOut, config_valid: cfgVal.ok || cfgFixed, config_error: cfgVal.error || null, config_fixed: cfgFixed,
+    log: logOut, log_valid: logVal.ok || logFixed, log_error: logVal.error || null, log_fixed: logFixed,
   }));
 }
 

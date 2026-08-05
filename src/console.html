@@ -95,6 +95,7 @@
       </div>
     </div>
     <div class="d-none" id="editor">
+      <div id="cfgWarn" class="alert alert-danger py-2 mb-3 small d-none"></div>
       <div class="row g-3 mb-3">
         <div class="col-5">
           <div class="card h-100 border-success">
@@ -282,7 +283,7 @@
     }
     async function load() {
       showOverlay(); try {
-        const r = await fetch('/api/console/load', { headers: { 'Authorization': 'Bearer ' + _token } }); if (!r.ok) { hideOverlay(); toast('載入失敗', 0); return } const d = await r.json(); cmConfig.setValue(d.config || DEFAULT_CONFIG); _rawLog = d.log || ''; applyLogFilter(); let msg = '已讀取'; if (d.config_valid === false) msg += ', config 格式錯誤：' + (d.config_error || '?'); if (d.log_valid === false) msg += ', log 格式錯誤：' + (d.log_error || '?')
+        const r = await fetch('/api/console/load', { headers: { 'Authorization': 'Bearer ' + _token } }); if (!r.ok) { hideOverlay(); toast('載入失敗', 0); return } const d = await r.json(); cmConfig.setValue(d.config || DEFAULT_CONFIG); _rawLog = d.log || ''; applyLogFilter(); let msg = '已讀取'; const cfgErr = d.config_valid === false ? 'config.json 格式錯誤：' + (d.config_error || '?') : ''; const logErr = d.log_valid === false ? 'log.json 格式錯誤：' + (d.log_error || '?') : ''; const cfgFixedMsg = d.config_fixed ? 'config.json 缺少結尾符號，已自動修正（請檢查後儲存）' : ''; const logFixedMsg = d.log_fixed ? 'log.json 部分行缺少結尾符號，已自動修正（請檢查後儲存）' : ''; const warn = document.getElementById('cfgWarn'); if (cfgErr || logErr || cfgFixedMsg || logFixedMsg) { warn.className = 'alert alert-warning py-2 mb-3 small'; warn.innerHTML = [cfgErr, logErr, cfgFixedMsg, logFixedMsg].filter(Boolean).map(e => '<div><i class="bi bi-exclamation-triangle-fill"></i> ' + e + '</div>').join('') } else { warn.className = 'alert py-2 mb-3 small d-none'; warn.innerHTML = '' } if (cfgErr) msg += ', config 格式錯誤'; if (logErr) msg += ', log 格式錯誤'; if (cfgFixedMsg) msg += ', config 已自動修正'; if (logFixedMsg) msg += ', log 已自動修正'
         try { const c = JSON.parse(d.config); const ec = c?.log || {}; document.getElementById('retentionLabel').textContent = ec.enabled === false ? '日誌已停用' : '保留 ' + (ec.retention_days || 7) + ' 天記錄' } catch { }
         hideOverlay(); toast(msg, 1); _refreshStatusLight()
       } catch (e) { hideOverlay(); toast('載入錯誤: ' + e.message, 0) }
