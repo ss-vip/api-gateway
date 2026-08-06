@@ -306,7 +306,7 @@ const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
@@ -325,6 +325,8 @@ const   DIRECT_PROVIDERS = {
   replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
   opencode: 'https://opencode.ai/zen',
   aihorde: 'https://oai.aihorde.net',
+  navy: 'https://api.navy',
+  ollama: 'https://ollama.com',
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
   morph: 'https://api.morphllm.com',
 };
@@ -349,6 +351,7 @@ const PROVIDER_BANNED_FIELDS = {
   cohere:        new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']),
   huggingface:   new Set(['user']),
   gpt4free:      new Set(['top_p']),
+  ollama:        new Set(['tool_choice','logit_bias','user','n']), // docs.ollama.com — unsupported fields
   llm7:          new Set(['response_format','quality','style','output_format']),
   nvidia:        new Set(['parallel_tool_calls']),
 };
@@ -589,6 +592,8 @@ const PROVIDER_RPM = {
   cerebras: 5,          // free tier: 5 RPM (gpt-oss-120b), others up to 30
   deepseek: 30,         // conservative; actual: concurrency-based (500/2500)
   'agnes-ai': 20,       // 20 RPM
+  navy: 20,             // paid gateway, safe middle
+  ollama: 30,           // Ollama Cloud, no published limits — conservative
   'sea-lion': 10,       // 10 RPM per user
   'kilo': 3,            // free :free models 200/hr/IP (~3.3/min); paid models have no gateway limit — raise via config rate_limit if only using paid
   // Providers without published RPM — conservative defaults; tune via config rate_limit if needed
@@ -763,12 +768,22 @@ function estimateTokens(messages) {
 // --- context sanitization ---
 const REASONING_PROVIDERS = new Set(['deepseek', 'opencode', 'nvidia']);
 const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
+// non-text (vision) content unsupported — log-verified 400s ("does not support vision input")
+const NO_NON_TEXT_TARGETS = new Set(['llm7/codestral-latest', 'llm7/gpt-oss:20b']);
 
 // Voice ID defaults — OpenAI voice name → provider voice ID
 const VOICE_MAP_CARTESIA = { alloy: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', echo: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', fable: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', onyx: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', nova: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', shimmer: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4' };
 const VOICE_MAP_ELEVENLABS = { alloy: 'JBFqnCBsd6RMkjVDRZzb', echo: 'JBFqnCBsd6RMkjVDRZzb', fable: 'JBFqnCBsd6RMkjVDRZzb', onyx: 'JBFqnCBsd6RMkjVDRZzb', nova: 'JBFqnCBsd6RMkjVDRZzb', shimmer: 'JBFqnCBsd6RMkjVDRZzb' };
 
-function buildTTSRequest(provider, body, upstreamModel) {
+function buildTTSRequest(provider, body, upstreamModel, base) {
+  if (_isCFBase(base)) {
+    return {
+      path: _cfRunPath(upstreamModel),
+      headers: {},
+      contentType: 'application/json',
+      body: JSON.stringify({ prompt: String(body.input || '') })
+    };
+  }
   if (provider === 'cartesia') {
     const voiceId = VOICE_MAP_CARTESIA[body.voice] || body.voice || 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4';
     return {
@@ -873,7 +888,7 @@ async function handleTTS(req, res, bodyJson, logId) {
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
-      const adapter = buildTTSRequest(provider, bodyJson, upstreamModel);
+      const adapter = buildTTSRequest(provider, bodyJson, upstreamModel, base);
       const bodyStr = adapter ? adapter.body : JSON.stringify({ ...bodyJson, model: upstreamModel });
       const ep = adapter ? adapter.path : (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/speech';
       const extraHdrs = adapter ? adapter.headers : {};
@@ -883,6 +898,26 @@ async function handleTTS(req, res, bodyJson, logId) {
         const up = await forwardToDirect(key, bodyStr, base, ep, 'application/octet-stream', ctype, extraHdrs, sig);
         const sc = up.statusCode;
         if (sc >= 200 && sc < 300) {
+          if (_isCFBase(base)) {
+            const raw = await collectBody(up);
+            let audio = '';
+            try { audio = JSON.parse(raw.toString()).result?.audio || ''; } catch {}
+            decActive(provider); releaseKey(provider, key);
+            if (!audio) {
+              _markKeyFailed(provider, key, 502, raw.toString());
+              lastErr = { status: 502, body: raw.toString() };
+              skippedProviders.add(provider);
+              log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf tts bad response ${_safeSlice(raw.toString(), 100)}`);
+              continue;
+            }
+            markKeySuccess(provider, key, Date.now()-t0);
+            _recordProviderSuccess(provider);
+            _recordModelSuccess(provider, upstreamModel);
+            logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+            log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+            res.writeHead(sc, { 'Content-Type': 'audio/wav', 'X-Request-Id': logId, 'X-Provider': provider });
+            res.end(Buffer.from(audio, 'base64')); return;
+          }
           decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
           _recordProviderSuccess(provider);
           _recordModelSuccess(provider, upstreamModel);
@@ -948,6 +983,21 @@ function patchMultipartFieldName(raw, oldName, newName) {
   return out;
 }
 
+// extract the binary file part from a multipart body (for CF's raw-audio /ai/run/{model} STT)
+function _extractMultipartFile(rawBody, contentType) {
+  const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
+  const boundary = m ? (m[1] || m[2]).trim() : '';
+  const fileIdx = rawBody.indexOf(Buffer.from('name="file"'));
+  if (fileIdx === -1) return null;
+  const headEnd = rawBody.indexOf(Buffer.from('\r\n\r\n'), fileIdx);
+  if (headEnd === -1) return null;
+  const ctM = rawBody.toString('latin1', fileIdx, headEnd).match(/content-type:\s*([^\r\n]+)/i);
+  const marker = boundary ? Buffer.from('\r\n--' + boundary) : Buffer.from('\r\n--');
+  const start = headEnd + 4;
+  const end = rawBody.indexOf(marker, start);
+  return { buf: rawBody.slice(start, end === -1 ? rawBody.length : end), ctype: ctM ? ctM[1].trim() : 'audio/wav' };
+}
+
 async function handleSTT(req, res, rawBody, logId, contentType) {
   const t0 = Date.now();
   log('─');
@@ -999,7 +1049,13 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       // Build provider-specific path, body, and headers
       let body = rawBody;
       let ep, extraHdrs = {};
-      if (provider === 'cartesia') {
+      const cfBase = _isCFBase(base);
+      if (cfBase) {
+        const file = _extractMultipartFile(rawBody, contentType);
+        body = file ? file.buf : rawBody;
+        ep = _cfRunPath(upstreamModel);
+        extraHdrs = { 'Content-Type': file ? file.ctype : 'audio/wav' };
+      } else if (provider === 'cartesia') {
         body = patchMultipartField(rawBody, 'model', upstreamModel);
         ep = '/stt';
         extraHdrs = { 'Cartesia-Version': '2026-03-01' };
@@ -1011,20 +1067,39 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       } else {
         ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/transcriptions';
       }
-      const ctype = provider === 'cartesia' || provider === 'elevenlabs' ? (contentType || 'multipart/form-data') : (contentType || 'application/octet-stream');
+      const ctype = cfBase ? undefined : (provider === 'cartesia' || provider === 'elevenlabs' ? (contentType || 'multipart/form-data') : (contentType || 'application/octet-stream'));
       try {
         addActive(provider);
         const up = await forwardToDirect(key, body, base, ep, 'application/json', ctype, extraHdrs, sig);
         const sc = up.statusCode;
         if (sc >= 200 && sc < 300) {
+          const raw = await collectBody(up);
+          if (cfBase) {
+            let text = '';
+            try { text = JSON.parse(raw.toString()).result?.text || ''; } catch {}
+            decActive(provider); releaseKey(provider, key);
+            if (!text) {
+              _markKeyFailed(provider, key, 502, raw.toString());
+              lastErr = { status: 502, body: raw.toString() };
+              skippedProviders.add(provider);
+              log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf stt bad response ${_safeSlice(raw.toString(), 100)}`);
+              continue;
+            }
+            markKeySuccess(provider, key, Date.now()-t0);
+            _recordProviderSuccess(provider);
+            _recordModelSuccess(provider, upstreamModel);
+            logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+            log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+            res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
+            res.end(JSON.stringify({ text })); return;
+          }
           decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
           _recordProviderSuccess(provider);
           _recordModelSuccess(provider, upstreamModel);
           logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
           log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
-          const bodyText = await collectBody(up);
           res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
-          res.end(bodyText); return;
+          res.end(raw); return;
         }
         decActive(provider); releaseKey(provider, key);
         const sttBody = await collectBody(up);
@@ -1100,6 +1175,10 @@ function _dropInvalidImageParts(msgs) {
 }
 // note: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
 const _NVIDIA_ASSISTANT_CONTENT = '.\n';
+
+// Cloudflare Workers AI: /ai/v1/{chat,embeddings} are OpenAI-compatible, but images/tts/stt only exist as /ai/run/{model} with non-OpenAI request/response shapes
+const _isCFBase = (base) => /api\.cloudflare\.com/i.test(base);
+const _cfRunPath = (model) => 'run/' + String(model).replace(/[^a-zA-Z0-9@._\-/]/g, (c) => encodeURIComponent(c));
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
   return new Promise((resolve, reject) => {
@@ -1235,6 +1314,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   delete bodyTemplate.model;
 
   let lastErr = null, upstreamRes = null, usedProvider = null, usedKey = null;
+  const hasNonText = _hasNonTextContent(bodyJson.messages); // image/audio parts present → filter non-vision targets
   const skippedProviders = new Set(); // providers that returned non-429 non-200 this request → skip channel
   let usedModel = null;
   let curProvider = null, curUpstream = null, curKey = null; // active upstream for leak-safe cleanup on client disconnect
@@ -1298,6 +1378,11 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (_isCircuitOpen(provider)) {
           log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (circuit breaker)`);
           transientSkipped = true;
+          continue;
+        }
+
+        if (hasNonText && NO_NON_TEXT_TARGETS.has(`${provider}/${upstreamModel}`.toLowerCase())) {
+          log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (no vision support)`);
           continue;
         }
 
@@ -1620,6 +1705,54 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       if (lastErr) await sleep(Math.random() * 300);
 
       if (directBase) {
+        const cfImage = _isCFBase(directBase) && endpointPath === '/images/generations' && jsonBody !== false;
+        if (cfImage) {
+          const cfBody = { prompt: String(bodyJson.prompt || '') };
+          if (bodyJson.size) cfBody.size = bodyJson.size;
+          const cfEp = _cfRunPath(upstreamModel);
+          try {
+            addActive(provider);
+            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', undefined, sig);
+            const sc = upstreamRes.statusCode;
+            if (sc >= 200 && sc < 300 && !clientGone) {
+              const raw = await collectBody(upstreamRes);
+              let img = '';
+              try { img = JSON.parse(raw.toString()).result?.image || ''; } catch {}
+              if (img) {
+                decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+                _recordProviderSuccess(provider);
+                _recordModelSuccess(provider, upstreamModel);
+                logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+                if (!sig.aborted) ac.abort();
+                log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+                res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
+                res.end(JSON.stringify({ data: [{ b64_json: img }] }));
+                return;
+              }
+              decActive(provider); releaseKey(provider, key);
+              _markKeyFailed(provider, key, 502, raw.toString());
+              log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf image bad response ${_safeSlice(raw.toString(), 100)}`);
+              logEvent({ logId, provider, model: upstreamModel, key, status: 502, body: raw.toString() });
+              lastErr = { status: 502, body: raw.toString() };
+              _recordProviderFailure(provider);
+              _recordModelFailure(provider, upstreamModel);
+              skippedProviders.add(provider);
+              continue;
+            }
+            if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
+            continue;
+          } catch (e) {
+            decActive(provider);
+            markKeyError(provider, key);
+            releaseKey(provider, key);
+            _recordProviderFailure(provider);
+            _recordModelFailure(provider, upstreamModel);
+            log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] key=${logKey(key)} ${e.message}`);
+            logEvent({ logId, provider, model: upstreamModel, key, status: 502, body: e.message });
+            lastErr = { status: 502, body: JSON.stringify({ error: { message: e.message } }) };
+            continue;
+          }
+        }
         if (jsonBody !== false) {
           const proxyBody = { ...bodyJson, model: upstreamModel };
           const banned = PROVIDER_BANNED_FIELDS[provider];
@@ -1691,9 +1824,9 @@ async function handleFiles(req, res, rawBody, logId, contentType) {
     const ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/files' + (suffix ? '/' + suffix : '');
     try {
       const up = await forwardToDirect(key, method === 'POST' ? rawBody : null, base, ep, 'application/json', method === 'POST' ? contentType : undefined, null, null, method);
-      const sc = up.statusCode;
-      if (sc >= 200 && sc < 300) {
-        decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
+        const sc = up.statusCode;
+        if (sc >= 200 && sc < 300) {
+          decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
         _recordProviderSuccess(provider);
         logEvent({ logId, provider, model: upstreamModel || 'files', key, latency: (Date.now()-t0)/1000 });
         log(`[${logId}] ✅ ${sc} [${provider}/files] (${((Date.now()-t0)/1000).toFixed(1)}s)`);

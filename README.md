@@ -74,8 +74,37 @@ curl http://localhost:3000/health
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde、navy、ollama |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
+
+> ollama 為雲端服務（`https://ollama.com/v1`，key 在 Ollama Cloud 申請）。
+
+- 額外支援 Workers-AI（自動判斷 `https://api.cloudflare.com/client/v4/accounts` URL）：chat / embeddings 原生 OpenAI 相容；image / TTS / STT 自動轉成 Workers AI `/ai/run/{model}` 格式（image 回應轉為 `b64_json`、TTS 回應轉為二進位音檔、STT 回應轉為 `{text}`）
+
+在 providers 加入：
+```jsonc
+// config.json
+"providers": {
+  "xxx-cf-workers": {
+    "apiKeys": ["cfut_xxx"],
+    "baseUrl": "https://api.cloudflare.com/client/v4/accounts/accountID-xxx/ai",
+    "pathPrefix": "/v1",
+    "rpm": 20
+  }
+},
+
+"models": {
+  "image": [
+    { "provider": "xxx-cf-workers", "model": "@cf/black-forest-labs/flux-1-schnell" }
+  ],
+  "tts": [
+    { "provider": "xxx-cf-workers", "model": "@cf/myshell-ai/melotts" }
+  ],
+  "stt": [
+    { "provider": "xxx-cf-workers", "model": "@cf/openai/whisper" }
+  ]
+}
+```
 
 ### TTS (Text-to-Speech)
 
