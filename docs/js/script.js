@@ -8,9 +8,19 @@ document.addEventListener('DOMContentLoaded', () => {
   const saved = localStorage.getItem('theme');
   if (saved === 'dark') html.classList.add('dark');
 
+  const sunIcon = document.getElementById('sunIcon');
+  const moonIcon = document.getElementById('moonIcon');
+  function syncThemeIcons() {
+    const isDark = html.classList.contains('dark');
+    if (sunIcon) sunIcon.style.display = isDark ? 'block' : 'none';
+    if (moonIcon) moonIcon.style.display = isDark ? 'none' : 'block';
+  }
+  syncThemeIcons();
+
   toggle?.addEventListener('click', () => {
     html.classList.toggle('dark');
     localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
+    syncThemeIcons();
   });
 
   function closeNav() { mobileNav?.classList.remove('open'); overlay?.classList.remove('open'); }
@@ -21,21 +31,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   overlay?.addEventListener('click', closeNav);
   mobileNav?.querySelector('.close-nav')?.addEventListener('click', closeNav);
-
-  document.querySelectorAll('.faq-question').forEach(q => {
-    q.addEventListener('click', () => {
-      const answer = q.nextElementSibling;
-      const isOpen = answer.classList.contains('open');
-      document.querySelectorAll('.faq-answer.open').forEach(a => {
-        a.classList.remove('open');
-        a.previousElementSibling.classList.remove('open');
-      });
-      if (!isOpen) {
-        answer.classList.add('open');
-        q.classList.add('open');
-      }
-    });
-  });
 
   if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
     const blobs = document.querySelectorAll('.blob');
