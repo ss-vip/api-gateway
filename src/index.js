@@ -2072,6 +2072,8 @@ function isJsonEndpoint(url) {
          url.startsWith('/v1/embeddings') ||
          url.startsWith('/v1/images/generations') ||
          url.startsWith('/v1/audio/speech') ||
+         url.startsWith('/v1/moderations') ||
+         url.startsWith('/v1/rerank') ||
            url === '/api/console/validate' ||
            url === '/api/console/save' ||
            url === '/api/console/retry401' ||
@@ -2165,6 +2167,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // --- GET /v1/models/{model} ---
+  if (req.url.startsWith('/v1/models/') && req.method === 'GET') {
+    const modelId = decodeURIComponent(req.url.slice('/v1/models/'.length));
+    const targets = MODELS[modelId];
+    if (!targets) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `model '${modelId}' not found`, type: 'invalid_request' } }));
+      return;
+    }
+    let owned_by = 'unknown';
+    if (typeof targets === 'string') owned_by = targets;
+    else if (Array.isArray(targets)) owned_by = targets.map(t => t.provider).join(',');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id: modelId, object: 'model', created: Math.floor(Date.now() / 1000), owned_by }));
+    return;
+  }
+
   // --- GET /console — console page ---
   if (req.url === '/console' && req.method === 'GET') {
     serveConsolePage(res);
@@ -2238,6 +2257,10 @@ const server = http.createServer((req, res) => {
         handleProxy(req, res, rawStr, logId, '/images/edits', false, req.headers['content-type']);
       } else if (req.url.startsWith('/v1/images/variations')) {
         handleProxy(req, res, rawStr, logId, '/images/variations', false, req.headers['content-type']);
+      } else if (req.url.startsWith('/v1/moderations')) {
+        handleProxy(req, res, json, logId, '/moderations', true);
+      } else if (req.url.startsWith('/v1/rerank')) {
+        handleProxy(req, res, json, logId, '/rerank', true);
       } else if (req.url.startsWith('/v1/files')) {
         handleFiles(req, res, rawStr, logId, req.headers['content-type']);
       } else if (req.url === '/api/console/validate') {
