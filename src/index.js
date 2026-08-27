@@ -327,6 +327,8 @@ const   DIRECT_PROVIDERS = {
   aihorde: 'https://oai.aihorde.net',
   navy: 'https://api.navy',
   ollama: 'https://ollama.com',
+  hermes: 'https://inference-api.nousresearch.com',
+  tokenharbor: 'https://tokenharbor.ai',
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
   morph: 'https://api.morphllm.com',
 };
