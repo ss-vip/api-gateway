@@ -122,7 +122,7 @@
 
     "stt": [
       { "provider": "cartesia", "model": "ink-whisper" },
-      { "provider": "elevenlabs", "model": "scribe" }
+      { "provider": "elevenlabs", "model": "scribe_v1" }
     ],
 
     "embedding": [

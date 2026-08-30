@@ -2,6 +2,7 @@
 
 process.env.TZ = process.env.TZ || 'Asia/Taipei';
 
+const lib = require('./lib');
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
@@ -23,117 +24,13 @@ function log(...a) { a[0]==='─' ? console.log('─'.repeat(60)) : console.log(
 function elog(...a) { a[0]==='─' ? console.error('─'.repeat(60)) : console.error(`[${_ts()}]`, ...a); }
 
 // note: custom JSONC parser — handles //, /* */, trailing commas. Edge cases in string values (// inside strings) may produce wrong output. No known issues in 6+ months of production. Add json5 dependency if/when this breaks.
-function parseJsonc(str) {
-  if (!str) return null;
-  // Pass 1: strip // and /* */ comments
-  let out = '', inStr = false, lineCom = false, blockCom = false, esc = false;
-  for (let i = 0; i < str.length; i++) {
-    const c = str[i], n = str[i + 1];
-    if (lineCom) { if (c === '\n') lineCom = false; continue; }
-    if (blockCom) { if (c === '*' && n === '/') { i++; blockCom = false; } continue; }
-    if (inStr) {
-      if (esc) { esc = false; out += c; continue; }
-      if (c === '\\') { esc = true; out += c; continue; }
-      if (c === '"') inStr = false;
-      out += c; continue;
-    }
-    if (c === '"') { inStr = true; out += c; continue; }
-    if (c === '/' && n === '/') { lineCom = true; i++; continue; }
-    if (c === '/' && n === '*') { blockCom = true; i++; continue; }
-    out += c;
-  }
-  // Pass 2: strip trailing commas before ] or } (valid in JSONC editors)
-  let clean = '', inStr2 = false, esc2 = false;
-  for (let i = 0; i < out.length; i++) {
-    const c = out[i];
-    if (inStr2) {
-      if (esc2) { esc2 = false; clean += c; continue; }
-      if (c === '\\') { esc2 = true; clean += c; continue; }
-      if (c === '"') inStr2 = false;
-      clean += c; continue;
-    }
-    if (c === '"') { inStr2 = true; clean += c; continue; }
-    if (c === ',') {
-      let j = i + 1;
-      while (j < out.length && (out[j] === ' ' || out[j] === '\t' || out[j] === '\n' || out[j] === '\r')) j++;
-      if (out[j] === ']' || out[j] === '}') continue;
-    }
-    clean += c;
-  }
-  const t = clean.trim();
-  return t ? JSON.parse(t) : null;
-}
-function _jsonValid(s) {
-  if (!s) return { ok: true };
-  try { JSON.parse(s); return { ok: true }; }
-  catch (e1) {
-    try { const r = parseJsonc(s); return r !== null ? { ok: true } : { ok: false, error: e1.message }; }
-    catch (e2) { return { ok: false, error: e1.message }; }
-  }
-}
-function _ndjsonValid(s) {
-  if (!s) return { ok: true };
-  let lineNo = 0;
-  for (const rawLine of s.split('\n')) {
-    const l = rawLine.trim();
-    if (!l) continue;
-    lineNo++;
-    try { JSON.parse(l); } catch (e) { return { ok: false, error: `line ${lineNo}: ${e.message}` }; }
-  }
-  return { ok: true };
-}
-
-// note: best-effort autofix for truncated JSON — appends missing closing brackets in LIFO order.
-// Only succeeds when the fixed text parses; never touches mismatched/unknown-structure input.
-function _autoFixJson(s) {
-  if (!s) return null;
-  const stack = [];
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '"') {
-      i++;
-      while (i < s.length) { if (s[i] === '\\') i++; else if (s[i] === '"') break; i++; }
-      continue;
-    }
-    if (c === '{' || c === '[') stack.push(c);
-    else if (c === '}' || c === ']') {
-      const open = stack.pop();
-      if (!open || (open === '{' && c !== '}') || (open === '[' && c !== ']')) return null;
-    }
-  }
-  if (!stack.length) return null;
-  let fixed = s;
-  for (let i = stack.length - 1; i >= 0; i--) fixed += stack[i] === '{' ? '}' : ']';
-  return parseJsonc(fixed) !== null ? fixed : null;
-}
+function parseJsonc(str) { return lib.parseJsonc(str); }
+function _jsonValid(s) { return lib._jsonValid(s); }
+function _ndjsonValid(s) { return lib._ndjsonValid(s); }
+function _autoFixJson(s) { return lib._autoFixJson(s); }
 
 // --- error log file ---
-function _errMsg(body) {
-  if (!body) return '-';
-  const raw = typeof body === 'string' ? body : body.toString();
-  const clean = raw.replace(/^\ufeff/, '').trim().replace(/\n/g, ' ');
-  if (/^</i.test(clean)) return 'upstream returned HTML (' + Buffer.byteLength(raw) + ' bytes)';
-  if (clean.length > LOG_BODY_MAX) return clean.slice(0, LOG_BODY_MAX) + '... (' + raw.length + ' chars)';
-  // Try to extract a clean error message from JSON
-  try {
-    const p = JSON.parse(clean);
-    const r = Array.isArray(p) ? p[0] : p;
-    const msg = r?.error?.message || r?.error?.type || r?.message;
-    if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
-  } catch {
-    // Raw newlines inside JSON string values make parse fail.
-    // Escape literal newlines inside strings, then retry parse.
-    try {
-      const escaped = clean.replace(/("(?:[^"\\]|\\.)*")/g, s => s.replace(/\n/g, '\\n'));
-      const p = JSON.parse(escaped);
-      const r = Array.isArray(p) ? p[0] : p;
-      const msg = r?.error?.message || r?.error?.type || r?.message;
-      if (msg && typeof msg === 'string') return msg.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
-    } catch {}
-  }
-  // note: _errMsg's regex-based newline-escape for JSON strings (line 98) is best-effort. Falls through to safe fallback (line 106) on failure. No known triggers.
-  return clean.replace(/\n/g, ' ').slice(0, LOG_BODY_MAX);
-}
+function _errMsg(body) { return lib._errMsg(body, LOG_BODY_MAX); }
 function getLogPath() {
   const ec = cfg.log;
   if (ec?.path) return ec.path;
@@ -187,6 +84,12 @@ function _buildStatusJSON() {
 }
 const MAX_LOG_LINES = 10000;
 const MAX_CLEANUP_BYTES = 50 * 1024 * 1024;
+const IN_FLIGHT_TIMEOUT_MS = 300000; // 5 min — purge stuck in-flight key entries
+const FLIGHT_CLEAN_EVERY = 50; // full-scan cleanup every N selectKey calls
+const LOG_CLEANUP_EVERY = 200; // trigger cleanup every N log writes
+const LOG_CLEANUP_COOLDOWN_MS = 600000; // 10 min — min interval between cleanups
+const MEM_CHECK_INTERVAL = 100; // check memory every N requests
+const RESEED_MAX_LINES = 5000;
 function _cleanupLog(p, cutoffOverride) {
   if (_logCleaning.has(p)) return;
   const ec = cfg.log;
@@ -196,18 +99,24 @@ function _cleanupLog(p, cutoffOverride) {
   try { if (fs.statSync(p).size > MAX_CLEANUP_BYTES) { elog('─'); elog(`[log] cleanup skip: ${path.basename(p)} > ${MAX_CLEANUP_BYTES/1024/1024}MB`); _logCleaning.delete(p); return; } } catch {}
   const cutoff = cutoffOverride || (Date.now() - (ec?.retention_days || 7) * 86400000);
   const old = p + '.old';
+  const tmp = p + '.tmp';
   fs.rename(p, old, (err) => {
     if (err) { _logCleaning.delete(p); return; }
     fs.readFile(old, 'utf8', (_, c) => {
-      fs.unlink(old, () => {});
-      if (!c) { _logCleaning.delete(p); _lastCleanup = Date.now(); return; }
+      if (!c) { fs.unlink(old, () => {}); _logCleaning.delete(p); _lastCleanup = Date.now(); return; }
       const kept = c.split('\n').filter(l => l.trim()).filter(l => {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
+      // Atomic write: write to temp file, then rename over the target
       if (kept.length > 0) {
-        fs.appendFile(p, kept.join('\n') + '\n', (e2) => { if (e2) { elog('─'); elog(`[log] cleanup write: ${e2.message}`); } _logCleaning.delete(p); _lastCleanup = Date.now(); });
+        fs.writeFile(tmp, kept.join('\n') + '\n', (e2) => {
+          if (e2) { elog('─'); elog(`[log] cleanup write: ${e2.message}`); fs.unlink(old, () => {}); fs.unlink(tmp, () => {}); _logCleaning.delete(p); return; }
+          fs.rename(tmp, p, (e3) => { if (e3) { elog('─'); elog(`[log] cleanup rename: ${e3.message}`); } fs.unlink(old, () => {}); _logCleaning.delete(p); _lastCleanup = Date.now(); });
+        });
       } else {
-        _logCleaning.delete(p); _lastCleanup = Date.now();
+        fs.unlink(old, () => {});
+        _logCleaning.delete(p);
+        _lastCleanup = Date.now();
       }
     });
   });
@@ -233,12 +142,12 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
   _pushSSE('log', entry);
   _logWriteCount = (_logWriteCount + 1) % 1000000007;
   // cleanup rewrites the whole log (O(file size)) — throttle: every 200 writes, only if >10 min since last cleanup
-  if (_logWriteCount % 200 === 1 && Date.now() - _lastCleanup > 600000) _triggerCleanup();
+  if (_logWriteCount % LOG_CLEANUP_EVERY === 1 && Date.now() - _lastCleanup > LOG_CLEANUP_COOLDOWN_MS) _triggerCleanup();
 }
 
 function _reseedStats() {
   try {
-    const _lines = p => { try { const all = fs.readFileSync(p, 'utf8').split('\n'); return all.slice(-MAX_LOG_LINES).filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
+    const _lines = p => { try { const all = fs.readFileSync(p, 'utf8').split('\n'); return all.slice(-RESEED_MAX_LINES).filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
     const all = _lines(getLogPath()).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     stats.httpCodes = {};
     for (const e of all) {
@@ -280,9 +189,20 @@ if (CONFIG_PATH) {
 } else {
   elog('─'); elog(`[config] no config.json or config.jsonc found — running with env vars and defaults only`);
 }
+// --- config schema validation ---
+if (cfg && typeof cfg === 'object') {
+  const KNOWN_CONFIG_KEYS = new Set([
+    '_note', 'client_token', 'timezone', 'port', 'timeout', 'key_cooldown', 'max_key_backoff', 'max_body_size', 'quota_backoff',
+    'model_lockout', 'log', 'providers', 'rate_limit', 'tpm_limit', 'model_limits', 'endpoint_fallbacks', 'models', 'models_aliases'
+  ]);
+  for (const k of Object.keys(cfg)) {
+    if (!KNOWN_CONFIG_KEYS.has(k)) elog(`⚠️ [config] unknown top-level key: "${k}"`);
+  }
+}
 if (cfg.timezone) process.env.TZ = cfg.timezone;
 
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || cfg.client_token || '';
+if (!CLIENT_TOKEN) { elog('─'); elog('⚠️ [config] no client_token set — all endpoints unprotected'); }
 
 const PROVIDER_KEYS = Object.fromEntries(
   Object.entries(cfg.providers || {}).filter(([k]) => !k.startsWith('_'))
@@ -372,30 +292,10 @@ const PROVIDERS_WITH_KEYS = new Set(
   Object.entries(PROVIDER_KEYS).filter(([, ks]) => ks.length > 0).map(([p]) => p)
 );
 
-function resolveModel(clientModel) {
-  const m = (clientModel || '').toLowerCase();
-  for (const [key, value] of MODEL_ENTRIES) {
-    const kl = key.toLowerCase();
-    if (m === kl || m.startsWith(kl + '/')) {
-      if (typeof value === 'string') {
-        return [{ provider: value, upstreamModel: clientModel }];
-      }
-      if (Array.isArray(value) && value.length > 0) {
-        return value.map(t => ({ provider: t.provider, upstreamModel: t.model || clientModel }));
-      }
-    }
-  }
-  return null;
-}
-
-function resolveModelForEndpoint(clientModel, endpointPath) {
-  let t = clientModel ? resolveModel(clientModel) : null;
-  if (!t && endpointPath) {
-    const alias = ENDPOINT_FALLBACKS[endpointPath];
-    if (alias) t = resolveModel(alias);
-  }
-  return t || null;
-}
+const _resolveModelImpl = lib.createModelResolver(MODEL_ENTRIES);
+function resolveModel(clientModel) { return _resolveModelImpl(clientModel); }
+const _resolveEndpointImpl = lib.createEndpointResolver(MODEL_ENTRIES, ENDPOINT_FALLBACKS);
+function resolveModelForEndpoint(clientModel, endpointPath) { return _resolveEndpointImpl(clientModel, endpointPath); }
 
 // env overrides config (empty env falls through); 0 is a valid value, unlike `x || default`
 const _cfgNum = (envV, cfgV, dflt) => {
@@ -445,12 +345,8 @@ function markKeyError(p, key) {
 }
 
 // Quota/credit exhaustion does not recover in seconds — degrade the key for a long window.
-const QUOTA_RE = /quota|insufficient|credit|billing|subscription|free[_ ]usage[_ ]exceeded/i;
-function _isQuotaError(status, body) {
-  if (status !== 429 && status !== 403) return false;
-  const s = typeof body === 'string' ? body : JSON.stringify(body || '');
-  return QUOTA_RE.test(s);
-}
+const QUOTA_RE = lib.QUOTA_RE;
+function _isQuotaError(status, body) { return lib._isQuotaError(status, body); }
 function markKeyQuotaExhausted(p, key) {
   initProvider(p);
   const st = keyPool.get(p)?.get(key);
@@ -516,13 +412,13 @@ async function selectKey(p) {
   if (healthy.length === 0) return null;
   const now = Date.now();
   // full-scan cleanup: every 50 selects, purge in-flight entries stuck longer than 5 min
-  _flightCleanTick = (_flightCleanTick + 1) % 50;
-  if (_flightCleanTick === 0) for (const [k, ts] of keyInFlight) if (now - ts > 300000) keyInFlight.delete(k);
+  _flightCleanTick = (_flightCleanTick + 1) % FLIGHT_CLEAN_EVERY;
+  if (_flightCleanTick === 0) for (const [k, ts] of keyInFlight) if (now - ts > IN_FLIGHT_TIMEOUT_MS) keyInFlight.delete(k);
   // Lazy cleanup: purge stale entries when encountered in healthy list
   const free = healthy.filter(k => {
     const v = keyInFlight.get(`${p}:${k}`);
     if (!v) return true;
-    if (now - v > 300000) { keyInFlight.delete(`${p}:${k}`); return true; }
+    if (now - v > IN_FLIGHT_TIMEOUT_MS) { keyInFlight.delete(`${p}:${k}`); return true; }
     return false;
   });
   if (free.length > 0) {
@@ -543,8 +439,8 @@ function releaseKey(p, key) {
 
 // --- low-level helpers ---
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const logKey = (k) => k ? `...${k.slice(-4)}` : '-';
-const _safeSlice = (str, len) => { const s = String(str).slice(0, len); const lc = s.charCodeAt(s.length - 1); return (lc >= 0xD800 && lc <= 0xDFFF) ? s.slice(0, -1) : s; };
+const logKey = lib.logKey;
+const _safeSlice = lib._safeSlice;
 const _statusIcon = (sc) => (sc === 200 ? '✅' : sc === 401 ? '⚠️' : '❌');
 const LOG_BODY_MAX = parseInt(process.env.LOG_BODY_MAX || '2000', 10);
 
@@ -553,19 +449,9 @@ function rid() {
   return Date.now().toString(36) + (++_ridSeq).toString(36) + Math.random().toString(36).slice(2, 4);
 }
 
-function formatUptime(sec) {
-  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600);
-  const m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
-  const p = (n, u) => n > 0 ? `${n}${u}` : '';
-  return [p(d, 'd'), p(h, 'h'), p(m, 'm'), p(s, 's')].filter(Boolean).join(' ') || '0s';
-}
+function formatUptime(sec) { return lib.formatUptime(sec); }
 
-function rewriteModelInSse(chunk, toModel) {
-  if (!toModel) return chunk;
-  const s = chunk.toString();
-  if (/^\s*data:\s*\{[^}]*"error"\s*:/.test(s)) return s;
-  return s.replace(/([{,]\s*)"model"\s*:\s*"[^"]+"/g, `$1"model":"${toModel}"`);
-}
+function rewriteModelInSse(chunk, toModel) { return lib.rewriteModelInSse(chunk, toModel); }
 
 function collectBody(res) {
   return new Promise(r => {
@@ -742,29 +628,8 @@ function rebuildTokenOrder() {
 }
 rebuildTokenOrder();
 
-function estimateStrTokens(str) {
-  const cjk = (str.match(/[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\u1100-\u11ff]/g) || []).length;
-  const nonCjk = str.length - cjk;
-  return Math.ceil(nonCjk / 4 * 1.2 + cjk / 1.5 * 1.2);
-}
-
-function estimateTokens(messages) {
-  if (!Array.isArray(messages)) return 0;
-  let est = 0, images = 0;
-  for (const m of messages) {
-    const c = m.content;
-    if (typeof c === 'string') {
-      est += estimateStrTokens(c);
-    } else if (c && typeof c === 'object') {
-      const parts = Array.isArray(c) ? c : [c];
-      for (const p of parts) {
-        if (p.text) est += estimateStrTokens(p.text);
-        if (p.type === 'image_url') images++;
-      }
-    }
-  }
-  return est + images * 1000;
-}
+function estimateStrTokens(str) { return lib.estimateStrTokens(str); }
+function estimateTokens(messages) { return lib.estimateTokens(messages); }
 
 
 // --- context sanitization ---
@@ -812,38 +677,8 @@ function buildTTSRequest(provider, body, upstreamModel, base) {
   return null; // OpenAI-compatible, use default proxy flow
 }
 
-function _sanitizeToolIds(msg, idMap) {
-  const m = { ...msg };
-  const validId = /^[a-zA-Z0-9]{9}$/;
-  const remap = (id) => {
-    if (!id || validId.test(id)) return id;
-    if (idMap.has(id)) return idMap.get(id);
-    const nid = (Math.random().toString(36).slice(2)+'000000000').slice(0,9);
-    idMap.set(id, nid);
-    return nid;
-  };
-  if (m.role === 'tool' && m.tool_call_id) m.tool_call_id = remap(m.tool_call_id);
-  if (m.role === 'assistant' && Array.isArray(m.tool_calls))
-    m.tool_calls = m.tool_calls.map(tc => tc.id ? { ...tc, id: remap(tc.id) } : tc);
-  return m;
-}
-function normalizeMessageOrder(messages) {
-  if (!Array.isArray(messages) || messages.length < 2) return messages;
-  const idMap = new Map();
-  const out = [];
-  for (let i = 0; i < messages.length; i++) {
-    const prev = out[out.length - 1];
-  if (prev && prev.role === 'tool' && messages[i].role === 'user') {
-    out.push({ role: 'assistant', content: _NVIDIA_ASSISTANT_CONTENT });
-  }
-  const msg = _sanitizeToolIds(messages[i], idMap);
-  if (msg.role === 'assistant' && !msg.content && !msg.reasoning_content && (!msg.tool_calls || msg.tool_calls.length === 0)) {
-    throw new Error('400 assistant message requires content or tool_calls');
-  }
-  out.push(msg);
-  }
-  return out;
-}
+function _sanitizeToolIds(msg, idMap) { return lib._sanitizeToolIds(msg, idMap); }
+function normalizeMessageOrder(messages) { return lib.normalizeMessageOrder(messages); }
 
 async function handleTTS(req, res, bodyJson, logId) {
   const t0 = Date.now();
@@ -1147,34 +982,11 @@ function sanitizeMessages(messages) {
   });
 }
 
-function _hasNonTextContent(msgs) {
-  return Array.isArray(msgs) && msgs.some(m => Array.isArray(m.content) && m.content.some(c => c?.type && c.type !== 'text'));
-}
+function _hasNonTextContent(msgs) { return lib._hasNonTextContent(msgs); }
 
 // drop invalid image parts (empty/non-http/non-data image_url) before routing — they would 400 upstream or misfire vision auto-route
-function _dropInvalidImageParts(msgs) {
-  let dropped = 0;
-  if (Array.isArray(msgs)) {
-    for (const m of msgs) {
-      if (!Array.isArray(m.content)) continue;
-      const before = m.content.length;
-      m.content = m.content.filter(c => {
-        if (c?.type === 'image_url') {
-          const u = c.image_url?.url;
-          const ok = typeof u === 'string' && (u.trim().startsWith('data:') || /^https?:\/\//i.test(u));
-          if (!ok) return false;
-        }
-        return true;
-      });
-      dropped += before - m.content.length;
-      if (m.content.length === 0) {
-        if (m.tool_calls?.length) delete m.content; // assistant + tool_calls: content optional per OpenAI spec
-        else m.content = [{ type: 'text', text: '.' }]; // non-empty placeholder ('' is rejected, whitespace gets trimmed)
-      }
-    }
-  }
-  return dropped;
-}
+function _dropInvalidImageParts(msgs) { return lib._dropInvalidImageParts(msgs); }
+async function _fetchAndConvertImages(msgs) { return lib._fetchAndConvertImages(msgs); }
 // note: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
 const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 
@@ -1212,34 +1024,7 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
 }
 
 // --- payload validation ---
-function validateChatBody(body) {
-  if (!body || typeof body !== 'object') return 'invalid request body';
-  if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) return 'messages must be a non-empty array';
-  if (!body.model || typeof body.model !== 'string') return 'model is required';
-  const hasNonEmptyContent = (msg) => {
-    if (typeof msg.content === 'string') return msg.content !== '';
-    if (Array.isArray(msg.content)) {
-      return msg.content.some(block => block && block.type === 'text' && block.text && block.text.trim() !== '');
-    }
-    return false;
-  };
-  for (let i = 0; i < body.messages.length; i++) {
-    const msg = body.messages[i];
-    if (!msg || typeof msg !== 'object') return `messages[${i}] must be an object`;
-    if (typeof msg.role !== 'string' || !msg.role) return `messages[${i}].role is required`;
-    if (msg.role === 'assistant') {
-      const hasContent = hasNonEmptyContent(msg) || (msg.reasoning_content && msg.reasoning_content !== '');
-      if (!hasContent && (!msg.tool_calls || !Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0))
-        return `messages[${i}].content or tool_calls required for assistant`;
-    } else if (msg.role === 'tool') {
-      if (!msg.tool_call_id) return `messages[${i}].tool_call_id required`;
-      if (msg.content === undefined) msg.content = '';
-    } else {
-      if (!msg.content && msg.content !== '') return `messages[${i}].content is required`;
-    }
-  }
-  return null;
-}
+function validateChatBody(body) { return lib.validateChatBody(body); }
 
 async function handleChatCompletion(req, res, bodyJson, logId) {
   const t0 = Date.now();
@@ -1255,6 +1040,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   const clientModel = bodyJson.model || 'unknown';
   const dropped = _dropInvalidImageParts(bodyJson.messages);
   if (dropped) log(`[${logId}] ➡️ dropped ${dropped} invalid image part(s)`);
+  // Auto-fetch remote images and convert to base64 data URIs for providers that don't support URLs
+  const converted = await _fetchAndConvertImages(bodyJson.messages);
+  if (converted) log(`[${logId}] ➡️ fetched & converted ${converted} remote image(s) to base64`);
   let targets = resolveModelForEndpoint(clientModel, '/v1/chat/completions');
   if (!targets) {
     log(`[${logId}] ❌ 400  unsupported model: ${clientModel}`);
@@ -2065,7 +1853,7 @@ function handleConsoleProviderDetail(req, res, logId, url) {
   res.end(JSON.stringify({
     provider: p,
     keys,
-    circuitBreaker: { open: cbOpen, count: cbEntry ? cbEntry.count : 0, openSince: cbEntry ? cbEntry.openSince : 0 },
+    circuitBreaker: { open: cbOpen, count: cbEntry ? cbEntry.count : 0, openUntil: cbEntry ? cbEntry.openUntil : 0 },
     recent401: [..._recent401.values()].filter(e => e.provider === p).map(e => ({ model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
   }));
 }
@@ -2087,7 +1875,7 @@ let _reqCount = 0;
 const MEM_LIMIT_MB = parseInt(process.env.MEM_LIMIT_MB || '300', 10);
 function _memGuard() {
   _reqCount++;
-  if (_reqCount % 100 === 0) {
+  if (_reqCount % MEM_CHECK_INTERVAL === 0) {
     const mem = process.memoryUsage().rss;
     if (MEM_LIMIT_MB > 0 && mem > MEM_LIMIT_MB * 1024 * 1024) { elog('─'); elog(`🚨 [mem] RSS ${(mem/1024/1024).toFixed(0)}MB > ${MEM_LIMIT_MB}MB — exiting`); process.exit(1); }
   }
@@ -2099,11 +1887,6 @@ const server = http.createServer((req, res) => {
   _memGuard();
   req.on('error', () => {});
   res.on('error', () => {});
-
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
-  res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
-  res.setHeader('Access-Control-Max-Age', '86400');
 
   // Safe response helpers — silently no-op if client already disconnected
   const _wh = res.writeHead.bind(res), _end = res.end.bind(res);
@@ -2119,6 +1902,13 @@ const server = http.createServer((req, res) => {
 
   const urlPath = req.url.split('?')[0].replace(/\/\/+/g, '/').replace(/\/+$/, '') || '/';
   const isHealth = urlPath === '/health' || urlPath === '/v1/health';
+
+  // CORS: wildcard for API endpoints, restricted for console management endpoints
+  const isConsoleCors = urlPath === '/console' || urlPath.startsWith('/api/console/');
+  res.setHeader('Access-Control-Allow-Origin', isConsoleCors ? (req.headers['origin'] || '*') : '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
@@ -2282,6 +2072,7 @@ const server = http.createServer((req, res) => {
     // Handle oversized body destroy
     req.on('error', (e) => {
       if (e.message === 'request body too large') {
+        logEvent({ logId, provider: '-', model: '-', key: '-', status: 413, body: 'request body too large' });
         res.writeHead(413, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'request body too large', type: 'payload_too_large' } }));
       }

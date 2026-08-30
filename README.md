@@ -14,7 +14,7 @@
 - **Key 故障轉移** — 429/5xx/網路錯誤 → 退避降級，成功後逐步恢復
 - **Provider 降級** — Fallback Chain 依序嘗試備援 Provider
 - **Model 別名路由** — 依 context window 自動選擇最適合的別名
-- **端點自動派生** — `endpoint_defaults` 讓單一 model 名稱自動對應各端點的 model 別名
+- **端點自動派生** — `endpoint_fallbacks` 讓單一 model 名稱自動對應各端點的 model 別名
 - **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
 - **非 Chat 端點** — embeddings、images/generations、images/edits、images/variations、audio/speech、audio/transcriptions、audio/translations、files
 - **請求頻率限制** — 可設定 RPM（rate_limit）與 TPM（tpm_limit）
@@ -35,6 +35,21 @@
 |---------|------|---------|
 | Node.js 18+ | ✅ | `npm start` 或 `node src/index.js` |
 | Bun | ✅ | `npm run bun` 或 `bun run src/index.js` |
+
+## 測試
+
+```bash
+npm test         # 單元測試
+```
+
+測試位於 `test/` 目錄，涵蓋：
+- Config 解析（JSONC、自動修正）
+- Model 別名解析與 Endpoint Fallback
+- Chat 請求驗證
+- Token 估算
+- Utility 函數（uptime、key masking、SSE rewrite 等）
+
+核心邏輯提取在 `src/lib.js`，`src/index.js` 透過 delegation 呼叫。
 
 ## 快速開始
 
