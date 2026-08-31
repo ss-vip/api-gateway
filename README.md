@@ -42,12 +42,9 @@
 npm test         # 單元測試
 ```
 
-測試位於 `test/` 目錄（`lib.test.js`），涵蓋：
-- Config 解析（JSONC、自動修正）
-- Model 別名解析與 Endpoint Fallback
-- Chat 請求驗證
-- Token 估算
-- Utility 函數（uptime、key masking、SSE rewrite 等）
+測試位於 `test/` 目錄，由 `npm test`（`node --test test/*.test.js`）執行：
+- `lib.test.js` — 單元測試：Config 解析（JSONC、自動修正）、Model 別名解析與 Endpoint Fallback、Chat 請求驗證、Token 估算、Utility 函數（uptime、key masking、SSE rewrite 等）
+- `integration.test.js` — 整合測試：啟動真實 gateway（subprocess）+ mock upstream，黑箱驗證路由 / auth / SSE rewrite / 錯誤處理 / 各 provider 轉發
 
 核心邏輯提取在 `src/lib.js`，`src/index.js` 透過 delegation 呼叫。
 
