@@ -247,6 +247,7 @@ const   DIRECT_PROVIDERS = {
   aihorde: 'https://oai.aihorde.net',
   navy: 'https://api.navy',
   ollama: 'https://ollama.com',
+  orcarouter: 'https://api.orcarouter.ai',
   hermes: 'https://inference-api.nousresearch.com',
   tokenharbor: 'https://tokenharbor.ai',
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
@@ -494,6 +495,7 @@ const PROVIDER_RPM = {
   replicate: 60,        // prediction API, not strictly RPM-limited
   baseten: 60,         // inference, safe middle
   parallel: 60,         // speed/base, safe middle
+  orcarouter: 20,       // OpenAI-compatible router gateway — conservative middle (no published RPM)
   morph: 30,            // YC-backed, conservative
 };
 // Conservative default for manual (config-defined) providers that have no RPM source, so they are never unthrottled (ban risk)

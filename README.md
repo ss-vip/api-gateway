@@ -42,7 +42,7 @@
 npm test         # 單元測試
 ```
 
-測試位於 `test/` 目錄，涵蓋：
+測試位於 `test/` 目錄（`lib.test.js`），涵蓋：
 - Config 解析（JSONC、自動修正）
 - Model 別名解析與 Endpoint Fallback
 - Chat 請求驗證
@@ -89,7 +89,7 @@ curl http://localhost:3000/health
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde、navy、ollama、hermes、tokenharbor |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde、navy、ollama、hermes、tokenharbor |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 > ollama 為雲端服務（`https://ollama.com/v1`，key 在 Ollama Cloud 申請）。
@@ -195,7 +195,7 @@ curl http://localhost:3000/v1/chat/completions \
 
 - `model` 可為 config 中定義的別名或真實模型名稱
 - 陣列中的目標依序嘗試：第一個目標所有 Key 失敗 → 自動換下一個
-- 非串流回應含 `X-Provider`、`X-Upstream-Model` headers
+- 回應含 `X-Request-Id` header；非串流成功回應目前不附 `X-Provider` / `X-Upstream-Model`（僅 SSE 透傳路徑會帶上游 model 資訊）
 
 ## Model 別名範例
 

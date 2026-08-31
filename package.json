@@ -6,6 +6,6 @@
   "scripts": {
     "start": "node --max-old-space-size=192 src/index.js",
     "bun": "bun run src/index.js",
-    "test": "node --test temp/test/*.test.js"
+    "test": "node --test test/*.test.js"
   }
 }
