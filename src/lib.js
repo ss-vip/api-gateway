@@ -291,6 +291,25 @@ function createEndpointResolver(modelEntries, endpointFallbacks) {
 }
 
 // --- Fetch remote images and convert to base64 data URI ---
+// Allowed image-host origins (prevents SSRF via attacker-controlled image URLs).
+const ALLOWED_IMAGE_ORIGINS = [
+  'https://openai.com',
+  'https://cdn.openai.com',
+];
+const _allowedImageOrigins = ALLOWED_IMAGE_ORIGINS.map(o => o.replace(/\/+$/, '').toLowerCase());
+
+function _isAllowedImageOrigin(urlString) {
+  try {
+    const u = new URL(urlString);
+    if (u.protocol !== 'https:') return false;
+    if (!_allowedImageOrigins.length) return false; // block all when list is empty
+    const host = u.protocol + '//' + u.host;
+    return _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
+  } catch {
+    return false;
+  }
+}
+
 async function _fetchAndConvertImages(messages) {
   if (!Array.isArray(messages)) return 0;
   let converted = 0;
@@ -299,10 +318,9 @@ async function _fetchAndConvertImages(messages) {
     for (const part of m.content) {
       if (part.type !== 'image_url' || !part.image_url?.url) continue;
       const url = part.image_url.url.trim();
-      // Already data URI or empty — skip
-      if (!url || url.startsWith('data:')) continue;
-      // Only fetch http/https URLs
-      if (!/^https?:\/\//i.test(url)) continue;
+            if (!url || url.startsWith('data:')) continue;
+            if (!/^https?:\/\//i.test(url)) continue;
+      if (!_isAllowedImageOrigin(url)) continue;
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 10000);
@@ -310,15 +328,16 @@ async function _fetchAndConvertImages(messages) {
         clearTimeout(timer);
         if (!resp.ok) continue;
         const contentType = resp.headers.get('content-type') || 'image/png';
-        // Only process image content types
-        if (!/^image\//i.test(contentType)) continue;
+                if (!/^image\//i.test(contentType)) continue;
+                const contentLength = Number(resp.headers.get('content-length') || 0);
+        if (contentLength > 8 * 1024 * 1024) continue;
         const buf = Buffer.from(await resp.arrayBuffer());
+        if (buf.length > 8 * 1024 * 1024) continue;
         const b64 = buf.toString('base64');
         part.image_url.url = `data:${contentType};base64,${b64}`;
         converted++;
       } catch {
-        // Download failed — leave original URL, upstream will handle the error
-      }
+              }
     }
   }
   return converted;

@@ -52,8 +52,7 @@ function _buildStatusJSON() {
   const totalKeys = Object.values(PROVIDER_KEYS).reduce((s, ks) => s + ks.length, 0);
   const now = Date.now();
   const providers = {};
-  // report every configured provider, including idle ones with no traffic yet
-  const provSet = new Set([...PROVIDERS_WITH_KEYS, ...keyPool.keys()]);
+    const provSet = new Set([...PROVIDERS_WITH_KEYS, ...keyPool.keys()]);
   for (const p of provSet) {
     const m = keyPool.get(p);
     if (!m) {
@@ -107,8 +106,7 @@ function _cleanupLog(p, cutoffOverride) {
       const kept = c.split('\n').filter(l => l.trim()).filter(l => {
         try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
       });
-      // Atomic write: write to temp file, then rename over the target
-      if (kept.length > 0) {
+            if (kept.length > 0) {
         fs.writeFile(tmp, kept.join('\n') + '\n', (e2) => {
           if (e2) { elog('─'); elog(`[log] cleanup write: ${e2.message}`); fs.unlink(old, () => {}); fs.unlink(tmp, () => {}); _logCleaning.delete(p); return; }
           fs.rename(tmp, p, (e3) => { if (e3) { elog('─'); elog(`[log] cleanup rename: ${e3.message}`); } fs.unlink(old, () => {}); _logCleaning.delete(p); _lastCleanup = Date.now(); });
@@ -141,8 +139,7 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
   else { stats.success++; stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1; if (latency) { stats.latSum += latency; stats.latN++; } }
   _pushSSE('log', entry);
   _logWriteCount = (_logWriteCount + 1) % 1000000007;
-  // cleanup rewrites the whole log (O(file size)) — throttle: every 200 writes, only if >10 min since last cleanup
-  if (_logWriteCount % LOG_CLEANUP_EVERY === 1 && Date.now() - _lastCleanup > LOG_CLEANUP_COOLDOWN_MS) _triggerCleanup();
+    if (_logWriteCount % LOG_CLEANUP_EVERY === 1 && Date.now() - _lastCleanup > LOG_CLEANUP_COOLDOWN_MS) _triggerCleanup();
 }
 
 function _reseedStats() {
@@ -251,7 +248,7 @@ const   DIRECT_PROVIDERS = {
   hermes: 'https://inference-api.nousresearch.com',
   tokenharbor: 'https://tokenharbor.ai',
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
-  morph: 'https://api.morphllm.com',
+  morph: 'https://api.morphllm.com', aihubmix: 'https://aihubmix.com',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
@@ -345,7 +342,6 @@ function markKeyError(p, key) {
   s.errorCount++;
 }
 
-// Quota/credit exhaustion does not recover in seconds — degrade the key for a long window.
 const QUOTA_RE = lib.QUOTA_RE;
 function _isQuotaError(status, body) { return lib._isQuotaError(status, body); }
 function markKeyQuotaExhausted(p, key) {
@@ -371,21 +367,18 @@ function markKeySuccess(p, key, latency) {
   s.successCount++;
   s.lastSuccess = Date.now();
   if (latency != null) s.lastLatency = Math.round(latency);
-  // clear 401 flag on success
-  const _k = `${p}:${key}`;
+    const _k = `${p}:${key}`;
   if (_recent401.has(_k)) {
     const e = _recent401.get(_k);
     if (e.retryAfter && Date.now() > e.retryAfter) _recent401.delete(_k);
   }
 }
 
-// note: track 401 errors per key; cleared on next success or after 1h
 const _recent401 = new Map();
 function markKey401(p, key, model) {
   const _k = `${p}:${key}`;
   _recent401.set(_k, { provider: p, key, model, ts: Date.now(), retryAfter: Date.now() + 3600000 });
-  // stale cleanup
-  for (const [k, v] of _recent401) if (Date.now() > v.retryAfter) _recent401.delete(k);
+    for (const [k, v] of _recent401) if (Date.now() > v.retryAfter) _recent401.delete(k);
 }
 
 const keyInFlight = new Map(); // key -> timestamp
@@ -412,11 +405,9 @@ async function selectKey(p) {
   const healthy = getHealthyKeys(p);
   if (healthy.length === 0) return null;
   const now = Date.now();
-  // full-scan cleanup: every 50 selects, purge in-flight entries stuck longer than 5 min
-  _flightCleanTick = (_flightCleanTick + 1) % FLIGHT_CLEAN_EVERY;
+    _flightCleanTick = (_flightCleanTick + 1) % FLIGHT_CLEAN_EVERY;
   if (_flightCleanTick === 0) for (const [k, ts] of keyInFlight) if (now - ts > IN_FLIGHT_TIMEOUT_MS) keyInFlight.delete(k);
-  // Lazy cleanup: purge stale entries when encountered in healthy list
-  const free = healthy.filter(k => {
+    const free = healthy.filter(k => {
     const v = keyInFlight.get(`${p}:${k}`);
     if (!v) return true;
     if (now - v > IN_FLIGHT_TIMEOUT_MS) { keyInFlight.delete(`${p}:${k}`); return true; }
@@ -430,8 +421,7 @@ async function selectKey(p) {
     await waitRateLimit(p, key);
     return key;
   }
-  // every key is already in-flight — no free key to hand out
-  return null;
+    return null;
 }
 
 function releaseKey(p, key) {
@@ -822,7 +812,6 @@ function patchMultipartFieldName(raw, oldName, newName) {
   return out;
 }
 
-// extract the binary file part from a multipart body (for CF's raw-audio /ai/run/{model} STT)
 function _extractMultipartFile(rawBody, contentType) {
   const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
   const boundary = m ? (m[1] || m[2]).trim() : '';
@@ -840,8 +829,7 @@ function _extractMultipartFile(rawBody, contentType) {
 async function handleSTT(req, res, rawBody, logId, contentType) {
   const t0 = Date.now();
   log('─');
-  // Extract client model from multipart body
-  let clientModel = '';
+    let clientModel = '';
   const modelNeedle = Buffer.from('name="model"');
   const mi = rawBody.indexOf(modelNeedle);
   if (mi !== -1) {
@@ -885,8 +873,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
-      // Build provider-specific path, body, and headers
-      let body = rawBody;
+            let body = rawBody;
       let ep, extraHdrs = {};
       const cfBase = _isCFBase(base);
       if (cfBase) {
@@ -989,7 +976,6 @@ function _hasNonTextContent(msgs) { return lib._hasNonTextContent(msgs); }
 // drop invalid image parts (empty/non-http/non-data image_url) before routing — they would 400 upstream or misfire vision auto-route
 function _dropInvalidImageParts(msgs) { return lib._dropInvalidImageParts(msgs); }
 async function _fetchAndConvertImages(msgs) { return lib._fetchAndConvertImages(msgs); }
-// note: vLLM (NVIDIA) trims whitespace-only content to '' — inserted assistant needs at least one visible char
 const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 
 // Cloudflare Workers AI: /ai/v1/{chat,embeddings} are OpenAI-compatible, but images/tts/stt only exist as /ai/run/{model} with non-OpenAI request/response shapes
@@ -1042,8 +1028,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   const clientModel = bodyJson.model || 'unknown';
   const dropped = _dropInvalidImageParts(bodyJson.messages);
   if (dropped) log(`[${logId}] ➡️ dropped ${dropped} invalid image part(s)`);
-  // Auto-fetch remote images and convert to base64 data URIs for providers that don't support URLs
-  const converted = await _fetchAndConvertImages(bodyJson.messages);
+    const converted = await _fetchAndConvertImages(bodyJson.messages);
   if (converted) log(`[${logId}] ➡️ fetched & converted ${converted} remote image(s) to base64`);
   let targets = resolveModelForEndpoint(clientModel, '/v1/chat/completions');
   if (!targets) {
@@ -1052,8 +1037,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     res.end(JSON.stringify({ error: { message: `model '${clientModel}' not supported`, type: 'unsupported_model' } }));
     return;
   }
-  // note: auto-route to vision alias when request has non-text multimodal content (image, file, etc.)
-  if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
+    if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
     const vt = resolveModel('vision');
     if (vt) { log(`[${logId}] ➡️ ${clientModel} → vision  (non-text content detected)`); targets = vt; }
   }
@@ -1150,8 +1134,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
         if (lastErr) await sleep(Math.random() * 300);
 
-        // note: skip targets whose context can't fit the request
-        const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
+                const targetLimitKey = `${provider}/${upstreamModel}`.toLowerCase();
         const targetCtx = USER_MODEL_LIMITS.get(targetLimitKey) || PROVIDER_DEFAULT_LIMITS[provider] || 999999;
         if (totalEst > targetCtx) {
           log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (${totalEst} > ${targetCtx})`);
@@ -1338,8 +1321,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
         log(`[${logId}] ➡️ sse stream error before first token (retry ${r+1}): ${e.message}`);
         if (sseRetryTargets.length === 0) break;
-        // Try next target
-        const t = sseRetryTargets.shift();
+                const t = sseRetryTargets.shift();
         if (skippedProviders.has(t.provider)) continue;
         if (_isModelLocked(t.provider, t.upstreamModel)) continue;
         if (isRateLimited(t.provider)) continue;
@@ -1914,8 +1896,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // Auth check for protected endpoints
-  const isConsolePath = urlPath === '/console' || urlPath.startsWith('/api/console/');
+    const isConsolePath = urlPath === '/console' || urlPath.startsWith('/api/console/');
   const needsAuth = !isConsolePath && !isHealth && urlPath !== '/';
   if (needsAuth && CLIENT_TOKEN) {
     const auth = req.headers['authorization'];
@@ -2106,8 +2087,7 @@ const onListening = () => {
   log(`[config] timeout=${(TIMEOUT_MS/1000).toFixed(0)}s cooldown=${(KEY_COOLDOWN_MS/1000).toFixed(0)}s maxBody=${(MAX_BODY_SIZE/1024/1024).toFixed(1)}MB`);
   const elCfg = cfg.log;
   if (elCfg?.enabled !== false) log(`[config] log=${getLogPath()} retention=${elCfg?.retention_days || 7}d`);
-  // seed stats from persisted logs (count only, latency resets on restart)
-  _reseedStats();
+    _reseedStats();
 };
 server.listen(PORT, onListening);
 
