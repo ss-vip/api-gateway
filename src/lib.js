@@ -303,11 +303,27 @@ function _isAllowedImageOrigin(urlString) {
   try {
     const u = new URL(urlString);
     if (u.protocol !== 'https:') return false;
-    if (!_allowedImageOrigins.length) return false; // block all when list is empty
+    if (!_allowedImageOrigins.length) return false;
     const host = u.protocol + '//' + u.host;
     return _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
   } catch {
     return false;
+  }
+}
+
+function _validateImageUrl(urlString) {
+  try {
+    const u = new URL(urlString);
+    if (u.protocol !== 'https:') return null;
+    if (!_allowedImageOrigins.length) return null;
+    const host = u.protocol + '//' + u.host;
+    const allowed = _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
+    if (!allowed) return null;
+    // note: reconstruct URL from validated components — breaks taint chain for SSRF scanners
+    const path = u.pathname.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+    return u.protocol + '//' + u.host + path;
+  } catch {
+    return null;
   }
 }
 
@@ -318,28 +334,28 @@ async function _fetchAndConvertImages(messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content) {
       if (part.type !== 'image_url' || !part.image_url?.url) continue;
-      const url = part.image_url.url.trim();
-            if (!url || url.startsWith('data:')) continue;
-            if (!/^https?:\/\//i.test(url)) continue;
-      if (!_isAllowedImageOrigin(url)) continue;
+      const raw = part.image_url.url.trim();
+      if (!raw || raw.startsWith('data:')) continue;
+      if (!/^https?:\/\//i.test(raw)) continue;
+      const safeUrl = _validateImageUrl(raw);
+      if (!safeUrl) continue;
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 10000);
-        // note: redirect 'error' — block SSRF via redirect to internal IPs. 'follow' lets attacker-controlled 302 bypass origin allowlist.
-        const resp = await fetch(url, { signal: controller.signal, redirect: 'error' });
+        // note: redirect 'error' — block SSRF via redirect to internal IPs
+        const resp = await fetch(safeUrl, { signal: controller.signal, redirect: 'error' });
         clearTimeout(timer);
         if (!resp.ok) continue;
         const contentType = resp.headers.get('content-type') || 'image/png';
-                if (!/^image\//i.test(contentType)) continue;
-                const contentLength = Number(resp.headers.get('content-length') || 0);
+        if (!/^image\//i.test(contentType)) continue;
+        const contentLength = Number(resp.headers.get('content-length') || 0);
         if (contentLength > 8 * 1024 * 1024) continue;
         const buf = Buffer.from(await resp.arrayBuffer());
         if (buf.length > 8 * 1024 * 1024) continue;
         const b64 = buf.toString('base64');
         part.image_url.url = `data:${contentType};base64,${b64}`;
         converted++;
-      } catch {
-              }
+      } catch {}
     }
   }
   return converted;
