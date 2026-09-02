@@ -223,7 +223,7 @@ const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
@@ -249,6 +249,7 @@ const   DIRECT_PROVIDERS = {
   tokenharbor: 'https://tokenharbor.ai',
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
   morph: 'https://api.morphllm.com', aihubmix: 'https://aihubmix.com',
+  amd: 'https://developer.amd.com.cn/radeon',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
@@ -289,6 +290,17 @@ const MODEL_ENTRIES = Object.entries(MODELS).sort((a, b) => b[0].length - a[0].l
 const PROVIDERS_WITH_KEYS = new Set(
   Object.entries(PROVIDER_KEYS).filter(([, ks]) => ks.length > 0).map(([p]) => p)
 );
+
+function _extractRootDomain(hostname) {
+  const parts = hostname.split('.');
+  return parts.length > 2 ? parts.slice(-2).join('.') : hostname;
+}
+const _autoImageOrigins = [...new Set(
+  Object.values(DIRECT_PROVIDERS)
+    .map(u => { try { return 'https://' + _extractRootDomain(new URL(u).hostname); } catch { return null; } })
+    .filter(Boolean)
+)];
+lib.setAllowedImageOrigins(cfg.allowed_image_origins || _autoImageOrigins);
 
 const _resolveModelImpl = lib.createModelResolver(MODEL_ENTRIES);
 function resolveModel(clientModel) { return _resolveModelImpl(clientModel); }

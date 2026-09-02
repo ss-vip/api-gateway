@@ -291,12 +291,13 @@ function createEndpointResolver(modelEntries, endpointFallbacks) {
 }
 
 // --- Fetch remote images and convert to base64 data URI ---
-// Allowed image-host origins (prevents SSRF via attacker-controlled image URLs).
-const ALLOWED_IMAGE_ORIGINS = [
-  'https://openai.com',
-  'https://cdn.openai.com',
-];
-const _allowedImageOrigins = ALLOWED_IMAGE_ORIGINS.map(o => o.replace(/\/+$/, '').toLowerCase());
+let _allowedImageOrigins = [];
+
+function setAllowedImageOrigins(origins) {
+  if (Array.isArray(origins) && origins.length) {
+    _allowedImageOrigins = origins.map(o => o.replace(/\/+$/, '').toLowerCase());
+  }
+}
 
 function _isAllowedImageOrigin(urlString) {
   try {
@@ -324,7 +325,8 @@ async function _fetchAndConvertImages(messages) {
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 10000);
-        const resp = await fetch(url, { signal: controller.signal, redirect: 'follow' });
+        // note: redirect 'error' — block SSRF via redirect to internal IPs. 'follow' lets attacker-controlled 302 bypass origin allowlist.
+        const resp = await fetch(url, { signal: controller.signal, redirect: 'error' });
         clearTimeout(timer);
         if (!resp.ok) continue;
         const contentType = resp.headers.get('content-type') || 'image/png';
@@ -365,4 +367,5 @@ module.exports = {
   createModelResolver,
   createEndpointResolver,
   _fetchAndConvertImages,
+  setAllowedImageOrigins,
 };
