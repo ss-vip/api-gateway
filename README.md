@@ -86,7 +86,7 @@ curl http://localhost:3000/health
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde、aihubmix、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde、aihubmix、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 > ollama 為雲端服務（`https://ollama.com/v1`，key 在 Ollama Cloud 申請）。

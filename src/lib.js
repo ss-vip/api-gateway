@@ -306,20 +306,26 @@ async function _fetchAndConvertImages(messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content) {
       if (part.type !== 'image_url' || !part.image_url?.url) continue;
-      const url = part.image_url.url.trim();
-      if (!url || url.startsWith('data:')) continue;
-      let allowed = false;
+      const raw = part.image_url.url.trim();
+      if (!raw || raw.startsWith('data:')) continue;
+      let safeUrl = null;
       try {
-        const u = new URL(url);
+        const u = new URL(raw);
         if (u.protocol === 'https:' && _allowedImageOrigins.length) {
-          const host = u.protocol + '//' + u.host;
-          allowed = _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
+          const reqHost = u.hostname;
+          for (const o of _allowedImageOrigins) {
+            const originHost = o.slice('https://'.length);
+            if (reqHost === originHost || reqHost.endsWith('.' + originHost)) {
+              // note: origin is server-controlled, path from parsed URL
+              safeUrl = o + u.pathname;
+              break;
+            }
+          }
         }
       } catch {}
-      if (!allowed) continue;
+      if (!safeUrl) continue;
       try {
-        // lgtm[js/ssrf]
-        const resp = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'error' });
+        const resp = await fetch(safeUrl, { signal: AbortSignal.timeout(10000), redirect: 'error' });
         if (!resp.ok) continue;
         const contentType = resp.headers.get('content-type') || 'image/png';
         if (!/^image\//i.test(contentType)) continue;

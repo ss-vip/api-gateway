@@ -53,6 +53,7 @@
     "amd": ["rc-..."],
     "bazaarlink": ["bz-..."],
     "flatkey": ["fk-..."],
+    "tokenrouter": ["tr-..."],
 
     "_custom_provider_example": "下方為自定 provider 範例",
     "my-proxy": {
