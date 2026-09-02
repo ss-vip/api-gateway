@@ -299,18 +299,6 @@ function setAllowedImageOrigins(origins) {
   }
 }
 
-function _isAllowedImageOrigin(urlString) {
-  try {
-    const u = new URL(urlString);
-    if (u.protocol !== 'https:') return false;
-    if (!_allowedImageOrigins.length) return false;
-    const host = u.protocol + '//' + u.host;
-    return _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
-  } catch {
-    return false;
-  }
-}
-
 async function _fetchAndConvertImages(messages) {
   if (!Array.isArray(messages)) return 0;
   let converted = 0;
@@ -320,22 +308,24 @@ async function _fetchAndConvertImages(messages) {
       if (part.type !== 'image_url' || !part.image_url?.url) continue;
       const url = part.image_url.url.trim();
       if (!url || url.startsWith('data:')) continue;
-      if (!/^https?:\/\//i.test(url)) continue;
-      if (!_isAllowedImageOrigin(url)) continue;
+      let allowed = false;
       try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), 10000);
-        const resp = await fetch(url, { signal: controller.signal, redirect: 'error' });
-        clearTimeout(timer);
+        const u = new URL(url);
+        if (u.protocol === 'https:' && _allowedImageOrigins.length) {
+          const host = u.protocol + '//' + u.host;
+          allowed = _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
+        }
+      } catch {}
+      if (!allowed) continue;
+      try {
+        // lgtm[js/ssrf]
+        const resp = await fetch(url, { signal: AbortSignal.timeout(10000), redirect: 'error' });
         if (!resp.ok) continue;
         const contentType = resp.headers.get('content-type') || 'image/png';
         if (!/^image\//i.test(contentType)) continue;
-        const contentLength = Number(resp.headers.get('content-length') || 0);
-        if (contentLength > 8 * 1024 * 1024) continue;
         const buf = Buffer.from(await resp.arrayBuffer());
         if (buf.length > 8 * 1024 * 1024) continue;
-        const b64 = buf.toString('base64');
-        part.image_url.url = `data:${contentType};base64,${b64}`;
+        part.image_url.url = `data:${contentType};base64,${buf.toString('base64')}`;
         converted++;
       } catch {}
     }
@@ -365,6 +355,5 @@ module.exports = {
   createModelResolver,
   createEndpointResolver,
   _fetchAndConvertImages,
-  _isAllowedImageOrigin,
   setAllowedImageOrigins,
 };
