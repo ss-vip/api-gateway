@@ -223,7 +223,7 @@ const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
@@ -250,6 +250,7 @@ const   DIRECT_PROVIDERS = {
   cartesia: 'https://api.cartesia.ai', elevenlabs: 'https://api.elevenlabs.io',
   morph: 'https://api.morphllm.com', aihubmix: 'https://aihubmix.com',
   amd: 'https://developer.amd.com.cn/radeon',
+  bazaarlink: 'https://api.bazaarlink.ai',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {

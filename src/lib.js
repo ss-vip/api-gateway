@@ -311,22 +311,6 @@ function _isAllowedImageOrigin(urlString) {
   }
 }
 
-function _validateImageUrl(urlString) {
-  try {
-    const u = new URL(urlString);
-    if (u.protocol !== 'https:') return null;
-    if (!_allowedImageOrigins.length) return null;
-    const host = u.protocol + '//' + u.host;
-    const allowed = _allowedImageOrigins.some(o => host === o || host.endsWith('.' + o.slice(u.protocol.length + 2)));
-    if (!allowed) return null;
-    // note: reconstruct URL from validated components — breaks taint chain for SSRF scanners
-    const path = u.pathname.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
-    return u.protocol + '//' + u.host + path;
-  } catch {
-    return null;
-  }
-}
-
 async function _fetchAndConvertImages(messages) {
   if (!Array.isArray(messages)) return 0;
   let converted = 0;
@@ -334,16 +318,14 @@ async function _fetchAndConvertImages(messages) {
     if (!Array.isArray(m.content)) continue;
     for (const part of m.content) {
       if (part.type !== 'image_url' || !part.image_url?.url) continue;
-      const raw = part.image_url.url.trim();
-      if (!raw || raw.startsWith('data:')) continue;
-      if (!/^https?:\/\//i.test(raw)) continue;
-      const safeUrl = _validateImageUrl(raw);
-      if (!safeUrl) continue;
+      const url = part.image_url.url.trim();
+      if (!url || url.startsWith('data:')) continue;
+      if (!/^https?:\/\//i.test(url)) continue;
+      if (!_isAllowedImageOrigin(url)) continue;
       try {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), 10000);
-        // note: redirect 'error' — block SSRF via redirect to internal IPs
-        const resp = await fetch(safeUrl, { signal: controller.signal, redirect: 'error' });
+        const resp = await fetch(url, { signal: controller.signal, redirect: 'error' });
         clearTimeout(timer);
         if (!resp.ok) continue;
         const contentType = resp.headers.get('content-type') || 'image/png';
@@ -383,5 +365,6 @@ module.exports = {
   createModelResolver,
   createEndpointResolver,
   _fetchAndConvertImages,
+  _isAllowedImageOrigin,
   setAllowedImageOrigins,
 };
