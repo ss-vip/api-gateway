@@ -223,7 +223,7 @@ const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink', FLATKEY_KEYS:'flatkey', TOKENROUTER_KEYS:'tokenrouter',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', ANTHROPIC_API_KEY:'anthropic', ANTHROPIC_KEYS:'anthropic', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink', FLATKEY_KEYS:'flatkey', TOKENROUTER_KEYS:'tokenrouter',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
@@ -241,6 +241,7 @@ const   DIRECT_PROVIDERS = {
   // --- Bearer-compatible additions ---
   replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
   opencode: 'https://opencode.ai/zen',
+  anthropic: 'https://api.anthropic.com',
   aihorde: 'https://oai.aihorde.net',
   navy: 'https://api.navy',
   ollama: 'https://ollama.com',
@@ -997,23 +998,41 @@ const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 const _isCFBase = (base) => /api\.cloudflare\.com/i.test(base);
 const _cfRunPath = (model) => 'run/' + String(model).replace(/[^a-zA-Z0-9@._\-/]/g, (c) => encodeURIComponent(c));
 
+function _opencodeExtraHeaders(req) {
+  const h = {};
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    if (k.toLowerCase().startsWith('x-opencode-')) h[k] = v;
+  }
+  if (Object.keys(h).length) h['User-Agent'] = 'api-gateway';
+  return Object.keys(h).length ? h : undefined;
+}
+
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(new Error('aborted')); return; }
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
     const url = new URL(joined);
     const isHttps = url.protocol === 'https:';
+    const isOpencode = baseUrl.includes('opencode.ai');
+    const isAnthropic = baseUrl.includes('anthropic.com');
+    const headers = {
+      'Content-Type': contentType || 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'Accept': accept || 'application/json',
+      ...(extraHeaders || {}),
+    };
+    if (isAnthropic) {
+      headers['x-api-key'] = apiKey;
+      headers['anthropic-version'] = '2023-06-01';
+      delete headers['Authorization'];
+    }
+    if (isOpencode && !headers['User-Agent'] && !headers['user-agent']) headers['User-Agent'] = 'api-gateway';
     const opts = {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
       path: url.pathname + url.search,
       method: method || 'POST',
-      headers: {
-        'Content-Type': contentType || 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Accept': accept || 'application/json',
-        ...(extraHeaders || {}),
-      },
+      headers,
       timeout: TIMEOUT_MS,
     };
     const mod = isHttps ? https : http;
@@ -1218,7 +1237,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             }
             addActive(provider);
             const chatPath = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
-            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', undefined, sig);
+            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', _opencodeExtraHeaders(req), sig);
             usedProvider = provider;
             usedModel = upstreamModel;
             curProvider = provider; curUpstream = upstreamRes; curKey = usedKey;
@@ -1358,7 +1377,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           addActive(sseProvider);
           const base = DIRECT_PROVIDERS[sseProvider];
           const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
-          sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig);
+          sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, _opencodeExtraHeaders(req), sig);
           curProvider = sseProvider; curUpstream = sseUpstream; curKey = nk;
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
             log(`[${logId}] ➡️ sse retry → [${sseProvider}/${sseModel}]`);
@@ -1501,7 +1520,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const cfEp = _cfRunPath(upstreamModel);
           try {
             addActive(provider);
-            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', undefined, sig);
+            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', _opencodeExtraHeaders(req), sig);
             const sc = upstreamRes.statusCode;
             if (sc >= 200 && sc < 300 && !clientGone) {
               const raw = await collectBody(upstreamRes);
@@ -1554,7 +1573,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
           addActive(provider);
-          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, undefined, sig);
+          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, _opencodeExtraHeaders(req), sig);
           if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
           continue;
         } catch (e) {
@@ -2051,6 +2070,10 @@ const server = http.createServer((req, res) => {
         handleProxy(req, res, json, logId, '/moderations', true);
       } else if (req.url.startsWith('/v1/rerank')) {
         handleProxy(req, res, json, logId, '/rerank', true);
+      } else if (req.url.startsWith('/v1/responses')) {
+        handleProxy(req, res, json, logId, '/responses', true);
+      } else if (req.url.startsWith('/v1/messages')) {
+        handleProxy(req, res, json, logId, '/messages', true);
       } else if (req.url.startsWith('/v1/files')) {
         handleFiles(req, res, rawStr, logId, req.headers['content-type']);
       } else if (req.url === '/api/console/validate') {

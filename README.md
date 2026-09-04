@@ -16,7 +16,7 @@
 - **Model 別名路由** — 依 context window 自動選擇最適合的別名
 - **端點自動派生** — `endpoint_fallbacks` 讓單一 model 名稱自動對應各端點的 model 別名
 - **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
-- **非 Chat 端點** — embeddings、images/generations、images/edits、images/variations、audio/speech、audio/transcriptions、audio/translations、files
+- **非 Chat 端點** — embeddings、images/generations、images/edits、images/variations、audio/speech、audio/transcriptions、audio/translations、files、responses、messages（Anthropic 原生 `x-api-key` + opencode 轉譯）
 - **請求頻率限制** — 可設定 RPM（rate_limit）與 TPM（tpm_limit）
 - **Circuit Breaker** — 連續 5 次 5xx 自動跳過該 provider 30 秒，成功後立即關閉
 - **Model Lockout** — 同一 provider/model 連續失敗達 threshold（預設 3）次後暫時停用，避免一直打到壞 model 或塞車的 tier
@@ -86,7 +86,7 @@ curl http://localhost:3000/health
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、morph、aihorde、aihubmix、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、anthropic、morph、aihorde、aihubmix、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 > ollama 為雲端服務（`https://ollama.com/v1`，key 在 Ollama Cloud 申請）。

@@ -41,6 +41,7 @@
     "llm7": ["..."],
     "gpt4free": ["g4f_..."],
     "opencode": ["sk-..."],
+    "anthropic": ["sk-ant-..."],
     "kilo": ["eyJ..."],
     "sea-lion": ["sk-...", "sk-..."],
     "cartesia": ["sk_car_..."],
