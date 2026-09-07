@@ -60,7 +60,7 @@ Client Token 非必要但是建議使用，將會是用戶端 API 調用的 head
 
 ```bash
 npm install -g pm2
-pm2 start src/index.js --name api-gateway --node-args="--max-old-space-size=192" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
+pm2 start src/index.js --name api-gateway --node-args="--max-old-space-size=256" --max-memory-restart 300M --exp-backoff-restart-delay 10000 --kill-timeout 10000
 pm2 save && pm2 startup
 ```
 
@@ -80,13 +80,29 @@ curl http://localhost:3000/health
 
 所有欄位說明請參閱 `src/config.example.json`。支援 `config.json` / `config.jsonc`（含 `//` 與 `/* */` 註解），各參數值可由同名稱環境變數覆寫。
 
+## 圖片預處理
+
+Gateway 會將請求中的遠端 `image_url` 預先抓回並轉換為 base64 data URI，避免上游不支援 URL 圖片。
+
+- 預設白名單來自既有 provider base URL 的根域名
+- 可手動覆寫：`config.json` 加入 `allowed_image_origins`
+- 只允許 HTTPS，且會限制單檔 8 MB
+
+```jsonc
+// config.json
+"allowed_image_origins": [
+  "https://openai.com",
+  "https://cdn.openai.com"
+]
+```
+
 ## 支援的 Provider
 
 相容 OpenAI Chat Completions API：
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、anthropic、morph、aihorde、aihubmix、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、anthropic、morph、aihorde、aihubmix、apinex、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 > ollama 為雲端服務（`https://ollama.com/v1`，key 在 Ollama Cloud 申請）。

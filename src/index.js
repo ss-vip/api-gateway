@@ -120,6 +120,19 @@ function _cleanupLog(p, cutoffOverride) {
   });
 }
 function _triggerCleanup() { _cleanupLog(getLogPath()); }
+function recordSuccess(provider, model, key, latency, tokens) {
+  markKeySuccess(provider, key, latency);
+  _recordProviderSuccess(provider);
+  _recordModelSuccess(provider, model);
+  logEvent({ logId, provider, model, key, latency: latency/1000, tokens: tokens || 0 });
+}
+function recordFailure(provider, model, key, status, body) {
+  _markKeyFailed(provider, key, status, body);
+  if (status >= 500) _recordProviderFailure(provider);
+  if (status !== 429) _recordModelFailure(provider, model);
+  if (status === 401) markKey401(provider, key, model);
+  logEvent({ logId, provider, model, key, status, body });
+}
 function logEvent({ logId, provider, model, key, status, latency, tokens, body }) {
   const ec = cfg.log;
   if (ec?.enabled === false) return;
@@ -190,7 +203,8 @@ if (CONFIG_PATH) {
 if (cfg && typeof cfg === 'object') {
   const KNOWN_CONFIG_KEYS = new Set([
     '_note', 'client_token', 'timezone', 'port', 'timeout', 'key_cooldown', 'max_key_backoff', 'max_body_size', 'quota_backoff',
-    'model_lockout', 'log', 'providers', 'rate_limit', 'tpm_limit', 'model_limits', 'endpoint_fallbacks', 'models', 'models_aliases'
+    'model_lockout', 'log', 'providers', 'rate_limit', 'tpm_limit', 'model_limits', 'endpoint_fallbacks', 'models', 'models_aliases',
+    'allowed_image_origins'
   ]);
   for (const k of Object.keys(cfg)) {
     if (!KNOWN_CONFIG_KEYS.has(k)) elog(`⚠️ [config] unknown top-level key: "${k}"`);
@@ -223,7 +237,7 @@ const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
   OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
   XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', ANTHROPIC_API_KEY:'anthropic', ANTHROPIC_KEYS:'anthropic', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink', FLATKEY_KEYS:'flatkey', TOKENROUTER_KEYS:'tokenrouter',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', ANTHROPIC_API_KEY:'anthropic', ANTHROPIC_KEYS:'anthropic', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink', FLATKEY_KEYS:'flatkey', TOKENROUTER_KEYS:'tokenrouter', APINEX_KEYS:'apinex',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
@@ -254,6 +268,7 @@ const   DIRECT_PROVIDERS = {
   bazaarlink: 'https://api.bazaarlink.ai',
   flatkey: 'https://router.flatkey.ai',
   tokenrouter: 'https://api.tokenrouter.com',
+  apinex: 'https://api.apinex.bond',
 };
 // Overlay config-defined base URLs (manual providers) — code defaults stay as fallback
 for (const [p, m] of Object.entries(provMeta)) {
@@ -270,17 +285,27 @@ for (const [p, m] of Object.entries(provMeta)) {
   if (m.pathPrefix) DIRECT_PATH_PREFIX[p] = m.pathPrefix;
 }
 
-// Fields known to cause 4xx for specific providers (strip before forwarding)
-const PROVIDER_BANNED_FIELDS = {
-  mistral:       new Set(['user','n','logit_bias','top_logprobs']),
-  cohere:        new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']),
-  huggingface:   new Set(['user']),
-  gpt4free:      new Set(['top_p']),
-  ollama:        new Set(['tool_choice','logit_bias','user','n']), // docs.ollama.com — unsupported fields
-  llm7:          new Set(['response_format','quality','style','output_format']),
-  nvidia:        new Set(['parallel_tool_calls']),
+// Provider-specific adapters: centralize fields/paths/tokens/auth quirks
+const ADAPTERS = {
+  groq:       { maxTokens: 8192 },
+  nvidia:     { banned: new Set(['parallel_tool_calls']) },
+  cohere:     { banned: new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']) },
+  mistral:    { banned: new Set(['user','n','logit_bias','top_logprobs']) },
+  huggingface:{ banned: new Set(['user']) },
+  gpt4free:   { banned: new Set(['top_p']) },
+  ollama:     { banned: new Set(['tool_choice','logit_bias','user','n']) },
+  llm7:       { banned: new Set(['response_format','quality','style','output_format']) },
 };
-const PROVIDER_MAX_TOKENS = { groq: 8192 };
+
+// Fields known to cause 4xx for specific providers (strip before forwarding)
+const PROVIDER_BANNED_FIELDS = {};
+for (const [k,v] of Object.entries(ADAPTERS)) { if (v.banned) PROVIDER_BANNED_FIELDS[k] = v.banned; }
+const PROVIDER_MAX_TOKENS = {};
+for (const [k,v] of Object.entries(ADAPTERS)) { if (v.maxTokens) PROVIDER_MAX_TOKENS[k] = v.maxTokens; }
+const RETRY_MAX_ROUNDS = 3;
+const RETRY_BASE_DELAY = 5000;
+const RETRY_MAX_DELAY = 30000;
+const RETRY_TRANSIENT_WAIT = 1500;
 
 // Env vars REPLACE (not append) config keys for the same provider.
 for (const [ev, p] of Object.entries(ENV_MAP)) {
@@ -644,7 +669,7 @@ function estimateTokens(messages) { return lib.estimateTokens(messages); }
 const REASONING_PROVIDERS = new Set(['deepseek', 'opencode', 'nvidia']);
 const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
 // non-text (vision) content unsupported — log-verified 400s ("does not support vision input")
-const NO_NON_TEXT_TARGETS = new Set(['llm7/codestral-latest', 'llm7/gpt-oss:20b']);
+const NO_NON_TEXT_TARGETS = new Set(['llm7/codestral-latest', 'llm7/gpt-oss:20b'].map(s => s.toLowerCase()));
 
 // Voice ID defaults — OpenAI voice name → provider voice ID
 const VOICE_MAP_CARTESIA = { alloy: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', echo: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', fable: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', onyx: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', nova: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4', shimmer: 'db6b0ed5-d5d3-463d-ae85-518a07d3c2b4' };
@@ -713,9 +738,9 @@ async function handleTTS(req, res, bodyJson, logId) {
   res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (!sig.aborted) ac.abort(); });
   let retryRound = 0;
   let transientSkipped = false;
-  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
+  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < RETRY_MAX_ROUNDS || transientSkipped)) {
     if (retryRound > 0) {
-      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      const wait = (transientSkipped && !lastErr) ? RETRY_TRANSIENT_WAIT : Math.min(retryRound * RETRY_BASE_DELAY, RETRY_MAX_DELAY);
       log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
       await sleep(wait);
     }
@@ -755,18 +780,12 @@ async function handleTTS(req, res, bodyJson, logId) {
               log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf tts bad response ${_safeSlice(raw.toString(), 100)}`);
               continue;
             }
-            markKeySuccess(provider, key, Date.now()-t0);
-            _recordProviderSuccess(provider);
-            _recordModelSuccess(provider, upstreamModel);
-            logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+            recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
             log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
             res.writeHead(sc, { 'Content-Type': 'audio/wav', 'X-Request-Id': logId, 'X-Provider': provider });
             res.end(Buffer.from(audio, 'base64')); return;
           }
-          decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
-          _recordProviderSuccess(provider);
-          _recordModelSuccess(provider, upstreamModel);
-          logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+          decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
           log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
           res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
           up.on('error', () => { try { res.end(); } catch {} });
@@ -869,9 +888,9 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
   res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (!sig.aborted) ac.abort(); });
   let retryRound = 0;
   let transientSkipped = false;
-  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
+  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < RETRY_MAX_ROUNDS || transientSkipped)) {
     if (retryRound > 0) {
-      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      const wait = (transientSkipped && !lastErr) ? RETRY_TRANSIENT_WAIT : Math.min(retryRound * RETRY_BASE_DELAY, RETRY_MAX_DELAY);
       log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
       await sleep(wait);
     }
@@ -927,18 +946,12 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
               log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf stt bad response ${_safeSlice(raw.toString(), 100)}`);
               continue;
             }
-            markKeySuccess(provider, key, Date.now()-t0);
-            _recordProviderSuccess(provider);
-            _recordModelSuccess(provider, upstreamModel);
-            logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+            recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
             log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
             res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
             res.end(JSON.stringify({ text })); return;
           }
-          decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
-          _recordProviderSuccess(provider);
-          _recordModelSuccess(provider, upstreamModel);
-          logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000 });
+          decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
           log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
           res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
           res.end(raw); return;
@@ -1014,7 +1027,8 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
     const url = new URL(joined);
     const isHttps = url.protocol === 'https:';
     const isOpencode = baseUrl.includes('opencode.ai');
-    const isAnthropic = baseUrl.includes('anthropic.com');
+    let isAnthropic = false;
+try { isAnthropic = new URL(baseUrl).hostname === 'api.anthropic.com'; } catch {}
     const headers = {
       'Content-Type': contentType || 'application/json',
       'Authorization': `Bearer ${apiKey}`,
@@ -1130,7 +1144,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   let curProvider = null, curUpstream = null, curKey = null; // active upstream for leak-safe cleanup on client disconnect
   let clientGone = false;
   let retryRound = 0;
-  let transientSkipped = false; // a target was skipped for a recoverable reason (concurrency/rate/TPM)
+  let transientSkipped = false;
   let sseStarted = false;
   let sseRetryTargets = [];
   const ac = new AbortController();
@@ -1147,10 +1161,10 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     sseStarted = true;
   }
 
-  while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
+  while (!upstreamRes && !clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < RETRY_MAX_ROUNDS || transientSkipped)) {
     if (retryRound > 0) {
       // all targets transiently skipped (concurrency/rate/TPM) and nothing reached an upstream: poll for a free slot before the next round
-      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      const wait = (transientSkipped && !lastErr) ? RETRY_TRANSIENT_WAIT : Math.min(retryRound * RETRY_BASE_DELAY, RETRY_MAX_DELAY);
       log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
     }
@@ -1368,7 +1382,11 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
         if (banned2) for (const f of banned2) delete bodyObj2[f];
         if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
-        if (!supportsReasoningContent(sseProvider, sseModel) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = sanitizeMessages(bodyObj2.messages);
+        const sseSanKey = `${sseProvider}/${sseModel}`;
+        if (!_sanCache.has(sseSanKey)) {
+          _sanCache.set(sseSanKey, !supportsReasoningContent(sseProvider, sseModel) ? sanitizeMessages(bodyObj2.messages) : bodyObj2.messages);
+        }
+        if (_sanCache.get(sseSanKey) !== bodyObj2.messages) bodyObj2.messages = _sanCache.get(sseSanKey);
         if (STRICT_ORDER_PROVIDERS.has(sseProvider) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = normalizeMessageOrder(bodyObj2.messages);
         const maxCap2 = PROVIDER_MAX_TOKENS[sseProvider];
         if (maxCap2 && (bodyObj2.max_tokens || 4096) > maxCap2) bodyObj2.max_tokens = maxCap2;
@@ -1482,9 +1500,9 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
 
   let retryRound = 0;
   let transientSkipped = false; // a target was skipped for a recoverable reason (concurrency/rate/TPM)
-  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < 3 || transientSkipped)) {
+  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < RETRY_MAX_ROUNDS || transientSkipped)) {
     if (retryRound > 0) {
-      const wait = (transientSkipped && !lastErr) ? 1500 : Math.min(retryRound * 5000, 30000);
+      const wait = (transientSkipped && !lastErr) ? RETRY_TRANSIENT_WAIT : Math.min(retryRound * RETRY_BASE_DELAY, RETRY_MAX_DELAY);
       log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (all targets transiently skipped, keeping client connection)' : ' for key recovery'}`);
       await sleep(wait);
     }

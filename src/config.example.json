@@ -10,6 +10,11 @@
   "max_body_size": 10485760,
   "quota_backoff": 3600000,
 
+  "allowed_image_origins": [
+    "https://openai.com",
+    "https://cdn.openai.com"
+  ],
+
   "model_lockout": {
     "_note": "(選用) 同一 provider/model 連續失敗達 threshold 次後暫時停用 (cooldown 毫秒)，避免一直打到壞 model / 塞車的 tier",
     "threshold": 3,
@@ -55,6 +60,7 @@
     "bazaarlink": ["bz-..."],
     "flatkey": ["fk-..."],
     "tokenrouter": ["tr-..."],
+    "apinex": ["sk-apx-..."],
 
     "_custom_provider_example": "下方為自定 provider 範例",
     "my-proxy": {
