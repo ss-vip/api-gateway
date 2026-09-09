@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 // --- JSONC Parser ---
 function parseJsonc(str) {
   if (!str) return null;
@@ -207,7 +209,9 @@ function _sanitizeToolIds(msg, idMap) {
   const remap = (id) => {
     if (!id || validId.test(id)) return id;
     if (idMap.has(id)) return idMap.get(id);
-    const nid = (Math.random().toString(36).slice(2)+'000000000').slice(0,9);
+    // crypto-based 9-char alphanumeric id — replaces Math.random() (collision-hardened for tool-call-heavy traffic)
+    const _ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const nid = Array.from(crypto.randomBytes(9), (b) => _ALNUM[b % 62]).join('');
     idMap.set(id, nid);
     return nid;
   };

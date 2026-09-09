@@ -258,6 +258,7 @@ const   DIRECT_PROVIDERS = {
   anthropic: 'https://api.anthropic.com',
   aihorde: 'https://oai.aihorde.net',
   navy: 'https://api.navy',
+  vyceai: 'https://vyceai.com',
   ollama: 'https://ollama.com',
   orcarouter: 'https://api.orcarouter.ai',
   hermes: 'https://inference-api.nousresearch.com',
@@ -288,6 +289,7 @@ for (const [p, m] of Object.entries(provMeta)) {
 // Provider-specific adapters: centralize fields/paths/tokens/auth quirks
 const ADAPTERS = {
   groq:       { maxTokens: 8192 },
+  vyceai:     { banned: new Set(['parallel_tool_calls','user']) },
   nvidia:     { banned: new Set(['parallel_tool_calls']) },
   cohere:     { banned: new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']) },
   mistral:    { banned: new Set(['user','n','logit_bias','top_logprobs']) },
@@ -528,8 +530,8 @@ const PROVIDER_RPM = {
   parallel: 60,         // speed/base, safe middle
   orcarouter: 20,       // OpenAI-compatible router gateway — conservative middle (no published RPM)
   morph: 30,            // YC-backed, conservative
+  vyceai: 60,            // OpenAI/Anthropic-compatible router (chat + Anthropic messages + image gen per docs)
 };
-// Conservative default for manual (config-defined) providers that have no RPM source, so they are never unthrottled (ban risk)
 const DEFAULT_MANUAL_RPM = 10;
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   if (keys.length === 0) continue;
@@ -864,7 +866,7 @@ function _extractMultipartFile(rawBody, contentType) {
 async function handleSTT(req, res, rawBody, logId, contentType) {
   const t0 = Date.now();
   log('─');
-    let clientModel = '';
+  let clientModel = '';
   const modelNeedle = Buffer.from('name="model"');
   const mi = rawBody.indexOf(modelNeedle);
   if (mi !== -1) {
@@ -908,7 +910,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
-            let body = rawBody;
+      let body = rawBody;
       let ep, extraHdrs = {};
       const cfBase = _isCFBase(base);
       if (cfBase) {
@@ -965,7 +967,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
         if (sc === 401) markKey401(provider, key, upstreamModel);
         if (sc !== 429) skippedProviders.add(provider);
       } catch (e) {
-        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
+        decActive(provider); if (!clientGone && !e.message.startsWith('aborted')) markKeyError(provider, key); releaseKey(provider, key);
         _recordProviderFailure(provider);
         _recordModelFailure(provider, upstreamModel);
         lastErr = { status: 502, body: e.message };
@@ -973,6 +975,7 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
     }
     if (!lastErr && !transientSkipped) break;
   }
+
   const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
   log(`[${logId}] ${_statusIcon(lastErr?.status || 502)} ${lastErr?.status||502} stt failed ${errMsg}`);
   res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
@@ -1216,24 +1219,24 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (banned) for (const f of banned) delete bodyObj[f];
         if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
          if (Array.isArray(bodyObj.messages)) {
-           if (!supportsReasoningContent(provider, upstreamModel)) {
-             bodyObj.messages = sanitizeMessages(bodyObj.messages);
-           }
-           if (STRICT_ORDER_PROVIDERS.has(provider)) {
-             try {
-               bodyObj.messages = normalizeMessageOrder(bodyObj.messages);
-             } catch (e) {
-               if (e.message.startsWith('400 ')) {
-                 decActive(provider);
-                 log(`[${logId}] ❌ 400 [${provider}/${upstreamModel}] ${e.message.substring(4)}`);
-                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                 res.end(JSON.stringify({ error: { message: e.message.substring(4), type: 'invalid_request' } }));
-                 return;
-               }
-               throw e;
-             }
-           }
-         }
+            if (!supportsReasoningContent(provider, upstreamModel)) {
+              bodyObj.messages = sanitizeMessages(bodyObj.messages);
+            }
+            if (STRICT_ORDER_PROVIDERS.has(provider)) {
+              try {
+                bodyObj.messages = normalizeMessageOrder(bodyObj.messages);
+              } catch (e) {
+                if (e.message.startsWith('400 ')) {
+                  if ((_providerActive.get(provider) || 0) > 0) decActive(provider);
+                  log(`[${logId}] ❌ 400 [${provider}/${upstreamModel}] ${e.message.substring(4)}`);
+                  res.writeHead(400, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ error: { message: e.message.substring(4), type: 'invalid_request' } }));
+                  return;
+                }
+                throw e;
+              }
+            }
+          }
         const bodyStr = JSON.stringify(bodyObj);
 
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -1296,7 +1299,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
 
           } catch (e) {
             decActive(provider);
-            markKeyError(provider, usedKey);
+            if (!clientGone && !e.message.startsWith('aborted')) markKeyError(provider, usedKey);
             releaseKey(provider, usedKey);
             _recordProviderFailure(provider);
             _recordModelFailure(provider, upstreamModel);
@@ -1357,8 +1360,10 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         break; // stream ended cleanly
       } catch (e) {
         if (committed) {
-          // Tokens already sent to client — a transparent upstream switch would duplicate/garble output. End the stream instead.
+          // Tokens already sent to client — a transparent upstream switch would duplicate/garble output. Signal the failure, then end the stream.
           log(`[${logId}] ❌ sse failed after tokens sent [${sseProvider}/${sseModel}]: ${e.message} — cannot fallback, ending stream`);
+          try { res.write(`data: ${JSON.stringify({ error: { message: `upstream stream failed after output started: ${_safeSlice(e.message, 200)}`, type: 'proxy_error' } })}\n\n`); } catch {}
+          try { res.write('data: [DONE]\n\n'); } catch {}
           break;
         }
         if (curKey) {
@@ -1569,7 +1574,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
             continue;
           } catch (e) {
             decActive(provider);
-            markKeyError(provider, key);
+            if (!clientGone && !e.message.startsWith('aborted')) markKeyError(provider, key);
             releaseKey(provider, key);
             _recordProviderFailure(provider);
             _recordModelFailure(provider, upstreamModel);

@@ -102,7 +102,7 @@ Gateway 會將請求中的遠端 `image_url` 預先抓回並轉換為 base64 dat
 
 | 類型 | Provider |
 |------|----------|
-| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、anthropic、morph、aihorde、aihubmix、apinex、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
+| Chat / Embedding | openai、mistral、cerebras、deepseek、xai、groq、together、openrouter、orcarouter、cohere、perplexity、huggingface、pollinations、literouter、llm7、nvidia、gpt4free、agnes-ai、sea-lion、kilo、replicate、baseten、parallel、opencode、anthropic、vyceai、morph、aihorde、aihubmix、apinex、navy、ollama、hermes、tokenharbor、amd、bazaarlink、flatkey、tokenrouter |
 | TTS / STT | cartesia、elevenlabs（內建 OpenAI ↔ 目標格式轉換） |
 
 > ollama 為雲端服務（`https://ollama.com/v1`，key 在 Ollama Cloud 申請）。

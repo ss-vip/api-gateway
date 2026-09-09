@@ -61,6 +61,7 @@
     "flatkey": ["fk-..."],
     "tokenrouter": ["tr-..."],
     "apinex": ["sk-apx-..."],
+    "vyceai": ["sk-..."],
 
     "_custom_provider_example": "下方為自定 provider 範例",
     "my-proxy": {
@@ -106,11 +107,21 @@
     "/v1/images/edits": "image",
     "/v1/images/variations": "image",
     "/v1/audio/translations": "stt",
-    "/v1/files": "nvidia"
+    "/v1/files": "nvidia",
+    "/v1/messages": "claude"
   },
 
   "models": {
     "_note": "key = client 送的 model 名稱；value = provider/model 的 fallback 鏈，依序嘗試",
+    "claude": [
+      { "provider": "anthropic", "model": "claude-sonnet-4-20250514" }
+    ],
+    "vyceai-auto": [
+      { "provider": "vyceai", "model": "auto" }
+    ],
+    "vyceai-image": [
+      { "provider": "vyceai", "model": "grok-imagine-2" }
+    ],
     "openai": [
       { "provider": "mistral", "model": "mistral-small-latest" },
       { "provider": "cerebras", "model": "zai-glm-4.7" },
