@@ -387,6 +387,14 @@ function markKeyError(p, key) {
 
 const QUOTA_RE = lib.QUOTA_RE;
 function _isQuotaError(status, body) { return lib._isQuotaError(status, body); }
+function _parseRetryAfter(res) {
+  const h = res?.headers?.['retry-after'] || res?.headers?.['Retry-After'];
+  if (!h) return 0;
+  const n = parseInt(h, 10);
+  if (!isNaN(n)) return n * 1000;
+  const t = Date.parse(h);
+  return isNaN(t) ? 0 : Math.max(0, t - Date.now());
+}
 function markKeyQuotaExhausted(p, key) {
   initProvider(p);
   const st = keyPool.get(p)?.get(key);
@@ -448,23 +456,27 @@ async function selectKey(p) {
   const healthy = getHealthyKeys(p);
   if (healthy.length === 0) return null;
   const now = Date.now();
-    _flightCleanTick = (_flightCleanTick + 1) % FLIGHT_CLEAN_EVERY;
+  _flightCleanTick = (_flightCleanTick + 1) % FLIGHT_CLEAN_EVERY;
   if (_flightCleanTick === 0) for (const [k, ts] of keyInFlight) if (now - ts > IN_FLIGHT_TIMEOUT_MS) keyInFlight.delete(k);
-    const free = healthy.filter(k => {
+  const free = healthy.filter(k => {
     const v = keyInFlight.get(`${p}:${k}`);
     if (!v) return true;
     if (now - v > IN_FLIGHT_TIMEOUT_MS) { keyInFlight.delete(`${p}:${k}`); return true; }
     return false;
   });
   if (free.length > 0) {
-    let idx = ((rrCursor.get(p) ?? -1) + 1) % free.length;
-    rrCursor.set(p, idx);
-    const key = free[idx];
+    free.sort((a, b) => {
+      const sa = keyPool.get(p).get(a), sb = keyPool.get(p).get(b);
+      if (sa.errorCount !== sb.errorCount) return sa.errorCount - sb.errorCount;
+      if (sa.successCount !== sb.successCount) return sb.successCount - sa.successCount;
+      return (sa.lastLatency || 0) - (sb.lastLatency || 0);
+    });
+    const key = free[0];
     keyInFlight.set(`${p}:${key}`, now);
     await waitRateLimit(p, key);
     return key;
   }
-    return null;
+  return null;
 }
 
 function releaseKey(p, key) {
@@ -499,38 +511,35 @@ function collectBody(res) {
 const PROVIDER_DEFAULT_LIMITS = {};
 const USER_MODEL_LIMITS = new Map(Object.entries(cfg.model_limits || {}).map(([k, v]) => [k.toLowerCase(), v]));
 const RATE_LIMITS = new Map(Object.entries(cfg.rate_limit || {}).map(([k, v]) => [k, v]));
-// note: known provider RPM (account-level), auto-calc per-key interval when not manually set
-// note: known free-plan RPM per provider, auto-calc per-key rate_limit = 60000 / (rpm / numKeys)
-// Keys are per-account, so each key's limit is independent. Manual rate_limit in config overrides auto-calc.
 const PROVIDER_RPM = {
-  literouter: 1,        // per-key ~1 RPM (5 keys → ~5 RPM)
-  pollinations: 60,     // no published limits
-  gpt4free: 60,         // no published limits
-  mistral: 30,          // free plan: large=0.07, small=0.83-5, ministral-8b=3.13 RPS. 30 RPM (~0.5 RPS) is a safe middle; very slow models (0.03-0.08 RPS) self-throttle via generation time
-  llm7: 40,             // ~40 RPM
-  nvidia: 40,           // NIM free: ~40 RPM
-  openrouter: 20,       // free models: 20 RPM
-  groq: 30,             // free tier: 30 RPM (org-level, per-model)
-  cerebras: 5,          // free tier: 5 RPM (gpt-oss-120b), others up to 30
-  deepseek: 30,         // conservative; actual: concurrency-based (500/2500)
-  'agnes-ai': 20,       // 20 RPM
-  navy: 20,             // paid gateway, safe middle
-  ollama: 30,           // Ollama Cloud, no published limits — conservative
-  'sea-lion': 10,       // 10 RPM per user
-  'kilo': 3,            // free :free models 200/hr/IP (~3.3/min); paid models have no gateway limit — raise via config rate_limit if only using paid
-  // Providers without published RPM — conservative defaults; tune via config rate_limit if needed
-  openai: 60,           // paid tiers high; free tier 3 RPM — conservative middle
-  xai: 60,             // grok: decent free RPM, higher paid
-  together: 60,         // varies by model, free ~60 RPM
-  cohere: 60,          // command-r-plus, reasonable
-  perplexity: 20,       // sonar online: ~20 RPM
-  huggingface: 30,      // router, varies by model
-  replicate: 60,        // prediction API, not strictly RPM-limited
-  baseten: 60,         // inference, safe middle
-  parallel: 60,         // speed/base, safe middle
-  orcarouter: 20,       // OpenAI-compatible router gateway — conservative middle (no published RPM)
-  morph: 30,            // YC-backed, conservative
-  vyceai: 60,            // OpenAI/Anthropic-compatible router (chat + Anthropic messages + image gen per docs)
+  literouter: 1,
+  pollinations: 10,
+  gpt4free: 10,
+  mistral: 10,
+  llm7: 15,
+  nvidia: 15,
+  openrouter: 10,
+  groq: 12,
+  cerebras: 5,
+  deepseek: 12,
+  'agnes-ai': 10,
+  navy: 10,
+  ollama: 10,
+  'sea-lion': 5,
+  kilo: 1,
+  openai: 10,
+  xai: 10,
+  together: 10,
+  cohere: 10,
+  perplexity: 10,
+  huggingface: 10,
+  replicate: 10,
+  baseten: 10,
+  parallel: 10,
+  orcarouter: 10,
+  morph: 10,
+  vyceai: 10,
+  apinex: 10,
 };
 const DEFAULT_MANUAL_RPM = 10;
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
@@ -539,6 +548,30 @@ for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   const rpm = PROVIDER_RPM[p] || (provMeta[p] && provMeta[p].rpm) || (manual ? DEFAULT_MANUAL_RPM : undefined);
   if (rpm && !RATE_LIMITS.has(p)) {
     RATE_LIMITS.set(p, Math.max(100, Math.round(60000 / (rpm / keys.length))));
+  }
+}
+const _effectiveRPM = new Map(Object.entries(PROVIDER_RPM));
+const _successStreak = new Map();
+function _adjustRpm(provider, success) {
+  const orig = PROVIDER_RPM[provider];
+  if (!orig) return;
+  let cur = _effectiveRPM.get(provider) ?? orig;
+  if (success) {
+    const streak = (_successStreak.get(provider) || 0) + 1;
+    _successStreak.set(provider, streak);
+    if (streak >= 10 && cur < orig) {
+      cur = Math.min(orig, cur + 1);
+      _effectiveRPM.set(provider, cur);
+      const keys = PROVIDER_KEYS[provider]?.length || 1;
+      RATE_LIMITS.set(provider, Math.max(100, Math.round(60000 / (cur / keys))));
+      _successStreak.set(provider, 0);
+    }
+  } else {
+    _successStreak.set(provider, 0);
+    cur = Math.max(1, Math.floor(cur * 0.7));
+    _effectiveRPM.set(provider, cur);
+    const keys = PROVIDER_KEYS[provider]?.length || 1;
+    RATE_LIMITS.set(provider, Math.max(100, Math.round(60000 / (cur / keys))));
   }
 }
 const _keyLastUsed = new Map(); // provider → Map(key → last timestamp)
@@ -1265,10 +1298,19 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
               _markKeyFailed(provider, usedKey, sc, body);
-              log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}`);
+              _adjustRpm(provider, false);
+              const retryAfter = _parseRetryAfter(upstreamRes);
+              if (retryAfter) {
+                if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
+                _keyLastUsed.get(provider).set(usedKey, Date.now() + retryAfter);
+              }
+              const isQuota = _isQuotaError(sc, body);
+              if (retryAfter) log(`[${logId}] ⏳ Retry-After ${Math.ceil(retryAfter/1000)}s [${provider}]${isQuota ? ' quota' : ''}`);
+              log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}${isQuota ? ' quota' : ''}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
               lastErr = { status: sc, body };
               upstreamRes = null;
+              if (retryAfter) await sleep(Math.min(retryAfter, RETRY_MAX_DELAY));
               continue;
             }
 
@@ -1292,6 +1334,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             markKeySuccess(provider, usedKey, Date.now()-t0);
             _recordProviderSuccess(provider);
             _recordModelSuccess(provider, upstreamModel);
+            _adjustRpm(provider, true);
             logEvent({ logId, provider, model: upstreamModel, key: usedKey, latency: (Date.now()-t0)/1000, tokens: totalEst || 0 });
             log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
             if (isStream) sseRetryTargets = rotated.slice(ti + 1);
