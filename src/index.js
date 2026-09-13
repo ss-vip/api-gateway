@@ -88,7 +88,7 @@ const FLIGHT_CLEAN_EVERY = 50; // full-scan cleanup every N selectKey calls
 const LOG_CLEANUP_EVERY = 200; // trigger cleanup every N log writes
 const LOG_CLEANUP_COOLDOWN_MS = 600000; // 10 min — min interval between cleanups
 const MEM_CHECK_INTERVAL = 100; // check memory every N requests
-const RESEED_MAX_LINES = 5000;
+const RESEED_MAX_LINES = 10000; // reseed last N log lines on startup — higher = more accurate stats, more startup time
 function _cleanupLog(p, cutoffOverride) {
   if (_logCleaning.has(p)) return;
   const ec = cfg.log;
@@ -429,7 +429,8 @@ const _recent401 = new Map();
 function markKey401(p, key, model) {
   const _k = `${p}:${key}`;
   _recent401.set(_k, { provider: p, key, model, ts: Date.now(), retryAfter: Date.now() + 3600000 });
-    for (const [k, v] of _recent401) if (Date.now() > v.retryAfter) _recent401.delete(k);
+  const now = Date.now();
+  for (const [k, v] of _recent401) { if (now > v.retryAfter) _recent401.delete(k); }
 }
 
 const keyInFlight = new Map(); // key -> timestamp
@@ -575,9 +576,7 @@ function _adjustRpm(provider, success) {
   }
 }
 const _keyLastUsed = new Map(); // provider → Map(key → last timestamp)
-function _rlMaybeReset() {}
 async function waitRateLimit(provider, key) {
-  _rlMaybeReset();
   const interval = RATE_LIMITS.get(provider);
   if (!interval) return;
   if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
@@ -587,7 +586,6 @@ async function waitRateLimit(provider, key) {
   byProv.set(key, Date.now());
 }
 function isRateLimited(provider) {
-  _rlMaybeReset();
   // No healthy key available (all in error-cooldown) → effectively limited
   if (getHealthyKeys(provider).length === 0) return true;
   const interval = RATE_LIMITS.get(provider);
@@ -603,6 +601,7 @@ function isRateLimited(provider) {
 }
 
 // --- circuit breaker ---
+const _sanCache = new Map(); // provider/model → sanitized messages (avoids re-sanitize per SSE retry)
 const _circuitBreaker = new Map();
 const CB_THRESHOLD = 5;
 const CB_COOLDOWN_MS = 30000;
@@ -748,121 +747,22 @@ function buildTTSRequest(provider, body, upstreamModel, base) {
 function _sanitizeToolIds(msg, idMap) { return lib._sanitizeToolIds(msg, idMap); }
 function normalizeMessageOrder(messages) { return lib.normalizeMessageOrder(messages); }
 
-async function handleTTS(req, res, bodyJson, logId) {
-  const t0 = Date.now();
-  log('─');
-  const clientModel = bodyJson?.model || '';
-  if (!bodyJson || !bodyJson.input) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'input required', type: 'invalid_request' } }));
-    return;
-  }
-  let targets = resolveModelForEndpoint(clientModel, '/v1/audio/speech');
-  if (!targets) targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
-  log(`[${logId}] ⚡ ${clientModel}  /v1/audio/speech`);
-  const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
-  if (activeTargets.length === 0) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'no keys', type: 'no_keys' } }));
-    return;
-  }
-  let lastErr = null;
-  const skippedProviders = new Set();
-  let clientGone = false;
-  const ac = new AbortController(), sig = ac.signal;
-  res.on('close', () => { if (res.writableEnded) return; clientGone = true; if (!sig.aborted) ac.abort(); });
-  let retryRound = 0;
-  let transientSkipped = false;
-  while (!clientGone && Date.now() - t0 < TIMEOUT_MS && (retryRound < RETRY_MAX_ROUNDS || transientSkipped)) {
-    if (retryRound > 0) {
-      const wait = (transientSkipped && !lastErr) ? RETRY_TRANSIENT_WAIT : Math.min(retryRound * RETRY_BASE_DELAY, RETRY_MAX_DELAY);
-      log(`[${logId}] 🔄 retry ${retryRound} — wait ${wait}ms${transientSkipped && !lastErr ? ' (transient)' : ''}`);
-      await sleep(wait);
-    }
-    retryRound++;
-    transientSkipped = false;
-    const rotatedTargets = rotateTargets(activeTargets, clientModel);
-    for (const target of rotatedTargets) {
-      if (clientGone) return;
-      const { provider, upstreamModel } = target;
-      if (skippedProviders.has(provider)) continue;
-      if (_isModelLocked(provider, upstreamModel)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (model lockout)`); continue; }
-      if (isRateLimited(provider)) { transientSkipped = true; continue; }
-      if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) { transientSkipped = true; continue; }
-      if (_isCircuitOpen(provider)) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (circuit breaker)`); transientSkipped = true; continue; }
-      const key = await selectKey(provider);
-      if (!key) { transientSkipped = true; continue; }
-      const base = DIRECT_PROVIDERS[provider];
-      const adapter = buildTTSRequest(provider, bodyJson, upstreamModel, base);
-      const bodyStr = adapter ? adapter.body : JSON.stringify({ ...bodyJson, model: upstreamModel });
-      const ep = adapter ? adapter.path : (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/speech';
-      const extraHdrs = adapter ? adapter.headers : {};
-      const ctype = adapter ? adapter.contentType : 'application/json';
-      try {
-        addActive(provider);
-        const up = await forwardToDirect(key, bodyStr, base, ep, 'application/octet-stream', ctype, extraHdrs, sig);
-        const sc = up.statusCode;
-        if (sc >= 200 && sc < 300) {
-          if (_isCFBase(base)) {
-            const raw = await collectBody(up);
-            let audio = '';
-            try { audio = JSON.parse(raw.toString()).result?.audio || ''; } catch {}
-            decActive(provider); releaseKey(provider, key);
-            if (!audio) {
-              _markKeyFailed(provider, key, 502, raw.toString());
-              lastErr = { status: 502, body: raw.toString() };
-              skippedProviders.add(provider);
-              log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf tts bad response ${_safeSlice(raw.toString(), 100)}`);
-              continue;
-            }
-            recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
-            log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
-            res.writeHead(sc, { 'Content-Type': 'audio/wav', 'X-Request-Id': logId, 'X-Provider': provider });
-            res.end(Buffer.from(audio, 'base64')); return;
-          }
-          decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
-          log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
-          res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
-          up.on('error', () => { try { res.end(); } catch {} });
-          up.pipe(res); return;
-        }
-        decActive(provider); releaseKey(provider, key);
-        const fileBody = await collectBody(up);
-        _markKeyFailed(provider, key, sc, fileBody);
-        lastErr = { status: sc, body: fileBody };
-        if (sc >= 500) _recordProviderFailure(provider);
-        if (sc !== 429) _recordModelFailure(provider, upstreamModel);
-        if (sc === 401) markKey401(provider, key, upstreamModel);
-        if (sc !== 429) skippedProviders.add(provider);
-      } catch (e) {
-        decActive(provider); markKeyError(provider, key); releaseKey(provider, key);
-        _recordProviderFailure(provider);
-        _recordModelFailure(provider, upstreamModel);
-        lastErr = { status: 502, body: e.message };
-      }
-    }
-    if (!lastErr && !transientSkipped) break;
-  }
-  const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
-  log(`[${logId}] ${_statusIcon(lastErr?.status || 502)} ${lastErr?.status||502} tts failed ${errMsg}`);
-  res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: { message: `tts failed: ${errMsg}` } }));
-}
-
+// --- shared audio request handler (TTS/STT) ---
 function patchMultipartField(raw, fieldName, newValue) {
   const needle = Buffer.from(`name="${fieldName}"`);
   const idx = raw.indexOf(needle);
   if (idx === -1) return raw;
-  const start = raw.indexOf(Buffer.from('\r\n\r\n'), idx) + 4;
-  if (start < 4) return raw;
-  const end = raw.indexOf(Buffer.from('\r\n'), start);
+  const start = raw.indexOf(Buffer.from('\r\n\r\n'), idx);
+  if (start === -1) return raw;
+  const dataStart = start + 4;
+  const end = raw.indexOf(Buffer.from('\r\n'), dataStart);
   if (end === -1) return raw;
-  const oldVal = raw.toString('utf8', start, end);
+  const oldVal = raw.toString('utf8', dataStart, end);
   if (oldVal === newValue) return raw;
   const out = Buffer.alloc(raw.length - oldVal.length + newValue.length);
-  raw.copy(out, 0, 0, start);
-  out.write(newValue, start);
-  raw.copy(out, start + newValue.length, end);
+  raw.copy(out, 0, 0, dataStart);
+  out.write(newValue, dataStart);
+  raw.copy(out, dataStart + newValue.length, end);
   return out;
 }
 
@@ -896,20 +796,12 @@ function _extractMultipartFile(rawBody, contentType) {
   return { buf: rawBody.slice(start, end === -1 ? rawBody.length : end), ctype: ctM ? ctM[1].trim() : 'audio/wav' };
 }
 
-async function handleSTT(req, res, rawBody, logId, contentType) {
+async function handleAudioRequest(req, res, logId, { clientModel, endpointPath, rawBody, contentType, buildBody, handleSuccess, failLabel }) {
   const t0 = Date.now();
   log('─');
-  let clientModel = '';
-  const modelNeedle = Buffer.from('name="model"');
-  const mi = rawBody.indexOf(modelNeedle);
-  if (mi !== -1) {
-    const valStart = rawBody.indexOf(Buffer.from('\r\n\r\n'), mi) + 4;
-    const valEnd = rawBody.indexOf(Buffer.from('\r\n'), valStart);
-    if (valEnd !== -1) clientModel = rawBody.toString('utf8', valStart, valEnd).trim();
-  }
-  let targets = resolveModelForEndpoint(clientModel, '/v1/audio/transcriptions');
+  let targets = resolveModelForEndpoint(clientModel, endpointPath);
   if (!targets) targets = [{ provider: 'openai', upstreamModel: clientModel || '' }];
-  log(`[${logId}] ⚡ ${clientModel}  /v1/audio/transcriptions`);
+  log(`[${logId}] ⚡ ${clientModel}  ${endpointPath}`);
   const activeTargets = targets.filter(t => PROVIDERS_WITH_KEYS.has(t.provider) && DIRECT_PROVIDERS[t.provider]);
   if (activeTargets.length === 0) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -943,58 +835,20 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
       const key = await selectKey(provider);
       if (!key) { transientSkipped = true; continue; }
       const base = DIRECT_PROVIDERS[provider];
-      let body = rawBody;
-      let ep, extraHdrs = {};
-      const cfBase = _isCFBase(base);
-      if (cfBase) {
-        const file = _extractMultipartFile(rawBody, contentType);
-        body = file ? file.buf : rawBody;
-        ep = _cfRunPath(upstreamModel);
-        extraHdrs = { 'Content-Type': file ? file.ctype : 'audio/wav' };
-      } else if (provider === 'cartesia') {
-        body = patchMultipartField(rawBody, 'model', upstreamModel);
-        ep = '/stt';
-        extraHdrs = { 'Cartesia-Version': '2026-03-01' };
-      } else if (provider === 'elevenlabs') {
-        body = patchMultipartFieldName(rawBody, 'model', 'model_id');
-        body = patchMultipartField(body, 'model_id', upstreamModel);
-        ep = '/v1/speech-to-text';
-        extraHdrs = { 'xi-api-key': key };
-      } else {
-        ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/transcriptions';
-      }
-      const ctype = cfBase ? undefined : (provider === 'cartesia' || provider === 'elevenlabs' ? (contentType || 'multipart/form-data') : (contentType || 'application/octet-stream'));
+      const built = buildBody(provider, upstreamModel, base, key);
       try {
         addActive(provider);
-        const up = await forwardToDirect(key, body, base, ep, 'application/json', ctype, extraHdrs, sig);
+        const up = await forwardToDirect(key, built.body, base, built.path, 'application/octet-stream', built.contentType, built.extraHeaders, sig);
         const sc = up.statusCode;
         if (sc >= 200 && sc < 300) {
-          const raw = await collectBody(up);
-          if (cfBase) {
-            let text = '';
-            try { text = JSON.parse(raw.toString()).result?.text || ''; } catch {}
-            decActive(provider); releaseKey(provider, key);
-            if (!text) {
-              _markKeyFailed(provider, key, 502, raw.toString());
-              lastErr = { status: 502, body: raw.toString() };
-              skippedProviders.add(provider);
-              log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf stt bad response ${_safeSlice(raw.toString(), 100)}`);
-              continue;
-            }
-            recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
-            log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
-            res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
-            res.end(JSON.stringify({ text })); return;
-          }
-          decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
-          log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
-          res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
-          res.end(raw); return;
+          const handled = await handleSuccess(up, provider, upstreamModel, key, base, sc);
+          if (handled) return;
+          continue;
         }
         decActive(provider); releaseKey(provider, key);
-        const sttBody = await collectBody(up);
-        _markKeyFailed(provider, key, sc, sttBody);
-        lastErr = { status: sc, body: sttBody };
+        const errBody = await collectBody(up);
+        _markKeyFailed(provider, key, sc, errBody);
+        lastErr = { status: sc, body: errBody };
         if (sc >= 500) _recordProviderFailure(provider);
         if (sc !== 429) _recordModelFailure(provider, upstreamModel);
         if (sc === 401) markKey401(provider, key, upstreamModel);
@@ -1008,11 +862,142 @@ async function handleSTT(req, res, rawBody, logId, contentType) {
     }
     if (!lastErr && !transientSkipped) break;
   }
-
   const errMsg = lastErr ? (typeof lastErr.body === 'string' ? _safeSlice(lastErr.body, 300) : _safeSlice(JSON.stringify(lastErr.body), 300)) : 'no upstream';
-  log(`[${logId}] ${_statusIcon(lastErr?.status || 502)} ${lastErr?.status||502} stt failed ${errMsg}`);
+  log(`[${logId}] ${_statusIcon(lastErr?.status || 502)} ${lastErr?.status||502} ${failLabel} failed ${errMsg}`);
   res.writeHead(lastErr?.status||502, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: { message: `stt failed: ${errMsg}` } }));
+  res.end(JSON.stringify({ error: { message: `${failLabel} failed: ${errMsg}` } }));
+}
+
+function buildTTSBody(bodyJson) {
+  return (provider, upstreamModel, base) => {
+    const adapter = buildTTSRequest(provider, bodyJson, upstreamModel, base);
+    return {
+      body: adapter ? adapter.body : JSON.stringify({ ...bodyJson, model: upstreamModel }),
+      path: adapter ? adapter.path : (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/speech',
+      contentType: adapter ? adapter.contentType : 'application/json',
+      extraHeaders: adapter ? adapter.headers : {},
+    };
+  };
+}
+
+function ttsHandleSuccess(res, logId, t0) {
+  return async (up, provider, upstreamModel, key, base, sc) => {
+    if (_isCFBase(base)) {
+      const raw = await collectBody(up);
+      let audio = '';
+      try { audio = JSON.parse(raw.toString()).result?.audio || ''; } catch {}
+      decActive(provider); releaseKey(provider, key);
+      if (!audio) {
+        _markKeyFailed(provider, key, 502, raw.toString());
+        log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf tts bad response ${_safeSlice(raw.toString(), 100)}`);
+        return false;
+      }
+      recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+      log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+      res.writeHead(sc, { 'Content-Type': 'audio/wav', 'X-Request-Id': logId, 'X-Provider': provider });
+      res.end(Buffer.from(audio, 'base64'));
+      return true;
+    }
+    decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+    log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+    res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
+    up.on('error', () => { try { res.end(); } catch {} });
+    up.pipe(res);
+    return true;
+  };
+}
+
+async function handleTTS(req, res, bodyJson, logId) {
+  if (!bodyJson || !bodyJson.input) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'input required', type: 'invalid_request' } }));
+    return;
+  }
+  const t0 = Date.now();
+  await handleAudioRequest(req, res, logId, {
+    clientModel: bodyJson?.model || '',
+    endpointPath: '/v1/audio/speech',
+    buildBody: buildTTSBody(bodyJson),
+    handleSuccess: ttsHandleSuccess(res, logId, t0),
+    failLabel: 'tts',
+  });
+}
+
+function buildSTTBody(rawBody, contentType) {
+  return (provider, upstreamModel, base, key) => {
+    let body = rawBody;
+    let ep, extraHdrs = {};
+    const cfBase = _isCFBase(base);
+    if (cfBase) {
+      const file = _extractMultipartFile(rawBody, contentType);
+      body = file ? file.buf : rawBody;
+      ep = _cfRunPath(upstreamModel);
+      extraHdrs = { 'Content-Type': file ? file.ctype : 'audio/wav' };
+    } else if (provider === 'cartesia') {
+      body = patchMultipartField(rawBody, 'model', upstreamModel);
+      ep = '/stt';
+      extraHdrs = { 'Cartesia-Version': '2026-03-01' };
+    } else if (provider === 'elevenlabs') {
+      body = patchMultipartFieldName(rawBody, 'model', 'model_id');
+      body = patchMultipartField(body, 'model_id', upstreamModel);
+      ep = '/v1/speech-to-text';
+      extraHdrs = { 'xi-api-key': key };
+    } else {
+      ep = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/audio/transcriptions';
+    }
+    const ctype = cfBase ? undefined : (provider === 'cartesia' || provider === 'elevenlabs' ? (contentType || 'multipart/form-data') : (contentType || 'application/octet-stream'));
+    return { body, path: ep, contentType: ctype, extraHeaders: extraHdrs };
+  };
+}
+
+function sttHandleSuccess(res, logId, t0) {
+  return async (up, provider, upstreamModel, key, base, sc) => {
+    const cfBase = _isCFBase(base);
+    const raw = await collectBody(up);
+    if (cfBase) {
+      let text = '';
+      try { text = JSON.parse(raw.toString()).result?.text || ''; } catch {}
+      decActive(provider); releaseKey(provider, key);
+      if (!text) {
+        _markKeyFailed(provider, key, 502, raw.toString());
+        log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf stt bad response ${_safeSlice(raw.toString(), 100)}`);
+        return false;
+      }
+      recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+      log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+      res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
+      res.end(JSON.stringify({ text }));
+      return true;
+    }
+    decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+    log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
+    res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
+    res.end(raw);
+    return true;
+  };
+}
+
+async function handleSTT(req, res, rawBody, logId, contentType) {
+  let clientModel = '';
+  const modelNeedle = Buffer.from('name="model"');
+  const mi = rawBody.indexOf(modelNeedle);
+  if (mi !== -1) {
+    const valStart = rawBody.indexOf(Buffer.from('\r\n\r\n'), mi);
+    if (valStart !== -1) {
+      const dataStart = valStart + 4;
+      const valEnd = rawBody.indexOf(Buffer.from('\r\n'), dataStart);
+      if (valEnd !== -1) clientModel = rawBody.toString('utf8', dataStart, valEnd).trim();
+    }
+  }
+  const t0 = Date.now();
+  await handleAudioRequest(req, res, logId, {
+    clientModel,
+    endpointPath: '/v1/audio/transcriptions',
+    rawBody, contentType,
+    buildBody: buildSTTBody(rawBody, contentType),
+    handleSuccess: sttHandleSuccess(res, logId, t0),
+    failLabel: 'stt',
+  });
 }
 
 function supportsReasoningContent(provider, model) {
@@ -1432,9 +1417,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
         const sseSanKey = `${sseProvider}/${sseModel}`;
         if (!_sanCache.has(sseSanKey)) {
-          _sanCache.set(sseSanKey, !supportsReasoningContent(sseProvider, sseModel) ? sanitizeMessages(bodyObj2.messages) : bodyObj2.messages);
+          _sanCache.set(sseSanKey, !supportsReasoningContent(sseProvider, sseModel) ? sanitizeMessages(JSON.parse(JSON.stringify(bodyObj2.messages))) : bodyObj2.messages);
         }
-        if (_sanCache.get(sseSanKey) !== bodyObj2.messages) bodyObj2.messages = _sanCache.get(sseSanKey);
+        bodyObj2.messages = JSON.parse(JSON.stringify(_sanCache.get(sseSanKey)));
         if (STRICT_ORDER_PROVIDERS.has(sseProvider) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = normalizeMessageOrder(bodyObj2.messages);
         const maxCap2 = PROVIDER_MAX_TOKENS[sseProvider];
         if (maxCap2 && (bodyObj2.max_tokens || 4096) > maxCap2) bodyObj2.max_tokens = maxCap2;
@@ -1855,9 +1840,10 @@ function handleConsoleSave(req, res, body, logId) {
 }
 function handleConsoleStream(req, res, logId) {
   log('─'); log(`[${logId}] /api/console/stream`);
-  // EventSource cannot set custom headers — accept token via ?token= query param
+  // note: EventSource cannot set custom headers — token accepted via ?token= query param.
+  // Trade-off: token appears in URL (browser history, proxy logs). Acceptable for local/SSE console use.
   const qToken = new URL(req.url, 'http://x').searchParams.get('token');
-  if (qToken && (!CLIENT_TOKEN || qToken === CLIENT_TOKEN)) {
+  if (qToken && qToken === CLIENT_TOKEN) {
     // token from query param is valid, skip header check
   } else if (!checkConsoleAuth(req, res)) { return; }
   res.writeHead(200, {

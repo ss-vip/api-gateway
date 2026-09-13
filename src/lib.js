@@ -304,6 +304,7 @@ function setAllowedImageOrigins(origins) {
 }
 
 async function _fetchAndConvertImages(messages) {
+  if (typeof fetch === 'undefined') return 0; // Node < 18 — skip remote image fetch
   if (!Array.isArray(messages)) return 0;
   let converted = 0;
   for (const m of messages) {
