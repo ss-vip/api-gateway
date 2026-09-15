@@ -203,7 +203,7 @@ if (CONFIG_PATH) {
 if (cfg && typeof cfg === 'object') {
   const KNOWN_CONFIG_KEYS = new Set([
     '_note', 'client_token', 'timezone', 'port', 'timeout', 'key_cooldown', 'max_key_backoff', 'max_body_size', 'quota_backoff',
-    'model_lockout', 'log', 'providers', 'rate_limit', 'tpm_limit', 'model_limits', 'endpoint_fallbacks', 'models', 'models_aliases',
+    'model_lockout', 'circuit_breaker', 'provider_concurrency', 'log', 'providers', 'rate_limit', 'tpm_limit', 'model_limits', 'endpoint_fallbacks', 'models', 'models_aliases',
     'allowed_image_origins'
   ]);
   for (const k of Object.keys(cfg)) {
@@ -297,11 +297,48 @@ const ADAPTERS = {
   gpt4free:   { banned: new Set(['top_p']) },
   ollama:     { banned: new Set(['tool_choice','logit_bias','user','n']) },
   llm7:       { banned: new Set(['response_format','quality','style','output_format']) },
+  amd:        { banned: new Set([]) },
+  kilo:       { banned: new Set([]) },
 };
 
 // Fields known to cause 4xx for specific providers (strip before forwarding)
 const PROVIDER_BANNED_FIELDS = {};
 for (const [k,v] of Object.entries(ADAPTERS)) { if (v.banned) PROVIDER_BANNED_FIELDS[k] = v.banned; }
+
+const PROVIDER_REASONING_SPEC = {
+  deepseek:   'keep',
+  opencode:   'keep',
+  nvidia:     'keep',
+  amd:        'strip',
+  kilo:       'strip',
+  mistral:    'effort',
+  'ag-llm':   'strip',
+};
+
+function _adjustReasoningFields(body, provider) {
+  const spec = PROVIDER_REASONING_SPEC[provider] || 'strip';
+  if (!body.reasoning && !body.reasoning_content) return;
+  if (spec === 'keep') return;
+  if (spec === 'strip') {
+    delete body.reasoning;
+    delete body.reasoning_content;
+    delete body.reasoning_effort;
+    return;
+  }
+  if (spec === 'effort') {
+    if (typeof body.reasoning === 'object' && body.reasoning.enabled !== undefined) {
+      const fromEffort = typeof body.reasoning.effort === 'number' ? body.reasoning.effort : (body.reasoning.enabled ? 3 : 1);
+      body.reasoning_effort = fromEffort;
+      delete body.reasoning;
+      delete body.reasoning_content;
+    } else if (body.reasoning?.effort !== undefined) {
+      body.reasoning_effort = body.reasoning.effort;
+      delete body.reasoning;
+    }
+    return;
+  }
+}
+
 const PROVIDER_MAX_TOKENS = {};
 for (const [k,v] of Object.entries(ADAPTERS)) { if (v.maxTokens) PROVIDER_MAX_TOKENS[k] = v.maxTokens; }
 const RETRY_MAX_ROUNDS = 3;
@@ -322,14 +359,15 @@ const PROVIDERS_WITH_KEYS = new Set(
   Object.entries(PROVIDER_KEYS).filter(([, ks]) => ks.length > 0).map(([p]) => p)
 );
 
-function _extractRootDomain(hostname) {
-  const parts = hostname.split('.');
-  return parts.length > 2 ? parts.slice(-2).join('.') : hostname;
+function _rootForAllowlist(hostname) {
+  if (hostname.endsWith('.com.cn')) return hostname.split('.').slice(-3).join('.');
+  const p = hostname.split('.');
+  return p.length > 2 ? p.slice(-2).join('.') : hostname;
 }
 const _autoImageOrigins = [...new Set(
-  Object.values(DIRECT_PROVIDERS)
-    .map(u => { try { return 'https://' + _extractRootDomain(new URL(u).hostname); } catch { return null; } })
-    .filter(Boolean)
+  Object.values(DIRECT_PROVIDERS).flatMap(u => {
+    try { const h = new URL(u).hostname; return ['https://' + h, 'https://' + _rootForAllowlist(h)]; } catch { return []; }
+  })
 )];
 lib.setAllowedImageOrigins(cfg.allowed_image_origins || _autoImageOrigins);
 
@@ -395,6 +433,16 @@ function _parseRetryAfter(res) {
   const t = Date.parse(h);
   return isNaN(t) ? 0 : Math.max(0, t - Date.now());
 }
+async function _handleUpstream429(provider, key, upstreamRes, body, logId) {
+  _markKeyFailed(provider, key, upstreamRes.statusCode || 429, body);
+  _adjustRpm(provider, false);
+  const retryAfter = _parseRetryAfter(upstreamRes);
+  if (retryAfter) {
+    if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
+    _keyLastUsed.get(provider).set(key, Date.now() + retryAfter);
+  }
+  return retryAfter;
+}
 function markKeyQuotaExhausted(p, key) {
   initProvider(p);
   const st = keyPool.get(p)?.get(key);
@@ -437,8 +485,7 @@ const keyInFlight = new Map(); // key -> timestamp
 const rrCursor = new Map();
 const modelCursor = new Map();
 let _flightCleanTick = 0;
-const _providerActive = new Map(); // provider → concurrent request count
-const PROVIDER_MAX_CONCURRENT = 4;
+const _providerActive = new Map();
 function addActive(p) { _providerActive.set(p, (_providerActive.get(p) || 0) + 1); }
 function decActive(p) {
   const c = (_providerActive.get(p) || 0) - 1;
@@ -541,7 +588,10 @@ const PROVIDER_RPM = {
   morph: 10,
   vyceai: 10,
   apinex: 10,
+  // 下調容易觸發 429 的 provider，降低自動計算的速率限制間隔
+  amd: 1,
 };
+
 const DEFAULT_MANUAL_RPM = 10;
 for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
   if (keys.length === 0) continue;
@@ -551,10 +601,23 @@ for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
     RATE_LIMITS.set(p, Math.max(100, Math.round(60000 / (rpm / keys.length))));
   }
 }
+
+const _referencedProviders = new Set(
+  [...Object.values(MODELS).flatMap(v => Array.isArray(v) ? v.map(t => t.provider) : []),
+   ...Object.values(ENDPOINT_FALLBACKS).flatMap(a => (MODELS[a] || []).map(t => t.provider))]
+);
+for (const [p, keys] of Object.entries(PROVIDER_KEYS)) {
+  if (keys.length === 0) continue;
+  if (!_referencedProviders.has(p)) continue;
+  if (!PROVIDER_RPM[p] && !provMeta[p]?.rpm && !provMeta[p]?.baseUrl) {
+    log('─');
+    log(`⚠️  [config] provider "${p}" has keys but no explicit RPM (will use DEFAULT_MANUAL_RPM=${DEFAULT_MANUAL_RPM})`);
+  }
+}
 const _effectiveRPM = new Map(Object.entries(PROVIDER_RPM));
 const _successStreak = new Map();
 function _adjustRpm(provider, success) {
-  const orig = PROVIDER_RPM[provider];
+  const orig = PROVIDER_RPM[provider] ?? provMeta[provider]?.rpm ?? DEFAULT_MANUAL_RPM;
   if (!orig) return;
   let cur = _effectiveRPM.get(provider) ?? orig;
   if (success) {
@@ -601,33 +664,31 @@ function isRateLimited(provider) {
 }
 
 // --- circuit breaker ---
-const _sanCache = new Map(); // provider/model → sanitized messages (avoids re-sanitize per SSE retry)
-const _circuitBreaker = new Map();
-const CB_THRESHOLD = 5;
-const CB_COOLDOWN_MS = 30000;
-function _recordProviderFailure(provider) {
-  const entry = _circuitBreaker.get(provider) || { count: 0, openUntil: 0 };
-  entry.count++;
-  if (entry.count >= CB_THRESHOLD && !entry.openUntil) {
-    entry.openUntil = Date.now() + CB_COOLDOWN_MS;
-    log('─'); log(`⚠️ [circuit] ${provider} opened (${entry.count}/${CB_THRESHOLD} failures, cooldown ${CB_COOLDOWN_MS}ms)`);
+// _sanCache: provider/model → sanitized messages (avoids re-sanitize per SSE retry).
+// **注意**：這是「同一次 SSE 請求的多個 retry 之間共用 sanitize 結果」，
+// 只有最後用到的 target 模型/串流才會真正儲入，因此不必按 PROVIDER/MODEL 做 LRU，
+// 但為免長運作時 Map 暴脹，加 upper bound 可選。
+const _sanCache = new Map();
+const SAN_CACHE_MAX_SIZE = 200;
+function _clearOverflowCache() {
+  while (_sanCache.size > SAN_CACHE_MAX_SIZE) {
+    const first = _sanCache.keys().next().value;
+    _sanCache.delete(first);
   }
-  _circuitBreaker.set(provider, entry);
 }
-function _recordProviderSuccess(provider) {
-  const before = _circuitBreaker.get(provider);
-  if (before) { log('─'); log(`✅ [circuit] ${provider} closed (after ${before.count} failures)`); _circuitBreaker.delete(provider); }
-}
-function _isCircuitOpen(provider) {
-  const entry = _circuitBreaker.get(provider);
-  if (!entry || !entry.openUntil) return false;
-  if (Date.now() >= entry.openUntil) { _circuitBreaker.delete(provider); return false; }
-  return true;
-}
+const _circuitBreaker = new Map();
 
 // --- model lockout (per-provider/model circuit: a broken model ID or saturated free tier) ---
 const MODEL_LOCKOUT_THRESHOLD = cfg.model_lockout?.threshold ?? 3;
-const MODEL_LOCKOUT_MS = cfg.model_lockout?.cooldown ?? 60000;
+const MODEL_LOCKOUT_MS = cfg.model_lockout?.cooldown_ms ?? cfg.model_lockout?.cooldown ?? 60000;
+
+// --- circuit breaker ---
+const CB_THRESHOLD = cfg.circuit_breaker?.threshold ?? 5;
+const CB_COOLDOWN_MS = cfg.circuit_breaker?.cooldown_ms ?? 30000;
+
+// --- provider concurrency ---
+const PROVIDER_MAX_CONCURRENT = cfg.provider_concurrency?.max_concurrent ?? 4;
+
 const _modelFails = new Map(); // "provider/model" → { count, until }
 function _modelKey(provider, model) { return `${provider}/${model}`; }
 function _recordModelFailure(provider, model) {
@@ -651,6 +712,26 @@ function _isModelLocked(provider, model) {
   const e = _modelFails.get(_modelKey(provider, model));
   if (!e || !e.until) return false;
   if (Date.now() >= e.until) { _modelFails.delete(_modelKey(provider, model)); return false; }
+  return true;
+}
+
+function _recordProviderFailure(provider) {
+  const entry = _circuitBreaker.get(provider) || { count: 0, openUntil: 0 };
+  entry.count++;
+  if (entry.count >= CB_THRESHOLD && !entry.openUntil) {
+    entry.openUntil = Date.now() + CB_COOLDOWN_MS;
+    log('─'); log(`⚠️ [circuit] ${provider} opened (${entry.count}/${CB_THRESHOLD} failures, cooldown ${CB_COOLDOWN_MS}ms)`);
+  }
+  _circuitBreaker.set(provider, entry);
+}
+function _recordProviderSuccess(provider) {
+  const before = _circuitBreaker.get(provider);
+  if (before) { log('─'); log(`✅ [circuit] ${provider} closed (after ${before.count} failures)`); _circuitBreaker.delete(provider); }
+}
+function _isCircuitOpen(provider) {
+  const entry = _circuitBreaker.get(provider);
+  if (!entry || !entry.openUntil) return false;
+  if (Date.now() >= entry.openUntil) { _circuitBreaker.delete(provider); return false; }
   return true;
 }
 
@@ -752,6 +833,8 @@ function patchMultipartField(raw, fieldName, newValue) {
   const needle = Buffer.from(`name="${fieldName}"`);
   const idx = raw.indexOf(needle);
   if (idx === -1) return raw;
+  const probe = raw.toString('utf8', Math.max(0, idx - 200), idx);
+  if (!probe.includes('Content-Disposition')) return raw;
   const start = raw.indexOf(Buffer.from('\r\n\r\n'), idx);
   if (start === -1) return raw;
   const dataStart = start + 4;
@@ -770,6 +853,8 @@ function patchMultipartFieldName(raw, oldName, newName) {
   const needle = Buffer.from(`name="${oldName}"`);
   const idx = raw.indexOf(needle);
   if (idx === -1) return raw;
+  const probe = raw.toString('utf8', Math.max(0, idx - 200), idx);
+  if (!probe.includes('Content-Disposition')) return raw;
   const repl = Buffer.from(`name="${newName}"`);
   if (repl.length === needle.length) {
     repl.copy(raw, idx);
@@ -838,7 +923,7 @@ async function handleAudioRequest(req, res, logId, { clientModel, endpointPath, 
       const built = buildBody(provider, upstreamModel, base, key);
       try {
         addActive(provider);
-        const up = await forwardToDirect(key, built.body, base, built.path, 'application/octet-stream', built.contentType, built.extraHeaders, sig);
+        const up = await forwardToDirect(key, built.body, base, built.path, '*/*', built.contentType, built.extraHeaders, sig);
         const sc = up.statusCode;
         if (sc >= 200 && sc < 300) {
           const handled = await handleSuccess(up, provider, upstreamModel, key, base, sc);
@@ -848,6 +933,14 @@ async function handleAudioRequest(req, res, logId, { clientModel, endpointPath, 
         decActive(provider); releaseKey(provider, key);
         const errBody = await collectBody(up);
         _markKeyFailed(provider, key, sc, errBody);
+        if (sc === 429) {
+          _adjustRpm(provider, false);
+          const retryAfter = _parseRetryAfter(up);
+          if (retryAfter) {
+            if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
+            _keyLastUsed.get(provider).set(key, Date.now() + retryAfter);
+          }
+        }
         lastErr = { status: sc, body: errBody };
         if (sc >= 500) _recordProviderFailure(provider);
         if (sc !== 429) _recordModelFailure(provider, upstreamModel);
@@ -892,13 +985,13 @@ function ttsHandleSuccess(res, logId, t0) {
         log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf tts bad response ${_safeSlice(raw.toString(), 100)}`);
         return false;
       }
-      recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+      recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0); _adjustRpm(provider, true);
       log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
       res.writeHead(sc, { 'Content-Type': 'audio/wav', 'X-Request-Id': logId, 'X-Provider': provider });
       res.end(Buffer.from(audio, 'base64'));
       return true;
     }
-    decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+    decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0); _adjustRpm(provider, true);
     log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
     res.writeHead(sc, { 'Content-Type': up.headers['content-type'] || 'audio/mpeg', 'X-Request-Id': logId, 'X-Provider': provider });
     up.on('error', () => { try { res.end(); } catch {} });
@@ -963,13 +1056,13 @@ function sttHandleSuccess(res, logId, t0) {
         log(`[${logId}] ❌ 502 [${provider}/${upstreamModel}] cf stt bad response ${_safeSlice(raw.toString(), 100)}`);
         return false;
       }
-      recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+      recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0); _adjustRpm(provider, true);
       log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
       res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
       res.end(JSON.stringify({ text }));
       return true;
     }
-    decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0);
+    decActive(provider); releaseKey(provider, key); recordSuccess(provider, upstreamModel, key, Date.now()-t0, 0); _adjustRpm(provider, true);
     log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
     res.writeHead(sc, { 'Content-Type': 'application/json', 'X-Request-Id': logId, 'X-Provider': provider });
     res.end(raw);
@@ -1032,7 +1125,9 @@ const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 const _isCFBase = (base) => /api\.cloudflare\.com/i.test(base);
 const _cfRunPath = (model) => 'run/' + String(model).replace(/[^a-zA-Z0-9@._\-/]/g, (c) => encodeURIComponent(c));
 
-function _opencodeExtraHeaders(req) {
+function _opencodeExtraHeaders(req, provider) {
+  const isOpencode = provider === 'opencode' || provider === 'opencode-go';
+  if (!isOpencode) return undefined;
   const h = {};
   for (const [k, v] of Object.entries(req.headers || {})) {
     if (k.toLowerCase().startsWith('x-opencode-')) h[k] = v;
@@ -1231,11 +1326,12 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
 
         const bodyObj = { ...bodyTemplate, model: upstreamModel };
-        const maxCap = PROVIDER_MAX_TOKENS[provider];
-        if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
-        const banned = PROVIDER_BANNED_FIELDS[provider];
-        if (banned) for (const f of banned) delete bodyObj[f];
-        if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
+                const maxCap = PROVIDER_MAX_TOKENS[provider];
+                if (maxCap && (bodyObj.max_tokens || 4096) > maxCap) bodyObj.max_tokens = maxCap;
+                const banned = PROVIDER_BANNED_FIELDS[provider];
+                if (banned) for (const f of banned) delete bodyObj[f];
+                _adjustReasoningFields(bodyObj, provider); // strip/rewrite unsupported reasoning params for this upstream
+                if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
          if (Array.isArray(bodyObj.messages)) {
             if (!supportsReasoningContent(provider, upstreamModel)) {
               bodyObj.messages = sanitizeMessages(bodyObj.messages);
@@ -1272,7 +1368,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             }
             addActive(provider);
             const chatPath = (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
-            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', _opencodeExtraHeaders(req), sig);
+            upstreamRes = await forwardToDirect(usedKey, bodyStr, DIRECT_PROVIDERS[provider], chatPath, acceptHdr, 'application/json', _opencodeExtraHeaders(req, provider), sig);
             usedProvider = provider;
             usedModel = upstreamModel;
             curProvider = provider; curUpstream = upstreamRes; curKey = usedKey;
@@ -1412,13 +1508,15 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const nk = await selectKey(sseProvider);
         if (!nk) { log(`[${logId}] ➡️ sse retry [${sseProvider}/${sseModel}] no key`); continue; }
         const bodyObj2 = { ...bodyTemplate, model: sseModel };
-        const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
-        if (banned2) for (const f of banned2) delete bodyObj2[f];
-        if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
-        const sseSanKey = `${sseProvider}/${sseModel}`;
-        if (!_sanCache.has(sseSanKey)) {
-          _sanCache.set(sseSanKey, !supportsReasoningContent(sseProvider, sseModel) ? sanitizeMessages(JSON.parse(JSON.stringify(bodyObj2.messages))) : bodyObj2.messages);
-        }
+                const banned2 = PROVIDER_BANNED_FIELDS[sseProvider];
+                if (banned2) for (const f of banned2) delete bodyObj2[f];
+                _adjustReasoningFields(bodyObj2, sseProvider); // strip/rewrite unsupported reasoning params for this upstream
+                if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
+                const sseSanKey = `${sseProvider}/${sseModel}`;
+                if (!_sanCache.has(sseSanKey)) {
+                  _sanCache.set(sseSanKey, !supportsReasoningContent(sseProvider, sseModel) ? sanitizeMessages(JSON.parse(JSON.stringify(bodyObj2.messages))) : bodyObj2.messages);
+                  _clearOverflowCache();
+                }
         bodyObj2.messages = JSON.parse(JSON.stringify(_sanCache.get(sseSanKey)));
         if (STRICT_ORDER_PROVIDERS.has(sseProvider) && Array.isArray(bodyObj2.messages)) bodyObj2.messages = normalizeMessageOrder(bodyObj2.messages);
         const maxCap2 = PROVIDER_MAX_TOKENS[sseProvider];
@@ -1428,7 +1526,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           addActive(sseProvider);
           const base = DIRECT_PROVIDERS[sseProvider];
           const ep = (DIRECT_PATH_PREFIX[sseProvider] || '/v1') + '/chat/completions';
-          sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, _opencodeExtraHeaders(req), sig);
+          sseUpstream = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, _opencodeExtraHeaders(req, sseProvider), sig);
           curProvider = sseProvider; curUpstream = sseUpstream; curKey = nk;
           if (sseUpstream.statusCode >= 200 && sseUpstream.statusCode < 300) {
             log(`[${logId}] ➡️ sse retry → [${sseProvider}/${sseModel}]`);
@@ -1509,6 +1607,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
       decActive(provider); releaseKey(provider, key); markKeySuccess(provider, key, Date.now()-t0);
       _recordProviderSuccess(provider);
       _recordModelSuccess(provider, upstreamModel);
+      _adjustRpm(provider, true);
       logEvent({ logId, provider, model: upstreamModel, key, latency: (Date.now()-t0)/1000, tokens: 0 });
       if (!sig.aborted) ac.abort();
       log(`[${logId}] ✅ ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} (${((Date.now()-t0)/1000).toFixed(1)}s)`);
@@ -1521,13 +1620,21 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     decActive(provider); releaseKey(provider, key);
     const body = await collectBody(upstreamRes);
     _markKeyFailed(provider, key, sc, body);
+    if (sc === 429) {
+      _adjustRpm(provider, false);
+      const retryAfter = _parseRetryAfter(upstreamRes);
+      if (retryAfter) {
+        if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
+        _keyLastUsed.get(provider).set(key, Date.now() + retryAfter);
+      }
+    }
     log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
     if (sc >= 500) _recordProviderFailure(provider);
     if (sc !== 429) _recordModelFailure(provider, upstreamModel);
     if (sc === 401) markKey401(provider, key, upstreamModel);
-    if (sc !== 429) skippedProviders.add(provider); // upstream/server issue → skip this channel
+    if (sc !== 429) skippedProviders.add(provider);
     return 'retry';
   };
 
@@ -1571,7 +1678,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const cfEp = _cfRunPath(upstreamModel);
           try {
             addActive(provider);
-            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', _opencodeExtraHeaders(req), sig);
+            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', _opencodeExtraHeaders(req, provider), sig);
             const sc = upstreamRes.statusCode;
             if (sc >= 200 && sc < 300 && !clientGone) {
               const raw = await collectBody(upstreamRes);
@@ -1613,18 +1720,19 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           }
         }
         if (jsonBody !== false) {
-          const proxyBody = { ...bodyJson, model: upstreamModel };
-          const banned = PROVIDER_BANNED_FIELDS[provider];
-          if (banned) for (const f of banned) delete proxyBody[f];
-          if (Array.isArray(proxyBody.tools)) proxyBody.tools = proxyBody.tools.map(t => { const c = { ...t }; delete c.strict; return c; });
-          bodyStr = JSON.stringify(proxyBody);
-        } else {
+                  const proxyBody = { ...bodyJson, model: upstreamModel };
+                  const banned = PROVIDER_BANNED_FIELDS[provider];
+                  if (banned) for (const f of banned) delete proxyBody[f];
+                  _adjustReasoningFields(proxyBody, provider); // strip/rewrite unsupported reasoning params for this upstream
+                  if (Array.isArray(proxyBody.tools)) proxyBody.tools = proxyBody.tools.map(t => { const c = { ...t }; delete c.strict; return c; });
+                  bodyStr = JSON.stringify(proxyBody);
+                } else {
           bodyStr = upstreamModel ? patchMultipartField(bodyJson, 'model', upstreamModel) : bodyJson;
         }
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
           addActive(provider);
-          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, _opencodeExtraHeaders(req), sig);
+          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, _opencodeExtraHeaders(req, provider), sig);
           if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
           continue;
         } catch (e) {
@@ -1934,6 +2042,8 @@ function isJsonEndpoint(url) {
          url.startsWith('/v1/audio/speech') ||
          url.startsWith('/v1/moderations') ||
          url.startsWith('/v1/rerank') ||
+         url.startsWith('/v1/responses') ||
+         url.startsWith('/v1/messages') ||
            url === '/api/console/validate' ||
            url === '/api/console/save' ||
            url === '/api/console/retry401' ||

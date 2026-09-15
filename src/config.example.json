@@ -16,9 +16,18 @@
   ],
 
   "model_lockout": {
-    "_note": "(選用) 同一 provider/model 連續失敗達 threshold 次後暫時停用 (cooldown 毫秒)，避免一直打到壞 model / 塞車的 tier",
+    "_note": "(選用) 同一 provider/model 連續失敗達 threshold 次後暫時停用 (cooldown_ms 毫秒)",
     "threshold": 3,
-    "cooldown": 60000
+    "cooldown_ms": 60000
+  },
+  "circuit_breaker": {
+    "_note": "(選用) circuit breaker: 失敗次數達 threshold 後暫時停用該 provider (cooldown 毫秒)",
+    "threshold": 5,
+    "cooldown_ms": 30000
+  },
+  "provider_concurrency": {
+    "_note": "(選用) 每個 provider 同時並發請求上限",
+    "max_concurrent": 4
   },
 
   "log": {
@@ -134,21 +143,17 @@
       { "provider": "openrouter", "model": "google/gemma-4-31b-it:free" },
       { "provider": "mistral", "model": "mistral-small-latest" }
     ],
-
     "image": [
       { "provider": "together", "model": "black-forest-labs/FLUX.1-schnell-free" }
     ],
-
     "tts": [
       { "provider": "cartesia", "model": "sonic-3.5" },
       { "provider": "elevenlabs", "model": "eleven_multilingual_v2" }
     ],
-
     "stt": [
       { "provider": "cartesia", "model": "ink-whisper" },
       { "provider": "elevenlabs", "model": "scribe_v1" }
     ],
-
     "embedding": [
       { "provider": "sea-lion", "model": "aisingapore/SEA-LION-ModernBERT-Embedding-600M" }
     ]
