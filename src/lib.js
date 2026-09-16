@@ -441,6 +441,101 @@ function chatToResponses(bodyObj) {
   return out;
 }
 
+// --- Chat → Anthropic Messages conversion ---
+function _chatContentToAnthropic(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return null;
+  const blocks = [];
+  for (const p of content) {
+    if (!p || typeof p !== 'object') continue;
+    if (p.type === 'text' && typeof p.text === 'string') {
+      blocks.push({ type: 'text', text: p.text });
+    } else if (p.type === 'image_url' && p.image_url?.url) {
+      const url = String(p.image_url.url);
+      const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(url);
+      if (m) {
+        blocks.push({ type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } });
+      } else if (/^https?:\/\//i.test(url)) {
+        blocks.push({ type: 'image', source: { type: 'url', url } });
+      }
+      // note: non-http non-data image urls are dropped (already filtered upstream)
+    }
+  }
+  return blocks.length ? blocks : null;
+}
+
+function _mapChatToolToAnthropic(t) {
+  if (!t || typeof t !== 'object') return null;
+  const fn = t.type === 'function' ? t.function : t;
+  if (!fn || typeof fn.name !== 'string') return null;
+  const r = { name: fn.name };
+  if (fn.description !== undefined) r.description = fn.description;
+  r.input_schema = fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : { type: 'object' };
+  return r;
+}
+
+function chatToAnthropic(bodyObj) {
+  const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : [];
+  const systemParts = [];
+  const messages = [];
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue;
+    if (m.role === 'system' || m.role === 'developer') {
+      const t = _chatTextParts(m.content);
+      if (t) systemParts.push(t);
+      continue;
+    }
+    if (m.role === 'user') {
+      const c = _chatContentToAnthropic(m.content);
+      if (c !== null) messages.push({ role: 'user', content: c });
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const blocks = [];
+      const text = _chatTextParts(m.content);
+      if (text) blocks.push({ type: 'text', text });
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (!tc || tc.type !== 'function' || !tc.function || typeof tc.function.name !== 'string') continue;
+          let input = {};
+          try { input = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments || '{}') : (tc.function.arguments || {}); } catch { input = {}; }
+          blocks.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+        }
+      }
+      if (blocks.length) messages.push({ role: 'assistant', content: blocks });
+      continue;
+    }
+    if (m.role === 'tool') {
+      const c = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? null);
+      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: m.tool_call_id, content: c }] });
+      continue;
+    }
+  }
+  if (!messages.length) {
+    const lastUser = [...msgs].reverse().find(m => m && m.role === 'user');
+    messages.push({ role: 'user', content: _chatTextParts(lastUser && lastUser.content) || 'hi' });
+  }
+  // note: Anthropic requires a non-empty user-first turn; merge leading non-user blocks
+  const out = { model: bodyObj.model, max_tokens: Number(bodyObj.max_tokens) || 1024, messages };
+  if (systemParts.length) out.system = systemParts.join('\n\n');
+  if (bodyObj.temperature !== undefined) out.temperature = bodyObj.temperature;
+  if (bodyObj.top_p !== undefined) out.top_p = bodyObj.top_p;
+  if (bodyObj.stop !== undefined) out.stop_sequences = Array.isArray(bodyObj.stop) ? bodyObj.stop : [bodyObj.stop];
+  if (bodyObj.tool_choice !== 'none' && Array.isArray(bodyObj.tools)) {
+    const tools = bodyObj.tools.map(_mapChatToolToAnthropic).filter(Boolean);
+    if (tools.length) {
+      out.tools = tools;
+      if (bodyObj.tool_choice === 'auto') out.tool_choice = { type: 'auto' };
+      else if (bodyObj.tool_choice === 'required') out.tool_choice = { type: 'any' };
+      else if (bodyObj.tool_choice && typeof bodyObj.tool_choice === 'object' && bodyObj.tool_choice.function?.name) {
+        out.tool_choice = { type: 'tool', name: bodyObj.tool_choice.function.name };
+      }
+    }
+  }
+  if (bodyObj.stream !== undefined) out.stream = !!bodyObj.stream;
+  return out;
+}
+
 function responsesOutputToChat(rj, clientModel) {
   const out = rj && Array.isArray(rj.output) ? rj.output : [];
   let text = '';
@@ -484,4 +579,5 @@ module.exports = {
   setAllowedImageOrigins,
   chatToResponses,
   responsesOutputToChat,
+  chatToAnthropic,
 };

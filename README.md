@@ -210,6 +210,30 @@ curl http://localhost:3000/v1/chat/completions \
 - 陣列中的目標依序嘗試：第一個目標所有 Key 失敗 → 自動換下一個
 - 回應含 `X-Request-Id` header；非串流成功回應目前不附 `X-Provider` / `X-Upstream-Model`（僅 SSE 透傳路徑與 endpoint 轉換路徑會帶）
 
+## Hermes Agent 接入
+
+Hermes（CLI / Desktop）把本 gateway 當任意 OpenAI-compatible custom endpoint 即可，需 `/v1/chat/completions`（tools + streaming + vision 皆已透傳）：
+
+```yaml
+# ~/.hermes/config.yaml
+model:
+  default: hermes-gateway  # 對應下方 models 的別名
+  provider: custom
+  base_url: http://127.0.0.1:3000/v1
+  api_key: sk-your-client-token  # 即 gateway 的 CLIENT_TOKEN
+  context_length: 128000  # custom endpoint 需手動指定，agent 要求至少 64000
+```
+
+```json
+// gateway src/config.json
+{ "models": { "hermes-gateway": [
+  { "provider": "openai", "model": "gpt-4o" },
+  { "provider": "mistral", "model": "mistral-small-latest", "fallback": "openai" }
+] } }
+```
+
+注意：agent 重度依賴 `tool_choice: auto` 與大 system prompt，請選 tools 支援好的上游（避免 llm7 / ollama 等弱相容），並在 `model_limits` 設定正確 context 上限，gateway 會自動跳過放不下的目標。
+
 ## Model 別名範例
 
 ```json

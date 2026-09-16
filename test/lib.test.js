@@ -359,3 +359,47 @@ test('responsesOutputToChat round-trips parallel tool calls', () => {
   assert.equal(conv.finish, 'tool_calls');
   assert.equal(conv.toolCalls[1].function.name, 'b');
 });
+
+test('chatToAnthropic extracts system and converts tool calls', () => {
+  const out = lib.chatToAnthropic({
+    model: 'm',
+    max_tokens: 77,
+    messages: [
+      { role: 'system', content: 'sys' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'let me check', tool_calls: [
+        { id: 't1', type: 'function', function: { name: 'search', arguments: '{"q":"x"}' } },
+      ] },
+      { role: 'tool', tool_call_id: 't1', content: 'found' },
+    ],
+    tools: [{ type: 'function', function: { name: 'search', description: 's', parameters: { type: 'object' } } }],
+    tool_choice: 'auto',
+  });
+  assert.equal(out.system, 'sys');
+  assert.equal(out.max_tokens, 77);
+  assert.equal(out.messages[1].content[1].type, 'tool_use');
+  assert.equal(out.messages[2].content[0].type, 'tool_result');
+  assert.equal(out.tools[0].input_schema.type, 'object');
+  assert.deepEqual(out.tool_choice, { type: 'auto' });
+});
+
+test('chatToAnthropic converts data-url images and drops bad parts', () => {
+  const out = lib.chatToAnthropic({
+    model: 'm',
+    messages: [{ role: 'user', content: [
+      { type: 'text', text: 'see' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA' } },
+      { type: 'image_url', image_url: { url: 'not-a-url' } },
+    ] }],
+  });
+  assert.equal(out.messages[0].content[0].type, 'text');
+  assert.equal(out.messages[0].content[1].type, 'image');
+  assert.equal(out.messages[0].content[1].source.media_type, 'image/png');
+  assert.equal(out.messages[0].content.length, 2);
+});
+
+test('chatToAnthropic falls back to last user text when empty', () => {
+  const out = lib.chatToAnthropic({ model: 'm', messages: [] });
+  assert.equal(out.messages[0].role, 'user');
+  assert.equal(out.max_tokens, 1024);
+});

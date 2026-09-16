@@ -425,6 +425,9 @@ function markKeyError(p, key) {
 
 const QUOTA_RE = lib.QUOTA_RE;
 function _isQuotaError(status, body) { return lib._isQuotaError(status, body); }
+// note: opencode free-tier models only work inside OpenCode — case-insensitive, no circuit penalty (model-level only)
+const FREE_TIER_RE = /free\s*tier\s*can\s*only\s*be\s*used\s*in\s*opencode/i;
+function _isFreeTierError(body) { return typeof body === 'string' && FREE_TIER_RE.test(body); }
 function _parseRetryAfter(res) {
   const h = res?.headers?.['retry-after'] || res?.headers?.['Retry-After'];
   if (!h) return 0;
@@ -518,7 +521,8 @@ async function selectKey(p) {
     for (const k of free) { const e = keyPool.get(p).get(k).errorCount; if (e < best) best = e; }
     const top = free.filter(k => keyPool.get(p).get(k).errorCount === best).sort();
     const n = rrCursor.get(p) ?? 0;
-    rrCursor.set(p, n + 1);
+    // note: bound cursor to avoid unbounded growth; modulo top.length at use keeps RR deterministic
+    rrCursor.set(p, (n + 1) % 1000000);
     const key = top[n % top.length];
     keyInFlight.set(`${p}:${key}`, now);
     await waitRateLimit(p, key);
@@ -933,14 +937,7 @@ async function handleAudioRequest(req, res, logId, { clientModel, endpointPath, 
         decActive(provider); releaseKey(provider, key);
         const errBody = await collectBody(up);
         _markKeyFailed(provider, key, sc, errBody);
-        if (sc === 429) {
-          _adjustRpm(provider, false);
-          const retryAfter = _parseRetryAfter(up);
-          if (retryAfter) {
-            if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
-            _keyLastUsed.get(provider).set(key, Date.now() + retryAfter);
-          }
-        }
+        if (sc === 429) await _handleUpstream429(provider, key, up, errBody, logId);
         lastErr = { status: sc, body: errBody };
         if (sc >= 500) _recordProviderFailure(provider);
         if (sc !== 429) _recordModelFailure(provider, upstreamModel);
@@ -1133,14 +1130,17 @@ function _opencodeExtraHeaders(req, provider) {
     if (k.toLowerCase().startsWith('x-opencode-')) h[k] = v;
   }
   if (!h['x-opencode-session'] && !h['X-Opencode-Session']) {
+    // note: hash only auth tail + UA to avoid holding full token in a temp string
     const auth = req.headers['authorization'] || '';
     const ua = req.headers['user-agent'] || '';
-    const seed = `${auth}|${ua}|${provider}`;
+    const seed = `${auth.slice(-12)}|${ua}|${provider}`;
     let hash = 0;
     for (let i = 0; i < seed.length; i++) hash = ((hash << 5) - hash + seed.charCodeAt(i)) >>> 0;
     h['x-opencode-session'] = `gw-${hash.toString(36)}`;
   }
-  h['User-Agent'] = 'api-gateway';
+  // note: preserve client UA for upstream debugging instead of overwriting
+  const clientUa = req.headers['user-agent'];
+  h['User-Agent'] = clientUa ? `api-gateway (${String(clientUa).slice(0, 80)})` : 'api-gateway';
   return h;
 }
 function _chatToResponses(bodyObj) { return lib.chatToResponses(bodyObj); }
@@ -1384,7 +1384,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           if (!usedKey) { log(`[${logId}] ➡️ [${provider}/${upstreamModel}] no key available`); logEvent({ logId, provider, model: upstreamModel, key: '-', status: 503, body: 'no healthy key' }); break; }
 
           try {
-            const acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             await waitTpmLimit(provider, usedKey, totalEst);
             if ((_providerActive.get(provider) || 0) >= PROVIDER_MAX_CONCURRENT) {
               log(`[${logId}] ➡️ [${provider}/${upstreamModel}] skip (concurrency ${_providerActive.get(provider)})`);
@@ -1393,12 +1392,15 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             addActive(provider);
             let targetPath = target.endpoint || (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
             let targetBodyStr = bodyStr;
+            // note: /v1/responses is always fetched non-stream then replayed as SSE if needed
+            let acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             if (target.endpoint === '/v1/responses') {
               const rBody = _chatToResponses(bodyObj);
               rBody.model = upstreamModel;
               targetBodyStr = JSON.stringify(rBody);
+              acceptHdr = 'application/json';
             } else if (target.endpoint === '/v1/messages') {
-              const mBody = { ...bodyObj, model: upstreamModel, max_tokens: bodyObj.max_tokens || 1024 };
+              const mBody = lib.chatToAnthropic({ ...bodyObj, model: upstreamModel });
               targetBodyStr = JSON.stringify(mBody);
             }
             upstreamRes = await forwardToDirect(usedKey, targetBodyStr, DIRECT_PROVIDERS[provider], targetPath, acceptHdr, 'application/json', _opencodeExtraHeaders(req, provider), sig);
@@ -1411,13 +1413,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               decActive(provider);
               releaseKey(provider, usedKey);
               const body = await collectBody(upstreamRes);
-              _markKeyFailed(provider, usedKey, sc, body);
-              _adjustRpm(provider, false);
-              const retryAfter = _parseRetryAfter(upstreamRes);
-              if (retryAfter) {
-                if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
-                _keyLastUsed.get(provider).set(usedKey, Date.now() + retryAfter);
-              }
+              const retryAfter = await _handleUpstream429(provider, usedKey, upstreamRes, body, logId);
               const isQuota = _isQuotaError(sc, body);
               if (retryAfter) log(`[${logId}] ⏳ Retry-After ${Math.ceil(retryAfter/1000)}s [${provider}]${isQuota ? ' quota' : ''}`);
               log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} attempt=${attempt+1}/${maxAttempts}${isQuota ? ' quota' : ''}`);
@@ -1482,11 +1478,13 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               _markKeyFailed(provider, usedKey, sc, body);
               log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
-              const isFreeTier = typeof body === 'string' && body.includes('free tier can only be used in OpenCode');
-              if (isFreeTier) {
+              if (_isFreeTierError(body)) {
+                // note: model-level only — skip channel for fallback, lock model, no provider circuit
+                _recordModelFailure(provider, upstreamModel);
+                skippedProviders.add(provider);
                 lastErr = { status: sc, body };
                 upstreamRes = null;
-                continue;
+                break;
               }
               if (sc >= 500) _recordProviderFailure(provider);
               _recordModelFailure(provider, upstreamModel);
@@ -1726,24 +1724,20 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     decActive(provider); releaseKey(provider, key);
     const body = await collectBody(upstreamRes);
     _markKeyFailed(provider, key, sc, body);
-    if (sc === 429) {
-      _adjustRpm(provider, false);
-      const retryAfter = _parseRetryAfter(upstreamRes);
-      if (retryAfter) {
-        if (!_keyLastUsed.has(provider)) _keyLastUsed.set(provider, new Map());
-        _keyLastUsed.get(provider).set(key, Date.now() + retryAfter);
-      }
-    }
-    const isFreeTier = typeof body === 'string' && body.includes('free tier can only be used in OpenCode');
+    if (sc === 429) await _handleUpstream429(provider, key, upstreamRes, body, logId);
+    const isFreeTier = _isFreeTierError(body);
     log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_safeSlice(body, 100)}${isFreeTier ? ' free-tier' : ''}`);
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
-    if (!isFreeTier) {
+    if (isFreeTier) {
+      _recordModelFailure(provider, upstreamModel);
+      skippedProviders.add(provider);
+    } else {
       if (sc >= 500) _recordProviderFailure(provider);
       if (sc !== 429) _recordModelFailure(provider, upstreamModel);
+      if (sc !== 429) skippedProviders.add(provider);
     }
     if (sc === 401) markKey401(provider, key, upstreamModel);
-    if (sc !== 429 && !isFreeTier) skippedProviders.add(provider);
     return 'retry';
   };
 
