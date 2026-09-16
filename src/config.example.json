@@ -125,6 +125,9 @@
     "claude": [
       { "provider": "anthropic", "model": "claude-sonnet-4-20250514" }
     ],
+    "opencode-free": [
+      { "provider": "opencode", "model": "muse-spark-1.2-contributor-free", "endpoint": "/v1/responses", "fallback": "claude" }
+    ],
     "vyceai-auto": [
       { "provider": "vyceai", "model": "auto" }
     ],

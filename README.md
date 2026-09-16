@@ -10,12 +10,12 @@
 
 ## 功能
 
-- **多 Key 輪詢** — 每個 Provider 獨立 Round-Robin
+- **多 Key 輪詢** — 每個 key 有健康分數（`errorCount`）同分的列隊輪詢、低分的退為備援
 - **Key 故障轉移** — 429/5xx/網路錯誤 → 退避降級，成功後逐步恢復
 - **Provider 降級** — Fallback Chain 依序嘗試備援 Provider
 - **Model 別名路由** — 依 context window 自動選擇最適合的別名
 - **端點自動派生** — `endpoint_fallbacks` 讓單一 model 名稱自動對應各端點的 model 別名
-- **SSE 串流** — 透傳上游串流，自動改回 client 請求的 model 名稱
+- **SSE 串流** — OpenAI 標準契約：省略 `stream` 回 JSON，`stream:true` 才回 SSE；透傳上游串流，自動改回 client 請求的 model 名稱
 - **非 Chat 端點** — embeddings、images/generations、images/edits、images/variations、audio/speech、audio/transcriptions、audio/translations、files、responses、messages（Anthropic 原生 `x-api-key` + opencode 轉譯）
 - **請求頻率限制** — 可設定 RPM（rate_limit）與 TPM（tpm_limit）
 - **Circuit Breaker** — 連續 5 次 5xx 自動跳過該 provider 30 秒，成功後立即關閉
@@ -43,7 +43,7 @@ npm test         # 單元測試
 ```
 
 測試位於 `test/` 目錄，由 `npm test`（`node --test test/*.test.js`）執行：
-- `lib.test.js` — 單元測試：Config 解析（JSONC、自動修正）、Model 別名解析與 Endpoint Fallback、Chat 請求驗證、Token 估算、Utility 函數（uptime、key masking、SSE rewrite 等）
+- `lib.test.js` — 單元測試：Config 解析（JSONC、自動修正）、Model 別名解析與 Endpoint Fallback、Chat 請求驗證、Token 估算、Chat↔Responses 轉換（tools、tool_choice、response_format、usage）、Utility 函數（uptime、key masking、SSE rewrite 等）
 - `integration.test.js` — 整合測試：啟動真實 gateway（subprocess）+ mock upstream，黑箱驗證路由 / auth / SSE rewrite / 錯誤處理 / 各 provider 轉發
 
 核心邏輯提取在 `src/lib.js`，`src/index.js` 透過 delegation 呼叫。
@@ -208,7 +208,7 @@ curl http://localhost:3000/v1/chat/completions \
 
 - `model` 可為 config 中定義的別名或真實模型名稱
 - 陣列中的目標依序嘗試：第一個目標所有 Key 失敗 → 自動換下一個
-- 回應含 `X-Request-Id` header；非串流成功回應目前不附 `X-Provider` / `X-Upstream-Model`（僅 SSE 透傳路徑會帶上游 model 資訊）
+- 回應含 `X-Request-Id` header；非串流成功回應目前不附 `X-Provider` / `X-Upstream-Model`（僅 SSE 透傳路徑與 endpoint 轉換路徑會帶）
 
 ## Model 別名範例
 
@@ -278,6 +278,24 @@ client 只認得一個 model 名稱，gateway 依端點決定實際路由。如�
 ```
 
 Client 端不需要知道哪些 provider 支援 vision，只要附圖，Gateway 自動優先調用支援 vision 的 provider，失敗則 fallback 到一般 chat chain。
+
+## 單目標端點覆寫
+
+`models` 別名的單一目標可加 `endpoint` 欄位，強制該目標走指定上游端點，例如 client 發送請求的端點 `/chat/completions`，設定好目標端點，將自動轉換到 `/v1/responses`
+
+## 跨別名 Fallback
+
+單一模型目標可加 `fallback`（指向其它別名，可陣列）。當該別名的所有 key／上游都失敗（4xx/5xx，非限流等待）時，Gateway 在同一次請求內展開 fallback 別名繼續嘗試，client 連線保持到 `TIMEOUT_MS` 為止：
+
+```jsonc
+// 以調用 opencode 上游為例，此模型 (opencode-free) 在自動 endpoint 轉換後會使用 /v1/responses 做轉發
+// 調用失敗後，fallback 到 auto-openai 模型別名，可以多筆使用
+"models": {
+  "opencode-free": [
+    { "provider": "opencode", "model": "muse-spark-1.2-contributor-free", "endpoint": "/v1/responses", "fallback": "auto-openai" }
+  ]
+}
+```
 
 ## 圖像編輯與變體
 

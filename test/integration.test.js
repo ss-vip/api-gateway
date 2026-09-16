@@ -2,10 +2,10 @@
 
 // Black-box integration tests for src/index.js.
 // Strategy: spin up ONE mock upstream HTTP server plus the real gateway (as a
-// subprocess with a temp config). The gateway always forwards to the upstream
-// in stream mode and rewrites `model` to the upstream model, so we distinguish
-// mock behaviour by the `Authorization` key the gateway sends (one key per
-// provider). No production code is modified.
+// subprocess with a temp config). The gateway follows the OpenAI-standard
+// stream contract (omitted stream means JSON; explicit stream:true means SSE),
+// so we distinguish mock behaviour by the `Authorization` key the gateway
+// sends (one key per provider). No production code is modified.
 
 const test = require('node:test');
 const { before, after } = require('node:test');
@@ -102,6 +102,8 @@ function startGateway() {
           [MODEL_SSE]: [{ provider: 'mocksse', model: 'mock-model' }],
           [MODEL_ERR]: [{ provider: 'mockerr', model: 'mock-model' }],
           orca: [{ provider: 'orcarouter', model: 'orca-model' }],
+          fbchain: [{ provider: 'mockerr', model: 'mock-model', fallback: MODEL_JSON }],
+          fbself: [{ provider: 'mockerr', model: 'mock-model', fallback: 'fbself' }],
         },
       };
       fs.writeFileSync(cfgPath, JSON.stringify(cfg));
@@ -189,11 +191,11 @@ test('auth: wrong token → 401', async () => {
 });
 
 test('chat: forwards to upstream and passes through response', async () => {
+  // note: omitted stream means JSON passthrough (OpenAI-standard default)
   const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody(MODEL_JSON));
   assert.equal(r.status, 200);
+  assert.ok(!r.body.includes('data:'), 'non-stream response must not be SSE-framed');
   const j = JSON.parse(r.body);
-  // gateway rewrites the model back to the client-requested model
-  assert.equal(j.model, MODEL_JSON);
   assert.equal(j.choices[0].message.content, 'ok');
 });
 
@@ -231,12 +233,32 @@ test('chat: SSE stream rewrites model back to client model', async () => {
 });
 
 test('chat: upstream 5xx surfaces as error to client', async () => {
-  // The gateway retries on key cooldown then returns the error as a streamed
-  // (status 200, SSE body) proxy_error. key_cooldown is low in the test config
-  // so retries resolve fast.
+  // The gateway retries on key cooldown then returns the error as JSON
+  // (omitted stream means non-stream). key_cooldown is low in the test
+  // config so retries resolve fast.
   const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_ERR));
-  assert.equal(r.status, 200);
+  assert.equal(r.status, 502);
   assert.ok(r.body.includes('error') || r.body.includes('all failed'), 'client should receive the upstream error');
+});
+
+test('chat: fallback alias is tried after primary hard-fails', async () => {
+  // fbchain → mockerr (500) → falls back to MODEL_JSON (mockjson 200 'ok')
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody('fbchain'));
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(r.body).choices[0].message.content, 'ok');
+});
+
+test('chat: self-referential fallback terminates instead of looping', async () => {
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 30000 }, chatBody('fbself'));
+  assert.equal(r.status, 502);
+  assert.ok(r.body.includes('error') || r.body.includes('all failed'));
+});
+
+test('chat: upstream 5xx with stream:true surfaces as SSE error', async () => {
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_ERR, { stream: true }));
+  assert.equal(r.status, 200);
+  assert.ok(r.body.includes('error') || r.body.includes('all failed'), 'stream client should receive the upstream error as SSE');
+  assert.ok(r.body.includes('[DONE]'));
 });
 
 test('GET /v1/models lists configured aliases', async () => {

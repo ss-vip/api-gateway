@@ -71,6 +71,16 @@ test('createModelResolver matches exact and prefixed client models', () => {
   assert.equal(resolve('unknown'), null);
 });
 
+test('createModelResolver propagates endpoint and fallback', () => {
+  const entries = new Map([
+    ['a', [{ provider: 'opencode', model: 'm', endpoint: '/v1/responses', fallback: 'b' }]],
+    ['c', [{ provider: 'x', model: 'y', fallback: ['b', 'a'] }]],
+  ]);
+  const resolve = lib.createModelResolver(entries);
+  assert.deepEqual(resolve('a'), [{ provider: 'opencode', upstreamModel: 'm', endpoint: '/v1/responses', fallback: 'b' }]);
+  assert.deepEqual(resolve('c'), [{ provider: 'x', upstreamModel: 'y', fallback: ['b', 'a'] }]);
+});
+
 test('createEndpointResolver falls back to endpoint alias', () => {
   const entries = new Map([
     ['dall-e-3', [{ provider: 'together', model: 'FLUX' }]],
@@ -225,4 +235,127 @@ test('normalizeMessageOrder sanitizes invalid tool ids', () => {
   assert.notEqual(newId, 'bad-id');
   assert.equal(/^[a-zA-Z0-9]{9}$/.test(newId), true);
   assert.equal(out[1].tool_call_id, newId);
+});
+
+// ---------------------------------------------------------------------------
+// Chat ↔ Responses conversion
+// ---------------------------------------------------------------------------
+test('chatToResponses maps history, tools and keeps output headroom', () => {
+  const out = lib.chatToResponses({
+    model: 'm',
+    messages: [{ role: 'system', content: 's' }, { role: 'user', content: 'hi' }],
+    max_tokens: 100,
+    tools: [{ type: 'function', function: { name: 'get_time', description: 'd', parameters: { type: 'object', properties: {} } } }],
+    tool_choice: 'auto',
+  });
+  assert.equal(out.max_output_tokens, 1024);
+  assert.deepEqual(out.input, [{ role: 'system', content: 's' }, { role: 'user', content: 'hi' }]);
+  assert.deepEqual(out.tools, [{ type: 'function', name: 'get_time', description: 'd', parameters: { type: 'object', properties: {} } }]);
+  assert.equal(out.tool_choice, 'auto');
+});
+
+test('chatToResponses converts tool_calls and tool results to responses items', () => {
+  const out = lib.chatToResponses({
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'what time' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_time', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_1', content: '12:00' },
+    ],
+  });
+  assert.deepEqual(out.input, [
+    { role: 'user', content: 'what time' },
+    { type: 'function_call', call_id: 'call_1', name: 'get_time', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call_1', output: '12:00' },
+  ]);
+});
+
+test('chatToResponses falls back to last user text on unmappable shapes', () => {
+  const out = lib.chatToResponses({
+    model: 'm',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'see' }, { type: 'image_url', image_url: { url: 'https://x/y.png' } }] }],
+  });
+  assert.equal(out.input, 'see');
+});
+
+test('responsesOutputToChat extracts text, tool calls and chat-shaped usage', () => {
+  const conv = lib.responsesOutputToChat({
+    status: 'completed',
+    output: [
+      { type: 'reasoning', status: 'completed' },
+      { type: 'message', content: [{ type: 'output_text', text: 'ok' }] },
+      { type: 'function_call', call_id: 'call_9', name: 'read_file', arguments: '{"p":"a"}' },
+    ],
+    usage: { input_tokens: 10, output_tokens: 20, total_tokens: 30 },
+  }, 'alias');
+  assert.equal(conv.text, 'ok');
+  assert.deepEqual(conv.toolCalls, [{ id: 'call_9', type: 'function', function: { name: 'read_file', arguments: '{"p":"a"}' } }]);
+  assert.equal(conv.finish, 'tool_calls');
+  assert.deepEqual(conv.usage, { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 });
+});
+
+test('responsesOutputToChat maps incomplete status to length', () => {
+  const conv = lib.responsesOutputToChat({ status: 'incomplete', output: [], usage: {} }, 'alias');
+  assert.equal(conv.finish, 'length');
+  assert.equal(conv.text, '');
+});
+
+test('chatToResponses maps response_format to text.format', () => {
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const o1 = lib.chatToResponses({ model: 'm', messages: msgs, response_format: { type: 'json_object' } });
+  assert.deepEqual(o1.text, { format: { type: 'json_object' } });
+  const o2 = lib.chatToResponses({ model: 'm', messages: msgs, response_format: { type: 'json_schema', json_schema: { name: 'ans', schema: { type: 'object' }, strict: true } } });
+  assert.deepEqual(o2.text, { format: { type: 'json_schema', name: 'ans', schema: { type: 'object' }, strict: true } });
+  const o3 = lib.chatToResponses({ model: 'm', messages: msgs, response_format: { type: 'text' } });
+  assert.equal(o3.text, undefined);
+});
+
+test('chatToResponses coerces tool_choice to upstream-supported auto', () => {
+  const msgs = [{ role: 'user', content: 'hi' }];
+  const tools = [{ type: 'function', function: { name: 'a', parameters: {} } }];
+  const r1 = lib.chatToResponses({ model: 'm', messages: msgs, tools, tool_choice: 'required' });
+  assert.equal(r1.tool_choice, 'auto');
+  assert.equal(r1.tools.length, 1);
+  const r2 = lib.chatToResponses({ model: 'm', messages: msgs, tools, tool_choice: { type: 'function', function: { name: 'a' } } });
+  assert.equal(r2.tool_choice, 'auto');
+  const r3 = lib.chatToResponses({ model: 'm', messages: msgs, tools, tool_choice: 'none' });
+  assert.equal(r3.tool_choice, undefined);
+  assert.equal(r3.tools, undefined);
+});
+
+test('chatToResponses maps named tool_choice and parallel tool_calls', () => {
+  const out = lib.chatToResponses({
+    model: 'm',
+    tool_choice: { type: 'function', function: { name: 'a' } },
+    messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: '', tool_calls: [
+        { id: 'c1', type: 'function', function: { name: 'a', arguments: '{"x":1}' } },
+        { id: 'c2', type: 'function', function: { name: 'b', arguments: '{}' } },
+      ] },
+      { role: 'tool', tool_call_id: 'c1', content: 'r1' },
+      { role: 'tool', tool_call_id: 'c2', content: { nested: true } },
+    ],
+  });
+  assert.equal(out.tool_choice, 'auto');
+  assert.deepEqual(out.input.slice(1), [
+    { type: 'function_call', call_id: 'c1', name: 'a', arguments: '{"x":1}' },
+    { type: 'function_call', call_id: 'c2', name: 'b', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'c1', output: 'r1' },
+    { type: 'function_call_output', call_id: 'c2', output: '{"nested":true}' },
+  ]);
+});
+
+test('responsesOutputToChat round-trips parallel tool calls', () => {
+  const conv = lib.responsesOutputToChat({
+    status: 'completed',
+    output: [
+      { type: 'function_call', call_id: 'c1', name: 'a', arguments: '{"x":1}' },
+      { type: 'function_call', call_id: 'c2', name: 'b', arguments: '{}' },
+    ],
+    usage: {},
+  }, 'alias');
+  assert.equal(conv.toolCalls.length, 2);
+  assert.equal(conv.finish, 'tool_calls');
+  assert.equal(conv.toolCalls[1].function.name, 'b');
 });

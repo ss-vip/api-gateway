@@ -274,7 +274,12 @@ function createModelResolver(modelEntries) {
           return [{ provider: value, upstreamModel: clientModel }];
         }
         if (Array.isArray(value) && value.length > 0) {
-          return value.map(t => ({ provider: t.provider, upstreamModel: t.model || clientModel }));
+          return value.map(t => {
+            const r = { provider: t.provider, upstreamModel: t.model || clientModel };
+            if (t.endpoint) r.endpoint = t.endpoint;
+            if (t.fallback) r.fallback = t.fallback;
+            return r;
+          });
         }
       }
     }
@@ -344,6 +349,116 @@ async function _fetchAndConvertImages(messages) {
   return converted;
 }
 
+// --- Chat ↔ Responses conversion (for providers reachable only through one shape) ---
+function _chatTextParts(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter(p => p && p.type === 'text' && typeof p.text === 'string').map(p => p.text).join('\n');
+  return '';
+}
+
+function _mapChatTool(t) {
+  if (!t || typeof t !== 'object') return null;
+  if (t.type === 'function' && t.function && typeof t.function.name === 'string') {
+    const r = { type: 'function', name: t.function.name };
+    if (t.function.description !== undefined) r.description = t.function.description;
+    if (t.function.parameters !== undefined) r.parameters = t.function.parameters;
+    if (t.function.strict !== undefined) r.strict = t.function.strict;
+    return r;
+  }
+  return { ...t }; // note: non-function tool types pass through untouched
+}
+
+function _mapChatToolChoice(c) {
+  if (c === 'auto') return 'auto';
+  // note: upstream only supports auto — required/named degrade to auto, none is honored by withholding tools
+  if (c === 'required') return 'auto';
+  if (c && c.type === 'function' && c.function && typeof c.function.name === 'string') return 'auto';
+  return undefined;
+}
+
+// Translates chat messages to responses input items. ok=false → caller keeps legacy last-user-text fallback.
+function _chatMessagesToInput(messages) {
+  const input = [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') return { ok: false };
+    if (m.role === 'system' || m.role === 'developer' || m.role === 'user') {
+      if (typeof m.content !== 'string') return { ok: false };
+      input.push({ role: m.role, content: m.content });
+    } else if (m.role === 'assistant') {
+      const text = _chatTextParts(m.content);
+      if (text) input.push({ role: 'assistant', content: text });
+      if (Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (!tc || tc.type !== 'function' || !tc.function || typeof tc.function.name !== 'string') return { ok: false };
+          input.push({ type: 'function_call', call_id: tc.id, name: tc.function.name, arguments: typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments || {}) });
+        }
+      } else if (!text) {
+        return { ok: false };
+      }
+    } else if (m.role === 'tool') {
+      if (typeof m.tool_call_id !== 'string') return { ok: false };
+      input.push({ type: 'function_call_output', call_id: m.tool_call_id, output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? null) });
+    } else {
+      return { ok: false };
+    }
+  }
+  return { ok: true, input };
+}
+
+function chatToResponses(bodyObj) {
+  const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : [];
+  const mapped = _chatMessagesToInput(msgs);
+  let input;
+  if (mapped.ok && mapped.input.length > 0) {
+    input = mapped.input;
+  } else {
+    const lastUser = [...msgs].reverse().find(m => m && m.role === 'user');
+    input = _chatTextParts(lastUser && lastUser.content) || 'hi';
+  }
+  const want = Number(bodyObj.max_tokens || bodyObj.max_output_tokens || 500) || 500;
+  // note: reasoning models spend the output budget on thinking — small limits return empty text, keep headroom
+  const out = { model: bodyObj.model, input, max_output_tokens: Math.max(want + 512, 1024) };
+  if (bodyObj.reasoning) out.reasoning = bodyObj.reasoning;
+  if (bodyObj.tool_choice !== 'none' && Array.isArray(bodyObj.tools)) {
+    const tools = bodyObj.tools.map(_mapChatTool).filter(Boolean);
+    if (tools.length > 0) out.tools = tools;
+  }
+  const choice = _mapChatToolChoice(bodyObj.tool_choice);
+  if (choice !== undefined) out.tool_choice = choice;
+  if (bodyObj.response_format && typeof bodyObj.response_format === 'object') {
+    const rf = bodyObj.response_format;
+    if (rf.type === 'json_object') {
+      out.text = { format: { type: 'json_object' } };
+    } else if (rf.type === 'json_schema' && rf.json_schema && typeof rf.json_schema === 'object') {
+      const js = rf.json_schema;
+      const fmt = { type: 'json_schema', name: js.name || 'response', schema: js.schema || {} };
+      if (js.strict !== undefined) fmt.strict = js.strict;
+      out.text = { format: fmt };
+    }
+  }
+  if (bodyObj.temperature !== undefined) out.temperature = bodyObj.temperature;
+  if (bodyObj.top_p !== undefined) out.top_p = bodyObj.top_p;
+  return out;
+}
+
+function responsesOutputToChat(rj, clientModel) {
+  const out = rj && Array.isArray(rj.output) ? rj.output : [];
+  let text = '';
+  const toolCalls = [];
+  for (const item of out) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const c of item.content) if (c && c.type === 'output_text' && c.text) text += c.text;
+    } else if (item.type === 'function_call' && item.name) {
+      toolCalls.push({ id: item.call_id || item.id, type: 'function', function: { name: item.name, arguments: typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}) } });
+    }
+  }
+  const finish = toolCalls.length > 0 ? 'tool_calls' : (rj && rj.status === 'completed' ? 'stop' : 'length');
+  const ru = (rj && rj.usage) || {};
+  const usage = { prompt_tokens: ru.input_tokens || 0, completion_tokens: ru.output_tokens || 0, total_tokens: ru.total_tokens || (ru.input_tokens || 0) + (ru.output_tokens || 0) };
+  return { text, toolCalls, finish, usage };
+}
+
 module.exports = {
   parseJsonc,
   _jsonValid,
@@ -367,4 +482,6 @@ module.exports = {
   createEndpointResolver,
   _fetchAndConvertImages,
   setAllowedImageOrigins,
+  chatToResponses,
+  responsesOutputToChat,
 };
