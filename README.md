@@ -196,7 +196,7 @@ client 送標準 OpenAI TTS 請求即可，Gateway 依 `model` 別名自動轉�
 
 ---
 
-## API 使用
+## Client API 使用
 
 相容 OpenAI Chat Completions API：
 
@@ -210,33 +210,9 @@ curl http://localhost:3000/v1/chat/completions \
 - 陣列中的目標依序嘗試：第一個目標所有 Key 失敗 → 自動換下一個
 - 回應含 `X-Request-Id` header；非串流成功回應目前不附 `X-Provider` / `X-Upstream-Model`（僅 SSE 透傳路徑與 endpoint 轉換路徑會帶）
 
-## Hermes Agent 接入
-
-Hermes（CLI / Desktop）把本 gateway 當任意 OpenAI-compatible custom endpoint 即可，需 `/v1/chat/completions`（tools + streaming + vision 皆已透傳）：
-
-```yaml
-# ~/.hermes/config.yaml
-model:
-  default: hermes-gateway  # 對應下方 models 的別名
-  provider: custom
-  base_url: http://127.0.0.1:3000/v1
-  api_key: sk-your-client-token  # 即 gateway 的 CLIENT_TOKEN
-  context_length: 128000  # custom endpoint 需手動指定，agent 要求至少 64000
-```
-
-```json
-// gateway src/config.json
-{ "models": { "hermes-gateway": [
-  { "provider": "openai", "model": "gpt-4o" },
-  { "provider": "mistral", "model": "mistral-small-latest", "fallback": "openai" }
-] } }
-```
-
-注意：agent 重度依賴 `tool_choice: auto` 與大 system prompt，請選 tools 支援好的上游（避免 llm7 / ollama 等弱相容），並在 `model_limits` 設定正確 context 上限，gateway 會自動跳過放不下的目標。
-
 ## Model 別名範例
 
-```json
+```jsonc
 {
   "models": {
     "openai": [
@@ -251,7 +227,7 @@ model:
 
 Client 送任何不在 `models` 中的 model 名稱（例如 `"openai"`），Gateway 會依端點路徑自動從 `endpoint_fallbacks` 查到對應的 model 別名再解析：
 
-```json
+```jsonc
 {
   "endpoint_fallbacks": {
     "/v1/chat/completions":      "gpt-4o",
@@ -291,7 +267,7 @@ client 只認得一個 model 名稱，gateway 依端點決定實際路由。如�
 
 請求含圖片（`image_url`）時，Gateway 會自動將 `model` 切換到 `vision` 別名（若存在於 `models` 中）：
 
-```json
+```jsonc
 "models": {
   "vision": [
     { "provider": "openrouter", "model": "google/gemma-4-31b-it:free" },
@@ -325,7 +301,7 @@ Client 端不需要知道哪些 provider 支援 vision，只要附圖，Gateway 
 
 `/v1/images/edits`（編輯）與 `/v1/images/variations`（變體）為 multipart 端點，raw body 直接 forward 到上游。model 由 multipart body 中的 `model` 欄位決定，未指定時透過 `endpoint_fallbacks` 指定 model 別名：
 
-```json
+```jsonc
 "/v1/images/edits": "image",
 "/v1/images/variations": "image"
 ```
@@ -346,7 +322,7 @@ model 別名與 `images/generations` 共用同一 `image` 鏈即可。
 
 需在 `endpoint_fallbacks` 指定檔案儲存的上游 provider：
 
-```json
+```jsonc
 "/v1/files": "nvidia"
 ```
 

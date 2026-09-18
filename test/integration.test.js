@@ -23,6 +23,9 @@ const TOKEN = 'test-client-token';
 const KEY_JSON = 'key-json';
 const KEY_SSE = 'key-sse';
 const KEY_ERR = 'key-err';
+const KEY_OC = 'key-oc';
+const KEY_RSP = 'key-rsp';
+const KEY_RSPEMPTY = 'key-rspempty';
 const MODEL_JSON = 'chat';
 const MODEL_SSE = 'chatstream';
 const MODEL_ERR = '_err5xx';
@@ -50,11 +53,27 @@ function startMock() {
         let body = {};
         try { body = JSON.parse(Buffer.concat(chunks).toString() || '{}'); } catch {}
         const auth = req.headers['authorization'] || '';
-        mock.requests.push({ method: req.method, url: req.url, auth, body });
+        mock.requests.push({ method: req.method, url: req.url, auth, body,
+          fp: { ua: req.headers['user-agent'] || '', client: req.headers['x-opencode-client'] || '',
+            session: req.headers['x-opencode-session'] || '', request: req.headers['x-opencode-request'] || '' } });
 
         if (auth.includes(KEY_ERR)) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'upstream boom', type: 'server_error' } }));
+          return;
+        }
+        if (auth.includes(KEY_RSPEMPTY)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ id: 'resp_e', status: 'incomplete', output: [], usage: { input_tokens: 9, output_tokens: 1024, total_tokens: 1033 } }));
+          return;
+        }
+        if (auth.includes(KEY_RSP)) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.end(
+            'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"delta-text"}\n\n' +
+            'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_t","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"snap-text"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}\n\n' +
+            'data: [DONE]\n\n'
+          );
           return;
         }
         if (auth.includes(KEY_SSE)) {
@@ -96,9 +115,15 @@ function startGateway() {
           mocksse: { apiKeys: [KEY_SSE], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockerr: { apiKeys: [KEY_ERR], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           orcarouter: { apiKeys: ['key-orca'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          opencode: { apiKeys: [KEY_OC], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockrsp: { apiKeys: [KEY_RSP], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockrspempty: { apiKeys: [KEY_RSPEMPTY], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
         },
         models: {
           [MODEL_JSON]: [{ provider: 'mockjson', model: 'mock-model' }],
+          ocmock: [{ provider: 'opencode', model: 'mock-model' }],
+          rsp: [{ provider: 'mockrsp', model: 'mock-model', endpoint: '/v1/responses' }],
+          rspempty: [{ provider: 'mockrspempty', model: 'mock-model', endpoint: '/v1/responses' }],
           [MODEL_SSE]: [{ provider: 'mocksse', model: 'mock-model' }],
           [MODEL_ERR]: [{ provider: 'mockerr', model: 'mock-model' }],
           orca: [{ provider: 'orcarouter', model: 'orca-model' }],
@@ -223,6 +248,48 @@ test('chat: orcarouter provider routes to upstream with its key', async () => {
   assert.equal(r.status, 200);
   const seen = mock.requests.some((x) => x.auth.includes('key-orca') && x.body && x.body.model === 'orca-model');
   assert.ok(seen, 'orcarouter provider should forward with its own key and upstream model');
+});
+
+test('chat: opencode provider sends CLI-imitating fingerprint headers', async () => {
+  mock.requests.length = 0;
+  const r1 = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('ocmock'));
+  assert.equal(r1.status, 200);
+  const r2 = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('ocmock'));
+  assert.equal(r2.status, 200);
+  const seen = mock.requests.filter(x => x.auth.includes(KEY_OC));
+  assert.ok(seen.length >= 2, 'upstream should receive both requests');
+  for (const s of seen) {
+    assert.match(s.fp.ua, /^opencode\/latest\/\d+\.\d+/, 'UA must carry versioned opencode identity');
+    assert.equal(s.fp.client, 'tui');
+    assert.ok(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(s.fp.session), 'session must be canonical ses_shape');
+    assert.ok(s.fp.request.startsWith('req-'), 'request id should be unique per call');
+  }
+  assert.notEqual(seen[0].fp.request, seen[1].fp.request, 'request ids must differ per call');
+});
+
+test('chat: responses-override streams upstream and assembles chat completion', async () => {
+  mock.requests.length = 0;
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('rsp'));
+  assert.equal(r.status, 200);
+  const j = JSON.parse(r.body);
+  assert.equal(j.object, 'chat.completion');
+  assert.equal(j.choices[0].message.content, 'snap-text');
+  assert.equal(j.usage.prompt_tokens, 7);
+  const seen = mock.requests.find(x => x.auth.includes(KEY_RSP));
+  assert.ok(seen && seen.body && seen.body.stream === true, 'upstream must be fetched with stream:true');
+});
+
+test('chat: responses-override bumps budget once on empty incomplete then answers honest empty', async () => {
+  mock.requests.length = 0;
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('rspempty'));
+  assert.equal(r.status, 200);
+  const j = JSON.parse(r.body);
+  assert.equal(j.choices[0].message.content, '');
+  assert.equal(j.choices[0].finish_reason, 'length');
+  const seen = mock.requests.filter(x => x.auth.includes(KEY_RSPEMPTY));
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0].body.max_output_tokens, 1024);
+  assert.equal(seen[1].body.max_output_tokens, 2048);
 });
 
 test('chat: SSE stream rewrites model back to client model', async () => {

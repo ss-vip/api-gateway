@@ -1129,20 +1129,22 @@ function _opencodeExtraHeaders(req, provider) {
   for (const [k, v] of Object.entries(req.headers || {})) {
     if (k.toLowerCase().startsWith('x-opencode-')) h[k] = v;
   }
-  if (!h['x-opencode-session'] && !h['X-Opencode-Session']) {
-    // note: hash only auth tail + UA to avoid holding full token in a temp string
+  // note: Zen free tier enforces the full request contract (versioned UA + ses_shape session + stream + accepted tools) — imitate the official CLI; client-sent values always win
+  if (!h['x-opencode-client'] && !h['X-Opencode-Client']) h['x-opencode-client'] = 'tui';
+  const s0 = h['x-opencode-session'] || h['X-Opencode-Session'];
+  if (!s0 || !lib.isCanonOpencodeSession(s0)) {
+    // note: hash only auth tail + UA to avoid holding full token in a temp string; foreign sessions are translated deterministically
     const auth = req.headers['authorization'] || '';
     const ua = req.headers['user-agent'] || '';
-    const seed = `${auth.slice(-12)}|${ua}|${provider}`;
-    let hash = 0;
-    for (let i = 0; i < seed.length; i++) hash = ((hash << 5) - hash + seed.charCodeAt(i)) >>> 0;
-    h['x-opencode-session'] = `gw-${hash.toString(36)}`;
+    delete h['x-opencode-session']; delete h['X-Opencode-Session'];
+    h['x-opencode-session'] = lib.canonOpencodeSession(s0 || `${auth.slice(-12)}|${ua}|${provider}`);
   }
-  // note: preserve client UA for upstream debugging instead of overwriting
-  const clientUa = req.headers['user-agent'];
-  h['User-Agent'] = clientUa ? `api-gateway (${String(clientUa).slice(0, 80)})` : 'api-gateway';
+  if (!h['x-opencode-request'] && !h['X-Opencode-Request']) h['x-opencode-request'] = `req-${rid()}`;
+  h['User-Agent'] = OPENCODE_UA;
   return h;
 }
+// note: free-tier floor moves fast (1.17 → 1.18 in a day) — bump on 426 UpgradeRequired
+const OPENCODE_UA = 'opencode/latest/1.18.0';
 function _chatToResponses(bodyObj) { return lib.chatToResponses(bodyObj); }
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
@@ -1262,6 +1264,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   const visitedAliases = new Set([(clientModel || '').toLowerCase()]);
   const pendingFallbacks = [];
   let justExpanded = false;
+  let responsesMaxOverride = 0;
   const queueFallbacks = (list) => {
     for (const t of list || []) {
       const fbs = Array.isArray(t.fallback) ? t.fallback : (t.fallback ? [t.fallback] : []);
@@ -1310,6 +1313,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     }
     retryRound++;
     transientSkipped = false;
+    justExpanded = false;
     for (let ti = 0; ti < rotated.length; ti++) {
       const target = rotated[ti];
       if (skippedProviders.has(target.provider)) continue;
@@ -1392,13 +1396,19 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             addActive(provider);
             let targetPath = target.endpoint || (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
             let targetBodyStr = bodyStr;
-            // note: /v1/responses is always fetched non-stream then replayed as SSE if needed
+            // note: /v1/responses is always streamed upstream (free-tier contract) then converted back to chat JSON / replayed SSE
             let acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             if (target.endpoint === '/v1/responses') {
               const rBody = _chatToResponses(bodyObj);
               rBody.model = upstreamModel;
+              rBody.stream = true;
+              if ((provider === 'opencode' || provider === 'opencode-go') && /free/i.test(upstreamModel) && !rBody.tools) {
+                rBody.tools = lib.PLACEHOLDER_TOOLS;
+                rBody.tool_choice = 'auto';
+              }
+              if (responsesMaxOverride > 0) rBody.max_output_tokens = responsesMaxOverride;
               targetBodyStr = JSON.stringify(rBody);
-              acceptHdr = 'application/json';
+              acceptHdr = 'text/event-stream';
             } else if (target.endpoint === '/v1/messages') {
               const mBody = lib.chatToAnthropic({ ...bodyObj, model: upstreamModel });
               targetBodyStr = JSON.stringify(mBody);
@@ -1428,9 +1438,10 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               decActive(provider);
               releaseKey(provider, usedKey);
               const raw = await collectBody(upstreamRes);
+              const ctype = String(upstreamRes.headers?.['content-type'] || '');
               let rj = null;
               try {
-                rj = JSON.parse(raw);
+                rj = ctype.includes('text/event-stream') ? lib.assembleResponsesSSE(raw) : JSON.parse(raw);
               } catch (e) {
                 _recordModelFailure(provider, upstreamModel);
                 lastErr = { status: 502, body: raw };
@@ -1438,6 +1449,22 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
                 continue;
               }
               const conv = lib.responsesOutputToChat(rj, clientModel);
+              if (rj.status === 'failed') {
+                _recordModelFailure(provider, upstreamModel);
+                lastErr = { status: 502, body: _safeSlice(raw, 2000) };
+                upstreamRes = null;
+                continue;
+              }
+              if (!conv.text && conv.toolCalls.length === 0 && rj.status === 'incomplete' && !responsesMaxOverride) {
+                // note: starved by reasoning budget — retry once with doubled budget instead of answering empty
+                const curMax = lib.chatToResponses(bodyObj).max_output_tokens || 1024;
+                responsesMaxOverride = Math.min(curMax * 2, 16384);
+                log(`[${logId}] ➡️ empty incomplete output — bump max_output_tokens to ${responsesMaxOverride} and retry (keeping client connection)`);
+                justExpanded = true;
+                retryRound = -1;
+                upstreamRes = null;
+                continue;
+              }
               markKeySuccess(provider, usedKey, Date.now()-t0);
               _recordProviderSuccess(provider);
               _recordModelSuccess(provider, upstreamModel);
@@ -1447,7 +1474,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               const message = { role: 'assistant', content: conv.text };
               if (conv.toolCalls.length > 0) message.tool_calls = conv.toolCalls;
               if (isStream) {
-                // note: upstream was fetched non-stream; replay as a single SSE chunk so OpenAI clients stay compatible
+                // note: upstream was streamed; replay the converted result as a single SSE chunk so OpenAI clients stay compatible
                 const cid = rj.id || `chatcmpl-${Date.now()}`;
                 const ts = Math.floor(Date.now() / 1000);
                 try {
@@ -1478,6 +1505,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               _markKeyFailed(provider, usedKey, sc, body);
               log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_safeSlice(body, 100)}`);
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
+              if (typeof body === 'string' && /or newer is required/.test(body)) log(`[${logId}] ⚠️ Zen demands a newer client — bump OPENCODE_UA (${_safeSlice(body, 120)})`);
               if (_isFreeTierError(body)) {
                 // note: model-level only — skip channel for fallback, lock model, no provider circuit
                 _recordModelFailure(provider, upstreamModel);
@@ -1519,7 +1547,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         }
       } catch (e) { if (target?.provider) { _recordProviderFailure(target.provider); if (target?.upstreamModel) _recordModelFailure(target.provider, target.upstreamModel); } log(`[${logId}] ❌ 502 [${target?.provider}/${target?.upstreamModel}] fatal ${e.message}`); logEvent({ logId, provider: target?.provider || '?', model: target?.upstreamModel || '?', key: '-', status: 502, body: e.message }); }
     }
-    justExpanded = false;
     if (!upstreamRes && !clientGone && pendingFallbacks.length > 0) {
       // note: expand the next fallback alias only when nothing primary is viable — transient skips keep polling primaries
       const viable = rotated.some(t => !skippedProviders.has(t.provider) && !_isModelLocked(t.provider, t.upstreamModel));

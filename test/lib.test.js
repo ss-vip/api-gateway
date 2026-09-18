@@ -346,6 +346,51 @@ test('chatToResponses maps named tool_choice and parallel tool_calls', () => {
   ]);
 });
 
+test('canonOpencodeSession renders stable ses_shape sessions', () => {
+  const a = lib.canonOpencodeSession('seed-1');
+  const b = lib.canonOpencodeSession('seed-1');
+  const c = lib.canonOpencodeSession('seed-2');
+  assert.equal(a, b);
+  assert.notEqual(a, c);
+  assert.ok(lib.isCanonOpencodeSession(a));
+  assert.ok(lib.isCanonOpencodeSession('ses_abcdef123456AbCdEfGhIjKlMn'));
+  assert.equal(lib.isCanonOpencodeSession('gw-abc'), false);
+  assert.equal(lib.isCanonOpencodeSession('ses_short'), false);
+});
+
+test('PLACEHOLDER_TOOLS declares callable-shaped function tools', () => {
+  assert.ok(Array.isArray(lib.PLACEHOLDER_TOOLS) && lib.PLACEHOLDER_TOOLS.length >= 6);
+  for (const t of lib.PLACEHOLDER_TOOLS) {
+    assert.equal(t.type, 'function');
+    assert.ok(typeof t.name === 'string' && t.name);
+  }
+});
+
+test('assembleResponsesSSE prefers the completed snapshot', () => {
+  const sse = 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"he"}\n\n'
+    + 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"llo"}\n\n'
+    + 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_9","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}\n\n'
+    + 'data: [DONE]\n\n';
+  const rj = lib.assembleResponsesSSE(sse);
+  assert.equal(rj.id, 'resp_9');
+  assert.equal(rj.status, 'completed');
+  const conv = lib.responsesOutputToChat(rj, 'alias');
+  assert.equal(conv.text, 'hi');
+  assert.equal(conv.finish, 'stop');
+  assert.deepEqual(conv.usage, { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 });
+});
+
+test('assembleResponsesSSE falls back to deltas without completed snapshot', () => {
+  const sse = 'data: {"type":"response.output_item.added","item":{"id":"it_1","type":"function_call","call_id":"call_7","name":"read"}}\n\n'
+    + 'data: {"type":"response.function_call_arguments.delta","item_id":"it_1","delta":"{\\"p\\":"}\n\n'
+    + 'data: {"type":"response.function_call_arguments.delta","item_id":"it_1","delta":"\\"a\\"}"}\n\n';
+  const conv = lib.responsesOutputToChat(lib.assembleResponsesSSE(sse), 'alias');
+  assert.equal(conv.toolCalls.length, 1);
+  assert.equal(conv.toolCalls[0].function.name, 'read');
+  assert.equal(conv.toolCalls[0].function.arguments, '{"p":"a"}');
+  assert.equal(conv.finish, 'tool_calls');
+});
+
 test('responsesOutputToChat round-trips parallel tool calls', () => {
   const conv = lib.responsesOutputToChat({
     status: 'completed',
