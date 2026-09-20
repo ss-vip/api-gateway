@@ -297,6 +297,20 @@ Client 端不需要知道哪些 provider 支援 vision，只要附圖，Gateway 
 }
 ```
 
+## 智慧路由 Tier
+
+`smart_route` 區塊內的文字生成模型，轉發時會依照可乘載 token 量來做渠道選擇，（lite→heavy 依 `max_tokens` 排序）：
+
+```jsonc
+"smart_route": {
+  "openai": [
+    { "alias": "openai-lite", "max_tokens": 4000 },
+    { "alias": "openai",      "max_tokens": 32000 },
+    { "alias": "openai-max",  "max_tokens": 128000 }
+  ]
+}
+```
+
 ## 圖像編輯與變體
 
 `/v1/images/edits`（編輯）與 `/v1/images/variations`（變體）為 multipart 端點，raw body 直接 forward 到上游。model 由 multipart body 中的 `model` 欄位決定，未指定時透過 `endpoint_fallbacks` 指定 model 別名：
@@ -325,6 +339,20 @@ model 別名與 `images/generations` 共用同一 `image` 鏈即可。
 ```jsonc
 "/v1/files": "nvidia"
 ```
+
+## 決策模型
+
+`/v1/classifier` 帶有快取機制的零樣本文字分類服務（Jev 決策模型，只分類不生成），回傳最貼切的 label 與信心分數。
+
+預設為 [classifier](https://classifier.dev)，`api_key` 留空即可免費用，或更換 `base_url`自建相容端點。
+
+```bash
+curl http://localhost:3000/v1/classifier \
+  -H "Authorization: Bearer $CLIENT_TOKEN" \
+  -d '{"texts":["the checkout button does nothing"],"labels":["bug","feature","praise"]}'
+```
+
+多決策上游時 body 可帶 `model` 指定別名（如 `{ "model": "jev", ... }`，走該別名首個目標的 baseUrl＋key，key 可空；省略則走 `classifier` 段）。快取指紋含上游，不同上游不串味。舊路徑 `/v1/classify` 保留為別名。
 
 ## Repobeats analytics
 

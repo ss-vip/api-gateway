@@ -264,7 +264,7 @@
     let _token = localStorage.getItem('gw_token') || '', _cmInit = false, cmConfig, cmLog, _rawLog = '', _evtSource = null, _lastStatus = null;
     const _esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     let _charts = { httpCodes: null, latency: null, keys: null };
-    const DEFAULT_CONFIG = JSON.stringify({ client_token: '', port: 3000, timeout: 600000, key_cooldown: 30000, max_key_backoff: 300000, max_body_size: 10485760, log: { enabled: true, retention_days: 7, path: './log.json' }, providers: {}, rate_limit: {}, tpm_limit: {}, model_limits: {}, endpoint_fallbacks: {}, models: {} }, null, 2);
+    const DEFAULT_CONFIG = JSON.stringify({ client_token: '', port: 3000, timeout: 600000, key_cooldown: 30000, max_key_backoff: 300000, max_body_size: 10485760, log: { enabled: true, retention_days: 7, path: './log.json' }, providers: {}, rate_limit: {}, tpm_limit: {}, model_limits: {}, endpoint_fallbacks: {}, models: {}, smart_route: {}, classifier: {} }, null, 2);
     (function () { const t = localStorage.getItem('bsTheme'); if (t) { document.documentElement.setAttribute('data-bs-theme', t); const b = document.getElementById('themeBtn'); if (b) b.innerHTML = t === 'dark' ? '<i class="bi bi-moon-fill"></i>' : '<i class="bi bi-sun-fill"></i>' } })();
     if (_token) showOverlay();
     function _cmTheme() { return document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'monokai' : 'eclipse' }

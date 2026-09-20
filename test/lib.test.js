@@ -448,3 +448,121 @@ test('chatToAnthropic falls back to last user text when empty', () => {
   assert.equal(out.messages[0].role, 'user');
   assert.equal(out.max_tokens, 1024);
 });
+
+test('assembleResponsesSSE backfills function_call from output_item.done', () => {
+  const sse = 'data: {"type":"response.output_item.done","item":{"id":"it_9","type":"function_call","call_id":"call_9","name":"bash","arguments":"{\\"cmd\\":\\"ls\\"}"}}\n\n'
+    + 'data: {"type":"response.completed","response":{"id":"resp_d","status":"completed","output":[],"usage":{}}}\n\n';
+  const conv = lib.responsesOutputToChat(lib.assembleResponsesSSE(sse), 'alias');
+  assert.equal(conv.toolCalls.length, 1);
+  assert.equal(conv.toolCalls[0].function.name, 'bash');
+  assert.equal(conv.toolCalls[0].function.arguments, '{"cmd":"ls"}');
+});
+
+// ---------------------------------------------------------------------------
+// smart routing helpers
+// ---------------------------------------------------------------------------
+test('buildNonChatAliases derives audio/image families from endpoint_fallbacks', () => {
+  const s = lib.buildNonChatAliases({
+    '/v1/chat/completions': 'openai',
+    '/v1/audio/speech': 'TTS',
+    '/v1/images/generations': 'image',
+  });
+  assert.equal(s.has('openai'), false);
+  assert.equal(s.has('tts'), true);
+  assert.equal(s.has('image'), true);
+  assert.deepEqual(lib.buildNonChatAliases(null), new Set());
+});
+
+test('pickTier returns first fit, largest fallback, null on empty', () => {
+  const tiers = [{ alias: 'lite', max_tokens: 4000 }, { alias: 'std', max_tokens: 32000 }];
+  assert.equal(lib.pickTier(tiers, 100).alias, 'lite');
+  assert.equal(lib.pickTier(tiers, 4000).alias, 'lite');
+  assert.equal(lib.pickTier(tiers, 4001).alias, 'std');
+  assert.equal(lib.pickTier(tiers, 999999).alias, 'std');
+  assert.equal(lib.pickTier([], 10), null);
+});
+
+test('classifyTexts posts classifier.dev shape, truncates, surfaces 429', async () => {
+  const http = require('http');
+  let seen = null;
+  const srv = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => (b += c));
+    req.on('end', () => {
+      seen = JSON.parse(b);
+      if (req.headers['x-force-429']) { res.writeHead(429, { 'retry-after': '2' }); res.end('{}'); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ results: [{ label: 'bug', confidence: 0.9 }] }));
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const out = await lib.classifyTexts({ baseUrl: base, tier: 'fast', timeoutMs: 3000, maxChars: 100 },
+      { labels: ['bug', 'feature'], inputs: ['x'.repeat(3000)] });
+    assert.equal(out.results[0].label, 'bug');
+    assert.ok(seen.inputs[0].length <= 100, 'input must be truncated to maxChars');
+    assert.equal(seen.tier, 'fast');
+    await assert.rejects(
+      lib.classifyTexts({ baseUrl: base }, { labels: ['only-one'], inputs: ['hi'] }),
+      /2\+ labels/
+    );
+    // 429 path needs a header hook — emulate via direct fetch here
+    const r429 = await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-force-429': '1' }, body: '{}' });
+    assert.equal(r429.status, 429);
+  } finally {
+    srv.close();
+  }
+});
+
+test('classifyTexts maps 429 to classifier_429 code', async () => {
+  const http = require('http');
+  const srv = http.createServer((req, res) => { res.writeHead(429, { 'retry-after': '5' }); res.end('{}'); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    await assert.rejects(
+      lib.classifyTexts({ baseUrl: `http://127.0.0.1:${srv.address().port}` }, { labels: ['a', 'b'], inputs: ['hi'] }),
+      (e) => e.code === 'classifier_429' && e.retryAfter === '5'
+    );
+  } finally {
+    srv.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// bounded memoizer
+// ---------------------------------------------------------------------------
+test('createMemoCache hits, expires by TTL, reports stats', () => {
+  const c = lib.createMemoCache({ maxEntries: 10, maxBytes: 1024, ttlMs: 1000 });
+  assert.equal(c.get('a', 0), undefined);
+  assert.equal(c.set('a', { v: 1 }, 0), true);
+  assert.deepEqual(c.get('a', 500), { v: 1 });
+  assert.equal(c.get('a', 1001), undefined, 'expired entries miss');
+  const s = c.stats();
+  assert.equal(s.hits, 1);
+  assert.equal(s.misses, 2);
+  assert.equal(s.entries, 0);
+});
+
+test('createMemoCache evicts oldest-first on count and byte caps', () => {
+  const c = lib.createMemoCache({ maxEntries: 2, maxBytes: 1 << 20, ttlMs: 60000 });
+  c.set('a', { v: 'a' }, 0); c.set('b', { v: 'b' }, 0);
+  c.get('a', 1); // touch a → b is oldest
+  c.set('c', { v: 'c' }, 0);
+  assert.deepEqual(c.get('b', 2), undefined);
+  assert.deepEqual(c.get('a', 2), { v: 'a' });
+
+  const small = lib.createMemoCache({ maxEntries: 1000, maxBytes: 50, ttlMs: 60000 });
+  assert.equal(small.set('x', { v: 'x' }, 0), true); // 10 bytes
+  assert.equal(small.set('y', { v: 'y'.repeat(35) }, 0), true); // 45 bytes: evicts x, then fits
+  assert.equal(small.stats().entries, 1, 'byte cap evicts oldest until fit');
+  assert.deepEqual(small.get('x', 1), undefined);
+  assert.deepEqual(small.get('y', 1).v, 'y'.repeat(35));
+  assert.equal(small.set('huge', { v: 'z'.repeat(1000) }, 0), false, 'single entry larger than cap is rejected');
+});
+
+test('createMemoCache with zero caps acts disabled', () => {
+  const c = lib.createMemoCache({ maxEntries: 0, maxBytes: 0, ttlMs: 60000 });
+  assert.equal(c.set('a', 1, 0), false);
+  assert.equal(c.get('a', 0), undefined);
+});

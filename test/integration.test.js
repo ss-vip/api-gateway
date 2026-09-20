@@ -57,6 +57,15 @@ function startMock() {
           fp: { ua: req.headers['user-agent'] || '', client: req.headers['x-opencode-client'] || '',
             session: req.headers['x-opencode-session'] || '', request: req.headers['x-opencode-request'] || '' } });
 
+        // classifier.dev shape (free-mode: no auth) — label by marker, else by labels
+        if (body && Array.isArray(body.inputs) && Array.isArray(body.labels)) {
+          const txt = String(body.inputs[0] || '');
+          const lb = body.labels.map(String);
+          const label = txt.includes('XYZZY-ABUSE') ? 'abuse' : lb.includes('complex') ? 'complex' : lb[0];
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ tier: 'fast', model: 'jev-test', results: [{ label, confidence: 0.95, scores: {} }], usage: { classifications: body.inputs.length } }));
+          return;
+        }
         if (auth.includes(KEY_ERR)) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: { message: 'upstream boom', type: 'server_error' } }));
@@ -118,7 +127,30 @@ function startGateway() {
           opencode: { apiKeys: [KEY_OC], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockrsp: { apiKeys: [KEY_RSP], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockrspempty: { apiKeys: [KEY_RSPEMPTY], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          tierlite: { apiKeys: ['key-lite'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          tierheavy: { apiKeys: ['key-heavy'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          trisemlite: { apiKeys: ['key-semlite'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          trisemheavy: { apiKeys: ['key-semheavy'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockcls2: { apiKeys: ['key-cls2'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mocklow: { apiKeys: ['key-low'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockvis: { apiKeys: ['key-vis'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mocknc: { apiKeys: ['key-nc'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
         },
+        model_limits: { 'mocklow/m': 100 },
+        endpoint_fallbacks: { '/v1/audio/speech': 'notchat' },
+        smart_route: {
+          tri: [
+            { alias: 'tri-lite', max_tokens: 4000 },
+            { alias: 'tri-heavy', max_tokens: 128000 },
+          ],
+          trisem: {
+            tiers: [
+              { alias: 'trisem-lite', max_tokens: 4000 },
+              { alias: 'trisem-heavy', max_tokens: 128000 },
+            ],
+          },
+        },
+        classifier: { base_url: `http://127.0.0.1:${mockPort}`, timeout_ms: 3000 },
         models: {
           [MODEL_JSON]: [{ provider: 'mockjson', model: 'mock-model' }],
           ocmock: [{ provider: 'opencode', model: 'mock-model' }],
@@ -129,6 +161,16 @@ function startGateway() {
           orca: [{ provider: 'orcarouter', model: 'orca-model' }],
           fbchain: [{ provider: 'mockerr', model: 'mock-model', fallback: MODEL_JSON }],
           fbself: [{ provider: 'mockerr', model: 'mock-model', fallback: 'fbself' }],
+          'tri-lite': [{ provider: 'tierlite', model: 'mock-model' }],
+          'tri-heavy': [{ provider: 'tierheavy', model: 'mock-model' }],
+          tri: [{ provider: 'tierlite', model: 'mock-model' }],
+          'trisem-lite': [{ provider: 'trisemlite', model: 'mock-model' }],
+          'trisem-heavy': [{ provider: 'trisemheavy', model: 'mock-model' }],
+          trisem: [{ provider: 'trisemlite', model: 'mock-model' }],
+          clsalt: [{ provider: 'mockcls2', model: 'alt-decidermodel' }],
+          low: [{ provider: 'mocklow', model: 'm' }],
+          vision: [{ provider: 'mockvis', model: 'mock-model' }],
+          notchat: [{ provider: 'mocknc', model: 'mock-model' }],
         },
       };
       fs.writeFileSync(cfgPath, JSON.stringify(cfg));
@@ -290,6 +332,103 @@ test('chat: responses-override bumps budget once on empty incomplete then answer
   assert.equal(seen.length, 2);
   assert.equal(seen[0].body.max_output_tokens, 1024);
   assert.equal(seen[1].body.max_output_tokens, 2048);
+});
+
+test('chat: smart_route picks lite tier for small prompts', async () => {
+  mock.requests.length = 0;
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('tri', { max_tokens: 10 }));
+  assert.equal(r.status, 200);
+  assert.ok(mock.requests.some((x) => x.auth.includes('key-lite')), 'small prompt should hit lite tier');
+});
+
+test('chat: smart_route picks heavy tier for large prompts', async () => {
+  mock.requests.length = 0;
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('tri', { max_tokens: 50000 }));
+  assert.equal(r.status, 200);
+  assert.ok(mock.requests.some((x) => x.auth.includes('key-heavy')), 'large prompt should hit heavy tier');
+});
+
+test('chat: smart_route object-form family also picks tiers', async () => {
+  mock.requests.length = 0;
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('trisem', { max_tokens: 10 }));
+  assert.equal(r.status, 200);
+  assert.ok(mock.requests.some((x) => x.auth.includes('key-semlite')), 'small prompt should hit lite tier');
+});
+
+test('POST /v1/classifier relays to classifier upstream', async () => {
+  const r = await req(
+    { method: 'POST', path: '/v1/classifier', headers: authH() },
+    { texts: ['the checkout button does nothing'], labels: ['bug', 'feature', 'praise'] }
+  );
+  assert.equal(r.status, 200);
+  const j = JSON.parse(r.body);
+  assert.equal(j.results[0].label, 'bug');
+});
+
+test('POST /v1/classifier serves repeats from memo without upstream', async () => {
+  mock.requests.length = 0;
+  const body = { texts: ['memo probe unique line 42'], labels: ['bug', 'feature'] };
+  const r1 = await req({ method: 'POST', path: '/v1/classifier', headers: authH() }, body);
+  assert.equal(r1.status, 200);
+  assert.equal(JSON.parse(r1.body).cached, false);
+  const r2 = await req({ method: 'POST', path: '/v1/classifier', headers: authH() }, body);
+  assert.equal(r2.status, 200);
+  assert.equal(JSON.parse(r2.body).cached, true);
+  const upstreamHits = mock.requests.filter((x) => x.body && Array.isArray(x.body.inputs));
+  assert.equal(upstreamHits.length, 1, 'second identical call must not reach upstream');
+});
+
+test('POST /v1/classifier routes by model and isolates memo per upstream', async () => {
+  mock.requests.length = 0;
+  const body = { model: 'clsalt', texts: ['model routing probe sentence'], labels: ['bug', 'feature'] };
+  const r = await req({ method: 'POST', path: '/v1/classifier', headers: authH() }, body);
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(r.body).cached, false);
+  assert.ok(mock.requests.some((x) => x.auth.includes('key-cls2')), 'must reach the alias upstream');
+  // same texts/labels via default upstream must NOT share the memo entry
+  const r2 = await req({ method: 'POST', path: '/v1/classifier', headers: authH() },
+    { texts: ['model routing probe sentence'], labels: ['bug', 'feature'] });
+  assert.equal(r2.status, 200);
+  assert.equal(JSON.parse(r2.body).cached, false);
+  const bad = await req({ method: 'POST', path: '/v1/classifier', headers: authH() },
+    { model: 'no-such-alias', texts: ['hi there'], labels: ['a', 'b'] });
+  assert.equal(bad.status, 400);
+});
+
+test('POST /v1/classify alias still reaches the same relay', async () => {
+  const r = await req(
+    { method: 'POST', path: '/v1/classify', headers: authH() },
+    { texts: ['alias path probe line'], labels: ['bug', 'feature'] }
+  );
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(r.body).results[0].label, 'bug');
+});
+
+test('POST /v1/classifier rejects bad input and missing auth', async () => {
+  const bad = await req(
+    { method: 'POST', path: '/v1/classifier', headers: authH() },
+    { texts: ['hi'], labels: ['only-one'] }
+  );
+  assert.equal(bad.status, 400);
+  const noauth = await req(
+    { method: 'POST', path: '/v1/classifier', headers: { 'Content-Type': 'application/json' } },
+    { texts: ['hi'], labels: ['a', 'b'] }
+  );
+  assert.equal(noauth.status, 401);
+});
+
+test('chat: vision-routed request never overflows onto audio aliases', async () => {
+  mock.requests.length = 0;
+  const r = await req(
+    { method: 'POST', path: '/v1/chat/completions', headers: authH() },
+    { model: 'low', messages: [{ role: 'user', content: [
+      { type: 'text', text: 'what is this' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+    ] }] }
+  );
+  assert.equal(r.status, 200);
+  assert.ok(mock.requests.some((x) => x.auth.includes('key-vis')), 'image request must stay on vision');
+  assert.ok(!mock.requests.some((x) => x.auth.includes('key-nc')), 'must not wander onto audio alias');
 });
 
 test('chat: SSE stream rewrites model back to client model', async () => {

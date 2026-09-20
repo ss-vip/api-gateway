@@ -592,6 +592,9 @@ function assembleResponsesSSE(sse) {
       } else if (ty === 'response.function_call_arguments.delta' && ev.item_id && typeof ev.delta === 'string') {
         const c = calls.get(ev.item_id);
         if (c) c.args += ev.delta;
+      } else if (ty === 'response.output_item.done' && ev.item && ev.item.type === 'function_call') {
+        // note: some servers send the full call here instead of deltas — backfill only untracked ids
+        if (!calls.has(ev.item.id)) calls.set(ev.item.id, { call_id: ev.item.call_id || ev.item.id, name: ev.item.name || '', args: typeof ev.item.arguments === 'string' ? ev.item.arguments : '' });
       } else if ((ty === 'response.completed' || ty === 'response.failed' || ty === 'response.incomplete') && ev.response) {
         const r = ev.response;
         if (r.id) rj.id = r.id;
@@ -608,6 +611,101 @@ function assembleResponsesSSE(sse) {
     rj.output = out;
   }
   return rj;
+}
+
+// --- smart routing helpers (pure) ---
+const CHAT_FAMILY_ENDPOINTS = ['/v1/chat/completions', '/v1/responses', '/v1/messages'];
+// note: legacy global overflow must not land on audio/image aliases — derive non-chat
+// families from endpoint_fallbacks values (config-driven, no new metadata)
+function buildNonChatAliases(endpointFallbacks, chatEndpoints = CHAT_FAMILY_ENDPOINTS) {
+  const out = new Set();
+  for (const [ep, alias] of Object.entries(endpointFallbacks || {})) {
+    if (typeof alias !== 'string' || !alias) continue;
+    if (!chatEndpoints.includes(ep)) out.add(alias.toLowerCase());
+  }
+  return out;
+}
+// note: tiers sorted ascending by max_tokens — first fit wins, none fit → largest (let targetCtx skip decide)
+function pickTier(tiers, totalEst) {
+  if (!Array.isArray(tiers) || tiers.length === 0) return null;
+  for (const t of tiers) {
+    if (t && typeof t.max_tokens === 'number' && totalEst <= t.max_tokens) return t;
+  }
+  return tiers[tiers.length - 1];
+}
+
+// --- bounded TTL memoizer (in-process; hard memory cap, PM2-safe by construction) ---
+// note: worst-case memory = min(maxEntries × avg entry, maxBytes) + map overhead.
+// defaults (2000 entries / 8MB) sit ~3% below a 256MB heap cap — it cannot move total RSS
+// meaningfully, and three outer guards still apply: V8 --max-old-space-size, in-app
+// MEM_LIMIT_MB (exit 1), PM2 --max-memory-restart. Expired entries are purged lazily.
+function createMemoCache({ maxEntries = 2000, maxBytes = 8 * 1024 * 1024, ttlMs = 3600000 } = {}) {
+  const map = new Map(); // fp -> { value, exp, bytes } (insertion order = oldest first)
+  let bytes = 0, hits = 0, misses = 0, sets = 0;
+  function purge(now) {
+    for (const [k, e] of map) {
+      if (e.exp <= now) { bytes -= e.bytes; map.delete(k); }
+    }
+  }
+  return {
+    get(fp, now = Date.now()) {
+      const e = map.get(fp);
+      if (!e) { misses++; return undefined; }
+      if (e.exp <= now) { bytes -= e.bytes; map.delete(fp); misses++; return undefined; }
+      map.delete(fp); map.set(fp, e); // LRU touch
+      hits++;
+      return e.value;
+    },
+    set(fp, value, now = Date.now()) {
+      if (maxEntries <= 0 || maxBytes <= 0) return false;
+      let json;
+      try { json = typeof value === 'string' ? value : JSON.stringify(value); } catch { return false; }
+      if (json == null) return false;
+      const b = fp.length + Buffer.byteLength(json);
+      if (b > maxBytes) return false; // single entry can never fit — don't cache
+      const old = map.get(fp);
+      if (old) { bytes -= old.bytes; map.delete(fp); }
+      if (++sets % 100 === 0) purge(now);
+      for (const [k, e] of map) {
+        if (map.size < maxEntries && bytes + b <= maxBytes) break;
+        bytes -= e.bytes; map.delete(k);
+      }
+      map.set(fp, { value, exp: now + ttlMs, bytes: b });
+      bytes += b;
+      return true;
+    },
+    stats() { return { hits, misses, entries: map.size, bytes }; },
+  };
+}
+
+// --- classifier.dev relay client (passive upstream adapter — this throws, caller maps errors) ---
+async function classifyTexts({ baseUrl, apiKey, tier = 'fast', timeoutMs = 15000, maxChars = 2000 } = {}, { labels, inputs } = {}) {
+  if (typeof fetch === 'undefined') throw new Error('fetch unavailable (Node 18+ required)');
+  if (!Array.isArray(labels) || labels.length < 2) throw new Error('classify requires 2+ labels');
+  if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('classify requires 1+ inputs');
+  const base = String(baseUrl || 'https://classifier.dev').replace(/\/+$/, '');
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  const clipped = inputs.map(s => String(s ?? '').slice(0, maxChars));
+  const r = await fetch(base, {
+    method: 'POST', headers,
+    body: JSON.stringify({ inputs: clipped, labels, tier }),
+    signal: AbortSignal.timeout(timeoutMs),
+    redirect: 'error',
+  });
+  const body = await r.text();
+  if (r.status === 429) {
+    const e = new Error('classifier rate limited');
+    e.code = 'classifier_429';
+    e.retryAfter = r.headers.get('retry-after');
+    throw e;
+  }
+  if (!r.ok) {
+    const e = new Error(`classifier upstream ${r.status}: ${body.slice(0, 200)}`);
+    e.code = `classifier_${r.status}`;
+    throw e;
+  }
+  return JSON.parse(body);
 }
 
 module.exports = {
@@ -640,4 +738,9 @@ module.exports = {
   isCanonOpencodeSession,
   PLACEHOLDER_TOOLS,
   assembleResponsesSSE,
+  CHAT_FAMILY_ENDPOINTS,
+  buildNonChatAliases,
+  pickTier,
+  createMemoCache,
+  classifyTexts,
 };

@@ -78,6 +78,7 @@ function _buildStatusJSON() {
     avg_latency_ms: stats.latN ? Math.round(stats.latSum / stats.latN) : 0,
     error_rate: totalReq ? (stats.error / totalReq * 100).toFixed(1) + '%' : '0%',
     http_codes: { ...stats.httpCodes },
+    cls_memo: CLS_MEMO_ON ? _clsMemo.stats() : { disabled: true },
     recent401: [..._recent401.values()].map(e => ({ provider: e.provider, model: e.model, key: logKey(e.key), ts: _ts(e.ts) })),
   };
 }
@@ -204,7 +205,7 @@ if (cfg && typeof cfg === 'object') {
   const KNOWN_CONFIG_KEYS = new Set([
     '_note', 'client_token', 'timezone', 'port', 'timeout', 'key_cooldown', 'max_key_backoff', 'max_body_size', 'quota_backoff',
     'model_lockout', 'circuit_breaker', 'provider_concurrency', 'log', 'providers', 'rate_limit', 'tpm_limit', 'model_limits', 'endpoint_fallbacks', 'models', 'models_aliases',
-    'allowed_image_origins'
+    'allowed_image_origins', 'smart_route', 'classifier'
   ]);
   for (const k of Object.keys(cfg)) {
     if (!KNOWN_CONFIG_KEYS.has(k)) elog(`⚠️ [config] unknown top-level key: "${k}"`);
@@ -780,6 +781,47 @@ function rebuildTokenOrder() {
 }
 rebuildTokenOrder();
 
+// note: smart_route families pin overflow inside an explicit tier chain (lite→heavy),
+// so a big chat prompt can no longer land on audio/image aliases via global overflow.
+// shape: "alias": [{alias, max_tokens}]  or  "alias": {tiers: [...], classify: {labels, pin, threshold, min_chars}}
+const SMART_ROUTE = new Map();
+for (const [name, raw] of Object.entries(cfg.smart_route || {})) {
+  if (name.startsWith('_')) continue;
+  const tiers = Array.isArray(raw) ? raw : raw?.tiers;
+  if (typeof name !== 'string' || !Array.isArray(tiers)) { elog(`⚠️ [config] smart_route "${name}" must map to a tier array or {tiers, classify} — ignored`); continue; }
+  const clean = tiers
+    .filter(t => t && typeof t.alias === 'string' && typeof t.max_tokens === 'number' && t.max_tokens > 0)
+    .sort((a, b) => a.max_tokens - b.max_tokens);
+  if (clean.length === 0) { elog(`⚠️ [config] smart_route "${name}" has no valid tiers — ignored`); continue; }
+  for (const t of clean) {
+    if (!MODELS[t.alias] && !Object.keys(MODELS).some(k => k.toLowerCase() === t.alias.toLowerCase())) {
+      elog(`⚠️ [config] smart_route "${name}" tier alias "${t.alias}" not found in models`);
+    }
+  }
+  if (!Array.isArray(raw) && raw && typeof raw.classify === 'object') {
+    elog(`⚠️ [config] smart_route "${name}".classify was removed — use POST /v1/classifier instead`);
+  }
+  SMART_ROUTE.set(name.toLowerCase(), { tiers: clean });
+}
+// note: legacy overflow skips aliases claimed by non-chat endpoint_fallbacks (tts/stt/image/…)
+const NON_CHAT_ALIASES = lib.buildNonChatAliases(ENDPOINT_FALLBACKS);
+
+// --- classifier.dev as a passive upstream (POST /v1/classifier relay, /v1/classify alias; key optional) ---
+// note: the gateway never calls it on its own — clients/agents decide when to classify
+const CLASSIFIER = cfg.classifier || {};
+// note: memoizer budget (default 2000 entries / 8MB / 1h TTL) is a fixed ceiling, not a
+// growth curve — see createMemoCache. Outer guards unchanged: V8 --max-old-space-size=256,
+// MEM_LIMIT_MB rss guard (exit 1), PM2 --max-memory-restart 300M (see README PM2 section).
+const _clsMemo = lib.createMemoCache({
+  maxEntries: CLASSIFIER.cache?.max_entries ?? 2000,
+  maxBytes: CLASSIFIER.cache?.max_bytes ?? 8 * 1024 * 1024,
+  ttlMs: CLASSIFIER.cache?.ttl_ms ?? 3600000,
+});
+const CLS_MEMO_ON = CLASSIFIER.cache?.enabled !== false;
+if (CLASSIFIER.enabled === true || CLASSIFIER.moderation) {
+  elog('⚠️ [config] classifier.enabled/moderation were removed — in-request classification is gone; use POST /v1/classifier instead');
+}
+
 function estimateStrTokens(str) { return lib.estimateStrTokens(str); }
 function estimateTokens(messages) { return lib.estimateTokens(messages); }
 
@@ -1143,8 +1185,8 @@ function _opencodeExtraHeaders(req, provider) {
   h['User-Agent'] = OPENCODE_UA;
   return h;
 }
-// note: free-tier floor moves fast (1.17 → 1.18 in a day) — bump on 426 UpgradeRequired
-const OPENCODE_UA = 'opencode/latest/1.18.0';
+// note: free-tier floor moves fast (1.17 → 1.18 in a day) — override via OPENCODE_UA env on 426 UpgradeRequired
+const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/1.18.31';
 function _chatToResponses(bodyObj) { return lib.chatToResponses(bodyObj); }
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
@@ -1212,18 +1254,33 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
     res.end(JSON.stringify({ error: { message: `model '${clientModel}' not supported`, type: 'unsupported_model' } }));
     return;
   }
-    if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
+  // note: vision-switched requests never leave the vision family (overflow used to drop images onto text aliases)
+  let visionRouted = false;
+  if (_hasNonTextContent(bodyJson.messages) && targets && 'vision' !== clientModel) {
     const vt = resolveModel('vision');
-    if (vt) { log(`[${logId}] ➡️ ${clientModel} → vision  (non-text content detected)`); targets = vt; }
+    if (vt) { log(`[${logId}] ➡️ ${clientModel} → vision  (non-text content detected)`); targets = vt; visionRouted = true; }
   }
 
   const est = estimateTokens(bodyJson.messages);
   const maxOut = bodyJson.max_tokens || 4096;
   const totalEst = est + maxOut;
-  if (TOKEN_ORDER.length > 0) {
+  const routeKey = (visionRouted ? 'vision' : clientModel).toLowerCase();
+  const fam = SMART_ROUTE.get(routeKey);
+  if (fam && fam.tiers.length > 0) {
+    const tier = lib.pickTier(fam.tiers, totalEst);
+    if (tier && tier.alias.toLowerCase() !== routeKey) {
+      const nt = resolveModel(tier.alias);
+      if (nt) {
+        log(`[${logId}] ➡️ ${clientModel} → ${tier.alias}  (prompt=${est}, max_out=${maxOut}, total=${totalEst}, tier≤${tier.max_tokens})`);
+        targets = nt;
+      }
+    }
+  } else if (!visionRouted && TOKEN_ORDER.length > 0) {
     const clientLimit = getAliasLimit(clientModel);
     if (totalEst > clientLimit) {
       for (const alias of TOKEN_ORDER) {
+        // note: never overflow onto audio/image aliases — explicit request for them still works, wandering does not
+        if (alias.toLowerCase() !== clientModel.toLowerCase() && NON_CHAT_ALIASES.has(alias.toLowerCase())) continue;
         const newTargets = resolveModel(alias);
         if (!newTargets) continue;
         const limit = getAliasLimit(alias);
@@ -1265,6 +1322,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
   const pendingFallbacks = [];
   let justExpanded = false;
   let responsesMaxOverride = 0;
+  let responsesMaxTarget = '';
   const queueFallbacks = (list) => {
     for (const t of list || []) {
       const fbs = Array.isArray(t.fallback) ? t.fallback : (t.fallback ? [t.fallback] : []);
@@ -1405,8 +1463,9 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               if ((provider === 'opencode' || provider === 'opencode-go') && /free/i.test(upstreamModel) && !rBody.tools) {
                 rBody.tools = lib.PLACEHOLDER_TOOLS;
                 rBody.tool_choice = 'auto';
+                log(`[${logId}] ➡️ [${provider}/${upstreamModel}] free-tier gate: injected ${lib.PLACEHOLDER_TOOLS.length} placeholder tools`);
               }
-              if (responsesMaxOverride > 0) rBody.max_output_tokens = responsesMaxOverride;
+              if (responsesMaxOverride > 0 && responsesMaxTarget === `${provider}/${upstreamModel}`) rBody.max_output_tokens = responsesMaxOverride;
               targetBodyStr = JSON.stringify(rBody);
               acceptHdr = 'text/event-stream';
             } else if (target.endpoint === '/v1/messages') {
@@ -1459,6 +1518,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
                 // note: starved by reasoning budget — retry once with doubled budget instead of answering empty
                 const curMax = lib.chatToResponses(bodyObj).max_output_tokens || 1024;
                 responsesMaxOverride = Math.min(curMax * 2, 16384);
+                responsesMaxTarget = `${provider}/${upstreamModel}`;
                 log(`[${logId}] ➡️ empty incomplete output — bump max_output_tokens to ${responsesMaxOverride} and retry (keeping client connection)`);
                 justExpanded = true;
                 retryRound = -1;
@@ -2126,6 +2186,74 @@ async function handleConsoleProbe(req, res, body, logId) {
     res.end(JSON.stringify({ ok: false, status: 0, error: e.message }));
   }
 }
+// note: decision-model relay — clients/agents call it explicitly (as an HTTP tool);
+// the gateway only relays. `model` selects the upstream (models alias or
+// endpoint_fallbacks["/v1/classifier"] (legacy "/v1/classify" also read); omitted = classifier section. Key optional.
+async function handleClassifyRelay(req, res, body, logId) {
+  log('─'); log(`[${logId}] /v1/classifier`);
+  const texts = Array.isArray(body?.texts) ? body.texts : (Array.isArray(body?.inputs) ? body.inputs : null);
+  const labels = Array.isArray(body?.labels) ? body.labels : null;
+  if (!texts || texts.length === 0 || !labels || labels.length < 2) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'texts[] (1-50) and labels[] (2+) required', type: 'invalid_request' } }));
+    return;
+  }
+  if (texts.length > 50) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'max 50 texts per call', type: 'invalid_request' } }));
+    return;
+  }
+  let baseUrl = CLASSIFIER.base_url, apiKey = CLASSIFIER.api_key, upDesc = 'classifier';
+  if (body?.model) {
+    const t = resolveModelForEndpoint(body.model, '/v1/classifier')?.[0];
+    if (!t || !DIRECT_PROVIDERS[t.provider]) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: `model '${body.model}' not supported`, type: 'invalid_request' } }));
+      return;
+    }
+    baseUrl = DIRECT_PROVIDERS[t.provider];
+    apiKey = (PROVIDER_KEYS[t.provider] || [])[0] || '';
+    upDesc = `${t.provider}/${t.upstreamModel}`;
+  } else {
+    const t = resolveModelForEndpoint(null, '/v1/classifier')?.[0]
+      || resolveModelForEndpoint(null, '/v1/classify')?.[0];
+    if (t && DIRECT_PROVIDERS[t.provider]) {
+      baseUrl = DIRECT_PROVIDERS[t.provider];
+      apiKey = (PROVIDER_KEYS[t.provider] || [])[0] || '';
+      upDesc = `${t.provider}/${t.upstreamModel}`;
+    }
+  }
+  const maxChars = CLASSIFIER.max_chars || 2000;
+  const clipped = texts.map((t) => String(t ?? '').slice(0, maxChars));
+  const fp = CLS_MEMO_ON
+    ? crypto.createHash('sha256').update(JSON.stringify({ u: upDesc, l: labels.map(String), t: clipped })).digest('hex')
+    : null;
+  if (fp) {
+    const hit = _clsMemo.get(fp);
+    if (hit !== undefined) {
+      log(`[${logId}] ✅ 200 /v1/classifier [${upDesc}] (${texts.length} texts, memo hit)`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ...hit, cached: true }));
+      return;
+    }
+  }
+  try {
+    const out = await lib.classifyTexts(
+      { baseUrl, apiKey, tier: 'fast', timeoutMs: CLASSIFIER.timeout_ms || 15000, maxChars },
+      { labels, inputs: clipped }
+    );
+    if (fp) _clsMemo.set(fp, out);
+    log(`[${logId}] ✅ 200 /v1/classifier [${upDesc}] (${texts.length} texts)`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...out, cached: false }));
+    return;
+  } catch (e) {
+    const sc = e && e.code === 'classifier_429' ? 429 : 502;
+    log(`[${logId}] ${_statusIcon(sc)} ${sc} /v1/classifier ${e.message}`);
+    res.writeHead(sc, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: e.message, type: 'classifier_error', code: e.code || 'classifier_error' } }));
+  }
+}
 function _ensureSSETimer() {
   if (_sseTimer) return;
   _sseTimer = setInterval(() => {
@@ -2174,10 +2302,12 @@ function isJsonEndpoint(url) {
          url.startsWith('/v1/rerank') ||
          url.startsWith('/v1/responses') ||
          url.startsWith('/v1/messages') ||
-           url === '/api/console/validate' ||
-           url === '/api/console/save' ||
-           url === '/api/console/retry401' ||
-           url === '/api/console/probe';
+         url.startsWith('/v1/classify') ||
+         url.startsWith('/v1/classifier') ||
+            url === '/api/console/validate' ||
+            url === '/api/console/save' ||
+            url === '/api/console/retry401' ||
+            url === '/api/console/probe';
 }
 
 let _activeRequests = 0;
@@ -2360,6 +2490,8 @@ const server = http.createServer((req, res) => {
         handleProxy(req, res, rawStr, logId, '/images/variations', false, req.headers['content-type']);
       } else if (req.url.startsWith('/v1/moderations')) {
         handleProxy(req, res, json, logId, '/moderations', true);
+      } else if (req.url.startsWith('/v1/classifier') || req.url.startsWith('/v1/classify')) {
+        handleClassifyRelay(req, res, json, logId);
       } else if (req.url.startsWith('/v1/rerank')) {
         handleProxy(req, res, json, logId, '/rerank', true);
       } else if (req.url.startsWith('/v1/responses')) {

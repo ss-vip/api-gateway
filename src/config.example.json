@@ -42,6 +42,8 @@
 
     "openai": ["sk-..."],
     "orcarouter": ["sk-..."],
+    "openrouter": ["sk-or-..."],
+    "together": ["..."],
     "mistral": ["..."],
     "cerebras": ["csk-..."],
     "deepseek": ["sk-..."],
@@ -129,17 +131,24 @@
       { "provider": "opencode", "model": "muse-spark-1.2-contributor-free", "endpoint": "/v1/responses", "fallback": "claude" }
     ],
     "vyceai-auto": [
-      { "provider": "vyceai", "model": "auto" }
+      { "provider": "vyceai", "model": "auto", "fallback": "openai" }
     ],
     "vyceai-image": [
-      { "provider": "vyceai", "model": "grok-imagine-2" }
+      { "provider": "vyceai", "model": "grok-imagine-2", "fallback": "image" }
     ],
     "openai": [
       { "provider": "mistral", "model": "mistral-small-latest" },
       { "provider": "cerebras", "model": "zai-glm-4.7" },
       { "provider": "opencode", "model": "deepseek-v4-flash-free" },
       { "provider": "groq", "model": "qwen/qwen3.6-27b" },
-      { "provider": "kilo", "model": "kilo-auto/free" }
+      { "provider": "kilo", "model": "kilo-auto/free" },
+      { "provider": "cohere", "model": "command-a-plus-05-2026" }
+    ],
+    "openai-lite": [
+      { "provider": "groq", "model": "qwen/qwen3.6-27b", "fallback": "openai" }
+    ],
+    "openai-max": [
+      { "provider": "cohere", "model": "command-a-plus-05-2026" }
     ],
 
     "vision": [
@@ -160,5 +169,29 @@
     "embedding": [
       { "provider": "sea-lion", "model": "aisingapore/SEA-LION-ModernBERT-Embedding-600M" }
     ]
+  },
+
+  "smart_route": {
+    "_note": "依照 token 量調用適合上游",
+    "openai": [
+      { "alias": "openai-lite", "max_tokens": 4000 },
+      { "alias": "openai", "max_tokens": 32000 },
+      { "alias": "openai-max", "max_tokens": 128000 }
+    ]
+  },
+
+  "classifier": {
+    "_note": "classifier.dev 決策模型， api_key 可不填寫，預設使用免費層級調用",
+    "base_url": "https://classifier.dev",
+    "api_key": "",
+    "timeout_ms": 15000,
+    "max_chars": 2000,
+    "cache": {
+      "_note": "內建快取機制",
+      "enabled": true,
+      "max_entries": 2000,
+      "max_bytes": 8388608,
+      "ttl_ms": 3600000
+    }
   }
 }
