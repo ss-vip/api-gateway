@@ -11,35 +11,35 @@
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
   <style>
-    /* ===== base ===== */
+    /* base */
     html,body{height:100%}
     body{display:flex;flex-direction:column;min-height:100vh}
 
-    /* ===== sidebar (desktop) ===== */
+    /* sidebar (desktop) */
     .sidebar{width:210px;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
     .snav{width:100%;text-align:left;border:0;background:transparent;color:var(--bs-secondary-color);
       padding:.55rem .8rem;border-radius:.5rem;display:flex;gap:.6rem;align-items:center}
     .snav:hover{background:var(--bs-tertiary-bg);color:var(--bs-body-color)}
     .snav.active{background:rgba(13,110,253,.15);color:var(--bs-body-color);font-weight:600}
 
-    /* ===== main area: flex-grow to push footer down ===== */
+    /* main area: flex-grow to push footer down */
     .main-wrap{flex:1;min-width:0;display:flex;flex-direction:column}
     .main-content{flex:1}
 
-    /* ===== footer ===== */
+    /* footer */
     .app-footer{flex-shrink:0}
 
-    /* ===== offcanvas sidebar (mobile) ===== */
+    /* offcanvas sidebar (mobile) */
     @media(max-width:768px){
       .sidebar{display:none}
       .sidebar-offcanvas .offcanvas-body{padding:.75rem}
     }
 
-    /* ===== mobile nav ===== */
+    /* mobile nav */
     .btn-sidebar-toggle{display:none}
     @media(max-width:768px){.btn-sidebar-toggle{display:inline-flex}}
 
-    /* ===== misc ===== */
+    /* misc */
     .mono{font-family:Consolas,'Courier New',monospace}
     .toast .toast-body,.toast .toast-body *{color:#fff!important}
     #gotop{position:fixed;bottom:24px;right:24px;width:44px;height:44px;border-radius:50%;
@@ -49,7 +49,7 @@
     .kpi-ic{font-size:1.1rem;opacity:.7}
     .detail-offcanvas{--bs-offcanvas-width:480px}
 
-    /* ===== translate dropdown ===== */
+    /* translate dropdown */
     #langDropdown{color:var(--bs-secondary-color);padding:.25rem .5rem;border-radius:.375rem}
     #langDropdown:hover{color:var(--bs-body-color)}
     #langDropdown::after{display:none}
@@ -64,7 +64,7 @@
     .lang-item.active .ck{visibility:visible}
     #translate{display:none!important}
 
-    /* ===== shared overlay + spinner CSS (inline fallback for CDN) ===== */
+    /* shared overlay + spinner CSS (inline fallback for CDN) */
     .trans-overlay, #overlay { position:fixed; top:0; left:0; width:100%; height:100%;
       display:none; align-items:center; justify-content:center; background:rgba(0,0,0,.85); z-index:1090;
       flex-direction:column; gap:1rem; }
@@ -77,7 +77,7 @@
     .trans-overlay p, #overlay p { color:#fff; font-size:1.25rem; font-weight:500; margin:0; }
 
 
-    /* ===== json highlight ===== */
+    /* json highlight */
     :root{--jk:#0066cc;--js:#a31515;--jn:#098658;--jb:#0000ff}
     [data-bs-theme="dark"]{--jk:#9cdcfe;--js:#ce9178;--jn:#b5cea8;--jb:#569cd1}
     .jsonwrap{position:relative}
@@ -93,14 +93,14 @@
     .jsonwrap textarea.jsonsrc::selection{background:rgba(13,110,253,.35)}
     .jk{color:var(--jk)} .js{color:var(--js)} .jn{color:var(--jn)} .jb{color:var(--jb)}
 
-    /* ===== tables ===== */
+    /* tables */
     .btn-group [data-lg]{min-width:88px}
     #lgBody td:first-child,#recentErrs td:first-child{white-space:nowrap;width:1%}
     th[data-sort],th[data-psort],th[data-msort]{cursor:pointer;user-select:none;white-space:nowrap}
     th[data-sort]:hover,th[data-psort]:hover,th[data-msort]:hover{color:var(--bs-body-color)}
     .sort-ind{font-size:.7em;margin-left:.3rem;opacity:.7}
 
-    /* ===== responsive: nav buttons ===== */
+    /* responsive: nav buttons */
     @media(max-width:576px){
       .nav-actions{gap:.25rem!important}
       .nav-actions .btn{padding:.2rem .4rem;font-size:.75rem}
@@ -110,10 +110,8 @@
 </head>
 <body>
 
-<!-- ============================================================ -->
-<!-- LOGIN VIEW                                                    -->
-<!-- ============================================================ -->
-<div class="container py-5" id="view-login">
+<!-- LOGIN VIEW -->
+<div class="container py-5 notranslate" id="view-login">
   <div class="row justify-content-center">
     <div class="col-12 col-sm-8 col-md-5 col-lg-4">
       <div class="card shadow">
@@ -129,13 +127,11 @@
   </div>
 </div>
 
-<!-- ============================================================ -->
-<!-- APP VIEW                                                      -->
-<!-- ============================================================ -->
+<!-- APP VIEW -->
 <div class="d-none" id="view-app">
   <div class="d-flex">
 
-    <!-- === Desktop Sidebar === -->
+    <!-- Desktop Sidebar -->
     <aside class="sidebar bg-body border-end p-3 d-none d-md-flex flex-column gap-1">
       <div class="d-flex align-items-center justify-content-center gap-2 px-1 pb-3">
         <i class="bi bi-lightning-charge-fill text-warning fs-5"></i>
@@ -150,7 +146,7 @@
       </div>
     </aside>
 
-    <!-- === Mobile Sidebar (offcanvas) === -->
+    <!-- Mobile Sidebar (offcanvas) -->
     <div class="offcanvas offcanvas-start sidebar-offcanvas" tabindex="-1" id="sidebarOff">
       <div class="offcanvas-header">
         <h6 class="offcanvas-title"><i class="bi bi-lightning-charge-fill text-warning"></i> API Gateway</h6>
@@ -167,7 +163,7 @@
       </div>
     </div>
 
-    <!-- === Main Content Area === -->
+    <!-- Main Content Area -->
     <div class="main-wrap">
 
       <!-- Top Nav -->
@@ -216,7 +212,7 @@
       <main class="main-content p-3">
         <div id="cfgWarn" class="alert alert-warning py-2 mb-3 small d-none"></div>
 
-        <!-- ===== Dashboard ===== -->
+        <!-- Dashboard -->
         <section data-sec="overview">
           <!-- KPI cards -->
           <div class="row g-3 mb-3">
@@ -283,7 +279,7 @@
           </div></div>
         </section>
 
-        <!-- ===== Config ===== -->
+        <!-- Config -->
         <section data-sec="config" class="d-none">
           <div class="row g-3">
             <!-- Left: form + providers + models -->
@@ -340,33 +336,33 @@
                 </div>
                 <div class="d-flex gap-2 flex-wrap mt-2">
                   <button class="btn btn-outline-secondary btn-sm" id="btnCfgReload"><i class="bi bi-arrow-clockwise"></i> Read</button>
-                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgValidate"><i class="bi bi-check2"></i> 校驗</button>
-                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgFormat"><i class="bi bi-magic"></i> 格式化</button>
+                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgValidate"><i class="bi bi-check2"></i>Validate</button>
+                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgFormat"><i class="bi bi-magic"></i>Format</button>
                   <button class="btn btn-outline-secondary btn-sm" id="btnCfgDl"><i class="bi bi-download"></i></button>
-                  <button class="btn btn-primary btn-sm ms-auto" id="btnCfgSave"><i class="bi bi-save"></i> 儲存</button>
+                  <button class="btn btn-primary btn-sm ms-auto" id="btnCfgSave"><i class="bi bi-save"></i>Save</button>
                 </div>
               </div></div>
             </div>
           </div>
         </section>
 
-        <!-- ===== Logs ===== -->
+        <!-- Logs -->
         <section data-sec="logs" class="d-none">
           <!-- Filter bar -->
           <div class="card mb-3"><div class="card-body py-2">
             <div class="d-flex gap-2 flex-wrap align-items-center">
               <div class="btn-group btn-group-sm" role="group">
-                <button class="btn btn-outline-secondary active" data-lg="all">全部</button>
+                <button class="btn btn-outline-secondary active" data-lg="all">All</button>
                 <button class="btn btn-outline-success" data-lg="ok">Success</button>
                 <button class="btn btn-outline-danger" data-lg="err">Error</button>
               </div>
-              <select class="form-select form-select-sm" id="lgProv" style="width:auto"><option value="">全部 provider</option></select>
-              <input class="form-control form-control-sm" id="lgSearch" placeholder="搜尋 model / 錯誤訊息…" style="max-width:240px">
+              <select class="form-select form-select-sm" id="lgProv" style="width:auto"><option value="">All providers</option></select>
+              <input class="form-control form-control-sm" id="lgSearch" placeholder="Search model / error…" style="max-width:240px">
               <input type="date" class="form-control form-control-sm" id="lgFrom" style="width:auto">
               <span class="small text-secondary">~</span>
               <input type="date" class="form-control form-control-sm" id="lgTo" style="width:auto">
-              <button class="btn btn-outline-secondary btn-sm" id="btnLgToday">今天</button>
-              <button class="btn btn-outline-secondary btn-sm" id="btnLgAll">全部</button>
+              <button class="btn btn-outline-secondary btn-sm" id="btnLgToday">Today</button>
+              <button class="btn btn-outline-secondary btn-sm" id="btnLgAll">All</button>
               <button class="btn btn-outline-secondary btn-sm ms-auto" id="btnLgRaw">Raw</button>
               <button class="btn btn-outline-secondary btn-sm" id="btnLgReload"><i class="bi bi-arrow-clockwise"></i> Read</button>
             </div>
@@ -379,10 +375,10 @@
               <textarea class="form-control jsonsrc" id="lgRaw" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
             </div>
             <div class="d-flex gap-2 mt-2">
-              <button class="btn btn-primary btn-sm" id="btnLgSave">儲存</button>
-              <button class="btn btn-danger btn-sm" id="btnLgClear">清空</button>
+              <button class="btn btn-primary btn-sm" id="btnLgSave">Save</button>
+              <button class="btn btn-danger btn-sm" id="btnLgClear">Clear</button>
             </div>
-            <p class="small text-secondary mt-2 mb-0">有篩選條件時儲存會自動合併被隱藏的行，避免誤刪。</p>
+            <p class="small text-secondary mt-2 mb-0">Filtered rows are merged back on save so hidden lines are kept.</p>
           </div></div>
           <!-- Log table -->
           <div class="card mb-3"><div class="card-body p-0">
@@ -396,33 +392,33 @@
                   <th>Summary</th>
                 </tr>
               </thead>
-              <tbody id="lgBody"><tr><td colspan="6" class="text-secondary small text-center">無資料</td></tr></tbody>
+              <tbody id="lgBody"><tr><td colspan="6" class="text-secondary small text-center">No data</td></tr></tbody>
             </table></div>
           </div></div>
           <!-- Pagination -->
           <div class="card"><div class="card-body py-2 d-flex align-items-center gap-2 flex-wrap">
-            <span class="small text-secondary" id="lgCount">0 筆</span>
+            <span class="small text-secondary" id="lgCount">0 records</span>
             <div class="ms-auto d-flex gap-2 align-items-center">
-              <button class="btn btn-outline-secondary btn-sm" id="btnLgPrev">‹ 上頁</button>
+              <button class="btn btn-outline-secondary btn-sm" id="btnLgPrev">‹ Prev</button>
               <span class="small" id="lgPage">1 / 1</span>
-              <button class="btn btn-outline-secondary btn-sm" id="btnLgNext">下頁 ›</button>
+              <button class="btn btn-outline-secondary btn-sm" id="btnLgNext">Next ›</button>
             </div>
           </div></div>
         </section>
 
-        <!-- ===== Providers ===== -->
+        <!-- Providers -->
         <section data-sec="providers" class="d-none">
           <div class="card"><div class="card-body">
             <div class="d-flex gap-2 align-items-center flex-wrap mb-2">
               <span class="small fw-bold"><i class="bi bi-hdd-stack text-info"></i> Providers</span>
-              <input class="form-control form-control-sm ms-auto" id="pFilter" placeholder="篩選…" style="max-width:180px">
+              <input class="form-control form-control-sm ms-auto" id="pFilter" placeholder="Filter…" style="max-width:180px">
               <select class="form-select form-select-sm" id="pSort" style="width:auto">
-                <option value="name">名稱</option><option value="latency">延遲</option><option value="degraded">錯誤</option>
+                <option value="name">Name</option><option value="latency">Latency</option><option value="degraded">Errors</option>
               </select>
               <small class="text-secondary" id="pCount"></small>
             </div>
             <div class="table-responsive"><table class="table table-sm table-hover mb-0">
-              <thead><tr><th data-psort="name">名稱</th><th>Keys</th><th data-psort="latency">延遲</th><th data-psort="degraded">錯誤</th><th>上次成功</th><th>斷路器</th><th></th></tr></thead>
+              <thead><tr><th data-psort="name">Name</th><th>Keys</th><th data-psort="latency">Latency</th><th data-psort="degraded">Errors</th><th>Last success</th><th>Breaker</th><th></th></tr></thead>
               <tbody id="pBody"></tbody>
             </table></div>
           </div></div>
@@ -448,7 +444,7 @@
 <!-- Loading overlay -->
 <div class="position-fixed top-0 start-0 w-100 h-100 d-none align-items-center justify-content-center flex-column gap-3" style="background:rgba(0,0,0,.85);z-index:1050" id="overlay">
   <div class="spinner-border" id="overlaySpinner"></div>
-  <p class="text-white m-0" id="overlayMsg">載入中…</p>
+  <p class="text-white m-0" id="overlayMsg">Loading…</p>
 </div>
 
 <!-- Provider detail offcanvas -->
@@ -460,18 +456,16 @@
 <!-- Log detail modal -->
 <div class="modal fade" id="rowModal" tabindex="-1"><div class="modal-dialog modal-lg modal-dialog-scrollable">
   <div class="modal-content">
-    <div class="modal-header"><h5 class="modal-title fs-6">Log 明細</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-header"><h5 class="modal-title fs-6">Log detail</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
     <div class="modal-body"><pre class="mono small mb-0" id="rowModalBody" style="white-space:pre-wrap"></pre></div>
   </div>
 </div></div>
 
-<!-- ============================================================ -->
-<!-- SCRIPT                                                        -->
-<!-- ============================================================ -->
+<!-- SCRIPT -->
 <script>
 'use strict';
 
-/* ===== globals ===== */
+/* globals */
 let _token = localStorage.getItem('gw_token') || '';
 let _rawLog = '', _cfgText = '', _cfgObj = null, _evt = null, _lastStatus = null;
 let _charts = {};
@@ -480,7 +474,7 @@ const LG_PER = 50;
 let _lgType = 'all', _rowModal = null, _detailOc = null;
 const $ = id => document.getElementById(id);
 const _esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'<','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const _mask = k => typeof k === 'string' && k.length > 4 ? '…' + k.slice(-4) : '(空)';
+const _mask = k => typeof k === 'string' && k.length > 4 ? '…' + k.slice(-4) : '(empty)';
 
 function stripJsonc(s){
   let out='', inS=false, esc=false, lc=false, bc=false;
@@ -499,7 +493,7 @@ const DEFAULT_CONFIG = JSON.stringify({ client_token: '', port: 3000, timeout: 6
 
 
 
-/* ===== nav / theme ===== */
+/* nav / theme */
 const TITLES = { overview:'Dashboard', config:'Config', logs:'Logs', providers:'Providers' };
 
 /* bind sidebar nav clicks (both desktop + offcanvas) */
@@ -529,7 +523,7 @@ $('btnTheme').addEventListener('click', () => {
 $('gotop').addEventListener('click', () => window.scrollTo({ top:0, behavior:'smooth' }));
 window.addEventListener('scroll', () => { $('gotop').style.display = window.scrollY > 300 ? 'block' : 'none'; });
 
-/* ===== auth ===== */
+/* auth */
 $('l_token').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
 $('l_btn').addEventListener('click', doAuth);
 $('btnLogout').addEventListener('click', () => {
@@ -539,20 +533,21 @@ $('btnLogout').addEventListener('click', () => {
 });
 async function doAuth(){
   const v = $('l_token').value;
-  if ([...v].some(c => c.charCodeAt(0) > 127)) { $('l_status').textContent = 'Token 含有非 ASCII 字元'; return; }
+  if ([...v].some(c => c.charCodeAt(0) > 127)) { $('l_status').textContent = 'Token contains non-ASCII characters'; return; }
   _token = v;
   showLoading();
   try {
     const headers = v ? { 'Authorization':'Bearer ' + v } : {};
     const r = await fetch('/api/console/validate', { method:'POST', headers });
-    if (!r.ok) { _token=''; localStorage.removeItem('gw_token'); hideLoading(); $('l_status').textContent='驗證失敗：token 不正確'; return; }
+    if (!r.ok) { _token=''; localStorage.removeItem('gw_token'); hideLoading(); $('l_status').textContent='Auth failed: incorrect token'; return; }
     localStorage.setItem('gw_token', _token);
     $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none');
     await loadAll(); openSSE();
-  } catch(e){ _token=''; hideLoading(); $('l_status').textContent='連線錯誤'; toast(_esc(e.message), 0); }
+    if (window.maybeStartTranslation) window.maybeStartTranslation(); // translate only inside app
+  } catch(e){ _token=''; hideLoading(); $('l_status').textContent='Connection error'; toast(_esc(e.message), 0); }
 }
 
-/* ===== load ===== */
+/* load */
 $('btnRefresh').addEventListener('click', loadAll);
 $('btnCfgReload').addEventListener('click', loadAll);
 $('btnLgReload').addEventListener('click', loadAll);
@@ -560,37 +555,37 @@ async function loadAll(){
   showLoading();
   try {
     const r = await fetch('/api/console/load', { headers:{ 'Authorization':'Bearer '+_token } });
-    if (!r.ok) { hideLoading(); toast('載入失敗', 0); return; }
+    if (!r.ok) { hideLoading(); toast('Load failed', 0); return; }
     const d = await r.json();
     _cfgText = d.config || DEFAULT_CONFIG; _rawLog = d.log || '';
     $('cfgRaw').value = _cfgText; syncHl($('cfgRaw'));
     const warns = [];
-    if (d.config_valid === false) warns.push('config.json 格式錯誤：' + (d.config_error || '?'));
-    if (d.log_valid === false) warns.push('log.json 格式錯誤：' + (d.log_error || '?'));
-    if (d.config_fixed) warns.push('config.json 已自動補齊結尾（請檢查後儲存）');
-    if (d.log_fixed) warns.push('log.json 部分行已自動修正（請檢查後儲存）');
+    if (d.config_valid === false) warns.push('config.json invalid: ' + (d.config_error || '?'));
+    if (d.log_valid === false) warns.push('log.json invalid: ' + (d.log_error || '?'));
+    if (d.config_fixed) warns.push('config.json end auto-completed (review before saving)');
+    if (d.log_fixed) warns.push('Some log.json lines auto-fixed (review before saving)');
     const w = $('cfgWarn');
     if (warns.length){ w.classList.remove('d-none'); w.innerHTML = warns.map(x=>'<div><i class="bi bi-exclamation-triangle-fill"></i> '+_esc(x)+'</div>').join(''); }
     else { w.classList.add('d-none'); w.innerHTML=''; }
-    try { const c = JSON.parse(stripJsonc(_cfgText)); $('retentionLbl').textContent = c?.log?.enabled === false ? '日誌已停用' : ('保留 ' + (c?.log?.retention_days || 7) + ' 天記錄'); } catch{}
+    try { const c = JSON.parse(stripJsonc(_cfgText)); $('retentionLbl').textContent = c?.log?.enabled === false ? 'Logging disabled' : ('Retains ' + (c?.log?.retention_days || 7) + ' days'); } catch{}
     fillConfigForm(); renderModels(); parseLogRows(); refreshStatus();
     hideLoading(); toast('Loaded', 1);
-  } catch(e){ hideLoading(); toast('載入錯誤：' + _esc(e.message), 0); }
+  } catch(e){ hideLoading(); toast('Load error: ' + _esc(e.message), 0); }
 }
 
-/* ===== config form ===== */
+/* config form */
 function fillConfigForm(){
   const p = tryParseCfg(_cfgText || $('cfgRaw').value || '');
   _cfgObj = p.ok ? p.obj : null;
   if (!p.ok){
-    setCfgStatus('Raw 解析失敗：' + p.err, 0);
+    setCfgStatus('Raw parse failed: ' + p.err, 0);
     ['f_token','f_port','f_timeout','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays'].forEach(id => { $(id).value = ''; });
     $('f_logen').checked = true;
-    $('provEdit').innerHTML = '<p class="text-secondary small mb-0">設定檔無效，修正 Raw 後重讀。</p>';
-    $('modelsTable').innerHTML = '<tr><td colspan="2" class="text-secondary small text-center">設定檔無效</td></tr>';
+    $('provEdit').innerHTML = '<p class="text-secondary small mb-0">Invalid config. Fix Raw and reload.</p>';
+    $('modelsTable').innerHTML = '<tr><td colspan="2" class="text-secondary small text-center">Invalid config</td></tr>';
     return;
   }
-  setCfgStatus('JSON 有效', 1);
+  setCfgStatus('Valid JSON', 1);
   const c = _cfgObj;
   $('f_token').value = c.client_token || ''; $('f_port').value = c.port ?? '';
   $('f_timeout').value = c.timeout ?? ''; $('f_cooldown').value = c.key_cooldown ?? '';
@@ -603,7 +598,7 @@ function fillConfigForm(){
 function setCfgStatus(m, ok){ $('cfgStatus').innerHTML = m ? '<span class="'+(ok?'text-success':'text-danger')+'">'+_esc(m)+'</span>' : ''; }
 $('btnApplyForm').addEventListener('click', () => {
   const p = tryParseCfg($('cfgRaw').value);
-  if (!p.ok){ setCfgStatus('Raw 解析失敗，先修好 JSON：' + p.err, 0); return; }
+  if (!p.ok){ setCfgStatus('Raw parse failed, fix JSON first: ' + p.err, 0); return; }
   const c = p.obj, num = id => { const v = $(id).value; return v === '' ? undefined : Number(v); };
   const put = (k, v) => { if (v === undefined || (typeof v === 'number' && isNaN(v))) delete c[k]; else c[k] = v; };
   c.client_token = $('f_token').value; put('port', num('f_port')); put('timeout', num('f_timeout'));
@@ -613,18 +608,18 @@ $('btnApplyForm').addEventListener('click', () => {
   const d = num('f_logdays'); if (d !== undefined) c.log.retention_days = d;
   c.log.enabled = $('f_logen').checked;
   $('cfgRaw').value = JSON.stringify(c, null, 2);
-  _cfgObj = c; renderProvEdit(); renderModels(); setCfgStatus('已套用至 JSON（尚未儲存）', 1); syncHl($('cfgRaw'));
+  _cfgObj = c; renderProvEdit(); renderModels(); setCfgStatus('Applied to JSON (unsaved)', 1); syncHl($('cfgRaw'));
 });
 function renderProvEdit(){
   const box = $('provEdit'); const provs = (_cfgObj && _cfgObj.providers) || {};
   const names = Object.keys(provs);
-  if (!names.length){ box.innerHTML = '<p class="text-secondary small mb-0">尚無 provider，在下方新增。</p>'; return; }
+  if (!names.length){ box.innerHTML = '<p class="text-secondary small mb-0">No providers yet. Add one below.</p>'; return; }
   box.innerHTML = names.map(n => {
     const ks = Array.isArray(provs[n]) ? provs[n] : [];
     return '<div class="border rounded p-2"><div class="d-flex justify-content-between align-items-center mb-1">'
       + '<strong class="small">'+_esc(n)+'</strong><span class="badge bg-secondary">'+ks.length+' keys</span></div>'
-      + '<div class="d-flex flex-wrap gap-1 mb-2">' + (ks.length ? ks.map((k,i)=>'<span class="badge border border-secondary text-secondary mono">'+_mask(k)+' <a href="#" class="text-danger text-decoration-none" data-prov="'+_esc(n)+'" data-idx="'+i+'">×</a></span>').join('') : '<span class="text-secondary small">無 key</span>') + '</div>'
-      + '<div class="d-flex gap-1"><input class="form-control form-control-sm mono" placeholder="新增 key…" data-add="'+_esc(n)+'" autocomplete="off"><button class="btn btn-outline-success btn-sm" data-addbtn="'+_esc(n)+'"><i class="bi bi-plus"></i></button></div></div>';
+      + '<div class="d-flex flex-wrap gap-1 mb-2">' + (ks.length ? ks.map((k,i)=>'<span class="badge border border-secondary text-secondary mono">'+_mask(k)+' <a href="#" class="text-danger text-decoration-none" data-prov="'+_esc(n)+'" data-idx="'+i+'">×</a></span>').join('') : '<span class="text-secondary small">No keys</span>') + '</div>'
+      + '<div class="d-flex gap-1"><input class="form-control form-control-sm mono" placeholder="Add key…" data-add="'+_esc(n)+'" autocomplete="off"><button class="btn btn-outline-success btn-sm" data-addbtn="'+_esc(n)+'"><i class="bi bi-plus"></i></button></div></div>';
   }).join('');
   box.querySelectorAll('a[data-prov]').forEach(a => a.addEventListener('click', e => {
     e.preventDefault();
@@ -641,14 +636,14 @@ function renderProvEdit(){
 }
 $('btnAddProv').addEventListener('click', () => {
   const n = ($('newProvName').value || '').trim(), k = ($('newProvKey').value || '').trim();
-  if (!n){ toast('請輸入 provider 名稱', 0); return; }
-  const p = tryParseCfg($('cfgRaw').value); if (!p.ok){ setCfgStatus('Raw 解析失敗：' + p.err, 0); return; }
+  if (!n){ toast('Enter a provider name', 0); return; }
+  const p = tryParseCfg($('cfgRaw').value); if (!p.ok){ setCfgStatus('Raw parse failed: ' + p.err, 0); return; }
   _cfgObj = p.obj; _cfgObj.providers = _cfgObj.providers || {};
   if (!_cfgObj.providers[n]) _cfgObj.providers[n] = [];
   if (k) _cfgObj.providers[n].push(k);
   $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2);
   $('newProvName').value=''; $('newProvKey').value='';
-  renderProvEdit(); renderModels(); setCfgStatus('已加入 provider（尚未儲存）', 1); syncHl($('cfgRaw'));
+  renderProvEdit(); renderModels(); setCfgStatus('Provider added (unsaved)', 1); syncHl($('cfgRaw'));
 });
 function renderModels(){
   const tb = $('modelsTable'); const models = (_cfgObj && _cfgObj.models) || {};
@@ -658,17 +653,17 @@ function renderModels(){
     const t = models[a];
     const chips = Array.isArray(t) ? t.map(x=>'<span class="badge border border-info text-info me-1 mb-1">'+_esc(x.provider||'?')+' / '+_esc(x.model||'')+(x.endpoint?' @'+_esc(x.endpoint):'')+'</span>').join('') : '<span class="text-secondary small">'+_esc(String(t))+'</span>';
     return '<tr><td class="mono small">'+_esc(a)+'</td><td>'+chips+'</td></tr>';
-  }).join('') + (names.length > 60 ? '<tr><td colspan="2" class="text-secondary small">…共 '+names.length+' 個，完整請看 Raw</td></tr>' : '');
+  }).join('') + (names.length > 60 ? '<tr><td colspan="2" class="text-secondary small">… '+names.length+' total, see Raw for full list</td></tr>' : '');
 }
 $('btnCfgValidate').addEventListener('click', () => {
   const p = tryParseCfg($('cfgRaw').value);
-  setCfgStatus(p.ok ? 'JSON 有效' : '無效：' + p.err, p.ok ? 1 : 0);
+  setCfgStatus(p.ok ? 'Valid JSON' : 'Invalid: ' + p.err, p.ok ? 1 : 0);
 });
 $('btnCfgFormat').addEventListener('click', () => {
   const p = tryParseCfg($('cfgRaw').value);
-  if (!p.ok){ setCfgStatus('無效：' + p.err, 0); return; }
+  if (!p.ok){ setCfgStatus('Invalid: ' + p.err, 0); return; }
   $('cfgRaw').value = JSON.stringify(p.obj, null, 2); _cfgObj = p.obj;
-  fillConfigForm(); setCfgStatus('已格式化', 1); syncHl($('cfgRaw'));
+  fillConfigForm(); setCfgStatus('Formatted', 1); syncHl($('cfgRaw'));
 });
 $('btnCfgDl').addEventListener('click', () => {
   const b = new Blob([$('cfgRaw').value], { type:'application/json' });
@@ -683,28 +678,28 @@ async function saveFile(file, content){
   showLoading();
   try {
     const r = await fetch('/api/console/save', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ file, content }) });
-    if (!r.ok){ const d = await r.json().catch(()=>({})); hideLoading(); toast('儲存失敗：' + _esc(d?.error || r.status), 0); return; }
-    toast('已儲存', 1);
+    if (!r.ok){ const d = await r.json().catch(()=>({})); hideLoading(); toast('Save failed: ' + _esc(d?.error || r.status), 0); return; }
+    toast('Saved', 1);
     if (file === 'config') await waitForServer(requiresRelogin); else { hideLoading(); refreshStatus(); }
-  } catch(e){ hideLoading(); toast('儲存錯誤：' + _esc(e.message), 0); }
+  } catch(e){ hideLoading(); toast('Save error: ' + _esc(e.message), 0); }
 }
 async function waitForServer(requiresRelogin = false){
-  showLoading('伺服器重啟中，請稍候…');
+  showLoading('Server restarting…');
   for (let w = 1500, i = 0; i < 10; i++, w = Math.min(w * 1.5, 10000)){
     await new Promise(r => setTimeout(r, w + Math.random() * 500));
     try { const r = await fetch('/health', { signal: AbortSignal.timeout(5000) }); if (r.ok){
       if (requiresRelogin) {
         _token = ''; localStorage.removeItem('gw_token'); closeSSE();
-        $('view-app').classList.add('d-none'); $('view-login').classList.remove('d-none'); $('l_token').value = ''; $('l_status').textContent = '密碼已設定，請重新登入';
+        $('view-app').classList.add('d-none'); $('view-login').classList.remove('d-none'); $('l_token').value = ''; $('l_status').textContent = 'Password set, please log in again';
         hideLoading(); return;
       }
-      toast('伺服器已重新啟動', 1); await loadAll(); return;
+      toast('Server restarted', 1); await loadAll(); return;
     } } catch{}
   }
-  hideLoading(); toast('伺服器重啟逾時，請重新整理頁面', 0);
+  hideLoading(); toast('Restart timed out, please refresh', 0);
 }
 
-/* ===== logs ===== */
+/* logs */
 function parseLogRows(){
   _logRows = _rawLog.split('\n').map(l => {
     const t = l.trim(); if (!t) return null;
@@ -713,7 +708,7 @@ function parseLogRows(){
   }).filter(Boolean);
   const provs = [...new Set(_logRows.map(r => r.obj?.provider).filter(Boolean))].sort();
   const sel = $('lgProv');
-  sel.innerHTML = '<option value="">全部 provider</option>' + provs.map(p=>'<option value="'+_esc(p)+'">'+_esc(p)+'</option>').join('');
+  sel.innerHTML = '<option value="">All providers</option>' + provs.map(p=>'<option value="'+_esc(p)+'">'+_esc(p)+'</option>').join('');
   applyLogFilter();
 }
 function applyLogFilter(){
@@ -752,13 +747,13 @@ function renderLogPage(){
       ? '<span class="text-secondary small notranslate">Latency: '+(o.latency ?? '-')+'s · token: '+(o.tokens ?? 0)+'</span>'
       : '<span class="small">'+_esc(String(o.error || o.status || '').slice(0,90))+'</span>';
     return '<tr class="clickable" data-gi="'+(_logPage*LG_PER+i)+'"><td class="mono small text-secondary">'+_esc(o.ts||'')+'</td><td>'+badge+'</td><td>'+codeBadge+'</td><td class="small">'+_esc(o.provider||'')+'</td><td class="mono small">'+_esc(o.model||'')+'</td><td>'+info+'</td></tr>';
-  }).join('') : '<tr><td colspan="6" class="text-secondary small text-center">無符合資料</td></tr>';
+  }).join('') : '<tr><td colspan="6" class="text-secondary small text-center">No matching records</td></tr>';
   $('lgBody').querySelectorAll('tr.clickable').forEach(tr => tr.addEventListener('click', () => {
     const r = _logFiltered[Number(tr.dataset.gi)];
     openRowModal(r.obj ? JSON.stringify(r.obj, null, 2) : r.raw);
   }));
   $('lgPage').textContent = (_logPage+1) + ' / ' + pages;
-  $('lgCount').textContent = total + ' 筆';
+  $('lgCount').textContent = total + ' records';
   renderRecentErrs();
 }
 function renderRecentErrs(){
@@ -772,7 +767,7 @@ function renderRecentErrs(){
       ? '<span class="text-secondary small notranslate">Latency: '+(o.latency ?? '-')+'s · token: '+(o.tokens ?? 0)+'</span>'
       : '<span class="small">'+_esc(String(o.error || o.status || '').slice(0,80))+'</span>';
     return '<tr class="clickable"><td class="mono small text-secondary">'+_esc(o.ts||'')+'</td><td>'+badge+'</td><td>'+(code===''?'—':'<span class="badge '+codeCls+'">'+code+'</span>')+'</td><td class="small">'+_esc(o.provider||'')+'</td><td class="mono small">'+_esc(o.model||'')+'</td><td class="small">'+info+'</td></tr>';
-  }).join('') : '<tr><td colspan="6" class="text-secondary small text-center">無資料</td></tr>';
+  }).join('') : '<tr><td colspan="6" class="text-secondary small text-center">No data</td></tr>';
   $('recentErrs').querySelectorAll('tr.clickable').forEach((tr, i) => tr.addEventListener('click', () => openRowModal(JSON.stringify(rows[i].obj, null, 2))));
 }
 function openRowModal(text){
@@ -796,7 +791,7 @@ $('btnLgPrev').addEventListener('click', () => { _logPage--; renderLogPage(); })
 $('btnLgNext').addEventListener('click', () => { _logPage++; renderLogPage(); });
 $('btnLgRaw').addEventListener('click', () => $('lgRawWrap').classList.toggle('d-none'));
 $('btnLgSave').addEventListener('click', () => saveFile('log', mergeLogContent()));
-$('btnLgClear').addEventListener('click', () => { _rawLog=''; $('lgRaw').value=''; syncHl($('lgRaw')); toast('已清空，請按儲存寫入檔案', 1); });
+$('btnLgClear').addEventListener('click', () => { _rawLog=''; $('lgRaw').value=''; syncHl($('lgRaw')); toast('Cleared, press Save to persist', 1); });
 function mergeLogContent(){
   const f = $('lgFrom').value, t = $('lgTo').value, q = ($('lgSearch').value||'').toLowerCase(), pv = $('lgProv').value;
   if (_lgType==='all' && !pv && !q && !f && !t) return $('lgRaw').value;
@@ -816,7 +811,7 @@ function mergeLogContent(){
   return [...hidden, ...$('lgRaw').value.split('\n')].filter(l=>l.trim()).join('\n');
 }
 
-/* ===== providers ===== */
+/* providers */
 $('pFilter').addEventListener('input', () => { if (_lastStatus) renderProvTable(_lastStatus); });
 $('pSort').addEventListener('change', () => { if (_lastStatus) renderProvTable(_lastStatus); });
 function renderProvTable(d){
@@ -837,8 +832,8 @@ function renderProvTable(d){
     + '<td class="small">'+(v.degraded?'<span class="text-danger fw-medium">'+v.degraded+'</span>':'<span class="text-secondary">0</span>')+'</td>'
     + '<td class="small text-secondary">'+_esc(v.last_success||'')+'</td>'
     + '<td>'+(v.cbOpen?'<span class="badge bg-warning-subtle text-warning">OPEN</span>':'<span class="text-secondary small">—</span>')+'</td>'
-    + '<td><button class="btn btn-outline-info btn-sm py-0 px-1" data-probe="'+_esc(p)+'" title="探測"><i class="bi bi-activity"></i></button></td></tr>'
-  ).join('') : '<tr><td colspan="7" class="text-secondary small text-center">無符合 provider</td></tr>';
+    + '<td><button class="btn btn-outline-info btn-sm py-0 px-1" data-probe="'+_esc(p)+'" title="Probe"><i class="bi bi-activity"></i></button></td></tr>'
+  ).join('') : '<tr><td colspan="7" class="text-secondary small text-center">No matching providers</td></tr>';
   $('pBody').querySelectorAll('tr.clickable').forEach(tr => tr.addEventListener('click', e => {
     if (e.target.closest('[data-probe]')) return;
     showProvDetail(tr.dataset.p);
@@ -847,8 +842,8 @@ function renderProvTable(d){
     e.stopPropagation(); b.disabled = true;
     try {
       const r = await fetch('/api/console/probe', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ provider: b.dataset.probe }) });
-      const j = await r.json(); toast(b.dataset.probe + (j.ok ? ' 可連通' : ' 不連通（' + _esc(j.error || j.status) + '）'), !!j.ok);
-    } catch(err){ toast('探測失敗', 0); } finally { b.disabled = false; }
+      const j = await r.json(); toast(b.dataset.probe + (j.ok ? ' reachable' : ' unreachable (' + _esc(j.error || j.status) + ')'), !!j.ok);
+    } catch(err){ toast('Probe failed', 0); } finally { b.disabled = false; }
   }));
 }
 async function showProvDetail(p){
@@ -861,25 +856,25 @@ async function showProvDetail(p){
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
     let h = d.keys.length
-      ? '<table class="table table-sm"><thead><tr><th>Key</th><th>延遲</th><th>成功</th><th>錯誤</th><th>狀態</th><th>上次</th></tr></thead><tbody>'
+      ? '<table class="table table-sm"><thead><tr><th>Key</th><th>Latency</th><th>OK</th><th>Errors</th><th>Status</th><th>Last</th></tr></thead><tbody>'
         + d.keys.map(k=>'<tr><td class="mono small">'+_esc(k.key)+'</td><td>'+k.latency_ms+'ms</td><td>'+k.successCount+'</td><td>'+k.errorCount+'</td><td>'+(k.degraded?'<span class="text-warning">Degraded</span>':'<span class="text-success">Healthy</span>')+'</td><td class="small text-secondary">'+_esc(k.lastSuccess)+'</td></tr>').join('') + '</tbody></table>'
-      : '<p class="text-secondary small">無金鑰資料</p>';
-    h += d.circuitBreaker?.open ? '<p class="text-warning small"><i class="bi bi-exclamation-triangle-fill"></i> 斷路器開啟中</p>' : '';
+      : '<p class="text-secondary small">No key data</p>';
+    h += d.circuitBreaker?.open ? '<p class="text-warning small"><i class="bi bi-exclamation-triangle-fill"></i> Circuit breaker open</p>' : '';
     h += d.recent401.length
-      ? '<h6 class="mt-3 text-warning">401 錯誤</h6><div class="mono small">' + d.recent401.map(e=>'['+_esc(e.ts)+'] '+_esc(e.model)+' / '+_esc(e.key)).join('<br>') + '</div>'
-      : '<p class="text-secondary small mt-2"><i class="bi bi-check-circle text-success"></i> 無 401 錯誤</p>';
+      ? '<h6 class="mt-3 text-warning">401 errors</h6><div class="mono small">' + d.recent401.map(e=>'['+_esc(e.ts)+'] '+_esc(e.model)+' / '+_esc(e.key)).join('<br>') + '</div>'
+      : '<p class="text-secondary small mt-2"><i class="bi bi-check-circle text-success"></i> No 401 errors</p>';
     $('detailBody').innerHTML = h;
-  } catch(e){ $('detailBody').innerHTML = '<p class="text-danger">載入失敗：' + _esc(e.message) + '</p>'; }
+  } catch(e){ $('detailBody').innerHTML = '<p class="text-danger">Load failed: ' + _esc(e.message) + '</p>'; }
 }
 $('btn401').addEventListener('click', async () => {
   showLoading();
   try {
     const r = await fetch('/api/console/retry401', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body:'{}' });
-    hideLoading(); toast(r.ok ? '已清除所有 401 記錄' : '操作失敗', r.ok);
-  } catch{ hideLoading(); toast('操作失敗', 0); }
+    hideLoading(); toast(r.ok ? 'All 401 records cleared' : 'Operation failed', r.ok);
+  } catch{ hideLoading(); toast('Operation failed', 0); }
 });
 
-/* ===== status + charts ===== */
+/* status + charts */
 function refreshStatus(){
   fetch('/api/console/status', { headers:{ 'Authorization':'Bearer '+_token } })
     .then(r => { if (!r.ok) throw new Error('Status request failed ('+r.status+')'); return r.json(); })
@@ -929,11 +924,11 @@ function renderCharts(d){
   const labels = [], data = [], colors = [];
   if (hc['200']){ labels.push('200'); data.push(hc['200']); colors.push('#198754'); }
   if (hc['401']){ labels.push('401'); data.push(hc['401']); colors.push('#ffc107'); }
-  if (other){ labels.push('其他'); data.push(other); colors.push('#dc3545'); }
+  if (other){ labels.push('Other'); data.push(other); colors.push('#dc3545'); }
   upsertChart('codes', $('chCodes'), { type:'doughnut',
-    data:{ labels: labels.length?labels:['無'], datasets:[{ data: data.length?data:[1], backgroundColor: data.length?colors:['#6c757d'], borderWidth:0 }] },
+    data:{ labels: labels.length?labels:['None'], datasets:[{ data: data.length?data:[1], backgroundColor: data.length?colors:['#6c757d'], borderWidth:0 }] },
     options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, cutout:'55%' } });
-  $('codesLegend').innerHTML = [['200','#198754'],['401','#ffc107'],['其他','#dc3545']]
+  $('codesLegend').innerHTML = [['200','#198754'],['401','#ffc107'],['Other','#dc3545']]
     .map(([l,c])=>'<span class="d-inline-flex align-items-center gap-1"><span class="rounded-circle d-inline-block" style="width:8px;height:8px;background:'+c+'"></span>'+l+'</span>').join('');
   const provs = Object.entries(d.providers || {});
   const topLat = [...provs].sort((a,b)=>(b[1].latency_ms||0)-(a[1].latency_ms||0)).slice(0,5);
@@ -947,7 +942,7 @@ function renderCharts(d){
       scales:{ x:{ grid:{ color:g }, ticks:{ color:t } }, y:{ beginAtZero:true, grid:{ color:g }, ticks:{ color:t } } } } });
 }
 
-/* ===== json highlight ===== */
+/* json highlight */
 function hlJson(s){
   return _esc(s).replace(/&quot;(?:(?!&quot;).)*?&quot;\s*:?|&[a-zA-Z]+;|&#[0-9]+;|\btrue\b|\bfalse\b|\bnull\b|-?\d+(?:\.\d+)?/g, m => {
     if (m[0] === '&' && !m.startsWith('&quot;')) return m;
@@ -971,7 +966,7 @@ function syncHl(ta){
   syncHl(ta);
 });
 
-/* ===== table sorting ===== */
+/* table sorting */
 let _lgSort = { key:'ts', dir:-1 };
 let _mdDir = 1;
 function lgSortVal(r, key){
@@ -997,10 +992,10 @@ document.querySelectorAll('th[data-psort]').forEach(th => th.addEventListener('c
 const _mdTh = document.querySelector('th[data-msort]');
 if (_mdTh) _mdTh.addEventListener('click', () => { _mdDir *= -1; renderModels(); });
 
-/* ===== boot ===== */
+/* boot */
 if (_token){ $('l_token').value = _token; doAuth(); }
 else (async () => {
-  try { const r = await fetch('/api/console/validate', { method:'POST' }); if (r.ok){ $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none'); await loadAll(); openSSE(); } } catch{}
+  try { const r = await fetch('/api/console/validate', { method:'POST' }); if (r.ok){ $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none'); await loadAll(); openSSE(); if (window.maybeStartTranslation) window.maybeStartTranslation(); } } catch{}
 })();
 </script>
 <!-- Translation overlay -->
@@ -1024,12 +1019,12 @@ else (async () => {
       box.appendChild(e); setTimeout(function(){ e.classList.remove('show'); setTimeout(function(){ e.remove(); }, 300); }, 4000);
     };
     window.showLoading = function(msg, ms) {
-      msg = msg || '載入中…'; ms = ms || 8000;
+      msg = msg || 'Loading…'; ms = ms || 8000;
       var ov = document.getElementById('overlay'); if (!ov) return;
       var lbl = document.getElementById('overlayMsg'); if (lbl) lbl.textContent = msg;
       ov.classList.remove('d-none'); ov.classList.add('d-flex');
       if (_ovTimer) clearTimeout(_ovTimer);
-      _ovTimer = setTimeout(function(){ window.hideLoading(); window.toast('連線逾時，請稍後再試', 0); }, ms);
+      _ovTimer = setTimeout(function(){ window.hideLoading(); window.toast('Connection timed out, try again later', 0); }, ms);
     };
     window.hideLoading = function(msg) {
       msg = msg || 'Loading...';
@@ -1039,7 +1034,7 @@ else (async () => {
       var lbl = document.getElementById('overlayMsg'); if (lbl) lbl.textContent = msg;
     };
     window.initTranslation = function(itemsSelector, defaultLang, toastOk, toastErr, toastTimeout) {
-      defaultLang = defaultLang || 'english'; toastOk = toastOk || '翻譯完成'; toastErr = toastErr || '翻譯失敗'; toastTimeout = toastTimeout || '連線逾時，請稍後再試';
+      defaultLang = defaultLang || 'english'; toastOk = toastOk || 'Translation done'; toastErr = toastErr || 'Translation failed'; toastTimeout = toastTimeout || 'Connection timed out, try again later';
       var items = document.querySelectorAll(itemsSelector);
       var savedLang = localStorage.getItem('gw_lang') || defaultLang;
       var transOverlay = document.getElementById('transOverlay');
@@ -1052,36 +1047,47 @@ else (async () => {
         if (!transFailed && !toastShown) { toastShown = true; window.toast(toastOk, 1); }
         transFailed = false;
       }
-      function failOverlay(isTimeout) { transFailed = true; toastShown = true; hideOverlay(); if (obs) { obs.disconnect(); } window.toast(isTimeout ? toastTimeout : toastErr, 0); }
+      function failOverlay(isTimeout) { transFailed = true; toastShown = true; hideOverlay(); if (obs) { try { obs.disconnect(); } catch(e){} obs = null; } window.toast(isTimeout ? toastTimeout : toastErr, 0); }
       var latestText = document.body.textContent || '';
-      obs = new MutationObserver(function() {
-        var ct = document.body.textContent || '';
-        if (ct !== latestText && ct.length > 100) {
-          latestText = ct;
-          if (hideDebounce) clearTimeout(hideDebounce);
-          hideDebounce = setTimeout(function() { hideOverlay(); hideDebounce = null; }, 600);
-        }
-      });
-      obs.observe(document.body, { childList: true, subtree: true, characterData: true });
-      var _ = translate;
+      var _ = (typeof translate !== 'undefined') ? translate : null;
+      if (!_) { markActive(savedLang); return; }
       if (_ && _.listener && typeof _.listener.renderTaskFinish === 'function') {
         var orig = _.listener.renderTaskFinish;
         _.listener.renderTaskFinish = function() { if (finishHandled) return; finishHandled = true; if (typeof orig === 'function') orig(); };
       }
+      var appVisible = function() { var v = document.getElementById('view-app'); return !!(v && !v.classList.contains('d-none')); };
       var startTranslate = function() {
+        markActive(savedLang);
+        if (savedLang === defaultLang) return; // default: no translation action
+        if (!appVisible()) return; // login view stays untranslated; start only inside app
         try {
-          _.language.setLocal(defaultLang); _.service.use('client.edge'); _.ignore.class.push('notranslate', null); _.listener.start(); _.execute();
-          if (savedLang !== defaultLang) { showOverlay(); transTimer = setTimeout(function(){ failOverlay(true); }, 5000); setTimeout(function(){ try { _.changeLanguage(savedLang); } catch(e) { failOverlay(false); } }, 300); }
+          _.language.setLocal(defaultLang); _.service.use('client.edge'); _.ignore.class.push('notranslate'); _.listener.start(); _.execute();
+          var appRoot = document.getElementById('view-app');
+          latestText = appRoot.textContent || '';
+          obs = new MutationObserver(function() {
+            var ct = appRoot.textContent || '';
+            if (ct !== latestText && ct.length > 100) {
+              latestText = ct;
+              if (hideDebounce) clearTimeout(hideDebounce);
+              hideDebounce = setTimeout(function() { hideOverlay(); hideDebounce = null; }, 600);
+            }
+          });
+          obs.observe(appRoot, { childList: true, subtree: true, characterData: true });
+          showOverlay(); transTimer = setTimeout(function(){ failOverlay(true); }, 5000);
+          setTimeout(function(){ try { _.changeLanguage(savedLang); } catch(e) { failOverlay(false); } }, 300);
         }
         catch(e) { failOverlay(false); }
       };
-      if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', startTranslate); }
-      else { startTranslate(); }
+      // no auto-start on page load (login stays untouched); app calls this after login
+      window.maybeStartTranslation = startTranslate;
       markActive(savedLang);
       items.forEach(function(item) {
         item.addEventListener('click', function(e) {
           e.preventDefault(); var lang = this.getAttribute('data-lang');
           localStorage.setItem('gw_lang', lang); markActive(lang);
+          if (lang === defaultLang) { location.reload(); return; } // back to source: reload for clean English
+          var app = document.getElementById('view-app');
+          if (!app || app.classList.contains('d-none')) return; // never translate login view
           overlayHidden = false; transFailed = false; toastShown = false; finishHandled = false;
           showOverlay(); transTimer = setTimeout(function(){ failOverlay(true); }, 5000);
           try { _.changeLanguage(lang); } catch(e) { failOverlay(false); }
@@ -1092,7 +1098,7 @@ else (async () => {
 
 </script>
 <script>
-  initTranslation('#langMenu .lang-item', 'english', '翻譯完成', '翻譯失敗');
+  initTranslation('#langMenu .lang-item', 'english', 'Translation done', 'Translation failed');
   /* dropdown toggle — console-specific (docs uses Bootstrap dropdown) */
   var ddBtn=document.getElementById('langDropdown');
   var ddMenu=document.getElementById('langMenu');
