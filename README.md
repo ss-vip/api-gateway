@@ -24,6 +24,7 @@
 - **管理後台** — `GET /console` 使用 client-token 登入，可檢視/編輯 config、Log
 - **運行儀表板** — `/console` 的 Status 顯示各 provider 健康度，並彙總成功/失敗次數、平均延遲、錯誤率
 - **配置檔熱重啟** — 修改 config 檔 1 秒後自動重啟
+- **決策模型路由** — 帶有快取機制的 [Classifier](https://classifier.dev) 請求路由
 
 > `log.json` 預設保留 7 天（檔名可由 `log.path` 指定），清理機制由 `/health` 每小時清理，並在每寫入 200 筆（且距上次清理超過 10 分鐘）時觸發，避免資料無限增長。
 
@@ -340,11 +341,13 @@ model 別名與 `images/generations` 共用同一 `image` 鏈即可。
 "/v1/files": "nvidia"
 ```
 
+---
+
 ## 決策模型
 
 `/v1/classifier` 帶有快取機制的零樣本文字分類服務（Jev 決策模型，只分類不生成），回傳最貼切的 label 與信心分數。
 
-預設為 [classifier](https://classifier.dev)，`api_key` 留空即可免費用，或更換 `base_url`自建相容端點。
+預設為 classifier.dev 上游，`api_key` 留空即可免費用，或更換 `base_url`自建相容端點。
 
 ```bash
 curl http://localhost:3000/v1/classifier \
@@ -352,7 +355,7 @@ curl http://localhost:3000/v1/classifier \
   -d '{"texts":["the checkout button does nothing"],"labels":["bug","feature","praise"]}'
 ```
 
-多決策上游時 body 可帶 `model` 指定別名（如 `{ "model": "jev", ... }`，走該別名首個目標的 baseUrl＋key，key 可空；省略則走 `classifier` 段）。快取指紋含上游，不同上游不串味。舊路徑 `/v1/classify` 保留為別名。
+---
 
 ## Repobeats analytics
 

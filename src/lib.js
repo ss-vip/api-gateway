@@ -683,6 +683,7 @@ async function classifyTexts({ baseUrl, apiKey, tier = 'fast', timeoutMs = 15000
   if (typeof fetch === 'undefined') throw new Error('fetch unavailable (Node 18+ required)');
   if (!Array.isArray(labels) || labels.length < 2) throw new Error('classify requires 2+ labels');
   if (!Array.isArray(inputs) || inputs.length === 0) throw new Error('classify requires 1+ inputs');
+  if (inputs.length > 1000) throw new Error('classify requires at most 1000 inputs');
   const base = String(baseUrl || 'https://classifier.dev').replace(/\/+$/, '');
   const headers = { 'Content-Type': 'application/json' };
   if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -698,11 +699,13 @@ async function classifyTexts({ baseUrl, apiKey, tier = 'fast', timeoutMs = 15000
     const e = new Error('classifier rate limited');
     e.code = 'classifier_429';
     e.retryAfter = r.headers.get('retry-after');
+    try { const b = JSON.parse(body); if (b.code) e.upstreamCode = b.code; } catch {}
     throw e;
   }
   if (!r.ok) {
     const e = new Error(`classifier upstream ${r.status}: ${body.slice(0, 200)}`);
     e.code = `classifier_${r.status}`;
+    try { const b = JSON.parse(body); if (b.code) e.upstreamCode = b.code; } catch {}
     throw e;
   }
   return JSON.parse(body);

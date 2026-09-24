@@ -31,11 +31,63 @@ function _autoFixJson(s) { return lib._autoFixJson(s); }
 
 // --- error log file ---
 function _errMsg(body) { return lib._errMsg(body, LOG_BODY_MAX); }
-function getLogPath() {
-  const ec = cfg.log;
-  if (ec?.path) return ec.path;
-  return path.join(__dirname, 'log.json');
+function _atomicWrite(p, data) { const tmp = p + '.tmp'; fs.writeFileSync(tmp, data, 'utf-8'); fs.renameSync(tmp, p); }
+function getLogPath() { const ec = cfg.log; if (ec?.path) return ec.path; return path.join(__dirname, 'log.json'); }
+let _logBuf = [], _logFlushTimer = null;
+const LOG_FLUSH_INTERVAL_MS = 5000, LOG_FLUSH_BATCH = 50;
+function _flushLog() {
+  if (_logBuf.length === 0) return;
+  const p = getLogPath(), data = _logBuf.join('\n') + '\n'; _logBuf = [];
+  if (_logFlushTimer) { clearTimeout(_logFlushTimer); _logFlushTimer = null; }
+  fs.appendFile(p, data, (err) => { if (err) { elog('─'); elog(`[log] flush ${p}: ${err.message}`); } });
 }
+function _flushLogSync() {
+  if (_logBuf.length === 0) return;
+  const p = getLogPath(), data = _logBuf.join('\n') + '\n'; _logBuf = [];
+  if (_logFlushTimer) { clearTimeout(_logFlushTimer); _logFlushTimer = null; }
+  try { fs.appendFileSync(p, data, 'utf-8'); }
+  catch (e) { elog('─'); elog(`[log] sync flush ${p}: ${e.message}`); }
+}
+function _cleanupLog() {
+  if (_logCleaning.has(getLogPath())) return;
+  const ec = cfg.log;
+  if (ec?.enabled === false) return;
+  const p = getLogPath();
+  if (!fs.existsSync(p)) return;
+  _logCleaning.add(p);
+  try {
+    const cutoff = Date.now() - (ec?.retention_days || 7) * 86400000, tmp = p + '.tmp';
+    const rs = fs.createReadStream(p, { encoding: 'utf8' });
+    const ws = fs.createWriteStream(tmp, { encoding: 'utf8' });
+    let tail = '', kept = 0, skipped = 0;
+    rs.on('data', (chunk) => {
+      const lines = (tail + chunk).split('\n');
+      tail = lines.pop();
+      for (const l of lines) {
+        if (!l.trim()) { ws.write(l + '\n'); kept++; continue; }
+        try {
+          if (new Date(JSON.parse(l).ts).getTime() > cutoff) { ws.write(l + '\n'); kept++; } else skipped++;
+        } catch { ws.write(l + '\n'); kept++; }
+      }
+    });
+    rs.on('end', () => {
+      if (tail.trim()) {
+        try {
+          if (new Date(JSON.parse(tail).ts).getTime() > cutoff) { ws.write(tail + '\n'); kept++; } else skipped++;
+        } catch { ws.write(tail + '\n'); kept++; }
+      }
+      ws.end();
+    });
+    ws.on('finish', () => {
+      if (skipped > 0) {
+        fs.rename(tmp, p, (e) => { if (e) { elog('─'); elog(`[log] cleanup rename: ${e.message}`); try { fs.unlinkSync(tmp); } catch {} } _logCleaning.delete(p); _lastCleanup = Date.now(); });
+      } else { try { fs.unlinkSync(tmp); } catch {} _logCleaning.delete(p); _lastCleanup = Date.now(); }
+    });
+    ws.on('error', (e) => { elog('─'); elog(`[log] cleanup write: ${e.message}`); try { fs.unlinkSync(tmp); } catch {} _logCleaning.delete(p); });
+    rs.on('error', (e) => { elog('─'); elog(`[log] cleanup read: ${e.message}`); try { fs.unlinkSync(tmp); } catch {} _logCleaning.delete(p); });
+  } catch (e) { elog('─'); elog(`[log] cleanup: ${e.message}`); _logCleaning.delete(p); }
+}
+function _triggerCleanup() { _cleanupLog(); }
 let _logWriteCount = 0, _logCleaning = new Set(), _lastCleanup = 0;
 const stats = { success: 0, error: 0, latSum: 0, latN: 0, httpCodes: {} };
 const _sseClients = new Set();
@@ -83,44 +135,12 @@ function _buildStatusJSON() {
   };
 }
 const MAX_LOG_LINES = 10000;
-const MAX_CLEANUP_BYTES = 50 * 1024 * 1024;
 const IN_FLIGHT_TIMEOUT_MS = 300000; // 5 min — purge stuck in-flight key entries
 const FLIGHT_CLEAN_EVERY = 50; // full-scan cleanup every N selectKey calls
 const LOG_CLEANUP_EVERY = 200; // trigger cleanup every N log writes
 const LOG_CLEANUP_COOLDOWN_MS = 600000; // 10 min — min interval between cleanups
 const MEM_CHECK_INTERVAL = 100; // check memory every N requests
 const RESEED_MAX_LINES = 10000; // reseed last N log lines on startup — higher = more accurate stats, more startup time
-function _cleanupLog(p, cutoffOverride) {
-  if (_logCleaning.has(p)) return;
-  const ec = cfg.log;
-  if (ec?.enabled === false) return;
-  if (!fs.existsSync(p)) return;
-  _logCleaning.add(p);
-  try { if (fs.statSync(p).size > MAX_CLEANUP_BYTES) { elog('─'); elog(`[log] cleanup skip: ${path.basename(p)} > ${MAX_CLEANUP_BYTES/1024/1024}MB`); _logCleaning.delete(p); return; } } catch {}
-  const cutoff = cutoffOverride || (Date.now() - (ec?.retention_days || 7) * 86400000);
-  const old = p + '.old';
-  const tmp = p + '.tmp';
-  fs.rename(p, old, (err) => {
-    if (err) { _logCleaning.delete(p); return; }
-    fs.readFile(old, 'utf8', (_, c) => {
-      if (!c) { fs.unlink(old, () => {}); _logCleaning.delete(p); _lastCleanup = Date.now(); return; }
-      const kept = c.split('\n').filter(l => l.trim()).filter(l => {
-        try { return new Date(JSON.parse(l).ts).getTime() > cutoff; } catch { return false; }
-      });
-            if (kept.length > 0) {
-        fs.writeFile(tmp, kept.join('\n') + '\n', (e2) => {
-          if (e2) { elog('─'); elog(`[log] cleanup write: ${e2.message}`); fs.unlink(old, () => {}); fs.unlink(tmp, () => {}); _logCleaning.delete(p); return; }
-          fs.rename(tmp, p, (e3) => { if (e3) { elog('─'); elog(`[log] cleanup rename: ${e3.message}`); } fs.unlink(old, () => {}); _logCleaning.delete(p); _lastCleanup = Date.now(); });
-        });
-      } else {
-        fs.unlink(old, () => {});
-        _logCleaning.delete(p);
-        _lastCleanup = Date.now();
-      }
-    });
-  });
-}
-function _triggerCleanup() { _cleanupLog(getLogPath()); }
 function recordSuccess(provider, model, key, latency, tokens) {
   markKeySuccess(provider, key, latency);
   _recordProviderSuccess(provider);
@@ -137,7 +157,6 @@ function recordFailure(provider, model, key, status, body) {
 function logEvent({ logId, provider, model, key, status, latency, tokens, body }) {
   const ec = cfg.log;
   if (ec?.enabled === false) return;
-  const p = getLogPath();
   const entry = { ts: _ts(), id: logId || '-', provider, model, key: key && key !== '-' ? logKey(key) : '-' };
   if (body !== undefined) {
     entry.status = status || 0;
@@ -148,18 +167,22 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
     entry.tokens = tokens || 0;
     entry.type = 'success';
   }
-  fs.appendFile(p, JSON.stringify(entry) + '\n', (err) => { if (err) { elog('─'); elog(`[log] write ${p}: ${err.message}`); } });
-  if (entry.type === 'error') { stats.error++; if (status) stats.httpCodes[status] = (stats.httpCodes[status] || 0) + 1; }
+  _logBuf.push(JSON.stringify(entry));
+  if (entry.type === 'error') { _flushLog(); stats.error++; if (status) stats.httpCodes[status] = (stats.httpCodes[status] || 0) + 1; }
   else { stats.success++; stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1; if (latency) { stats.latSum += latency; stats.latN++; } }
   _pushSSE('log', entry);
   _logWriteCount = (_logWriteCount + 1) % 1000000007;
-    if (_logWriteCount % LOG_CLEANUP_EVERY === 1 && Date.now() - _lastCleanup > LOG_CLEANUP_COOLDOWN_MS) _triggerCleanup();
+  if (_logBuf.length >= LOG_FLUSH_BATCH) _flushLog();
+  else if (!_logFlushTimer) _logFlushTimer = setTimeout(_flushLog, LOG_FLUSH_INTERVAL_MS);
+  if (_logWriteCount % LOG_CLEANUP_EVERY === 1 && Date.now() - _lastCleanup > LOG_CLEANUP_COOLDOWN_MS) _triggerCleanup();
 }
 
 function _reseedStats() {
   try {
-    const _lines = p => { try { const all = fs.readFileSync(p, 'utf8').split('\n'); return all.slice(-RESEED_MAX_LINES).filter(l => l.trim() && !l.trim().startsWith('#')); } catch { return []; } };
-    const all = _lines(getLogPath()).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const p = getLogPath(); let lines = [];
+    try { const all = fs.readFileSync(p, 'utf8').split('\n'); lines = all.slice(-RESEED_MAX_LINES); } catch {}
+    const all = lines.filter(l => l.trim() && !l.trim().startsWith('#'))
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     stats.httpCodes = {};
     for (const e of all) {
       if (e.type === 'success') stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1;
@@ -191,7 +214,7 @@ if (CONFIG_PATH) {
     const fixed = _autoFixJson(fs.readFileSync(CONFIG_PATH, 'utf-8'));
     if (fixed !== null) {
       elog('─'); elog(`[config] ${path.basename(CONFIG_PATH)} had missing closing brackets — auto-fixed and saved`);
-      try { fs.writeFileSync(CONFIG_PATH, fixed); } catch {}
+      try { _atomicWrite(CONFIG_PATH, fixed); } catch {}
       cfg = parseJsonc(fixed);
     } else {
       elog('─'); elog(`[config] failed to load ${path.basename(CONFIG_PATH)}:`, e.message);
@@ -212,6 +235,15 @@ if (cfg && typeof cfg === 'object') {
   }
 }
 if (cfg.timezone) process.env.TZ = cfg.timezone;
+
+// Built-in anonymous fallback: keep available unless config explicitly defines these entries.
+// This lets a fresh install route `model: openai` to gpt4free/auto without a key.
+if (!CONFIG_PATH && (!cfg.providers || !Object.prototype.hasOwnProperty.call(cfg.providers, 'gpt4free'))) {
+  cfg.providers = { ...(cfg.providers || {}), gpt4free: [''] };
+}
+if (!CONFIG_PATH && (!cfg.models || !Object.prototype.hasOwnProperty.call(cfg.models, 'openai'))) {
+  cfg.models = { ...(cfg.models || {}), openai: [{ provider: 'gpt4free', model: 'auto' }] };
+}
 
 const CLIENT_TOKEN = process.env.CLIENT_TOKEN || cfg.client_token || '';
 if (!CLIENT_TOKEN) { elog('─'); elog('⚠️ [config] no client_token set — all endpoints unprotected'); }
@@ -293,7 +325,7 @@ const ADAPTERS = {
   vyceai:     { banned: new Set(['parallel_tool_calls','user']) },
   nvidia:     { banned: new Set(['parallel_tool_calls']) },
   cohere:     { banned: new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']) },
-  mistral:    { banned: new Set(['user','n','logit_bias','top_logprobs']) },
+  mistral:    { banned: new Set(['user','n','logit_bias','top_logprobs','store']) },
   huggingface:{ banned: new Set(['user']) },
   gpt4free:   { banned: new Set(['top_p']) },
   ollama:     { banned: new Set(['tool_choice','logit_bias','user','n']) },
@@ -1200,8 +1232,8 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
 try { isAnthropic = new URL(baseUrl).hostname === 'api.anthropic.com'; } catch {}
     const headers = {
       'Content-Type': contentType || 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
       'Accept': accept || 'application/json',
+      ...(apiKey ? { 'Authorization': `Bearer ${apiKey}` } : {}),
       ...(extraHeaders || {}),
     };
     if (isAnthropic) {
@@ -2119,8 +2151,8 @@ function handleConsoleSave(req, res, body, logId) {
         }
       }
     }
-    fs.writeFileSync(target, body.content, 'utf-8');
-    log(`[${logId}] saved ${path.basename(target)}`);
+    _atomicWrite(target, body.content);
+    log(`[${logId}] saved ${body.file}`);
     if (body.file === 'log') { stats.latSum = 0; stats.latN = 0; _reseedStats(); }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
@@ -2189,21 +2221,26 @@ async function handleConsoleProbe(req, res, body, logId) {
 // note: decision-model relay — clients/agents call it explicitly (as an HTTP tool);
 // the gateway only relays. `model` selects the upstream (models alias or
 // endpoint_fallbacks["/v1/classifier"] (legacy "/v1/classify" also read); omitted = classifier section. Key optional.
+// note: tier is a pass-through label to the upstream classifier; whitelist to prevent
+// arbitrary strings from reaching the upstream — unknown values fall back to 'fast'.
+const _CLS_TIERS = new Set(['fast', 'balanced', 'smart']);
+function _normalizeClassifierTier(t) { const v = String(t || 'fast').toLowerCase(); return _CLS_TIERS.has(v) ? v : 'fast'; }
 async function handleClassifyRelay(req, res, body, logId) {
   log('─'); log(`[${logId}] /v1/classifier`);
-  const texts = Array.isArray(body?.texts) ? body.texts : (Array.isArray(body?.inputs) ? body.inputs : null);
+  const texts = Array.isArray(body?.texts) ? body.texts : (Array.isArray(body?.inputs) ? body.inputs : (body?.input ? [body.input] : null));
   const labels = Array.isArray(body?.labels) ? body.labels : null;
   if (!texts || texts.length === 0 || !labels || labels.length < 2) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'texts[] (1-50) and labels[] (2+) required', type: 'invalid_request' } }));
+    res.end(JSON.stringify({ error: { message: 'texts[] (1-1000) and labels[] (2+) required', type: 'invalid_request' } }));
     return;
   }
-  if (texts.length > 50) {
+  if (texts.length > 1000) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'max 50 texts per call', type: 'invalid_request' } }));
+    res.end(JSON.stringify({ error: { message: 'max 1000 texts per call', type: 'invalid_request' } }));
     return;
   }
   let baseUrl = CLASSIFIER.base_url, apiKey = CLASSIFIER.api_key, upDesc = 'classifier';
+  if (apiKey === 'unused' || apiKey === '') apiKey = '';
   if (body?.model) {
     const t = resolveModelForEndpoint(body.model, '/v1/classifier')?.[0];
     if (!t || !DIRECT_PROVIDERS[t.provider]) {
@@ -2223,7 +2260,7 @@ async function handleClassifyRelay(req, res, body, logId) {
       upDesc = `${t.provider}/${t.upstreamModel}`;
     }
   }
-  const maxChars = CLASSIFIER.max_chars || 2000;
+  const maxChars = CLASSIFIER.max_chars || 32000;
   const clipped = texts.map((t) => String(t ?? '').slice(0, maxChars));
   const fp = CLS_MEMO_ON
     ? crypto.createHash('sha256').update(JSON.stringify({ u: upDesc, l: labels.map(String), t: clipped })).digest('hex')
@@ -2239,7 +2276,7 @@ async function handleClassifyRelay(req, res, body, logId) {
   }
   try {
     const out = await lib.classifyTexts(
-      { baseUrl, apiKey, tier: 'fast', timeoutMs: CLASSIFIER.timeout_ms || 15000, maxChars },
+      { baseUrl, apiKey, tier: _normalizeClassifierTier(body.tier), timeoutMs: CLASSIFIER.timeout_ms || 15000, maxChars },
       { labels, inputs: clipped }
     );
     if (fp) _clsMemo.set(fp, out);
@@ -2251,7 +2288,7 @@ async function handleClassifyRelay(req, res, body, logId) {
     const sc = e && e.code === 'classifier_429' ? 429 : 502;
     log(`[${logId}] ${_statusIcon(sc)} ${sc} /v1/classifier ${e.message}`);
     res.writeHead(sc, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: e.message, type: 'classifier_error', code: e.code || 'classifier_error' } }));
+    res.end(JSON.stringify({ error: { message: e.message, type: 'classifier_error', code: e.upstreamCode || e.code || 'classifier_error' } }));
   }
 }
 function _ensureSSETimer() {
@@ -2590,6 +2627,7 @@ function _gracefulRestart() {
 
 // --- shutdown handlers ---
 function shutdown(signal) {
+  _flushLog();
   log('─');
   log(`[config] ${signal} — closing...`);
   server.close(() => {
@@ -2603,5 +2641,5 @@ function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
-process.on('uncaughtException', (e) => { elog('─'); elog('[config] FATAL:', e.stack); process.exit(1); });
+process.on('uncaughtException', (e) => { _flushLogSync(); elog('─'); elog('[config] FATAL:', e.stack); process.exit(1); });
 process.on('unhandledRejection', (r) => { elog('─'); elog('[config] REJECTION:', r instanceof Error ? r.stack : r); });

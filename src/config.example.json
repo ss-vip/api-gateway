@@ -185,7 +185,7 @@
     "base_url": "https://classifier.dev",
     "api_key": "",
     "timeout_ms": 15000,
-    "max_chars": 2000,
+    "max_chars": 32000,
     "cache": {
       "_note": "內建快取機制",
       "enabled": true,

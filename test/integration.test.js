@@ -417,6 +417,17 @@ test('POST /v1/classifier rejects bad input and missing auth', async () => {
   assert.equal(noauth.status, 401);
 });
 
+test('POST /v1/classifier normalizes unknown tier to fast', async () => {
+  // regression: a bogus tier must not cause ReferenceError → 502
+  // (tests the _normalizeClassifierTier helper call path)
+  const r = await req(
+    { method: 'POST', path: '/v1/classifier', headers: authH() },
+    { texts: ['tier probe sentence'], labels: ['bug', 'feature'], tier: 'bogus' }
+  );
+  assert.equal(r.status, 200);
+  assert.equal(JSON.parse(r.body).results[0].label, 'bug');
+});
+
 test('chat: vision-routed request never overflows onto audio aliases', async () => {
   mock.requests.length = 0;
   const r = await req(
