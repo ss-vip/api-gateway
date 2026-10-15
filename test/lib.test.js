@@ -4,9 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const lib = require('../src/lib.js');
 
-// ---------------------------------------------------------------------------
-// JSONC / config parsing
-// ---------------------------------------------------------------------------
+// --- JSONC / config parsing
 test('parseJsonc strips line and block comments', () => {
   const src = `{
     // line comment
@@ -56,9 +54,7 @@ test('_ndjsonValid validates one object per line', () => {
   assert.deepEqual(lib._ndjsonValid(''), { ok: true });
 });
 
-// ---------------------------------------------------------------------------
-// Model alias resolution & endpoint fallback
-// ---------------------------------------------------------------------------
+// --- Model alias resolution & endpoint fallback
 test('createModelResolver matches exact and prefixed client models', () => {
   const entries = new Map([
     ['gpt-4o', [{ provider: 'openai', model: 'gpt-4o' }]],
@@ -94,9 +90,7 @@ test('createEndpointResolver falls back to endpoint alias', () => {
   assert.equal(resolve(null, '/v1/missing'), null);
 });
 
-// ---------------------------------------------------------------------------
-// Chat body validation
-// ---------------------------------------------------------------------------
+// --- Chat body validation
 test('validateChatBody rejects malformed bodies', () => {
   assert.equal(lib.validateChatBody(null), 'invalid request body');
   assert.equal(lib.validateChatBody({}), 'messages must be a non-empty array');
@@ -131,9 +125,7 @@ test('validateChatBody allows assistant with tool_calls', () => {
   assert.equal(lib.validateChatBody(body), null);
 });
 
-// ---------------------------------------------------------------------------
-// Token estimation
-// ---------------------------------------------------------------------------
+// --- Token estimation
 test('estimateStrTokens: CJK costs more than latin', () => {
   const cjk = lib.estimateStrTokens('中文測試中文測試');
   const latin = lib.estimateStrTokens('hello world');
@@ -150,9 +142,7 @@ test('estimateTokens counts images', () => {
   assert.equal(lib.estimateTokens(null), 0);
 });
 
-// ---------------------------------------------------------------------------
-// Utility functions
-// ---------------------------------------------------------------------------
+// --- Utility functions
 test('formatUptime formats human readable uptime', () => {
   assert.equal(lib.formatUptime(0), '0s');
   assert.equal(lib.formatUptime(65), '1m 5s');
@@ -180,9 +170,7 @@ test('_safeSlice avoids splitting a surrogate pair', () => {
   assert.equal(lib._safeSlice('abc', 2), 'ab');
 });
 
-// ---------------------------------------------------------------------------
-// Quota / error detection
-// ---------------------------------------------------------------------------
+// --- Quota / error detection
 test('_isQuotaError detects quota signatures on 429/403', () => {
   assert.equal(lib._isQuotaError(429, 'insufficient quota'), true);
   assert.equal(lib._isQuotaError(403, 'billing issue'), true);
@@ -190,11 +178,111 @@ test('_isQuotaError detects quota signatures on 429/403', () => {
   assert.equal(lib._isQuotaError(429, 'rate limit exceeded'), false);
 });
 
-test('_errMsg extracts message from JSON error body', () => {
-  const body = JSON.stringify({ error: { message: 'bad key' } });
-  assert.equal(lib._errMsg(body, 100), 'bad key');
-  assert.equal(lib._errMsg('plain text error', 100), 'plain text error');
-  assert.equal(lib._errMsg(null, 100), '-');
+test('_errMsg redacts by default and only extracts text when opted in', () => {
+  // Upstream error bodies echo the offending request. Default must NOT persist it.
+  const body = JSON.stringify({ error: { message: 'my password is hunter2 and my SSN is 123-45-6789' } });
+  const redacted = lib._errMsg(body, 100);           // capture falsy
+  assert.ok(redacted.startsWith('[redacted]'), 'should be redacted by default: ' + redacted);
+  assert.ok(!redacted.includes('hunter2'), 'secret leaked into log line');
+  assert.ok(!redacted.includes('123-45-6789'), 'PII leaked into log line');
+  assert.ok(/json \d+B/.test(redacted), 'should still fingerprint shape/size: ' + redacted);
+
+  // explicit opt-in restores the old behaviour for local debugging
+  assert.equal(lib._errMsg(body, 100, true), 'my password is hunter2 and my SSN is 123-45-6789');
+  assert.equal(lib._errMsg('plain text error', 100, true), 'plain text error');
+  assert.equal(lib._errMsg(null, 100, true), '-');
+  // error codes survive redaction so the console is still useful for triage
+  assert.ok(/code=rate_limit/.test(lib._errMsg(JSON.stringify({ error: { code: 'rate_limit' } }), 100)));
+});
+
+test('config.example.jsonc is internally consistent', () => {
+// Dangling aliases must fail: `"/v1/files": "nvidia"` once shipped a provider
+// name where an alias was required and silently fell back to openai.
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const raw = fs.readFileSync(path.join(__dirname, '../src/config.example.jsonc'), 'utf8');
+  const cfg = lib.parseJsonc(raw);
+  assert.ok(cfg, 'example config must be valid JSONC');
+  assert.equal(Object.keys(cfg).filter((k) => k.startsWith('_')).length, 0, '_note fields should be comments now');
+
+  const entries = Object.entries(cfg.models || {}).sort((a, b) => b[0].length - a[0].length);
+  const resolveModel = lib.createModelResolver(entries);
+  const resolveForEndpoint = lib.createEndpointResolver(entries, cfg.endpoint_fallbacks || {});
+
+  for (const [ep, alias] of Object.entries(cfg.endpoint_fallbacks || {})) {
+    assert.ok(resolveModel(alias), `endpoint_fallbacks["${ep}"] = "${alias}" is not a model alias in models{}`);
+  }
+  for (const [name, tiers] of Object.entries(cfg.smart_route || {})) {
+    assert.ok(resolveModel(name), `smart_route key "${name}" is not a model alias`);
+    for (const t of tiers) assert.ok(resolveModel(t.alias), `smart_route.${name} tier alias "${t.alias}" is not a model alias`);
+  }
+  for (const [alias, chain] of Object.entries(cfg.models || {})) {
+    for (const t of chain) {
+      assert.ok(t.provider && typeof t.provider === 'string', `models.${alias} entry missing provider`);
+      if (t.fallback) {
+        const fb = Array.isArray(t.fallback) ? t.fallback : [t.fallback];
+        for (const f of fb) assert.ok(resolveModel(f), `models.${alias}.fallback "${f}" is not a model alias`);
+      }
+    }
+  }
+  // every provider referenced by models must actually have a key slot
+  for (const p of new Set(Object.values(cfg.models || {}).flat().map((t) => t.provider))) {
+    assert.ok(cfg.providers?.[p], `models references provider "${p}" which is absent from providers{}`);
+  }
+  assert.ok(resolveForEndpoint('', '/v1/files'), '/v1/files must resolve to a real target, not the openai fallback');
+});
+
+test('validateConfigObject accepts a healthy config and rejects broken ones', () => {
+  const good = {
+    port: 3000, timeout: 60000,
+    providers: { a: ['k1'], b: { apiKeys: ['k2'], baseUrl: 'https://x.example.com', rpm: 5 } },
+    models: {
+      m1: [{ provider: 'a', model: 'x' }],
+      m2: [{ provider: 'b', model: 'y', fallback: 'm1' }],
+    },
+    endpoint_fallbacks: { '/v1/chat/completions': 'm1' },
+    smart_route: { m1: [{ alias: 'm2', max_tokens: 100 }] },
+  };
+  assert.equal(lib.validateConfigObject(good), '');
+  const cases = [
+    ['not an object', null, 'must be a JSON object'],
+    ['bad port', { ...good, port: 99999 }, 'port must be <= 65535'],
+    ['negative timeout', { ...good, timeout: -1 }, 'timeout must be >= 1'],
+    ['no providers', { ...good, providers: {} }, 'at least one provider'],
+    ['providers not object', { ...good, providers: [] }, 'providers must be an object'],
+    ['no live keys', { ...good, providers: { a: ['  '] } }, 'at least one non-empty API key'],
+    ['bad provider shape', { ...good, providers: { a: 'oops' } }, 'must be a key array'],
+    ['bad baseUrl', { ...good, providers: { a: { apiKeys: ['k'], baseUrl: 'ftp://x' } } }, 'baseUrl must start with http'],
+    ['bad rpm', { ...good, providers: { a: { apiKeys: ['k'], rpm: 0 } } }, 'rpm must be a positive number'],
+    ['no models', { ...good, models: {} }, 'at least one model alias'],
+    ['empty chain', { ...good, models: { m1: [] } }, 'must be a non-empty array'],
+    ['dangling provider', { ...good, models: { m1: [{ provider: 'ghost', model: 'x' }] } }, 'unknown provider "ghost"'],
+    ['dangling fallback', { ...good, models: { m1: [{ provider: 'a', model: 'x', fallback: 'nope' }] } }, 'unknown alias "nope"'],
+    ['dangling endpoint fallback', { ...good, endpoint_fallbacks: { '/v1/chat/completions': 'nope' } }, 'unknown alias "nope"'],
+    ['dangling smart tier', { ...good, smart_route: { m1: [{ alias: 'nope', max_tokens: 1 }] } }, 'not a model alias'],
+    ['tier without budget', { ...good, smart_route: { m1: [{ alias: 'm2', max_tokens: 0 }] } }, 'needs max_tokens > 0'],
+  ];
+  for (const [label, cfg, want] of cases) {
+    const got = lib.validateConfigObject(cfg);
+    assert.ok(got.includes(want), `${label}: expected "${want}" in "${got}"`);
+  }
+});
+
+test('config.example.jsonc passes validateConfigObject', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const cfg = lib.parseJsonc(fs.readFileSync(path.join(__dirname, '../src/config.example.jsonc'), 'utf8'));
+  assert.equal(lib.validateConfigObject(cfg), '');
+});
+
+test('successClearsFailure rejects a success that predates the newest failure', () => {
+// A stale success must not wipe out a breaker that newer failures opened.
+  assert.equal(lib.successClearsFailure(0, 1000), true, 'no failure state → allow');
+  assert.equal(lib.successClearsFailure(500, 1000), true, 'failure older than the request → allow');
+  assert.equal(lib.successClearsFailure(1000, 1000), true, 'same instant → allow');
+  assert.equal(lib.successClearsFailure(1500, 1000), false, 'success started before the failure → REJECT');
+  assert.equal(lib.successClearsFailure(2000, 1000), false, 'much newer failure → REJECT');
+  assert.equal(lib.successClearsFailure(1500, undefined), true, 'unknown start time → preserve legacy behaviour');
 });
 
 test('_hasNonTextContent detects image parts', () => {
@@ -237,9 +325,7 @@ test('normalizeMessageOrder sanitizes invalid tool ids', () => {
   assert.equal(out[1].tool_call_id, newId);
 });
 
-// ---------------------------------------------------------------------------
-// Chat ↔ Responses conversion
-// ---------------------------------------------------------------------------
+// --- Chat ↔ Responses conversion
 test('chatToResponses maps history, tools and keeps output headroom', () => {
   const out = lib.chatToResponses({
     model: 'm',
@@ -458,9 +544,7 @@ test('assembleResponsesSSE backfills function_call from output_item.done', () =>
   assert.equal(conv.toolCalls[0].function.arguments, '{"cmd":"ls"}');
 });
 
-// ---------------------------------------------------------------------------
-// smart routing helpers
-// ---------------------------------------------------------------------------
+// --- smart routing helpers
 test('buildNonChatAliases derives audio/image families from endpoint_fallbacks', () => {
   const s = lib.buildNonChatAliases({
     '/v1/chat/completions': 'openai',
@@ -529,9 +613,7 @@ test('classifyTexts maps 429 to classifier_429 code', async () => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// bounded memoizer
-// ---------------------------------------------------------------------------
+// --- bounded memoizer
 test('createMemoCache hits, expires by TTL, reports stats', () => {
   const c = lib.createMemoCache({ maxEntries: 10, maxBytes: 1024, ttlMs: 1000 });
   assert.equal(c.get('a', 0), undefined);
@@ -565,4 +647,52 @@ test('createMemoCache with zero caps acts disabled', () => {
   const c = lib.createMemoCache({ maxEntries: 0, maxBytes: 0, ttlMs: 60000 });
   assert.equal(c.set('a', 1, 0), false);
   assert.equal(c.get('a', 0), undefined);
+});
+
+test('isBlockedEgressUrl allows public, blocks private in any numeric form', () => {
+  const allow = [
+    'https://api.openai.com/v1',
+    'https://example.com./',          // trailing dot
+    'http://127.0.0.1:8080/',         // loopback http (tests/local dev)
+    'https://127.0.0.1/',             // loopback https
+    'https://[::1]/',                 // v6 loopback — same loopback policy
+    'https://2130706433/',            // decimal 127.0.0.1 — loopback policy
+    'https://0x7f.0.0.1/',            // hex loopback
+    'https://0177.0.0.1/',            // octal loopback
+  ];
+  for (const u of allow) {
+    assert.equal(lib.isBlockedEgressUrl(u), null, `${u} should be allowed`);
+  }
+  const block = [
+    ['https://3232235777/', 'private'],      // decimal 192.168.1.1
+    ['https://0xC0.0xA8.0x1.0x1/', 'private'],
+    ['https://2852031653/', 'private'],      // decimal 169.254.169.254
+    ['https://0xa9.0xfe.0xa9.0xfe/', 'private'],
+    ['https://167772161/', 'private'],       // decimal 10.0.0.1
+    ['https://0x0A000001/', 'private'],
+    ['https://10.0.0.1/', 'private'],
+    ['https://192.168.1.1/', 'private'],
+    ['https://169.254.169.254/latest/', 'private'],
+    ['https://10.0.0.1:8443/', 'port'],
+    ['ftp://example.com/', 'https'],
+    ['https://user@example.com/', 'credentials'],
+    ['https://localhost/', 'loopback'],
+    ['not a url', 'invalid'],
+  ];
+  for (const [u, want] of block) {
+    const got = lib.isBlockedEgressUrl(u);
+    assert.ok(got && got.toLowerCase().includes(want), `${u} should be blocked (${want}), got: ${got}`);
+  }
+});
+
+test('normalizeIPv4 folds inet_aton forms to dotted quad', () => {
+  assert.equal(lib.normalizeIPv4('2130706433'), '127.0.0.1');
+  assert.equal(lib.normalizeIPv4('0x7f.0.0.1'), '127.0.0.1');
+  assert.equal(lib.normalizeIPv4('0177.0.0.1'), '127.0.0.1');
+  assert.equal(lib.normalizeIPv4('3232235777'), '192.168.1.1');
+  assert.equal(lib.normalizeIPv4('10.0.0.1'), '10.0.0.1');
+  assert.equal(lib.normalizeIPv4('::1'), '127.0.0.1');
+  assert.equal(lib.normalizeIPv4('::ffff:127.0.0.1'), '127.0.0.1');
+  assert.equal(lib.normalizeIPv4('example.com'), null);
+  assert.equal(lib.normalizeIPv4('2001:db8::1'), null);
 });

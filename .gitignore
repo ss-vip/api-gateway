@@ -1,9 +1,10 @@
 node_modules
 dist
-*.log
-.DS_Store
-.env
-temp
-config.json
-log.json
+config.json*
+log.json*
+gw-state.json*
 *.tmp
+*.log
+temp
+.env
+.DS_Store

@@ -153,7 +153,6 @@ function initTranslation(itemsSelector, defaultLang = 'english',
     translate.listener.renderTaskFinish = function () {
       if (finishHandled) return;
       finishHandled = true;
-      // Let MutationObserver detect DOM completion, then hideOverlay()
       if (typeof orig === 'function') orig();
     };
   }
@@ -165,8 +164,9 @@ function initTranslation(itemsSelector, defaultLang = 'english',
     try {
       translate.language.setLocal(defaultLang);
       translate.service.use('client.edge');
-      // Pass null as 2nd arg to avoid "conditionFunction type not function" warning
-      translate.ignore.class.push('notranslate', null);
+      // A real condition function is required: the library warns
+      // ("第二个参数类型不是function") for anything else, including null.
+      translate.ignore.class.push('notranslate', function () { return true; });
       translate.listener.start();
       translate.execute();
 
@@ -193,7 +193,6 @@ function initTranslation(itemsSelector, defaultLang = 'english',
 
   markActive(savedLang);
 
-  // Click handler for language dropdown
   items.forEach(item => {
     item.addEventListener('click', e => {
       e.preventDefault();

@@ -1,11 +1,7 @@
 'use strict';
 
-// Black-box integration tests for src/index.js.
-// Strategy: spin up ONE mock upstream HTTP server plus the real gateway (as a
-// subprocess with a temp config). The gateway follows the OpenAI-standard
-// stream contract (omitted stream means JSON; explicit stream:true means SSE),
-// so we distinguish mock behaviour by the `Authorization` key the gateway
-// sends (one key per provider). No production code is modified.
+// Black-box: one mock upstream + the real gateway as a subprocess.
+// Mock branches on the Authorization key (one key per provider).
 
 const test = require('node:test');
 const { before, after } = require('node:test');
@@ -26,6 +22,38 @@ const KEY_ERR = 'key-err';
 const KEY_OC = 'key-oc';
 const KEY_RSP = 'key-rsp';
 const KEY_RSPEMPTY = 'key-rspempty';
+// stream that closes WITHOUT a terminal marker ([DONE] / stop / message_stop) →
+// the gateway must treat it as a truncated upstream, not a clean success
+const KEY_SSETRUNC = 'key-ssetrunc';
+// stream that terminates with finish_reason but NO [DONE] — still a valid ending
+const KEY_SSEFIN = 'key-ssefin';
+// stream whose CONTENT contains the literal text `"stop":` but never terminates.
+// A naive /"stop":/ regex would call this complete; it must be reported truncated.
+const KEY_SSEDECOY = 'key-ssedecoy';
+// upstream that DOES honour stream_options.include_usage — the gateway must
+// pass its usage chunk through instead of synthesising a second one
+const KEY_SSEUP = 'key-sse-usage';
+const MODEL_SSEUP = 'chatstreamusage';
+// upstream that reports its OWN rate-limit headers + one that always 429s
+const KEY_RLHDR = 'key-rlhdr';
+const KEY_429 = 'key-429';
+const MODEL_RL = 'chatrlhdr';
+const MODEL_429 = 'chat429';
+// regression fixtures (2026-10 review): STT model patching + recordSuccess fix,
+// 3xx-must-not-stream, and explicit rate_limit surviving a 429 (auto-RPM guard)
+const KEY_STT = 'key-stt';
+const KEY_302 = 'key-302';
+const KEY_RL429 = 'key-rl429';
+// slow-but-steady body: keeps trickling for ~2s without ever idling.
+// Must NOT be killed (the cap is an idle timeout that resets per chunk).
+const KEY_SLOW = 'key-slow';
+const MODEL_SSEFIN = 'chatstreamfin';
+const MODEL_SSEDECOY = 'chatstreamdecoy';
+const MODEL_SLOW = 'chatslow';
+// sends headers declaring a body, then hangs up mid-body → truncation
+const KEY_TRUNC = 'key-trunc';
+const MODEL_SSETRUNC = 'chatstreamtrunc';
+const MODEL_TRUNC = 'chattrunc';
 const MODEL_JSON = 'chat';
 const MODEL_SSE = 'chatstream';
 const MODEL_ERR = '_err5xx';
@@ -51,9 +79,10 @@ function startMock() {
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         let body = {};
-        try { body = JSON.parse(Buffer.concat(chunks).toString() || '{}'); } catch {}
+        const raw = Buffer.concat(chunks).toString('utf8');
+        try { body = JSON.parse(raw || '{}'); } catch {}
         const auth = req.headers['authorization'] || '';
-        mock.requests.push({ method: req.method, url: req.url, auth, body,
+        mock.requests.push({ method: req.method, url: req.url, auth, body, raw,
           fp: { ua: req.headers['user-agent'] || '', client: req.headers['x-opencode-client'] || '',
             session: req.headers['x-opencode-session'] || '', request: req.headers['x-opencode-request'] || '' } });
 
@@ -83,6 +112,85 @@ function startMock() {
             'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_t","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"snap-text"}]}],"usage":{"input_tokens":7,"output_tokens":2,"total_tokens":9}}}\n\n' +
             'data: [DONE]\n\n'
           );
+          return;
+        }
+        if (auth.includes(KEY_429)) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '17' });
+          res.end(JSON.stringify({ error: { message: 'rate limited', type: 'rate_limit_error' } }));
+          return;
+        }
+        if (auth.includes(KEY_302)) {
+          // a redirect must be treated as an upstream failure, never piped as success
+          res.writeHead(302, { 'Content-Type': 'application/json', Location: 'http://127.0.0.1:1/x' });
+          res.end(JSON.stringify({ id: 'x', choices: [{ message: { content: 'redirect-body' } }] }));
+          return;
+        }
+        if (auth.includes(KEY_RL429)) {
+          // 429 on the first hit, success afterwards — lets the test observe the
+          // interval AFTER a 429 (the auto-RPM guard must keep it untouched)
+          const n = mock.requests.filter((q) => q.auth.includes(KEY_RL429)).length;
+          if (n <= 1) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'slow down' } }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ id: 'x', choices: [{ message: { content: 'ok' } }] }));
+          }
+          return;
+        }
+        if (auth.includes(KEY_RLHDR)) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'x-ratelimit-limit-requests': '77', 'x-ratelimit-remaining-requests': '5' });
+          res.end(JSON.stringify({ id: 'x', choices: [{ message: { content: 'ok' } }] }));
+          return;
+        }
+        if (auth.includes(KEY_SSEUP)) {
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"id":"up1","model":"upstream-actual","choices":[{"delta":{"content":"up"}}]}\n\n');
+          res.write('data: {"id":"up1","model":"upstream-actual","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+          res.write('data: {"id":"up1","model":"upstream-actual","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":4242}}\n\n');
+          res.write('data: [DONE]\n\n');
+          setTimeout(() => { try { res.end(); } catch {} }, 10);
+          return;
+        }
+        if (auth.includes(KEY_SSEFIN)) {
+          // terminal chunk carries finish_reason and there is no [DONE] frame
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"model":"upstream-actual","choices":[{"delta":{"content":"fin"}}]}\n\n');
+          res.write('data: {"model":"upstream-actual","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+          setTimeout(() => { try { res.end(); } catch {} }, 10);
+          return;
+        }
+        if (auth.includes(KEY_SSEDECOY)) {
+          // the model literally emits `"stop":` as content, then the socket dies
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"model":"upstream-actual","choices":[{"delta":{"content":"here is a JSON snippet: "}}]}\n\n');
+          res.write('data: {"model":"upstream-actual","choices":[{"delta":{"content":"\\"stop\\": true, "}}]}\n\n');
+          setTimeout(() => { try { res.end(); } catch {} }, 10);
+          return;
+        }
+        if (auth.includes(KEY_SLOW)) {
+          // one byte every 250ms — every gap stays far below the idle timeout
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          let n = 0;
+          const tick = setInterval(() => {
+            if (n++ === 0) return res.write('{"msg":"');
+            if (n > 6) { clearInterval(tick); return res.end('slow-ok"}'); }
+            res.write('x');
+          }, 250);
+          return;
+        }
+        if (auth.includes(KEY_SSETRUNC)) {
+          // headers say 200/stream, we emit one delta then END with no terminal
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+          res.write('data: {"model":"upstream-actual","choices":[{"delta":{"content":"partial"}}]}\n\n');
+          setTimeout(() => { try { res.end(); } catch {} }, 20);
+          return;
+        }
+        if (auth.includes(KEY_TRUNC)) {
+          // declare 500 bytes, send 10, then destroy the socket mid-body
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '500' });
+          res.write('{"partial":');
+          setTimeout(() => { try { res.destroy(); } catch {} }, 20);
           return;
         }
         if (auth.includes(KEY_SSE)) {
@@ -132,10 +240,22 @@ function startGateway() {
           trisemlite: { apiKeys: ['key-semlite'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           trisemheavy: { apiKeys: ['key-semheavy'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockcls2: { apiKeys: ['key-cls2'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockssetrunc: { apiKeys: [KEY_SSETRUNC], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockssefin: { apiKeys: [KEY_SSEFIN], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockssedecoy: { apiKeys: [KEY_SSEDECOY], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mocksseup: { apiKeys: [KEY_SSEUP], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockrlhdr: { apiKeys: [KEY_RLHDR], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mock429: { apiKeys: [KEY_429], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockslow: { apiKeys: [KEY_SLOW], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mocktrunc: { apiKeys: [KEY_TRUNC], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mocklow: { apiKeys: ['key-low'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockvis: { apiKeys: ['key-vis'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mocknc: { apiKeys: ['key-nc'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockstt: { apiKeys: [KEY_STT], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mock302: { apiKeys: [KEY_302], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
+          mockrl429: { apiKeys: [KEY_RL429], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
         },
+        rate_limit: { mockrl429: 100 },
         model_limits: { 'mocklow/m': 100 },
         endpoint_fallbacks: { '/v1/audio/speech': 'notchat' },
         smart_route: {
@@ -157,6 +277,14 @@ function startGateway() {
           rsp: [{ provider: 'mockrsp', model: 'mock-model', endpoint: '/v1/responses' }],
           rspempty: [{ provider: 'mockrspempty', model: 'mock-model', endpoint: '/v1/responses' }],
           [MODEL_SSE]: [{ provider: 'mocksse', model: 'mock-model' }],
+          [MODEL_SSETRUNC]: [{ provider: 'mockssetrunc', model: 'mock-model' }],
+          [MODEL_SSEFIN]: [{ provider: 'mockssefin', model: 'mock-model' }],
+          [MODEL_SSEDECOY]: [{ provider: 'mockssedecoy', model: 'mock-model' }],
+          [MODEL_SSEUP]: [{ provider: 'mocksseup', model: 'mock-model' }],
+          [MODEL_RL]: [{ provider: 'mockrlhdr', model: 'mock-model' }],
+          [MODEL_429]: [{ provider: 'mock429', model: 'mock-model' }],
+          [MODEL_SLOW]: [{ provider: 'mockslow', model: 'mock-model' }],
+          [MODEL_TRUNC]: [{ provider: 'mocktrunc', model: 'mock-model' }],
           [MODEL_ERR]: [{ provider: 'mockerr', model: 'mock-model' }],
           orca: [{ provider: 'orcarouter', model: 'orca-model' }],
           fbchain: [{ provider: 'mockerr', model: 'mock-model', fallback: MODEL_JSON }],
@@ -171,13 +299,14 @@ function startGateway() {
           low: [{ provider: 'mocklow', model: 'm' }],
           vision: [{ provider: 'mockvis', model: 'mock-model' }],
           notchat: [{ provider: 'mocknc', model: 'mock-model' }],
+          sttmock: [{ provider: 'mockstt', model: 'stt-upstream-model' }],
+          redir302: [{ provider: 'mock302', model: 'mock-model' }],
+          rl429: [{ provider: 'mockrl429', model: 'mock-model' }],
         },
       };
       fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 
-      // NOTE: stdio is fully ignored. Piping gateway's stdout/stderr to the
-      // parent would fill the pipe buffer (64KB) and BLOCK the gateway process
-      // once it emits enough logs during a request. We wait on /health instead.
+// NOTE: stdio ignored — piping it would fill the 64KB buffer and block the gateway.
       gw = spawn(process.execPath, ['src/index.js'], {
         cwd: path.join(__dirname, '..'),
         env: { ...process.env, CONFIG_PATH: cfgPath, CLIENT_TOKEN: TOKEN },
@@ -201,7 +330,7 @@ function startGateway() {
 
 function req(opts, body) {
   return new Promise((resolve, reject) => {
-    const data = body ? JSON.stringify(body) : null;
+    const data = body == null ? null : (typeof body === 'string' ? body : JSON.stringify(body));
     const r = http.request({
       hostname: '127.0.0.1', port: gwPort, method: opts.method || 'POST',
       path: opts.path, headers: opts.headers || {},
@@ -274,9 +403,13 @@ test('chat: mock upstream received the forwarded request', async () => {
   assert.ok(seen, 'upstream should receive forwarded body fields');
 });
 
-test('chat: unsupported model → 400', async () => {
+test('chat: unsupported model → 404 model_not_found (OpenAI contract)', async () => {
   const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, { model: 'nope-model', messages: [{ role: 'user', content: 'x' }] });
-  assert.equal(r.status, 400);
+  assert.equal(r.status, 404);
+  const e = JSON.parse(r.body).error;
+  assert.equal(e.type, 'not_found_error');
+  assert.equal(e.code, 'model_not_found');
+  assert.equal(e.param, 'model');
 });
 
 test('chat: invalid body (no messages) → 400', async () => {
@@ -449,10 +582,24 @@ test('chat: SSE stream rewrites model back to client model', async () => {
   assert.ok(r.body.includes('[DONE]'));
 });
 
+test('chat: SSE frames are forwarded exactly once (no duplication)', async () => {
+  // Regression: the non-include_usage path wrote every frame AND the raw chunk,
+  // so clients received each token twice.
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody(MODEL_SSE, { stream: true }));
+  assert.equal(r.status, 200);
+  const frames = r.body.split('\n\n').map((f) => f.trim()).filter(Boolean);
+  const dataFrames = frames.filter((f) => f.startsWith('data:') && !f.includes('[DONE]'));
+  const seen = new Set();
+  for (const f of dataFrames) {
+    assert.ok(!seen.has(f), `duplicate SSE frame forwarded to client: ${f.slice(0, 80)}`);
+    seen.add(f);
+  }
+  const dones = frames.filter((f) => f.includes('[DONE]'));
+  assert.equal(dones.length, 1, `expected exactly one [DONE], got ${dones.length}`);
+});
+
 test('chat: upstream 5xx surfaces as error to client', async () => {
-  // The gateway retries on key cooldown then returns the error as JSON
-  // (omitted stream means non-stream). key_cooldown is low in the test
-  // config so retries resolve fast.
+// Retries resolve fast: key_cooldown is low in the test config.
   const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_ERR));
   assert.equal(r.status, 502);
   assert.ok(r.body.includes('error') || r.body.includes('all failed'), 'client should receive the upstream error');
@@ -478,6 +625,234 @@ test('chat: upstream 5xx with stream:true surfaces as SSE error', async () => {
   assert.ok(r.body.includes('[DONE]'));
 });
 
+test('chat: SSE stream that ends without a terminal marker is NOT counted as success', async () => {
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SSETRUNC, { stream: true }));
+  assert.equal(r.status, 200);
+  assert.ok(r.body.includes('partial'), 'client should still receive the partial delta');
+  assert.ok(/error|before terminal/i.test(r.body), 'truncated stream must be signalled, not silently accepted');
+});
+
+test('chat: truncated upstream body yields 502, not an empty 200 success', async () => {
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_TRUNC));
+  assert.equal(r.status, 502, 'truncated body must not be reported as success');
+  assert.ok(/truncat/i.test(r.body));
+});
+
+test('chat: SSE ending with finish_reason (no [DONE]) counts as complete', async () => {
+  // not every provider emits a literal [DONE]; a terminal finish_reason is a
+  // valid ending and must not be misreported as a truncated stream
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SSEFIN, { stream: true }));
+  assert.equal(r.status, 200);
+  assert.ok(r.body.includes('fin'), 'content should reach the client: ' + r.body.slice(0, 200));
+  assert.ok(!/truncat|terminal/i.test(r.body), 'finish_reason stream wrongly flagged as truncated: ' + r.body.slice(0, 200));
+});
+
+test('chat: literal "stop": in content does NOT fake a terminal event', async () => {
+  // a naive /"stop":/ scan over raw stream bytes would accept this truncated
+  // stream as complete, because the model emitted that text as its answer
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SSEDECOY, { stream: true }));
+  assert.equal(r.status, 200);
+  assert.ok(r.body.includes('JSON snippet'), 'content should still reach the client');
+  assert.ok(/error|terminal|truncat/i.test(r.body), 'truncated stream must be signalled: ' + r.body.slice(0, 300));
+});
+
+test('chat: slow-but-steady upstream body is not killed by the idle timeout', async () => {
+  // the cap is an IDLE timeout, not a total budget: the timer resets on every
+  // chunk, so a body that keeps trickling is never killed
+  const t0 = Date.now();
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SLOW));
+  const ms = Date.now() - t0;
+  assert.equal(r.status, 200, 'slow steady body should succeed: ' + r.body.slice(0, 160));
+  assert.ok(r.body.includes('slow-ok'), 'body should be complete: ' + r.body.slice(0, 160));
+  assert.ok(ms > 1000, `expected a multi-second transfer, took ${ms}ms`);
+});
+
+test('chat: stream_options.include_usage emits a usage-only chunk before [DONE]', async () => {
+  // Most OpenAI-compatible upstreams ignore the flag, so the gateway has to
+  // synthesise it. Agent tools depend on this for context/cost accounting.
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SSE, {
+    stream: true, stream_options: { include_usage: true },
+  }));
+  assert.equal(r.status, 200);
+  const frames = r.body.split('\n\n').map((f) => f.trim()).filter(Boolean);
+  const doneIdx = frames.findIndex((f) => /data:\s*\[DONE\]/.test(f));
+  assert.ok(doneIdx >= 0, 'stream must end with [DONE]');
+  const usageFrames = frames.filter((f) => /"usage"/.test(f));
+  assert.equal(usageFrames.length, 1, `expected exactly one usage frame, got ${usageFrames.length}`);
+  const payload = JSON.parse(usageFrames[0].replace(/^data:\s*/, ''));
+  assert.deepEqual(payload.choices, [], 'usage chunk must carry an empty choices array');
+  assert.equal(payload.object, 'chat.completion.chunk');
+  assert.equal(payload.model, MODEL_SSE, 'usage chunk must use the client alias');
+  assert.ok(payload.usage.prompt_tokens > 0, 'prompt_tokens should be counted');
+  assert.ok(payload.usage.completion_tokens > 0, 'completion_tokens should be counted');
+  assert.equal(payload.usage.total_tokens, payload.usage.prompt_tokens + payload.usage.completion_tokens, 'total mismatch');
+  assert.ok(frames.indexOf(usageFrames[0]) < doneIdx, 'usage chunk must precede [DONE]');
+});
+
+test('chat: include_usage does not duplicate an upstream-supplied usage chunk', async () => {
+  // an upstream that DOES honour the flag must not get a second usage frame
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SSEUP, {
+    stream: true, stream_options: { include_usage: true },
+  }));
+  assert.equal(r.status, 200);
+  const usageFrames = r.body.split('\n\n').filter((f) => /"usage"/.test(f));
+  assert.equal(usageFrames.length, 1, `upstream usage must be passed through exactly once, got ${usageFrames.length}`);
+  const payload = JSON.parse(usageFrames[0].replace(/^data:\s*/, ''));
+  assert.equal(payload.usage.total_tokens, 4242, 'upstream usage values must be preserved, not overwritten');
+});
+
+test('chat: include_usage off by default adds no usage chunk', async () => {
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody(MODEL_SSE, { stream: true }));
+  assert.equal(r.status, 200);
+  assert.ok(!/"usage"/.test(r.body), 'no usage chunk unless the client asked for one');
+  assert.ok(/data:\s*\[DONE\]/.test(r.body), 'must still terminate with [DONE]');
+});
+
+test('errors use the OpenAI error envelope', async () => {
+  const r = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody('_err5xx'));
+  assert.equal(r.status, 502);
+  const j = JSON.parse(r.body);
+  assert.ok(j.error, 'no error object');
+  assert.equal(typeof j.error.message, 'string');
+  assert.equal(j.error.type, 'api_error', `expected api_error for a 5xx, got ${j.error.type}`);
+  assert.ok(typeof j.error.code === 'string' && j.error.code, 'missing machine-readable code');
+});
+
+test('error types follow the OpenAI status mapping', async () => {
+  const bad = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, '{bad');
+  assert.equal(bad.status, 400, 'malformed JSON status');
+  assert.equal(JSON.parse(bad.body).error.type, 'invalid_request_error', '400 maps to invalid_request_error');
+
+  const unsupported = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, { model: 'no-such-alias', messages: [{ role: 'user', content: 'x' }] });
+  assert.equal(unsupported.status, 404, 'unknown model must be 404 per OpenAI spec');
+  const um = JSON.parse(unsupported.body).error;
+  assert.equal(um.type, 'not_found_error', `404 maps to not_found_error, got ${um.type}`);
+  assert.equal(um.code, 'model_not_found', 'model_not_found code lets clients offer a model list');
+  assert.equal(um.param, 'model', 'param should identify the offending field');
+
+  const unauth = await fetch(`http://127.0.0.1:${gwPort}/v1/models`, { headers: { Authorization: 'Bearer wrong' } });
+  assert.equal(unauth.status, 401, 'bad token status');
+  const ue = await unauth.json();
+  assert.equal(ue.error.type, 'authentication_error', `401 maps to authentication_error, got ${ue.error.type}`);
+});
+
+test('x-ratelimit-* headers are emitted for a rate-limited provider', async () => {
+  // mockjson is a manual provider, so the gateway auto-derives an interval
+  // (DEFAULT_MANUAL_RPM) and can honestly advertise its admission capacity
+  const r = await fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+    body: JSON.stringify({ model: MODEL_JSON, messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 }),
+  });
+  await r.text();
+  const limit = r.headers.get('x-ratelimit-limit-requests');
+  const remaining = r.headers.get('x-ratelimit-remaining-requests');
+  const reset = r.headers.get('x-ratelimit-reset-requests');
+  assert.ok(limit, 'x-ratelimit-limit-requests missing');
+  assert.ok(remaining !== null, 'x-ratelimit-remaining-requests missing');
+  assert.ok(reset, 'x-ratelimit-reset-requests missing');
+  assert.ok(/^\d+$/.test(limit), `limit should be an integer, got ${limit}`);
+  assert.ok(/^(\d+ms|\d+s)$/.test(reset), `reset should be an OpenAI-style duration, got ${reset}`);
+});
+
+test('upstream x-ratelimit-* headers are relayed verbatim', async () => {
+  const r = await fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+    body: JSON.stringify({ model: MODEL_RL, messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 }),
+  });
+  await r.text();
+  assert.equal(r.headers.get('x-ratelimit-limit-requests'), '77', 'upstream limit header must win over our own');
+  assert.equal(r.headers.get('x-ratelimit-remaining-requests'), '5', 'upstream remaining must be relayed');
+});
+
+test('a 429 publishes a retry-after backoff signal', async () => {
+  const r = await fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + TOKEN },
+    body: JSON.stringify({ model: MODEL_429, messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 }),
+  });
+  await r.text();
+  assert.equal(r.headers.get('x-ratelimit-remaining-requests'), '0', 'a rate-limited response must report 0 remaining');
+  const ra = r.headers.get('retry-after');
+  assert.ok(ra, 'retry-after missing on 429');
+  assert.ok(Number(ra) >= 1, `retry-after should be seconds, got ${ra}`);
+  const reset = r.headers.get('x-ratelimit-reset-requests');
+  assert.ok(reset && /^\d+(ms|s)$/.test(reset), `reset should be a duration, got ${reset}`);
+});
+
+// ---------------------------------------------------------------------------
+// regressions from the 2026-10 review (each guards a bug the E2E suite caught)
+test('stt: multipart model field is patched to the upstream model and success is recorded', async () => {
+  // two bugs in one flow: (1) the default STT branch used to forward the raw
+  // multipart with the client alias as model; (2) a recordSuccess(logId) crash
+  // turned every successful STT into a 502 AFTER the upstream had answered.
+  const boundary = '----gwtest42';
+  const mp = `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nsttmock\r\n`
+    + `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\nContent-Type: audio/wav\r\n\r\nBINARYWAVBYTES\r\n`
+    + `--${boundary}--\r\n`;
+  const r = await req({
+    path: '/v1/audio/transcriptions',
+    headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, Authorization: `Bearer ${TOKEN}` },
+  }, mp);
+  assert.equal(r.status, 200, 'STT success must reach the client, got: ' + r.body.slice(0, 120));
+  const hit = mock.requests.find((q) => q.auth.includes(KEY_STT));
+  assert.ok(hit, 'upstream saw the STT request');
+  assert.match(hit.raw, /name="model"\r\n\r\nstt-upstream-model\r\n/, 'model field must be patched to the upstream model');
+  assert.ok(hit.raw.includes('BINARYWAVBYTES'), 'audio bytes must survive untouched');
+});
+
+test('chat: upstream 3xx is a failure, never streamed to the client as success', async () => {
+  const r = await req({ path: '/v1/chat/completions', headers: authH() }, chatBody('redir302'));
+  assert.equal(r.status, 502, 'a 302 must surface as an upstream failure');
+  const j = JSON.parse(r.body);
+  assert.equal(j.error.code, 'upstream_unavailable');
+  assert.match(j.error.message, /all failed/, 'reported through the gateway error envelope, not a piped 2xx');
+});
+
+test('rate_limit: an explicit configured interval survives a 429 (auto-RPM must not clobber it)', async () => {
+  // one key: first hit 429s, second succeeds — the success response advertises
+  // the gateway interval. Before the guard, the 429 stretched 100ms to ~8.5s
+  // (limit-requests 600 → 7) and it stayed there.
+  const r = await req({ path: '/v1/chat/completions', headers: authH(), timeout: 20000 }, chatBody('rl429'));
+  assert.equal(r.status, 200, 'the retry after the 429 must succeed, got: ' + r.body.slice(0, 120));
+  assert.equal(r.headers['x-ratelimit-limit-requests'], '600',
+    `60000/100ms must stay intact after a 429, got ${r.headers['x-ratelimit-limit-requests']}`);
+});
+
+test('CORS: console endpoints do not reflect foreign origins; API endpoints stay wildcard', async () => {
+  const evil = await req({ method: 'GET', path: '/api/console/status', headers: { Origin: 'http://evil.example' } });
+  assert.equal(evil.status, 401, 'unauthenticated console access stays denied');
+  assert.equal(evil.headers['access-control-allow-origin'], undefined,
+    'a foreign Origin must not be reflected on console endpoints');
+  const api = await req({ method: 'GET', path: '/v1/models', headers: { Origin: 'http://evil.example' } });
+  assert.equal(api.headers['access-control-allow-origin'], '*', 'API endpoints keep the wildcard CORS');
+});
+
+test('error responses are always valid JSON, never a dropped connection', async () => {
+// Undefined X-Request-Id used to destroy the socket instead of sending JSON.
+  const post_ = (raw) => fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authH() },
+    body: raw,
+    signal: AbortSignal.timeout(20000),
+  });
+  const cases = [
+    ['unknown model', JSON.stringify({ model: 'nope-model', messages: [{ role: 'user', content: 'x' }] }), 404],
+    ['malformed JSON', '{bad', 400],
+    ['missing messages', JSON.stringify({ model: MODEL_JSON }), 400],
+  ];
+  for (const [label, raw, want] of cases) {
+    let r;
+    try { r = await post_(raw); } catch (e) { throw new Error(`${label}: connection dropped instead of returning an error (${e.message})`); }
+    const text = await r.text();
+    assert.equal(r.status, want, `${label}: status`);
+    let j = null;
+    try { j = JSON.parse(text); } catch { throw new Error(`${label}: body is not JSON: ${text.slice(0, 140)}`); }
+    assert.ok(j.error && j.error.message, `${label}: no error envelope, got ${text.slice(0, 120)}`);
+  }
+});
+
 test('GET /v1/models lists configured aliases', async () => {
   const r = await req({ method: 'GET', path: '/v1/models', headers: authH() });
   assert.equal(r.status, 200);
@@ -485,4 +860,26 @@ test('GET /v1/models lists configured aliases', async () => {
   const ids = j.data.map((m) => m.id);
   assert.ok(ids.includes(MODEL_JSON));
   assert.ok(ids.includes(MODEL_SSE));
+});
+
+test('console save rejects structurally invalid config without touching the file', async () => {
+  // A successful save would restart the shared gateway fixture, so only the
+  // rejection paths are exercised here — and each must leave the file alone.
+  const before = fs.readFileSync(cfgPath, 'utf8');
+  const save = (content) => req(
+    { method: 'POST', path: '/api/console/save', headers: authH(), timeout: 20000 },
+    { file: 'config', content },
+  );
+  const cases = [
+    ['empty providers', JSON.stringify({ providers: {}, models: { m: [{ provider: 'x', model: 'y' }] } }), /at least one provider/],
+    ['no live keys', JSON.stringify({ providers: { a: ['  '] }, models: { m: [{ provider: 'a', model: 'y' }] } }), /non-empty API key/],
+    ['dangling provider', JSON.stringify({ providers: { a: ['k'] }, models: { m: [{ provider: 'ghost', model: 'y' }] } }), /unknown provider/],
+    ['bad port', JSON.stringify({ port: 99999, providers: { a: ['k'] }, models: { m: [{ provider: 'a', model: 'y' }] } }), /port must be/],
+  ];
+  for (const [label, content, want] of cases) {
+    const r = await save(content);
+    assert.equal(r.status, 400, `${label}: expected 400, got ${r.status}: ${r.body.slice(0, 160)}`);
+    assert.ok(want.test(r.body), `${label}: expected ${want}, got ${r.body.slice(0, 160)}`);
+  }
+  assert.equal(fs.readFileSync(cfgPath, 'utf8'), before, 'rejected saves must not modify the config file');
 });

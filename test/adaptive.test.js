@@ -1,90 +1,124 @@
-'use strict';
+// Client errors (404/400/410) must never degrade keys or open circuits.
+//
+//   node --test test/adaptive.test.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const http = require('http');
+const { spawn } = require('child_process');
 
-function _parseRetryAfter(res) {
-  const h = res?.headers?.['retry-after'] || res?.headers?.['Retry-After'];
-  if (!h) return 0;
-  const n = parseInt(h, 10);
-  if (!isNaN(n)) return n * 1000;
-  const t = Date.parse(h);
-  return isNaN(t) ? 0 : Math.max(0, t - Date.now());
+let mock, gw, gwPort, cfgPath, gwOut = '';
+let tmpDir;
+
+function freePort() {
+  return new Promise((res, rej) => {
+    const s = http.createServer();
+    s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); });
+    s.on('error', rej);
+  });
 }
 
-test('_parseRetryAfter seconds', () => {
-  assert.equal(_parseRetryAfter({ headers: { 'retry-after': '120' } }), 120000);
-});
-
-test('_parseRetryAfter date', () => {
-  const future = new Date(Date.now() + 5000).toUTCString();
-  const v = _parseRetryAfter({ headers: { 'retry-after': future } });
-  assert.ok(v > 4000 && v <= 5000);
-});
-
-test('_parseRetryAfter missing', () => {
-  assert.equal(_parseRetryAfter({ headers: {} }), 0);
-});
-
-test('adaptive RPM decreases on 429', () => {
-  const PROVIDER_RPM = { groq: 12 };
-  const _effectiveRPM = new Map(Object.entries(PROVIDER_RPM));
-  function _adjustRpm(p, success) {
-    const orig = PROVIDER_RPM[p];
-    let cur = _effectiveRPM.get(p) ?? orig;
-    if (success) {
-      cur = Math.min(orig, cur + 1);
-      _effectiveRPM.set(p, cur);
-    } else {
-      cur = Math.max(1, Math.floor(cur * 0.7));
-      _effectiveRPM.set(p, cur);
-    }
-  }
-  _adjustRpm('groq', false);
-  assert.equal(_effectiveRPM.get('groq'), 8);
-  _adjustRpm('groq', false);
-  assert.equal(_effectiveRPM.get('groq'), 5);
-});
-
-test('health score sorts by errorCount', () => {
-  const pool = new Map([
-    ['k1', { errorCount: 2, successCount: 10, lastLatency: 100 }],
-    ['k2', { errorCount: 0, successCount: 5, lastLatency: 200 }],
-    ['k3', { errorCount: 0, successCount: 10, lastLatency: 50 }],
-  ]);
-  const free = ['k1', 'k2', 'k3'];
-  free.sort((a, b) => {
-    const sa = pool.get(a), sb = pool.get(b);
-    if (sa.errorCount !== sb.errorCount) return sa.errorCount - sb.errorCount;
-    if (sa.successCount !== sb.successCount) return sb.successCount - sa.successCount;
-    return (sa.lastLatency || 0) - (sb.lastLatency || 0);
+function startMock(handler) {
+  return new Promise((res) => {
+    mock = http.createServer(handler);
+    mock.listen(0, '127.0.0.1', () => res());
   });
-  assert.deepEqual(free, ['k3', 'k2', 'k1']);
-});
+}
 
-test('reasoning strip deletes fields', () => {
-  const PROVIDER_REASONING_SPEC = { amd: 'strip', deepseek: 'keep', mistral: 'effort' };
-  function _adjust(body, provider) {
-    const spec = PROVIDER_REASONING_SPEC[provider] || 'strip';
-    if (!body.reasoning && !body.reasoning_content) return;
-    if (spec === 'keep') return;
-    if (spec === 'strip') { delete body.reasoning; delete body.reasoning_content; delete body.reasoning_effort; }
+async function startGateway(cfgOverrides = {}) {
+  gwPort = await freePort();
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-adapt-'));
+  cfgPath = path.join(tmpDir, 'config.jsonc');
+  fs.writeFileSync(cfgPath, JSON.stringify({
+    client_token: 'tok', port: gwPort, timeout: 10000,
+    log: { enabled: false },
+    circuit_breaker: { threshold: 3, cooldown_ms: 20000 },
+    model_lockout: { threshold: 3, cooldown_ms: 20000 },
+    providers: { mock: { apiKeys: ['k1'], baseUrl: `http://127.0.0.1:${mock.address().port}`, pathPrefix: '/v1' } },
+    models: { m: [{ provider: 'mock', model: 'mm' }] },
+    ...cfgOverrides,
+  }, null, 2));
+  gw = spawn(process.execPath, [path.resolve(__dirname, '../src/index.js')], {
+    env: { ...process.env, CONFIG_PATH: cfgPath, CLIENT_TOKEN: 'tok' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  gwOut = '';
+  gw.stdout.on('data', (d) => { gwOut += d; });
+  gw.stderr.on('data', (d) => { gwOut += d; });
+  for (let i = 0; i < 100; i++) {
+    try { const r = await fetch(`http://127.0.0.1:${gwPort}/health`); if (r.ok) return; } catch {}
+    await new Promise((r) => setTimeout(r, 100));
   }
-  const b1 = { reasoning: { enabled: true }, reasoning_content: 'x' };
-  _adjust(b1, 'amd');
-  assert.equal(b1.reasoning, undefined);
-  assert.equal(b1.reasoning_content, undefined);
-  const b2 = { reasoning: { enabled: true } };
-  _adjust(b2, 'deepseek');
-  assert.ok(b2.reasoning);
+  throw new Error('gateway did not start:\n' + gwOut);
+}
+
+function stopAll() {
+  try { gw?.kill('SIGKILL'); } catch {}
+  try { mock?.close(); } catch {}
+  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+}
+
+const post = (model = 'm', timeout = 60000) => fetch(`http://127.0.0.1:${gwPort}/v1/chat/completions`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok' },
+  body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 }),
+  signal: AbortSignal.timeout(timeout),
+}).then(async (r) => ({ status: r.status, text: await r.text() }));
+
+const status = () => fetch(`http://127.0.0.1:${gwPort}/api/console/status`, { headers: { Authorization: 'Bearer tok' } })
+  .then((r) => r.json());
+
+test('client errors (404) never degrade the key pool or open the circuit', async (t) => {
+  await startMock((req, res) => { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'no such model' } })); });
+  await startGateway();
+  t.after(stopAll);
+
+  const r = await post();
+  assert.equal(r.status, 502, 'upstream 404 surfaces to the client as 502');
+  assert.ok(gwOut.includes('404'), 'the request actually reached the upstream');
+  assert.ok(!/[circuit] mock opened/.test(gwOut), '404 must not open the circuit');
+  assert.ok(!/\[lockout\]/.test(gwOut), '404 must not lock the model');
+
+  const s = await status();
+  assert.equal(s.providers.mock.degraded, 0, 'the key must still be healthy after a 404');
 });
 
-test('_sanCache FIFO', () => {
-  const m = new Map();
-  const max = 3;
-  function clear() { while (m.size > max) m.delete(m.keys().next().value); }
-  m.set('a', 1); m.set('b', 2); m.set('c', 3); m.set('d', 4);
-  clear();
-  assert.equal(m.size, 3);
-  assert.ok(!m.has('a'));
-  assert.ok(m.has('d'));
+test('server errors DO open the circuit', async (t) => {
+  await startMock((req, res) => { res.writeHead(503); res.end('busy'); });
+// Single-key providers report no capacity; the breaker needs multiple keys.
+  await startGateway({
+    key_cooldown: 0, max_key_backoff: 0,
+    providers: { mock: { apiKeys: ['k1', 'k2', 'k3'], baseUrl: `http://127.0.0.1:${mock.address().port}`, pathPrefix: '/v1' } },
+  });
+  t.after(stopAll);
+
+  await Promise.all([post(), post(), post(), post()]);
+
+  assert.ok(/\[circuit\] mock opened/.test(gwOut), 'circuit should open after 3x5xx:\n' + gwOut.split('\n').filter((l) => l.includes('circuit')).join('\n'));
+  const s = await status();
+  assert.ok(s.providers.mock.cbOpen, 'status should report the breaker open');
+});
+
+test('a single-key provider reports no capacity rather than hammering upstream', async (t) => {
+  await startMock((req, res) => { res.writeHead(503); res.end('busy'); });
+  await startGateway({ key_cooldown: 30000 });
+  t.after(stopAll);
+  let hits = 0;
+  mock.on('request', () => { hits++; });
+
+  await Promise.all([post(), post(), post()]);
+  assert.equal(hits, 1, `a cooling key must absorb only one in-flight failure, upstream got ${hits} hits`);
+});
+
+test('a 401 marks the key but does not open the provider circuit', async (t) => {
+  await startMock((req, res) => { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: 'invalid api key' } })); });
+  await startGateway();
+  t.after(stopAll);
+
+  await post();
+  const s = await status();
+  assert.ok(s.recent401.length >= 1, '401 should be tracked for the retry-401 workflow');
+  assert.equal(s.providers.mock.cbOpen, false, '401 is key-scoped, not a provider outage');
 });

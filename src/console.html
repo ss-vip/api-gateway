@@ -40,6 +40,13 @@
     @media(max-width:768px){.btn-sidebar-toggle{display:inline-flex}}
 
     /* misc */
+    /* The top nav and table theads are both Bootstrap sticky-top (z-index
+       1020). Equal z-index resolves by DOM order, so the thead — later in the
+       document — paints over the language dropdown, which is trapped inside
+       the nav's stacking context (no child z-index can escape it). Lift the
+       nav just above table headers but below offcanvas (1045) / modal (1055)
+       / loading overlay (1090). */
+    nav.app-nav{z-index:1030}
     .mono{font-family:Consolas,'Courier New',monospace}
     .toast .toast-body,.toast .toast-body *{color:#fff!important}
     #gotop{position:fixed;bottom:24px;right:24px;width:44px;height:44px;border-radius:50%;
@@ -93,9 +100,22 @@
     .jsonwrap textarea.jsonsrc::selection{background:rgba(13,110,253,.35)}
     .jk{color:var(--jk)} .js{color:var(--js)} .jn{color:var(--jn)} .jb{color:var(--jb)}
 
+    /* textarea scrollbars: default — the styled track+thumb read as two stacked rails */
+
     /* tables */
     .btn-group [data-lg]{min-width:88px}
     #lgBody td:first-child,#recentErrs td:first-child{white-space:nowrap;width:1%}
+    /* Log tables: fixed layout so Provider/Model keep readable width on ~1230px
+       (MacBook Air 1440 − sidebar). Summary takes the remainder. */
+    table.log-table{table-layout:fixed;width:100%}
+    table.log-table col.c-ts{width:150px}
+    table.log-table col.c-status{width:76px}
+    table.log-table col.c-type{width:70px}
+    table.log-table col.c-prov{width:150px}
+    table.log-table col.c-model{width:230px}
+    table.log-table col.c-sum{width:auto}
+    table.log-table td:nth-child(4),table.log-table td:nth-child(5){white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    table.log-table td:nth-child(6){white-space:normal;word-break:break-word}
     th[data-sort],th[data-psort],th[data-msort]{cursor:pointer;user-select:none;white-space:nowrap}
     th[data-sort]:hover,th[data-psort]:hover,th[data-msort]:hover{color:var(--bs-body-color)}
     .sort-ind{font-size:.7em;margin-left:.3rem;opacity:.7}
@@ -104,7 +124,6 @@
     @media(max-width:576px){
       .nav-actions{gap:.25rem!important}
       .nav-actions .btn{padding:.2rem .4rem;font-size:.75rem}
-      .nav-actions .conn-label{display:none}
     }
   </style>
 </head>
@@ -119,7 +138,7 @@
           <h2 class="fs-4 mb-2"><i class="bi bi-lightning-charge-fill text-warning"></i> API Gateway</h2>
           <p class="text-secondary mb-4">Enter Client Token to manage config</p>
           <input type="password" class="form-control mb-3" id="l_token" placeholder="Client Token" autofocus>
-          <button class="btn btn-primary w-100 mb-3" id="l_btn">Login</button>
+          <button class="btn btn-primary w-100 mb-3" id="l_btn"><i class="bi bi-box-arrow-in-right"></i> Login</button>
           <p class="text-secondary small mb-0" id="l_status"></p>
         </div>
       </div>
@@ -167,20 +186,16 @@
     <div class="main-wrap">
 
       <!-- Top Nav -->
-      <nav class="d-flex justify-content-between align-items-center py-2 px-3 bg-body border-bottom sticky-top flex-wrap gap-1">
+      <nav class="app-nav d-flex justify-content-between align-items-center py-2 px-3 bg-body border-bottom sticky-top flex-wrap gap-1">
         <div class="d-flex align-items-center gap-2">
           <button class="btn btn-outline-secondary btn-sm btn-sidebar-toggle" id="btnSidebar" title="Menu"><i class="bi bi-list"></i></button>
           <h1 class="fs-5 m-0" id="pageTitle">Dashboard</h1>
         </div>
         <div class="d-flex gap-2 align-items-center nav-actions">
-          <span class="small text-secondary d-flex align-items-center gap-1 conn-label">
-            <span id="connDot" class="rounded-circle d-inline-block" style="width:9px;height:9px;background:#6c757d"></span>
-            <span class="notranslate" id="connTxt">Disconnected</span>
-          </span>
           <button class="btn btn-outline-secondary btn-sm" id="btnTheme" title="Toggle Theme"><i class="bi bi-moon-fill"></i></button>
           <div class="dropdown">
             <button class="btn btn-outline-secondary btn-sm dropdown-toggle" id="langDropdown" title="Language"><i class="bi bi-translate"></i></button>
-            <ul class="lang-menu dropdown-menu dropdown-menu-end" id="langMenu">
+            <ul class="lang-menu dropdown-menu dropdown-menu-end notranslate" id="langMenu" translate="no">
               <li><a class="lang-item" href="#" data-lang="english"><span class="ck">&#10003;</span> English</a></li>
               <li><a class="lang-item" href="#" data-lang="chinese_traditional"><span class="ck">&#10003;</span> 繁體中文</a></li>
               <li><a class="lang-item" href="#" data-lang="chinese_simplified"><span class="ck">&#10003;</span> 简体中文</a></li>
@@ -204,7 +219,7 @@
           </div>
           <button class="btn btn-outline-secondary btn-sm" id="btnRefresh" title="Refresh"><i class="bi bi-arrow-clockwise"></i></button>
           <button class="btn btn-outline-warning btn-sm d-none" id="btn401" title="Retry all 401s"><i class="bi bi-exclamation-triangle"></i> <span id="badge401">0</span></button>
-          <button class="btn btn-outline-secondary btn-sm" id="btnLogout">Logout</button>
+          <button class="btn btn-outline-secondary btn-sm" id="btnLogout"><i class="bi bi-box-arrow-right"></i> Logout</button>
         </div>
       </nav>
 
@@ -273,74 +288,82 @@
           <div class="card"><div class="card-body">
             <div class="small fw-bold mb-2"><i class="bi bi-clock-history text-info"></i> Last 10 records</div>
             <div class="table-responsive"><table class="table table-sm table-hover mb-0">
-              <thead><tr><th class="notranslate">Time</th><th class="notranslate">Status</th><th class="notranslate">Type</th><th class="notranslate">Provider</th><th class="notranslate">Model</th><th class="notranslate">Summary</th></tr></thead>
-                            <tbody id="recentErrs"><tr><td colspan="6" class="text-secondary small text-center">No data</td></tr></tbody>
+              <thead><tr><th>Time</th><th>Status</th><th>Type</th><th>Provider</th><th>Model</th><th>Summary</th></tr></thead>
+                            <tbody id="recentErrs" class="notranslate" translate="no"><tr><td colspan="6" class="text-secondary small text-center">No data</td></tr></tbody>
             </table></div>
           </div></div>
         </section>
 
         <!-- Config -->
         <section data-sec="config" class="d-none">
+          <!-- Raw editor (top, full width, collapsible) -->
+          <div class="card mb-3"><div class="card-body">
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+              <span class="small fw-bold"><i class="bi bi-filetype-json text-primary"></i> <span class="notranslate" id="cfgFileName">config.json</span> Raw <span class="text-secondary fw-normal notranslate">(auto-restart on save)</span></span>
+              <span class="d-flex gap-2 align-items-center">
+                <span class="small" id="cfgStatus"></span>
+                <button class="btn btn-outline-secondary btn-sm py-0 px-2" id="btnCfgRawToggle" title="Show/hide the Raw editor">Hide</button>
+              </span>
+            </div>
+            <div id="cfgRawWrap">
+              <div class="jsonwrap">
+                <pre class="jsonhl" id="cfgRawHl" aria-hidden="true"></pre>
+                <textarea class="form-control jsonsrc" id="cfgRaw" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
+              </div>
+              <div class="d-flex gap-2 flex-wrap mt-2">
+                <button class="btn btn-outline-secondary btn-sm" id="btnCfgReload"><i class="bi bi-arrow-clockwise"></i> Read</button>
+                <button class="btn btn-outline-secondary btn-sm" id="btnCfgValidate"><i class="bi bi-check2"></i> Validate</button>
+                <button class="btn btn-outline-secondary btn-sm" id="btnCfgFormat"><i class="bi bi-magic"></i> Format</button>
+                <button class="btn btn-outline-secondary btn-sm" id="btnCfgDl"><i class="bi bi-download"></i> Download</button>
+                <button class="btn btn-primary btn-sm ms-auto" id="btnCfgSave"><i class="bi bi-save"></i> Save &amp; activated</button>
+              </div>
+            </div>
+          </div></div>
           <div class="row g-3">
             <!-- Left: form + providers + models -->
             <div class="col-12 col-xl-5">
               <!-- Basic params -->
               <div class="card mb-3"><div class="card-body">
-                <div class="small fw-bold mb-2"><i class="bi bi-sliders text-primary"></i> Basic Parameters</div>
+                <div class="small fw-bold mb-2"><i class="bi bi-sliders text-primary"></i> Basic Parameters <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Top-level config keys. client_token, port, timeouts, backoffs and PROVIDER keys can also be set via environment variables. Saving from this form reorders the JSON and drops comments — use the Raw editor to keep them."></i></div>
                 <div class="row g-2">
-                  <div class="col-12"><label class="form-label small mb-1">client_token</label><input type="password" class="form-control form-control-sm mono" id="f_token" autocomplete="off"></div>
-                  <div class="col-6"><label class="form-label small mb-1">port</label><input type="number" class="form-control form-control-sm" id="f_port"></div>
-                  <div class="col-6"><label class="form-label small mb-1">timeout (ms)</label><input type="number" class="form-control form-control-sm" id="f_timeout"></div>
-                  <div class="col-6"><label class="form-label small mb-1">key_cooldown (ms)</label><input type="number" class="form-control form-control-sm" id="f_cooldown"></div>
-                  <div class="col-6"><label class="form-label small mb-1">max_key_backoff (ms)</label><input type="number" class="form-control form-control-sm" id="f_backoff"></div>
-                  <div class="col-6"><label class="form-label small mb-1">max_body_size</label><input type="number" class="form-control form-control-sm" id="f_maxbody"></div>
-                  <div class="col-6"><label class="form-label small mb-1">quota_backoff (ms)</label><input type="number" class="form-control form-control-sm" id="f_quota"></div>
-                  <div class="col-6"><label class="form-label small mb-1">log.path</label><input type="text" class="form-control form-control-sm mono" id="f_logpath"></div>
-                  <div class="col-3"><label class="form-label small mb-1">Retention (days)</label><input type="number" class="form-control form-control-sm" id="f_logdays"></div>
-                  <div class="col-3 d-flex align-items-end"><div class="form-check mb-1"><input class="form-check-input" type="checkbox" id="f_logen"><label class="form-check-label small" for="f_logen">Enable logging</label></div></div>
+                  <div class="col-12"><label class="form-label small mb-1" title="Client 與 /console 共用的 Bearer token。留空 = 所有端點不驗證，僅適合本機測試。">client_token</label><input type="password" class="form-control form-control-sm mono" id="f_token" autocomplete="off"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="監聽埠號 (1–65535)">port</label><input type="number" class="form-control form-control-sm" id="f_port"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="單一請求的最長處理時間（毫秒）。failover 與重試都在此預算內。">timeout (ms)</label><input type="number" class="form-control form-control-sm" id="f_timeout"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="單次 upstream 無回應的容忍時間（毫秒），非整體預算">upstream_timeout (ms)</label><input type="number" class="form-control form-control-sm" id="f_uptimeout"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="單次上游回應 body 上限（位元組），超過視為截斷">upstream_max_body</label><input type="number" class="form-control form-control-sm" id="f_upmaxbody"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="金鑰失敗後的首次冷卻（毫秒），之後指數退避">key_cooldown (ms)</label><input type="number" class="form-control form-control-sm" id="f_cooldown"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="指數退避上限（毫秒）">max_key_backoff (ms)</label><input type="number" class="form-control form-control-sm" id="f_backoff"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="請求 body 上限（位元組），超過回 413">max_body_size</label><input type="number" class="form-control form-control-sm" id="f_maxbody"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="偵測到 quota / billing 耗盡時的長時間降級（毫秒）">quota_backoff (ms)</label><input type="number" class="form-control form-control-sm" id="f_quota"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="相對路徑以設定檔所在目錄為基準">log.path</label><input type="text" class="form-control form-control-sm mono" id="f_logpath"></div>
+                  <div class="col-3"><label class="form-label small mb-1" title="超過天數的舊紀錄會被清理">Retention (days)</label><input type="number" class="form-control form-control-sm" id="f_logdays"></div>
+                  <div class="col-3 d-flex align-items-end"><div class="form-check mb-1"><input class="form-check-input" type="checkbox" id="f_logen"><label class="form-check-label small" for="f_logen" title="關閉後仍保留金鑰降級狀態（gw-state.json），不受影響">Enable logging</label></div></div>
                 </div>
                 <div class="d-flex gap-2 mt-3">
-                  <button class="btn btn-outline-primary btn-sm" id="btnApplyForm"><i class="bi bi-arrow-right"></i> Apply to JSON</button>
+                  <button class="btn btn-outline-primary btn-sm" id="btnApplyForm"><i class="bi bi-save"></i> Save &amp; activated</button>
                 </div>
                 <p class="small text-secondary mt-2 mb-0">Apply will reorder JSON (comments lost). To preserve comments, edit Raw directly.</p>
               </div></div>
               <!-- Providers -->
               <div class="card mb-3"><div class="card-body">
-                <div class="small fw-bold mb-2"><i class="bi bi-key text-warning"></i> Providers <span class="text-secondary fw-normal notranslate">(keys masked, last 4 only)</span></div>
+                <div class="small fw-bold mb-2"><i class="bi bi-key text-warning"></i> Providers <span class="text-secondary fw-normal notranslate">(keys masked, last 4 only)</span> <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Quick-add creates the plain key-array form; Custom… sets baseUrl, pathPrefix and rpm. Health comes from live traffic — only 401/403/429/5xx mark a key bad, client errors (400/404) never do."></i></div>
                 <div id="provEdit" class="d-flex flex-column gap-2"></div>
                 <div class="d-flex gap-2 mt-2">
                   <input class="form-control form-control-sm" id="newProvName" placeholder="Add provider name" style="max-width:180px">
                   <input class="form-control form-control-sm mono" id="newProvKey" placeholder="API key" autocomplete="off">
-                  <button class="btn btn-outline-success btn-sm" id="btnAddProv"><i class="bi bi-plus"></i></button>
+                  <button class="btn btn-outline-success btn-sm" id="btnAddProv" title="Add provider"><i class="bi bi-plus"></i></button>
+                  <button class="btn btn-outline-secondary btn-sm" id="btnAddProvCustom" title="Add custom upstream (base URL, path, RPM)"><i class="bi bi-gear"></i> Custom…</button>
                 </div>
-              </div></div>
-              <!-- Models -->
-              <div class="card"><div class="card-body">
-                <div class="small fw-bold mb-2"><i class="bi bi-diagram-3 text-info"></i> Models alias</div>
-                <div class="table-responsive"><table class="table table-sm mb-0">
-                  <thead><tr><th data-msort>Alias<span class="sort-ind" id="sortAlias"></span></th><th class="notranslate">Target URL</th></tr></thead>
-                  <tbody id="modelsTable"><tr><td colspan="2" class="text-secondary small text-center notranslate">No data</td></tr></tbody>
-                </table></div>
               </div></div>
             </div>
-            <!-- Right: Raw editor -->
+            <!-- Right: models -->
             <div class="col-12 col-xl-7">
               <div class="card"><div class="card-body">
-                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
-                  <span class="small fw-bold"><i class="bi bi-filetype-json text-primary"></i> config.json Raw <span class="text-secondary fw-normal notranslate">(auto-restart on save)</span></span>
-                  <span class="small" id="cfgStatus"></span>
-                </div>
-                <div class="jsonwrap">
-                  <pre class="jsonhl" id="cfgRawHl" aria-hidden="true"></pre>
-                  <textarea class="form-control jsonsrc" id="cfgRaw" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
-                </div>
-                <div class="d-flex gap-2 flex-wrap mt-2">
-                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgReload"><i class="bi bi-arrow-clockwise"></i> Read</button>
-                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgValidate"><i class="bi bi-check2"></i>Validate</button>
-                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgFormat"><i class="bi bi-magic"></i>Format</button>
-                  <button class="btn btn-outline-secondary btn-sm" id="btnCfgDl"><i class="bi bi-download"></i></button>
-                  <button class="btn btn-primary btn-sm ms-auto" id="btnCfgSave"><i class="bi bi-save"></i>Save</button>
-                </div>
+                <div class="small fw-bold mb-2"><i class="bi bi-diagram-3 text-info"></i> Models alias <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Key = the model name clients send; value = ordered target chain — a target whose keys are all exhausted moves to the next."></i></div>
+                <div class="table-responsive"><table class="table table-sm mb-0">
+                  <thead><tr><th data-msort>Alias<span class="sort-ind" id="sortAlias"></span></th><th>Target URL</th></tr></thead>
+                  <tbody id="modelsTable" class="notranslate" translate="no"><tr><td colspan="2" class="text-secondary small text-center notranslate">No data</td></tr></tbody>
+                </table></div>
               </div></div>
             </div>
           </div>
@@ -369,7 +392,7 @@
           </div></div>
           <!-- Raw editor (hidden by default) -->
           <div class="card mb-3 d-none" id="lgRawWrap"><div class="card-body">
-            <div class="small fw-bold mb-2">Raw NDJSON <span class="text-secondary fw-normal" id="retentionLbl"></span></div>
+            <div class="small fw-bold mb-2"><span class="notranslate" id="lgFileName">log.json</span> — Raw NDJSON <span class="text-secondary fw-normal" id="retentionLbl"></span></div>
             <div class="jsonwrap">
               <pre class="jsonhl" id="lgRawHl" aria-hidden="true"></pre>
               <textarea class="form-control jsonsrc" id="lgRaw" spellcheck="false" autocomplete="off" autocapitalize="off"></textarea>
@@ -382,7 +405,8 @@
           </div></div>
           <!-- Log table -->
           <div class="card mb-3"><div class="card-body p-0">
-            <div class="table-responsive"><table class="table table-sm table-hover mb-0">
+            <div class="table-responsive"><table class="table table-sm table-hover mb-0 log-table">
+              <colgroup><col class="c-ts"><col class="c-status"><col class="c-type"><col class="c-prov"><col class="c-model"><col class="c-sum"></colgroup>
               <thead class="sticky-top bg-body">
                 <tr>
                   <th style="white-space:nowrap" data-sort="ts">Time<span class="sort-ind" id="sortTs"></span></th>
@@ -392,15 +416,15 @@
                   <th>Summary</th>
                 </tr>
               </thead>
-              <tbody id="lgBody"><tr><td colspan="6" class="text-secondary small text-center">No data</td></tr></tbody>
+              <tbody id="lgBody" class="notranslate" translate="no"><tr><td colspan="6" class="text-secondary small text-center">No data</td></tr></tbody>
             </table></div>
           </div></div>
           <!-- Pagination -->
-          <div class="card"><div class="card-body py-2 d-flex align-items-center gap-2 flex-wrap">
+          <div class="card"><div class="card-body py-2 d-flex align-items-center gap-2 flex-wrap justify-content-start">
             <span class="small text-secondary" id="lgCount">0 records</span>
-            <div class="ms-auto d-flex gap-2 align-items-center">
+            <span class="small" id="lgPage">1 / 1</span>
+            <div class="d-flex gap-2 align-items-center">
               <button class="btn btn-outline-secondary btn-sm" id="btnLgPrev">‹ Prev</button>
-              <span class="small" id="lgPage">1 / 1</span>
               <button class="btn btn-outline-secondary btn-sm" id="btnLgNext">Next ›</button>
             </div>
           </div></div>
@@ -410,7 +434,7 @@
         <section data-sec="providers" class="d-none">
           <div class="card"><div class="card-body">
             <div class="d-flex gap-2 align-items-center flex-wrap mb-2">
-              <span class="small fw-bold"><i class="bi bi-hdd-stack text-info"></i> Providers</span>
+              <span class="small fw-bold"><i class="bi bi-hdd-stack text-info"></i> Providers <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Live health per provider: latency, error counts and breaker state. A breaker shows OPEN for 30 s after 5 consecutive 5xx, then closes on the first success. Only 401/403/429/5xx are counted as errors."></i></span>
               <input class="form-control form-control-sm ms-auto" id="pFilter" placeholder="Filter…" style="max-width:180px">
               <select class="form-select form-select-sm" id="pSort" style="width:auto">
                 <option value="name">Name</option><option value="latency">Latency</option><option value="degraded">Errors</option>
@@ -419,7 +443,7 @@
             </div>
             <div class="table-responsive"><table class="table table-sm table-hover mb-0">
               <thead><tr><th data-psort="name">Name</th><th>Keys</th><th data-psort="latency">Latency</th><th data-psort="degraded">Errors</th><th>Last success</th><th>Breaker</th><th></th></tr></thead>
-              <tbody id="pBody"></tbody>
+              <tbody id="pBody" class="notranslate" translate="no"></tbody>
             </table></div>
           </div></div>
         </section>
@@ -457,9 +481,234 @@
 <div class="modal fade" id="rowModal" tabindex="-1"><div class="modal-dialog modal-lg modal-dialog-scrollable">
   <div class="modal-content">
     <div class="modal-header"><h5 class="modal-title fs-6">Log detail</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
-    <div class="modal-body"><pre class="mono small mb-0" id="rowModalBody" style="white-space:pre-wrap"></pre></div>
+    <div class="modal-body"><pre class="mono small mb-0 notranslate" id="rowModalBody" translate="no" style="white-space:pre-wrap"></pre></div>
   </div>
 </div></div>
+
+<!-- Key edit modal -->
+<div class="modal fade" id="keyModal" tabindex="-1"><div class="modal-dialog">
+  <div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title fs-6">Edit key <span class="text-secondary fw-normal" id="keyModalSub"></span></h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body">
+      <label class="form-label small mb-1">Key value</label>
+      <input type="text" class="form-control form-control-sm mono" id="keyModalInput" autocomplete="off" spellcheck="false">
+      <div class="form-text">Save writes back to the in-memory config and Raw JSON (unsaved until you press Save).</div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="keyModalSave" title="Save and it will take effect">OK</button></div>
+  </div>
+</div></div>
+
+<!-- Provider modal: add a custom upstream, or edit baseUrl/pathPrefix/rpm.
+  Array-form providers (built-in endpoint) convert to object form on save, but
+  only if at least one custom field is filled — otherwise they stay an array. -->
+<div class="modal fade" id="provModal" tabindex="-1"><div class="modal-dialog">
+  <div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title fs-6"><span id="provModalTitle">Add provider</span></h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body">
+      <label class="form-label small mb-1">Provider name</label>
+      <input type="text" class="form-control form-control-sm mono notranslate" id="provModalName" translate="no" autocomplete="off" spellcheck="false">
+      <label class="form-label small mb-1 mt-2">Base URL <span class="text-secondary fw-normal">(empty = built-in default)</span></label>
+      <input type="text" class="form-control form-control-sm mono notranslate" id="provModalBase" translate="no" placeholder="https://my-host.example.com" autocomplete="off" spellcheck="false">
+      <div class="row g-2 mt-1">
+        <div class="col-6"><label class="form-label small mb-1">Path prefix</label>
+          <input type="text" class="form-control form-control-sm mono notranslate" id="provModalPrefix" translate="no" placeholder="/v1" autocomplete="off" spellcheck="false"></div>
+        <div class="col-6"><label class="form-label small mb-1">RPM per key</label>
+          <input type="number" class="form-control form-control-sm" id="provModalRpm" placeholder="10" min="1"></div>
+      </div>
+      <div class="form-text" id="provModalHint">Leave all three empty for a built-in OpenAI-compatible endpoint.</div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="provModalSave" title="Save and it will take effect">OK</button></div>
+  </div>
+</div></div>
+
+<script>
+// Own login-safe initTranslation; shared.js would auto-translate the login view.
+  if (typeof toast === 'undefined') {
+// _ovSeq must be declared: reading it undeclared throws and aborts loadAll.
+    var _ovTimer = null, _ovSeq = 0;
+    window.toast = function(m, ok) {
+      var box = document.getElementById('toasts');
+      if (!box) { box = document.createElement('div'); box.id = 'toasts';
+        box.className = 'toast-container position-fixed bottom-0 end-0 p-3'; document.body.appendChild(box); }
+      var e = document.createElement('div');
+      e.className = 'toast align-items-center text-white border-0 show bg-' + (ok ? 'success' : 'danger');
+      // textContent, not innerHTML: callers pass server-controlled strings
+      // (provider names, error bodies) and must not be able to inject markup
+      var b = document.createElement('div'); b.className = 'toast-body'; b.textContent = String(m ?? '');
+      var row = document.createElement('div'); row.className = 'd-flex'; row.appendChild(b); e.appendChild(row);
+      box.appendChild(e); setTimeout(function(){ e.classList.remove('show'); setTimeout(function(){ e.remove(); }, 300); }, 4000);
+    };
+    window.showLoading = function(msg, ms) {
+      msg = msg || 'Loading…'; ms = ms || 30000;
+      var ov = document.getElementById('overlay'); if (!ov) return 0;
+// New operation supersedes: older completions can't hide its overlay.
+      _ovSeq = (_ovSeq || 0) + 1;
+      var seq = _ovSeq;
+      var lbl = document.getElementById('overlayMsg'); if (lbl) lbl.textContent = msg;
+      ov.classList.remove('d-none'); ov.classList.add('d-flex');
+      if (_ovTimer) clearTimeout(_ovTimer);
+      _ovTimer = setTimeout(function(){ if (seq !== _ovSeq) return; window.hideLoading(seq); window.toast('Connection timed out, try again later', 0); }, ms);
+      return seq;
+    };
+    window.hideLoading = function(seq) {
+      var ov = document.getElementById('overlay'); if (!ov) return;
+      if (seq !== undefined && seq !== _ovSeq) return;   // not the owner
+      _ovSeq = 0;
+      if (_ovTimer) { clearTimeout(_ovTimer); _ovTimer = null; }
+      ov.classList.add('d-none'); ov.classList.remove('d-flex');
+    };
+    window.hideAllLoading = function() { window.hideLoading(_ovSeq); };
+    window.initTranslation = function(itemsSelector, defaultLang, toastOk, toastErr, toastTimeout) {
+      defaultLang = defaultLang || 'english'; toastOk = toastOk || 'Translation done'; toastErr = toastErr || 'Translation failed'; toastTimeout = toastTimeout || 'Connection timed out, try again later';
+      var TRANS_TIMEOUT_MS = 20000, TRANS_SETTLE_MS = 800, TRANS_QUIET_MS = 600;
+      var items = document.querySelectorAll(itemsSelector);
+      var savedLang = localStorage.getItem('gw_lang') || defaultLang;
+      var transOverlay = document.getElementById('transOverlay');
+      var transTimer = null, overlayHidden = false, transFailed = false, toastShown = false, finishHandled = false, succeeded = false, hideDebounce = null, settleTimer = null, langTimer = null, obs = null, cycleId = 0;
+      function markActive(lang) { items.forEach(function(i){ i.classList.toggle('active', i.getAttribute('data-lang') === lang); }); }
+      function showOverlay() { cycleId++; if (!overlayHidden) transOverlay.classList.add('show'); toastShown = false; finishHandled = false; succeeded = false; transFailed = false; if (hideDebounce) { clearTimeout(hideDebounce); hideDebounce = null; } if (settleTimer) { clearTimeout(settleTimer); settleTimer = null; } }
+      function hideOverlay() {
+        overlayHidden = true; transOverlay.classList.remove('show');
+        if (transTimer) { clearTimeout(transTimer); transTimer = null; }
+        if (!transFailed && !toastShown) { toastShown = true; window.toast(toastOk, 1); }
+        transFailed = false;
+      }
+      function failOverlay(isTimeout, cyc) {
+        if (cyc !== undefined && cyc !== cycleId) return; // stale cycle
+        transFailed = true; toastShown = true; hideOverlay();
+        if (obs) { try { obs.disconnect(); } catch(e){} obs = null; }
+        window.toast(isTimeout ? toastTimeout : toastErr, 0);
+      }
+// renderTaskFinish is the success signal; the observer below is only fallback.
+      function onTranslateSettled() {
+        if (succeeded) return; succeeded = true;
+        if (transTimer) { clearTimeout(transTimer); transTimer = null; }
+        if (settleTimer) clearTimeout(settleTimer);
+        settleTimer = setTimeout(function() { settleTimer = null; hideOverlay(); }, TRANS_SETTLE_MS);
+      }
+      var latestText = document.body.textContent || '';
+      var _ = (typeof translate !== 'undefined') ? translate : null;
+      if (!_) { markActive(savedLang); return; }
+// Init once, lazily, post-login — init at load caused a request loop.
+      var libInitDone = false;
+      function libInitOnce() {
+        if (libInitDone) return;
+        libInitDone = true;
+        try {
+          _.language.setLocal(defaultLang);
+          _.service.use('client.edge');
+          // The second argument is mandatory: without a condition function the
+          // library logs "第二个参数类型不是function，被抛弃" on every init.
+          _.ignore.class.push('notranslate', function () { return true; });
+// setDocuments([view-app]): login view is structurally never translated.
+          var appRoot0 = document.getElementById('view-app');
+          if (appRoot0 && typeof _.setDocuments === 'function') _.setDocuments([appRoot0]);
+// clearCacheLanguage(): gw_lang stays the single source of truth.
+          if (_.language && typeof _.language.clearCacheLanguage === 'function') _.language.clearCacheLanguage();
+          _.listener.start();
+          _.execute();
+        } catch (e) { console.warn('[console] translation init failed:', e); }
+        if (_.listener && typeof _.listener.renderTaskFinish === 'function') {
+          var orig = _.listener.renderTaskFinish;
+          _.listener.renderTaskFinish = function() {
+            if (typeof orig === 'function') orig();   // always chain through
+            if (finishHandled) return;                 // one settle per cycle only
+            finishHandled = true; onTranslateSettled();
+          };
+        }
+      }
+      var appVisible = function() { var v = document.getElementById('view-app'); return !!(v && !v.classList.contains('d-none')); };
+// Shared per-cycle setup for auto-start and manual switches.
+      function watchCycle(onTimeout) {
+        clearCycleTimers();   // a rapid A→B→C switch must not leave A's timers armed
+        var appRoot = document.getElementById('view-app');
+        latestText = appRoot.textContent || '';
+        if (obs) { try { obs.disconnect(); } catch(e){} obs = null; }
+        showOverlay();
+        var cyc = cycleId;
+        obs = new MutationObserver(function(records) {
+          if (cyc !== cycleId) return;          // superseded cycle
+          if (succeeded) return;
+// Only translatable-node changes count; SSE updates must not dismiss early.
+          var relevant = records.some(function(rec) {
+            var n = rec.target;
+            while (n && n !== appRoot) {
+              if (n.nodeType === 1) {
+                if (n.classList && (n.classList.contains('notranslate') || n.getAttribute('translate') === 'no')) return false;
+                if (n.tagName === 'CODE' || n.tagName === 'PRE' || n.tagName === 'SCRIPT' || n.tagName === 'STYLE') return false;
+              }
+              n = n.parentNode;
+            }
+            return n === appRoot;
+          });
+          if (!relevant) return;
+          var ct = appRoot.textContent || '';
+          if (ct !== latestText && ct.length > 100) {
+            latestText = ct;
+            if (hideDebounce) clearTimeout(hideDebounce);
+            hideDebounce = setTimeout(function() { hideDebounce = null; if (cyc === cycleId) onTranslateSettled(); }, TRANS_QUIET_MS);
+          }
+        });
+        obs.observe(appRoot, { childList: true, subtree: true, characterData: true });
+        if (transTimer) clearTimeout(transTimer);
+        transTimer = setTimeout(function(){ failOverlay(true, cyc); }, onTimeout || TRANS_TIMEOUT_MS);
+      }
+// Stale cycle callbacks must never apply to a replaced language choice.
+      function clearCycleTimers() {
+        [transTimer, hideDebounce, settleTimer, langTimer].forEach(function(t){ if (t) { clearTimeout(t); } });
+        transTimer = hideDebounce = settleTimer = langTimer = null;
+      }
+      var startTranslate = function() {
+        // Refresh the saved preference: the user may have changed it in another tab.
+        savedLang = localStorage.getItem('gw_lang') || defaultLang;
+        markActive(savedLang);
+        if (savedLang === defaultLang) return; // default: no translation action
+        if (!appVisible()) return; // login view stays untranslated; start only inside app
+        try {
+          libInitOnce();
+          watchCycle();
+          var cyc = cycleId;
+          langTimer = setTimeout(function(){
+            langTimer = null;
+            if (cyc !== cycleId) return; // superseded
+            try { _.changeLanguage(savedLang); } catch(e) { failOverlay(false, cyc); }
+          }, 300);
+        }
+        catch(e) { failOverlay(false); }
+      };
+      // no auto-start on page load (login stays untouched); app calls this after login
+      window.maybeStartTranslation = startTranslate;
+      markActive(savedLang);
+      items.forEach(function(item) {
+        item.addEventListener('click', function(e) {
+          e.preventDefault(); var lang = this.getAttribute('data-lang');
+          var prevLang = localStorage.getItem('gw_lang') || defaultLang;   // before this click overwrites it
+          localStorage.setItem('gw_lang', lang); markActive(lang);
+          if (lang === defaultLang) {
+// Reload wipes unsaved edits: ask first; cancel restores THIS click's pre-state
+// (savedLang is boot-time and goes stale after any earlier language switch).
+            try {
+              const dirty = typeof unsavedEdits === 'function' && unsavedEdits();
+              if (dirty && !confirm('Switching language reloads the page and discards UNSAVED changes. Continue?')) {
+                try { localStorage.setItem('gw_lang', prevLang); } catch {}
+                markActive(prevLang); return;
+              }
+            } catch {}
+            location.reload(); return;
+          }
+          var app = document.getElementById('view-app');
+          if (!app || app.classList.contains('d-none')) return; // never translate login view
+          overlayHidden = false; transFailed = false; toastShown = false; finishHandled = false;
+          libInitOnce();
+          watchCycle();
+          var cyc = cycleId;
+          try { _.changeLanguage(lang); } catch(e) { failOverlay(false, cyc); }
+        });
+      });
+    };
+  }
+
+</script>
 
 <!-- SCRIPT -->
 <script>
@@ -467,14 +716,18 @@
 
 /* globals */
 let _token = localStorage.getItem('gw_token') || '';
-let _rawLog = '', _cfgText = '', _cfgObj = null, _evt = null, _lastStatus = null;
+let _rawLog = '', _cfgText = '', _cfgObj = null, _lastStatus = null, _logTruncated = false;
 let _charts = {};
 let _logRows = [], _logFiltered = [], _logPage = 0;
+let _lgRawDirty = false;   // user hand-edited the raw log textarea
 const LG_PER = 50;
 let _lgType = 'all', _rowModal = null, _detailOc = null;
+let _keyModal = null, _keyFocusT = null;
 const $ = id => document.getElementById(id);
 const _esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'<','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const _mask = k => typeof k === 'string' && k.length > 4 ? '…' + k.slice(-4) : '(empty)';
+// numeric coercion for server/log values interpolated into innerHTML — never trust their type
+const _num = (v, dflt) => { const n = Number(v); return Number.isFinite(n) ? n : (dflt === undefined ? 0 : dflt); };
 
 function stripJsonc(s){
   let out='', inS=false, esc=false, lc=false, bc=false;
@@ -489,7 +742,7 @@ function stripJsonc(s){
   return out;
 }
 const tryParseCfg = t => { try { return { ok:true, obj: JSON.parse(stripJsonc(t)) }; } catch(e){ return { ok:false, err:e.message }; } };
-const DEFAULT_CONFIG = JSON.stringify({ client_token: '', port: 3000, timeout: 600000, key_cooldown: 30000, max_key_backoff: 300000, max_body_size: 10485760, log: { enabled: true, retention_days: 7, path: './log.json' }, providers: { gpt4free: [''] }, rate_limit: {}, tpm_limit: {}, model_limits: {}, endpoint_fallbacks: {}, models: { openai: [{ provider: 'gpt4free', model: 'auto' }] }, smart_route: {}, classifier: { base_url: 'https://classifier.dev', cache: { enabled: true, max_entries: 2000, max_bytes: 8388608, ttl_ms: 3600000 } } }, null, 2);
+const DEFAULT_CONFIG = JSON.stringify({ client_token: '', port: 3000, timeout: 600000, upstream_timeout: 120000, upstream_max_body: 20971520, key_cooldown: 30000, max_key_backoff: 300000, max_body_size: 10485760, log: { enabled: true, retention_days: 7, max_size_mb: 100, path: './log.json', capture_error_body: false }, providers: { gpt4free: [''] }, rate_limit: {}, tpm_limit: {}, model_limits: {}, endpoint_fallbacks: {}, models: { openai: [{ provider: 'gpt4free', model: 'auto' }] }, smart_route: {}, classifier: { base_url: 'https://classifier.dev', cache: { enabled: true, max_entries: 2000, max_bytes: 8388608, ttl_ms: 3600000 } } }, null, 2);
 
 
 
@@ -507,7 +760,11 @@ function bindNavBtns(){
 }
 bindNavBtns();
 
-/* mobile sidebar toggle */
+/* help "?" icons on card headers; guarded so the DOM-stub boot test (no bootstrap global) still parses */
+if (typeof bootstrap !== 'undefined' && bootstrap.Popover) {
+  document.querySelectorAll('[data-bs-toggle="popover"]').forEach(el => { try { new bootstrap.Popover(el); } catch {} });
+}
+
 $('btnSidebar').addEventListener('click', () => {
   let oc = bootstrap.Offcanvas.getOrCreateInstance($('sidebarOff'));
   oc.show();
@@ -526,61 +783,123 @@ window.addEventListener('scroll', () => { $('gotop').style.display = window.scro
 /* auth */
 $('l_token').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
 $('l_btn').addEventListener('click', doAuth);
-$('btnLogout').addEventListener('click', () => {
+$('btnLogout').addEventListener('click', () => resetSession());   // never pass the MouseEvent as `msg`
+
+// Session tags: late responses from another session must never write into this UI.
+let _sess = 0;
+let _loadCtl = null, _detailCtl = null, _detailReq = 0, _authReq = 0;
+function sessTag() { return _sess; }
+function sessAlive(tag) { return tag === _sess; }
+
+function resetSession(msg) {
+  _sess++;
+  if (_loadCtl) { _loadCtl.abort(); _loadCtl = null; }
+  if (_detailCtl) { _detailCtl.abort(); _detailCtl = null; }
+  _authReq++;
   _token=''; localStorage.removeItem('gw_token'); closeSSE();
-  _rawLog=''; _cfgText=''; _cfgObj=null;
-  $('view-app').classList.add('d-none'); $('view-login').classList.remove('d-none'); $('l_token').value='';
-});
+  _rawLog=''; _cfgText=''; _cfgObj=null; _lastStatus=null; _logTruncated=false;
+  _logRows=[]; _logFiltered=[]; _logPage=0; _lgRawDirty=false;
+  // drop raw editors too — a later login must never see the previous session's keys
+  try { $('cfgRaw').value=''; $('lgRaw').value=''; syncHl($('cfgRaw')); syncHl($('lgRaw')); } catch {}
+  if ($('f_token')) $('f_token').value='';
+  if (window.__lgT) { clearTimeout(window.__lgT); window.__lgT=null; }
+  $('view-app').classList.add('d-none'); $('view-login').classList.remove('d-none');
+  $('l_token').value=''; $('l_status').textContent = msg || '';
+  hideAllLoading();
+  try {
+    ['keyModal', 'provModal', 'rowModal'].forEach(id => {
+      const inst = window.bootstrap && bootstrap.Modal.getInstance($(id));
+      if (inst) inst.hide();
+    });
+    const oc = window.bootstrap && bootstrap.Offcanvas.getInstance($('detailPanel'));
+    if (oc) oc.hide();
+  } catch {}
+  // drop authenticated DOM so a later login can never show the previous session
+  $('lgBody').innerHTML=''; $('pBody').innerHTML=''; $('recentErrs').innerHTML=''; $('detailBody').innerHTML='';
+  try { if (_charts) { for (const k of Object.keys(_charts)) { _charts[k]?.destroy?.(); delete _charts[k]; } } } catch{}
+}
+
+// central 401 path — every authenticated fetch funnels through here
+function onUnauthorized() { resetSession('Session expired, please log in again'); }
+
+async function apiFetch(url, opts, tag) {
+  const t = tag === undefined ? sessTag() : tag;
+  const r = await fetch(url, Object.assign({ headers:{ 'Authorization':'Bearer '+_token } }, opts || {}));
+  if (r.status === 401 && sessAlive(t)) { onUnauthorized(); throw new Error('unauthorized'); }
+  return r;
+}
+
 async function doAuth(){
   const v = $('l_token').value;
   if ([...v].some(c => c.charCodeAt(0) > 127)) { $('l_status').textContent = 'Token contains non-ASCII characters'; return; }
-  _token = v;
-  showLoading();
-  try {
-    const headers = v ? { 'Authorization':'Bearer ' + v } : {};
-    const r = await fetch('/api/console/validate', { method:'POST', headers });
-    if (!r.ok) { _token=''; localStorage.removeItem('gw_token'); hideLoading(); $('l_status').textContent='Auth failed: incorrect token'; return; }
-    localStorage.setItem('gw_token', _token);
-    $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none');
-    await loadAll(); openSSE();
-    if (window.maybeStartTranslation) window.maybeStartTranslation(); // translate only inside app
-  } catch(e){ _token=''; hideLoading(); $('l_status').textContent='Connection error'; toast(_esc(e.message), 0); }
+  const ld = showLoading();
+  try { await bootAuth(v); } finally { hideLoading(ld); }
 }
 
 /* load */
-$('btnRefresh').addEventListener('click', loadAll);
-$('btnCfgReload').addEventListener('click', loadAll);
-$('btnLgReload').addEventListener('click', loadAll);
-async function loadAll(){
-  showLoading();
+// wrappers: addEventListener would pass the MouseEvent as `tag`, which never
+// equals _sess → the fetch result is discarded and the overlay sticks for 30s
+$('btnRefresh').addEventListener('click', () => loadAll());
+$('btnCfgReload').addEventListener('click', () => loadAll());
+$('btnLgReload').addEventListener('click', () => loadAll());
+// Shared dirty check (config form + Raw editor + hand-edited log raw).
+function unsavedEdits(){
+  return /unsaved/i.test((($('cfgStatus') || {}).textContent) || '')
+    || (($('cfgRaw') || {}).value || '') !== (_cfgText || '')
+    || !!_lgRawDirty;
+}
+async function loadAll(tag){
+  tag = (tag === undefined) ? sessTag() : tag;
+  if (unsavedEdits() && !confirm('Reload discards UNSAVED changes (config / raw log edits). Continue?')) return;
+  if (_loadCtl) { try { _loadCtl.abort(); } catch{} }
+  const ctl = new AbortController(); _loadCtl = ctl;
+  const ld = showLoading();
   try {
-    const r = await fetch('/api/console/load', { headers:{ 'Authorization':'Bearer '+_token } });
-    if (!r.ok) { hideLoading(); toast('Load failed', 0); return; }
+    const r = await apiFetch('/api/console/load', { signal: ctl.signal }, tag);
+    if (!sessAlive(tag) || _loadCtl !== ctl) return;      // superseded or logged out
+    if (!r.ok) { hideLoading(ld); toast('Load failed', 0); return; }
     const d = await r.json();
-    _cfgText = d.config || DEFAULT_CONFIG; _rawLog = d.log || '';
+    if (!sessAlive(tag) || _loadCtl !== ctl) return;
+    _cfgText = d.config || DEFAULT_CONFIG; _rawLog = d.log || ''; _lgRawDirty = false;
+    _logTruncated = !!d.log_truncated;
+    // label the editors with the files that are actually read/written
+    const cfgName = d.config_file || 'config.json', logName = d.log_file || 'log.json';
+    $('cfgFileName').textContent = cfgName;
+    $('lgFileName').textContent = logName;
     $('cfgRaw').value = _cfgText; syncHl($('cfgRaw'));
     const warns = [];
-    if (d.config_valid === false) warns.push('config.json invalid: ' + (d.config_error || '?'));
-    if (d.log_valid === false) warns.push('log.json invalid: ' + (d.log_error || '?'));
-    if (d.config_fixed) warns.push('config.json end auto-completed (review before saving)');
-    if (d.log_fixed) warns.push('Some log.json lines auto-fixed (review before saving)');
+    if (d.config_valid === false) warns.push(cfgName + ' invalid: ' + (d.config_error || '?'));
+    if (d.log_valid === false) warns.push(logName + ' invalid: ' + (d.log_error || '?'));
+    if (d.config_fixed) warns.push(cfgName + ' end auto-completed (review before saving)');
+    if (d.log_fixed) warns.push('Some ' + logName + ' lines auto-fixed (review before saving)');
     const w = $('cfgWarn');
     if (warns.length){ w.classList.remove('d-none'); w.innerHTML = warns.map(x=>'<div><i class="bi bi-exclamation-triangle-fill"></i> '+_esc(x)+'</div>').join(''); }
     else { w.classList.add('d-none'); w.innerHTML=''; }
     try { const c = JSON.parse(stripJsonc(_cfgText)); $('retentionLbl').textContent = c?.log?.enabled === false ? 'Logging disabled' : ('Retains ' + (c?.log?.retention_days || 7) + ' days'); } catch{}
-    fillConfigForm(); renderModels(); parseLogRows(); refreshStatus();
-    hideLoading(); toast('Loaded', 1);
-  } catch(e){ hideLoading(); toast('Load error: ' + _esc(e.message), 0); }
+    fillConfigForm(); renderModels(); parseLogRows();
+    hideLoading(ld); toast('Loaded', 1);
+    refreshStatus(tag, true);   // fire-and-forget; explicit load always refreshes metrics
+  } catch(e){ if (!sessAlive(tag) || _loadCtl !== ctl) return; hideLoading(ld); if (e.name !== 'AbortError') toast('Load error: ' + e.message, 0); }
 }
 
 /* config form */
+// Snapshot of the form as last filled/applied — btnCfgSave refuses to save a
+// config that would silently discard unapplied form edits.
+let _formSnap = null;
+function _readForm(){
+  const one = (id) => { const el = $(id); return el ? (el.type === 'checkbox' ? String(el.checked) : el.value) : ''; };
+  return ['f_token','f_port','f_timeout','f_uptimeout','f_upmaxbody','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays','f_logen'].map(one).join('\u0001');
+}
 function fillConfigForm(){
-  const p = tryParseCfg(_cfgText || $('cfgRaw').value || '');
+  // textarea first: _cfgText is the last-loaded snapshot, so reading it here
+  // rolled the form (and _cfgObj) back after Format / Raw edits
+  const p = tryParseCfg($('cfgRaw').value || _cfgText || '');
   _cfgObj = p.ok ? p.obj : null;
   if (!p.ok){
     setCfgStatus('Raw parse failed: ' + p.err, 0);
-    ['f_token','f_port','f_timeout','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays'].forEach(id => { $(id).value = ''; });
+    ['f_token','f_port','f_timeout','f_uptimeout','f_upmaxbody','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays'].forEach(id => { $(id).value = ''; });
     $('f_logen').checked = true;
+    _formSnap = _readForm();   // cleared fields ARE the current form state
     $('provEdit').innerHTML = '<p class="text-secondary small mb-0">Invalid config. Fix Raw and reload.</p>';
     $('modelsTable').innerHTML = '<tr><td colspan="2" class="text-secondary small text-center">Invalid config</td></tr>';
     return;
@@ -588,20 +907,35 @@ function fillConfigForm(){
   setCfgStatus('Valid JSON', 1);
   const c = _cfgObj;
   $('f_token').value = c.client_token || ''; $('f_port').value = c.port ?? '';
-  $('f_timeout').value = c.timeout ?? ''; $('f_cooldown').value = c.key_cooldown ?? '';
+  $('f_timeout').value = c.timeout ?? ''; $('f_uptimeout').value = c.upstream_timeout ?? ''; $('f_upmaxbody').value = c.upstream_max_body ?? '';
+  $('f_cooldown').value = c.key_cooldown ?? '';
   $('f_backoff').value = c.max_key_backoff ?? ''; $('f_maxbody').value = c.max_body_size ?? '';
   $('f_quota').value = c.quota_backoff ?? '';
   $('f_logpath').value = c.log?.path || ''; $('f_logdays').value = c.log?.retention_days ?? '';
   $('f_logen').checked = c.log?.enabled !== false;
   renderProvEdit();
+  _formSnap = _readForm();
 }
 function setCfgStatus(m, ok){ $('cfgStatus').innerHTML = m ? '<span class="'+(ok?'text-success':'text-danger')+'">'+_esc(m)+'</span>' : ''; }
+// Raw editor collapse, persisted across sessions. The header (title + status +
+// toggle) always stays visible so "Valid JSON" remains readable while collapsed.
+function setRawCollapsed(collapsed) {
+  $('cfgRawWrap').classList.toggle('d-none', !!collapsed);
+  $('btnCfgRawToggle').textContent = collapsed ? 'Show' : 'Hide';
+  try { localStorage.setItem('gw_raw_open', collapsed ? '0' : '1'); } catch {}
+}
+$('btnCfgRawToggle').addEventListener('click', () => setRawCollapsed(!$('cfgRawWrap').classList.contains('d-none')));
+// Default collapsed: the form + provider cards cover daily edits, Raw is for
+// advanced use. Only an explicit prior "open" persists across sessions.
+try { setRawCollapsed(localStorage.getItem('gw_raw_open') !== '1'); } catch { setRawCollapsed(true); }
 $('btnApplyForm').addEventListener('click', () => {
+  if (!confirm('Write the form values into the Raw JSON editor?')) return;
   const p = tryParseCfg($('cfgRaw').value);
   if (!p.ok){ setCfgStatus('Raw parse failed, fix JSON first: ' + p.err, 0); return; }
   const c = p.obj, num = id => { const v = $(id).value; return v === '' ? undefined : Number(v); };
   const put = (k, v) => { if (v === undefined || (typeof v === 'number' && isNaN(v))) delete c[k]; else c[k] = v; };
   c.client_token = $('f_token').value; put('port', num('f_port')); put('timeout', num('f_timeout'));
+  put('upstream_timeout', num('f_uptimeout')); put('upstream_max_body', num('f_upmaxbody'));
   put('key_cooldown', num('f_cooldown')); put('max_key_backoff', num('f_backoff'));
   put('max_body_size', num('f_maxbody')); put('quota_backoff', num('f_quota'));
   c.log = c.log || {}; c.log.path = $('f_logpath').value || './log.json';
@@ -609,38 +943,180 @@ $('btnApplyForm').addEventListener('click', () => {
   c.log.enabled = $('f_logen').checked;
   $('cfgRaw').value = JSON.stringify(c, null, 2);
   _cfgObj = c; renderProvEdit(); renderModels(); setCfgStatus('Applied to JSON (unsaved)', 1); syncHl($('cfgRaw'));
+  _formSnap = _readForm();
 });
+// Handles both provider shapes (array vs {apiKeys,...}); array-only code dropped meta.
+function _provKeyList(name, create) {
+  const provs = (_cfgObj && _cfgObj.providers) || {};
+  const p = provs[name];
+  if (Array.isArray(p)) return p;
+  if (p && typeof p === 'object') {
+    if (!Array.isArray(p.apiKeys)) { if (!create) return []; p.apiKeys = []; }
+    return p.apiKeys;
+  }
+  return null; // unknown provider, or a scalar that should not happen
+}
+// Single sync point after any in-memory key mutation: Raw editor, both lists,
+// status flag. Nothing touches the server — Save (with restart) stays explicit.
+function _syncCfgAfterKeyChange(msg, detailProv) {
+  $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2); syncHl($('cfgRaw'));
+  renderProvEdit(); renderModels();
+  setCfgStatus(msg || 'Keys updated (unsaved)', 1);
+  if (detailProv) { renderDetailKeys(detailProv); renderDetailMeta(detailProv); }
+}
+// Custom-upstream meta for a provider, or null when it uses the built-in
+// default endpoint (array form). Never throws on malformed entries.
+function _provMeta(name) {
+  const p = (_cfgObj && _cfgObj.providers || {})[name];
+  if (!p || Array.isArray(p) || typeof p !== 'object') return null;
+  return {
+    baseUrl: typeof p.baseUrl === 'string' ? p.baseUrl : '',
+    pathPrefix: typeof p.pathPrefix === 'string' ? p.pathPrefix : '',
+    rpm: p.rpm != null && !isNaN(Number(p.rpm)) ? Number(p.rpm) : null,
+  };
+}
+// Model aliases that would dangle if this provider were deleted.
+function _provReferencedBy(name) {
+  const out = [];
+  for (const [alias, chain] of Object.entries((_cfgObj && _cfgObj.models) || {})) {
+    if (Array.isArray(chain) && chain.some((t) => t && t.provider === name)) out.push(alias);
+  }
+  return out;
+}
+function deleteProvider(name) {
+  const refs = _provReferencedBy(name);
+  const msg = 'Delete provider "' + name + '"' + (refs.length ? ', used by model alias(es): ' + refs.join(', ') : '') + '? (Unsaved until Save.)';
+  if (!confirm(msg)) return;
+  delete _cfgObj.providers[name];
+  if (_detailOc && $('detailTitle').textContent === name) { try { _detailOc.hide(); } catch {} }
+  _syncCfgAfterKeyChange('Provider deleted (unsaved)');
+}
 function renderProvEdit(){
   const box = $('provEdit'); const provs = (_cfgObj && _cfgObj.providers) || {};
   const names = Object.keys(provs);
   if (!names.length){ box.innerHTML = '<p class="text-secondary small mb-0">No providers yet. Add one below.</p>'; return; }
   box.innerHTML = names.map(n => {
-    const ks = Array.isArray(provs[n]) ? provs[n] : [];
+    const ks = _provKeyList(n) || [];
+    const meta = (!Array.isArray(provs[n]) && provs[n] && typeof provs[n] === 'object')
+      ? ' <span class="text-secondary fw-normal">· ' + _esc([provs[n].baseUrl, provs[n].pathPrefix && ('path:' + provs[n].pathPrefix), provs[n].rpm != null && ('rpm:' + provs[n].rpm)].filter(Boolean).join(' ') || 'custom') + '</span>' : '';
+    const isCustom = !Array.isArray(provs[n]) && provs[n] && typeof provs[n] === 'object';
     return '<div class="border rounded p-2"><div class="d-flex justify-content-between align-items-center mb-1">'
-      + '<strong class="small">'+_esc(n)+'</strong><span class="badge bg-secondary">'+ks.length+' keys</span></div>'
-      + '<div class="d-flex flex-wrap gap-1 mb-2">' + (ks.length ? ks.map((k,i)=>'<span class="badge border border-secondary text-secondary mono">'+_mask(k)+' <a href="#" class="text-danger text-decoration-none" data-prov="'+_esc(n)+'" data-idx="'+i+'">×</a></span>').join('') : '<span class="text-secondary small">No keys</span>') + '</div>'
+      + '<strong class="small notranslate" translate="no">'+_esc(n)+'</strong>'
+      + '<span class="d-flex gap-1 align-items-center"><span class="badge bg-secondary">'+ks.length+' keys</span>'
+      + '<button class="btn btn-outline-secondary btn-sm py-0 px-1" data-pedit="'+_esc(n)+'" title="Edit upstream settings"><i class="bi bi-pencil"></i></button>'
+      + '<button class="btn btn-outline-danger btn-sm py-0 px-1" data-pdel="'+_esc(n)+'" title="Delete provider"><i class="bi bi-trash"></i></button></span></div>'
+      + (meta ? '<div class="small mb-1">' + meta + '</div>' : '')
+      + '<div class="d-flex flex-wrap gap-1 mb-2">' + (ks.length ? ks.map((k,i)=>'<span class="badge border border-secondary text-secondary mono notranslate" translate="no" style="cursor:pointer" title="Click to edit" data-editprov="'+_esc(n)+'" data-editidx="'+i+'">'+_mask(k)+' <a href="#" class="text-danger text-decoration-none" data-prov="'+_esc(n)+'" data-idx="'+i+'" title="Delete">×</a></span>').join('') : '<span class="text-secondary small">No keys</span>') + '</div>'
       + '<div class="d-flex gap-1"><input class="form-control form-control-sm mono" placeholder="Add key…" data-add="'+_esc(n)+'" autocomplete="off"><button class="btn btn-outline-success btn-sm" data-addbtn="'+_esc(n)+'"><i class="bi bi-plus"></i></button></div></div>';
   }).join('');
   box.querySelectorAll('a[data-prov]').forEach(a => a.addEventListener('click', e => {
-    e.preventDefault();
-    _cfgObj.providers[a.dataset.prov].splice(Number(a.dataset.idx), 1);
-    $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2); renderProvEdit(); renderModels(); syncHl($('cfgRaw'));
+    e.preventDefault(); e.stopPropagation();
+    const ks = _provKeyList(a.dataset.prov);
+    if (!ks) { toast('Provider no longer exists', 0); return; }
+    ks.splice(Number(a.dataset.idx), 1);
+    _syncCfgAfterKeyChange('Key deleted (unsaved)');
   }));
+  /* key edit modal — _keyModal/_keyFocusT live at module scope, NOT here: a
+     per-render instance would create a new bootstrap.Modal on the same DOM node
+     on every re-render (duplicate backdrop / double show), and a pending focus
+     timer from a previous click would steal focus from the next one. */
+  box.querySelectorAll('[data-editprov]').forEach(b => b.addEventListener('click', e => {
+    if (e.target.closest('a[data-prov]')) return;
+    const prov = b.dataset.editprov, idx = Number(b.dataset.editidx);
+    const cur = (_provKeyList(prov) || [])[idx] || '';
+    $('keyModalSub').textContent = prov + ' #' + (idx + 1);
+    $('keyModalInput').value = cur;
+    $('keyModal').dataset.prov = prov; $('keyModal').dataset.idx = String(idx);
+    if (!_keyModal) _keyModal = new bootstrap.Modal($('keyModal'));
+    _keyModal.show();
+    if (_keyFocusT) clearTimeout(_keyFocusT);
+    _keyFocusT = setTimeout(() => { _keyFocusT = null; if ($('keyModal').classList.contains('show')) $('keyModalInput').focus(); }, 300);
+  }));
+  box.querySelectorAll('[data-pedit]').forEach(b => b.addEventListener('click', () => openProvModal('edit', b.dataset.pedit)));
+  box.querySelectorAll('[data-pdel]').forEach(b => b.addEventListener('click', () => deleteProvider(b.dataset.pdel)));
   box.querySelectorAll('[data-addbtn]').forEach(b => b.addEventListener('click', () => {
     const n = b.dataset.addbtn, inp = box.querySelector('input[data-add="'+CSS.escape(n)+'"]');
     const v = (inp.value || '').trim(); if (!v) return;
-    if (!Array.isArray(_cfgObj.providers[n])) _cfgObj.providers[n] = [];
-    _cfgObj.providers[n].push(v); inp.value='';
-    $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2); renderProvEdit(); renderModels(); syncHl($('cfgRaw'));
+    const ks = _provKeyList(n, true);
+    if (!ks) { toast('Provider no longer exists', 0); return; }
+    ks.push(v); inp.value='';
+    _syncCfgAfterKeyChange('Key added (unsaved)');
   }));
 }
-$('btnAddProv').addEventListener('click', () => {
-  const n = ($('newProvName').value || '').trim(), k = ($('newProvKey').value || '').trim();
+$('keyModalSave').addEventListener('click', () => {
+  const v = ($('keyModalInput').value || '').trim();
+  if (!v) { toast('Key cannot be empty', 0); return; }
+  const prov = $('keyModal').dataset.prov, idx = Number($('keyModal').dataset.idx);
+  const ks = prov ? _provKeyList(prov) : null;
+  if (!ks || idx < 0 || idx >= ks.length) { toast('Save failed: key no longer exists', 0); return; }
+  ks[idx] = v;
+  bootstrap.Modal.getInstance($('keyModal')).hide(); $('keyModalInput').value = ''; toast('Key updated (unsaved)', 1);
+  _syncCfgAfterKeyChange('Key updated (unsaved)', prov);
+});
+$('keyModalInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('keyModalSave').click(); });
+/* provider modal: add a custom upstream, or edit baseUrl/pathPrefix/rpm */
+let _provModal = null;
+function openProvModal(mode, name) {
+  $('provModalTitle').textContent = mode === 'edit' ? 'Edit upstream' : 'Add custom provider';
+  $('provModalName').value = mode === 'edit' ? name : '';
+  $('provModalName').disabled = mode === 'edit';
+  const m = mode === 'edit' ? _provMeta(name) : null;
+  $('provModalBase').value = (m && m.baseUrl) || '';
+  $('provModalPrefix').value = (m && m.pathPrefix) || '';
+  $('provModalRpm').value = (m && m.rpm != null) ? m.rpm : '';
+  $('provModal').dataset.mode = mode;
+  $('provModalHint').textContent = mode === 'edit'
+    ? 'Clear all three fields to revert to the built-in default endpoint.'
+    : 'Leave all three empty for a built-in OpenAI-compatible endpoint.';
+  if (!_provModal) _provModal = new bootstrap.Modal($('provModal'));
+  _provModal.show();
+}
+$('provModalSave').addEventListener('click', () => {
+  const mode = $('provModal').dataset.mode || 'add';
+  const name = ($('provModalName').value || '').trim();
+  const base = ($('provModalBase').value || '').trim();
+  const prefix = ($('provModalPrefix').value || '').trim();
+  const rpmRaw = ($('provModalRpm').value || '').trim();
+  if (!name) { toast('Provider name cannot be empty', 0); return; }
+  if (base && !/^https?:\/\//i.test(base)) { toast('Base URL must start with http:// or https://', 0); return; }
+  let rpm = null;
+  if (rpmRaw) { rpm = Number(rpmRaw); if (!Number.isFinite(rpm) || rpm <= 0) { toast('RPM must be a positive number', 0); return; } }
+  _cfgObj.providers = _cfgObj.providers || {};
+  if (mode === 'add' && _cfgObj.providers[name] !== undefined) { toast('Provider already exists — use Edit instead', 0); return; }
+  const ks = mode === 'edit' ? (_provKeyList(name) || []) : [];
+  if (base || prefix || rpm != null) {
+    const obj = { apiKeys: ks };
+    if (base) obj.baseUrl = base;
+    if (prefix) obj.pathPrefix = prefix;
+    if (rpm != null) obj.rpm = rpm;
+    _cfgObj.providers[name] = obj;
+  } else {
+    // no custom fields: plain array form (built-in endpoint)
+    _cfgObj.providers[name] = ks;
+  }
+  bootstrap.Modal.getInstance($('provModal')).hide();
+  _syncCfgAfterKeyChange(mode === 'edit' ? 'Upstream updated (unsaved)' : 'Provider added (unsaved)', name);
+  toast(mode === 'edit' ? 'Upstream updated (unsaved)' : 'Provider added (unsaved)', 1);
+});
+$('provModal').addEventListener('hidden.bs.modal', () => {
+  $('provModalName').value = ''; $('provModalBase').value = ''; $('provModalPrefix').value = ''; $('provModalRpm').value = '';
+});
+$('keyModal').addEventListener('hidden.bs.modal', () => { $('keyModalInput').value = ''; if (_keyFocusT) { clearTimeout(_keyFocusT); _keyFocusT = null; } });
+$('btnAddProvCustom').addEventListener('click', () => openProvModal('add'));
+$('btnAddProv').addEventListener('click', () => {  const n = ($('newProvName').value || '').trim(), k = ($('newProvKey').value || '').trim();
   if (!n){ toast('Enter a provider name', 0); return; }
   const p = tryParseCfg($('cfgRaw').value); if (!p.ok){ setCfgStatus('Raw parse failed: ' + p.err, 0); return; }
   _cfgObj = p.obj; _cfgObj.providers = _cfgObj.providers || {};
-  if (!_cfgObj.providers[n]) _cfgObj.providers[n] = [];
-  if (k) _cfgObj.providers[n].push(k);
+  if (k) {
+    // Route through the shared accessor: a plain push() throws when the
+    // provider is object-form ({apiKeys, baseUrl, ...} has no .push).
+    if (_cfgObj.providers[n] === undefined) _cfgObj.providers[n] = [];
+    const ks = _provKeyList(n, true);
+    if (!ks) { toast('Provider entry is malformed', 0); return; }
+    ks.push(k);
+  } else if (_cfgObj.providers[n] === undefined) {
+    _cfgObj.providers[n] = [];
+  }
   $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2);
   $('newProvName').value=''; $('newProvKey').value='';
   renderProvEdit(); renderModels(); setCfgStatus('Provider added (unsaved)', 1); syncHl($('cfgRaw'));
@@ -652,7 +1128,7 @@ function renderModels(){
   tb.innerHTML = names.slice(0, 60).map(a => {
     const t = models[a];
     const chips = Array.isArray(t) ? t.map(x=>'<span class="badge border border-info text-info me-1 mb-1">'+_esc(x.provider||'?')+' / '+_esc(x.model||'')+(x.endpoint?' @'+_esc(x.endpoint):'')+'</span>').join('') : '<span class="text-secondary small">'+_esc(String(t))+'</span>';
-    return '<tr><td class="mono small">'+_esc(a)+'</td><td>'+chips+'</td></tr>';
+    return '<tr class="notranslate" translate="no"><td class="mono small">'+_esc(a)+'</td><td>'+chips+'</td></tr>';
   }).join('') + (names.length > 60 ? '<tr><td colspan="2" class="text-secondary small">… '+names.length+' total, see Raw for full list</td></tr>' : '');
 }
 $('btnCfgValidate').addEventListener('click', () => {
@@ -670,33 +1146,145 @@ $('btnCfgDl').addEventListener('click', () => {
   const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'api-gateway-config.json'; a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
 });
-$('btnCfgSave').addEventListener('click', () => saveFile('config', $('cfgRaw').value));
+// Pre-save check for dead-gateway configs; server enforces the same rules.
+function validateConfigForSave(c) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return 'config must be a JSON object';
+  const num = (v, name, min, max) => {
+    if (v === undefined || v === null || v === '') return '';
+    const n = Number(v);
+    if (!Number.isFinite(n)) return `${name} must be a number`;
+    if (min != null && n < min) return `${name} must be >= ${min}`;
+    if (max != null && n > max) return `${name} must be <= ${max}`;
+    return '';
+  };
+  for (const [k, min, max] of [
+    ['port', 1, 65535], ['timeout', 1, null], ['upstream_timeout', 1, null],
+    ['upstream_max_body', 1, null], ['key_cooldown', 0, null], ['max_key_backoff', 0, null],
+    ['max_body_size', 1, null], ['quota_backoff', 0, null],
+  ]) {
+    const e = num(c[k], k, min, max);
+    if (e) return e;
+  }
+  // mirror of lib.validateConfigObject: nested numeric maps (a string here
+  // reaches `now + value` at runtime and wedges breaker/lockout/rate state)
+  const numMap = (obj, label, min) => {
+    if (obj === undefined || obj === null) return '';
+    if (typeof obj !== 'object' || Array.isArray(obj)) return `${label} must be an object`;
+    for (const [k, v] of Object.entries(obj)) {
+      const e = num(v, `${label}.${k}`, min, null);
+      if (e) return e;
+    }
+    return '';
+  };
+  for (const label of ['rate_limit', 'tpm_limit', 'model_lockout', 'circuit_breaker']) {
+    const e = numMap(c[label], label, 0);
+    if (e) return e;
+  }
+  const epc = numMap(c.provider_concurrency, 'provider_concurrency', 1);
+  if (epc) return epc;
+  // mirror of lib.validateConfigObject: a NaN retention cutoff wipes log.json
+  const lg = c.log;
+  if (lg !== undefined && lg !== null) {
+    if (typeof lg !== 'object' || Array.isArray(lg)) return 'log must be an object';
+    for (const k of ['retention_days', 'max_size_mb']) {
+      if (lg[k] === undefined || lg[k] === null || lg[k] === '') continue;
+      const n = Number(lg[k]);
+      if (!Number.isFinite(n)) return `log.${k} must be a number`;
+      if (n <= 0) return `log.${k} must be > 0`;
+    }
+    if (lg.path != null && lg.path !== '' && typeof lg.path !== 'string') return 'log.path must be a string';
+  }
+  const provs = c.providers;
+  if (!provs || typeof provs !== 'object' || Array.isArray(provs)) return 'providers must be an object';
+  const names = Object.keys(provs).filter((k) => !k.startsWith('_'));
+  if (!names.length) return 'at least one provider is required, otherwise nothing can route';
+  let totalKeys = 0;
+  for (const n of names) {
+    const v = provs[n];
+    const keys = Array.isArray(v) ? v : (v && Array.isArray(v.apiKeys) ? v.apiKeys : null);
+    if (keys === null) return `provider "${n}" must be a key array or {apiKeys:[...]}`;
+    const real = keys.filter((k) => typeof k === 'string' && k.trim());
+    totalKeys += real.length;
+    if (!Array.isArray(v) && v.baseUrl !== undefined && !/^https?:\/\//i.test(String(v.baseUrl))) {
+      return `provider "${n}" baseUrl must start with http:// or https://`;
+    }
+    if (!Array.isArray(v) && v.rpm !== undefined && !(Number(v.rpm) > 0)) {
+      return `provider "${n}" rpm must be a positive number`;
+    }
+  }
+  if (!totalKeys) return 'at least one non-empty API key is required, otherwise nothing can route';
+  const models = c.models;
+  if (!models || typeof models !== 'object' || Array.isArray(models)) return 'models must be an object';
+  const aliases = Object.keys(models).filter((k) => !k.startsWith('_'));
+  if (!aliases.length) return 'at least one model alias is required';
+  for (const a of aliases) {
+    const chain = models[a];
+    if (!Array.isArray(chain) || !chain.length) return `model alias "${a}" must be a non-empty array`;
+    for (const t of chain) {
+      if (!t || typeof t !== 'object') return `model alias "${a}" has a malformed target`;
+      if (!t.provider || typeof t.provider !== 'string') return `model alias "${a}" has a target without provider`;
+      if (!names.includes(t.provider)) return `model alias "${a}" points at unknown provider "${t.provider}"`;
+    }
+    for (const t of chain) {
+      const fb = t.fallback === undefined ? [] : (Array.isArray(t.fallback) ? t.fallback : [t.fallback]);
+      for (const f of fb) {
+        if (!aliases.includes(f)) return `model alias "${a}" falls back to unknown alias "${f}"`;
+      }
+    }
+  }
+  for (const [ep, alias] of Object.entries(c.endpoint_fallbacks || {})) {
+    if (!aliases.includes(alias)) return `endpoint_fallbacks["${ep}"] points at unknown alias "${alias}"`;
+  }
+  for (const [alias, tiers] of Object.entries(c.smart_route || {})) {
+    if (!aliases.includes(alias)) return `smart_route key "${alias}" is not a model alias`;
+    if (!Array.isArray(tiers)) return `smart_route["${alias}"] must be an array`;
+    for (const t of tiers) {
+      if (!t || !aliases.includes(t.alias)) return `smart_route["${alias}"] tier "${t && t.alias}" is not a model alias`;
+      if (!(Number(t.max_tokens) > 0)) return `smart_route["${alias}"] tier "${t.alias}" needs max_tokens > 0`;
+    }
+  }
+  return '';
+}
+$('btnCfgSave').addEventListener('click', () => {
+  const p = tryParseCfg($('cfgRaw').value);
+  if (!p.ok) { setCfgStatus('Raw parse failed: ' + p.err, 0); toast('Fix JSON errors before saving', 0); return; }
+  // Form edits never reached the Raw textarea — saving would silently discard them.
+  if (_formSnap !== null && _readForm() !== _formSnap) { toast('Form has unapplied edits — press "Apply to JSON" first', 0); return; }
+  const err = validateConfigForSave(p.obj);
+  if (err) { setCfgStatus('Invalid config: ' + err, 0); toast('Invalid config: ' + err, 0); return; }
+  if (!String(p.obj.client_token || '').trim()
+    && !confirm('client_token is empty — all endpoints will be unprotected. Save anyway?')) return;
+  if (!confirm('Save the config to the server? The gateway will restart and the new config takes effect.')) return;
+  saveFile('config', $('cfgRaw').value);
+});
 async function saveFile(file, content){
+  const tag = sessTag();
   const parsed = file === 'config' ? tryParseCfg(content) : null;
   const newClientToken = parsed?.ok ? String(parsed.obj?.client_token || '') : '';
   const requiresRelogin = file === 'config' && newClientToken !== '' && newClientToken !== _token;
-  showLoading();
+  const ld = showLoading();
   try {
-    const r = await fetch('/api/console/save', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ file, content }) });
-    if (!r.ok){ const d = await r.json().catch(()=>({})); hideLoading(); toast('Save failed: ' + _esc(d?.error || r.status), 0); return; }
+    const r = await apiFetch('/api/console/save', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ file, content }) }, tag);
+    if (!sessAlive(tag)) return;
+    if (!r.ok){ const d = await r.json().catch(()=>({})); hideLoading(ld); toast('Save failed: ' + (d?.error || r.status), 0); return; }
     toast('Saved', 1);
-    if (file === 'config') await waitForServer(requiresRelogin); else { hideLoading(); refreshStatus(); }
-  } catch(e){ hideLoading(); toast('Save error: ' + _esc(e.message), 0); }
+    if (file === 'config') { _cfgText = content; setCfgStatus('Saved', 1); await waitForServer(requiresRelogin, tag, ld); }
+    else { _rawLog = content; parseLogRows(); applyLogFilter(); _lgRawDirty = false; hideLoading(ld); refreshStatus(tag, true); }   // _rawLog follows the save, else a 2nd save writes the pre-save view back
+  } catch(e){ if (!sessAlive(tag)) return; hideLoading(ld); if (e.message !== 'unauthorized') toast('Save error: ' + e.message, 0); }
 }
-async function waitForServer(requiresRelogin = false){
-  showLoading('Server restarting…');
+async function waitForServer(requiresRelogin = false, tag, ld){
+  if (tag === undefined) tag = sessTag();
+  ld = showLoading('Server restarting…', 60000);   // new message + longer budget; new owner token
   for (let w = 1500, i = 0; i < 10; i++, w = Math.min(w * 1.5, 10000)){
     await new Promise(r => setTimeout(r, w + Math.random() * 500));
+    if (!sessAlive(tag)) return;
     try { const r = await fetch('/health', { signal: AbortSignal.timeout(5000) }); if (r.ok){
-      if (requiresRelogin) {
-        _token = ''; localStorage.removeItem('gw_token'); closeSSE();
-        $('view-app').classList.add('d-none'); $('view-login').classList.remove('d-none'); $('l_token').value = ''; $('l_status').textContent = 'Password set, please log in again';
-        hideLoading(); return;
-      }
-      toast('Server restarted', 1); await loadAll(); return;
+      if (requiresRelogin) { resetSession('Password set, please log in again'); return; }
+      toast('Server restarted', 1); hideLoading(ld); await loadAll(tag); return;   // loadAll's dirty-confirm can cancel — don't leave the overlay up
     } } catch{}
   }
-  hideLoading(); toast('Restart timed out, please refresh', 0);
+  if (!sessAlive(tag)) return;
+  hideLoading(ld); toast('Restart timed out, please refresh', 0);
 }
 
 /* logs */
@@ -742,11 +1330,11 @@ function renderLogPage(){
     const badge = o.type === 'success' ? '<span class="badge bg-success-subtle text-success">SUCCESS</span>' : '<span class="badge bg-danger-subtle text-danger">ERROR</span>';
     const code = o.status || (o.type === 'success' ? 200 : '');
     const codeCls = code === '' ? '' : code >= 500 ? 'bg-danger-subtle text-danger' : code >= 400 ? 'bg-warning-subtle text-warning' : 'bg-success-subtle text-success';
-    const codeBadge = code === '' ? '<span class="text-secondary small">—</span>' : '<span class="badge ' + codeCls + '">' + code + '</span>';
+    const codeBadge = code === '' ? '<span class="text-secondary small">—</span>' : '<span class="badge ' + codeCls + '">' + _esc(code) + '</span>';
     const info = o.type === 'success'
-      ? '<span class="text-secondary small notranslate">Latency: '+(o.latency ?? '-')+'s · token: '+(o.tokens ?? 0)+'</span>'
-      : '<span class="small">'+_esc(String(o.error || o.status || '').slice(0,90))+'</span>';
-    return '<tr class="clickable" data-gi="'+(_logPage*LG_PER+i)+'"><td class="mono small text-secondary">'+_esc(o.ts||'')+'</td><td>'+badge+'</td><td>'+codeBadge+'</td><td class="small">'+_esc(o.provider||'')+'</td><td class="mono small">'+_esc(o.model||'')+'</td><td>'+info+'</td></tr>';
+      ? '<span class="text-secondary small notranslate">Latency: '+_esc(o.latency ?? '-')+'s · token: '+_esc(o.tokens ?? 0)+'</span>'
+      : '<span class="small notranslate">'+_esc(String(o.error || o.status || '').slice(0,90))+'</span>';
+    return '<tr class="clickable notranslate" data-gi="'+(_logPage*LG_PER+i)+'" translate="no"><td class="mono small text-secondary">'+_esc(o.ts||'')+'</td><td>'+badge+'</td><td>'+codeBadge+'</td><td class="small">'+_esc(o.provider||'')+'</td><td class="mono small">'+_esc(o.model||'')+'</td><td>'+info+'</td></tr>';
   }).join('') : '<tr><td colspan="6" class="text-secondary small text-center">No matching records</td></tr>';
   $('lgBody').querySelectorAll('tr.clickable').forEach(tr => tr.addEventListener('click', () => {
     const r = _logFiltered[Number(tr.dataset.gi)];
@@ -764,9 +1352,9 @@ function renderRecentErrs(){
     const code = o.status || (o.type === 'success' ? 200 : '');
     const codeCls = code === '' ? '' : code >= 500 ? 'bg-danger-subtle text-danger' : code >= 400 ? 'bg-warning-subtle text-warning' : 'bg-success-subtle text-success';
     const info = o.type === 'success'
-      ? '<span class="text-secondary small notranslate">Latency: '+(o.latency ?? '-')+'s · token: '+(o.tokens ?? 0)+'</span>'
-      : '<span class="small">'+_esc(String(o.error || o.status || '').slice(0,80))+'</span>';
-    return '<tr class="clickable"><td class="mono small text-secondary">'+_esc(o.ts||'')+'</td><td>'+badge+'</td><td>'+(code===''?'—':'<span class="badge '+codeCls+'">'+code+'</span>')+'</td><td class="small">'+_esc(o.provider||'')+'</td><td class="mono small">'+_esc(o.model||'')+'</td><td class="small">'+info+'</td></tr>';
+      ? '<span class="text-secondary small notranslate">Latency: '+_esc(o.latency ?? '-')+'s · token: '+_esc(o.tokens ?? 0)+'</span>'
+      : '<span class="small notranslate">'+_esc(String(o.error || o.status || '').slice(0,80))+'</span>';
+    return '<tr class="clickable notranslate" translate="no"><td class="mono small text-secondary">'+_esc(o.ts||'')+'</td><td>'+badge+'</td><td>'+(code===''?'—':'<span class="badge '+codeCls+'">'+_esc(code)+'</span>')+'</td><td class="small">'+_esc(o.provider||'')+'</td><td class="mono small">'+_esc(o.model||'')+'</td><td class="small">'+info+'</td></tr>';
   }).join('') : '<tr><td colspan="6" class="text-secondary small text-center">No data</td></tr>';
   $('recentErrs').querySelectorAll('tr.clickable').forEach((tr, i) => tr.addEventListener('click', () => openRowModal(JSON.stringify(rows[i].obj, null, 2))));
 }
@@ -775,7 +1363,21 @@ function openRowModal(text){
   if (!_rowModal) _rowModal = new bootstrap.Modal($('rowModal'));
   _rowModal.show();
 }
-function fillRawFromFilter(){ $('lgRaw').value = _logFiltered.map(r => r.raw).join('\n'); syncHl($('lgRaw')); }
+// Blur focus out on hide, before aria-hidden lands (else Chrome warns).
+['rowModal', 'keyModal'].forEach((id) => {
+  $(id).addEventListener('hide.bs.modal', () => {
+    const m = $(id);
+    if (m.contains(document.activeElement)) document.activeElement.blur();
+  });
+});
+function fillRawFromFilter(){
+  if (_lgRawDirty) return;   // hand-edited raw — never clobber it
+  // keep comment (#) rows too: dropping them here made a no-filter Save delete
+  // every comment line in the file
+  const keep = new Set(_logFiltered);
+  $('lgRaw').value = _logRows.filter(r => r.skip || keep.has(r)).map(r => r.raw).join('\n');
+  syncHl($('lgRaw'));
+}
 document.querySelectorAll('[data-lg]').forEach(b => b.addEventListener('click', () => {
   document.querySelectorAll('[data-lg]').forEach(x => x.classList.remove('active'));
   b.classList.add('active'); _lgType = b.dataset.lg; applyLogFilter();
@@ -790,25 +1392,42 @@ $('btnLgAll').addEventListener('click', () => { $('lgFrom').value=''; $('lgTo').
 $('btnLgPrev').addEventListener('click', () => { _logPage--; renderLogPage(); });
 $('btnLgNext').addEventListener('click', () => { _logPage++; renderLogPage(); });
 $('btnLgRaw').addEventListener('click', () => $('lgRawWrap').classList.toggle('d-none'));
-$('btnLgSave').addEventListener('click', () => saveFile('log', mergeLogContent()));
-$('btnLgClear').addEventListener('click', () => { _rawLog=''; $('lgRaw').value=''; syncHl($('lgRaw')); toast('Cleared, press Save to persist', 1); });
+$('btnLgSave').addEventListener('click', () => {
+  const c = mergeLogContent();
+  if (!c.trim()) { toast('Log view is empty — refusing to overwrite the log file', 0); return; }
+  if (_logTruncated && !confirm('The loaded view holds only the newest log lines; saving overwrites the file and drops earlier entries. Continue?')) return;
+  saveFile('log', c);
+});
+$('btnLgClear').addEventListener('click', () => {
+  // reset rows too — otherwise the next filter change refills the textarea
+  // from the stale filtered set and undoes the clear
+  _rawLog=''; _logRows=[]; _logFiltered=[]; _logPage=0;
+  $('lgRaw').value=''; _lgRawDirty=false; syncHl($('lgRaw')); renderLogPage();
+  toast('Cleared (display only — reload restores rows; an empty Save is refused)', 1);
+});
 function mergeLogContent(){
   const f = $('lgFrom').value, t = $('lgTo').value, q = ($('lgSearch').value||'').toLowerCase(), pv = $('lgProv').value;
-  if (_lgType==='all' && !pv && !q && !f && !t) return $('lgRaw').value;
+  // no-filter shortcut removed: textarea lines are not re-checked against
+  // _rawLog there, so unparseable lines (comments) present in _rawLog but not
+  // in the textarea were silently dropped on save
   const shown = new Set($('lgRaw').value.split('\n').map(l=>l.trim()).filter(Boolean));
   const hidden = _rawLog.split('\n').filter(l => {
     const x = l.trim(); if (!x || shown.has(x)) return false;
-    try {
-      const o = JSON.parse(x);
-      if (o.type==='success' && _lgType==='err') return true;
-      if (o.type==='error' && _lgType==='ok') return true;
-      if (pv && o.provider !== pv) return true;
-      if ((f||t) && o.ts){ const d=String(o.ts).slice(0,10); if(f&&d<f)return true; if(t&&d>t)return true; }
-      if (q && !x.toLowerCase().includes(q)) return true;
-    } catch{}
+// Default-preserve: unparseable lines stay instead of being deleted on save.
+    let o = null;
+    try { o = JSON.parse(x); } catch { return true; }
+    if (o.type==='success' && _lgType==='err') return true;
+    if (o.type==='error' && _lgType==='ok') return true;
+    if (pv && o.provider !== pv) return true;
+    if ((f||t) && o.ts){ const d=String(o.ts).slice(0,10); if(f&&d<f)return true; if(t&&d>t)return true; }
+    if (q && !x.toLowerCase().includes(q)) return true;
     return false;
   });
-  return [...hidden, ...$('lgRaw').value.split('\n')].filter(l=>l.trim()).join('\n');
+  // Merge in timestamp order: prepending hidden rows scrambled chronology on
+  // save (and broke the log's "first line = oldest" age probe). Comments stay on top.
+  const tsOf = (l) => { try { const v = new Date(String(JSON.parse(l).ts).replace(' ', 'T')).getTime(); return Number.isFinite(v) ? v : Infinity; } catch { return -1; } };
+  return [...hidden, ...$('lgRaw').value.split('\n')].filter(l=>l.trim())
+    .map((l, i) => [tsOf(l), i, l]).sort((a, b) => a[0] - b[0] || a[1] - b[1]).map(x => x[2]).join('\n');
 }
 
 /* providers */
@@ -826,10 +1445,10 @@ function renderProvTable(d){
   });
   $('pCount').textContent = entries.length + '/' + Object.keys(d.providers||{}).length;
   $('pBody').innerHTML = entries.length ? entries.map(([p,v]) =>
-    '<tr class="clickable" data-p="'+_esc(p)+'"><td><strong class="small">'+_esc(p)+'</strong></td>'
-    + '<td><span class="badge border border-info text-info">'+v.keys+(v.degraded?' ('+v.degraded+' degraded)':'')+'</span></td>'
-    + '<td class="small text-info">'+(v.latency_ms||'-')+'ms</td>'
-    + '<td class="small">'+(v.degraded?'<span class="text-danger fw-medium">'+v.degraded+'</span>':'<span class="text-secondary">0</span>')+'</td>'
+    '<tr class="clickable notranslate" translate="no" data-p="'+_esc(p)+'"><td><strong class="small">'+_esc(p)+'</strong></td>'
+    + '<td><span class="badge border border-info text-info">'+_num(v.keys)+(v.degraded?' ('+_num(v.degraded)+' degraded)':'')+'</span></td>'
+    + '<td class="small text-info">'+(_num(v.latency_ms, '-'))+'ms</td>'
+    + '<td class="small">'+(v.degraded?'<span class="text-danger fw-medium">'+_num(v.degraded)+'</span>':'<span class="text-secondary">0</span>')+'</td>'
     + '<td class="small text-secondary">'+_esc(v.last_success||'')+'</td>'
     + '<td>'+(v.cbOpen?'<span class="badge bg-warning-subtle text-warning">OPEN</span>':'<span class="text-secondary small">—</span>')+'</td>'
     + '<td><button class="btn btn-outline-info btn-sm py-0 px-1" data-probe="'+_esc(p)+'" title="Probe"><i class="bi bi-activity"></i></button></td></tr>'
@@ -840,58 +1459,210 @@ function renderProvTable(d){
   }));
   $('pBody').querySelectorAll('[data-probe]').forEach(b => b.addEventListener('click', async e => {
     e.stopPropagation(); b.disabled = true;
+    const tag = sessTag(), name = b.dataset.probe;
     try {
-      const r = await fetch('/api/console/probe', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ provider: b.dataset.probe }) });
-      const j = await r.json(); toast(b.dataset.probe + (j.ok ? ' reachable' : ' unreachable (' + _esc(j.error || j.status) + ')'), !!j.ok);
-    } catch(err){ toast('Probe failed', 0); } finally { b.disabled = false; }
+      const r = await apiFetch('/api/console/probe', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ provider: name }) }, tag);
+      if (!sessAlive(tag)) return;
+      if (!r.ok) { const j = await r.json().catch(()=>({})); toast('Probe failed: ' + (j?.error || r.status), 0); return; }
+      const j = await r.json(); toast(name + (j.ok ? ' reachable' : ' unreachable (' + (j.error || j.status) + ')'), !!j.ok);
+    } catch(err){ if (sessAlive(tag) && err.message !== 'unauthorized') toast('Probe failed', 0); } finally { b.disabled = false; }
   }));
 }
 async function showProvDetail(p){
   if (!_detailOc) _detailOc = new bootstrap.Offcanvas($('detailPanel'));
+  if (_detailCtl) { try { _detailCtl.abort(); } catch{} }
+  const ctl = new AbortController(); _detailCtl = ctl;
+  const tag = sessTag(), reqId = ++_detailReq;
   $('detailTitle').textContent = p;
   $('detailBody').innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm text-primary"></div></div>';
   _detailOc.show();
   try {
-    const r = await fetch('/api/console/provider-detail?provider=' + encodeURIComponent(p), { headers:{ 'Authorization':'Bearer '+_token } });
+    const r = await apiFetch('/api/console/provider-detail?provider=' + encodeURIComponent(p), { signal: ctl.signal }, tag);
+    // a newer provider selection or a logout invalidates this response
+    if (!sessAlive(tag) || reqId !== _detailReq || _detailCtl !== ctl) return;
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
-    let h = d.keys.length
-      ? '<table class="table table-sm"><thead><tr><th>Key</th><th>Latency</th><th>OK</th><th>Errors</th><th>Status</th><th>Last</th></tr></thead><tbody>'
-        + d.keys.map(k=>'<tr><td class="mono small">'+_esc(k.key)+'</td><td>'+k.latency_ms+'ms</td><td>'+k.successCount+'</td><td>'+k.errorCount+'</td><td>'+(k.degraded?'<span class="text-warning">Degraded</span>':'<span class="text-success">Healthy</span>')+'</td><td class="small text-secondary">'+_esc(k.lastSuccess)+'</td></tr>').join('') + '</tbody></table>'
+    if (!sessAlive(tag) || reqId !== _detailReq || _detailCtl !== ctl) return;
+    const keys = Array.isArray(d.keys) ? d.keys : [], r401 = Array.isArray(d.recent401) ? d.recent401 : [];
+    let h = keys.length
+      ? '<table class="table table-sm notranslate" translate="no"><thead><tr><th>Key</th><th>Latency</th><th>OK</th><th>Errors</th><th>Status</th><th>Last</th></tr></thead><tbody>'
+        + keys.map(k=>'<tr><td class="mono small">'+_esc(k.key)+'</td><td>'+_num(k.latency_ms, '-')+'ms</td><td>'+_num(k.successCount, 0)+'</td><td>'+_num(k.errorCount, 0)+'</td><td>'+(k.degraded?'<span class="text-warning">Degraded</span>':'<span class="text-success">Healthy</span>')+'</td><td class="small text-secondary">'+_esc(k.lastSuccess)+'</td></tr>').join('') + '</tbody></table>'
       : '<p class="text-secondary small">No key data</p>';
     h += d.circuitBreaker?.open ? '<p class="text-warning small"><i class="bi bi-exclamation-triangle-fill"></i> Circuit breaker open</p>' : '';
-    h += d.recent401.length
-      ? '<h6 class="mt-3 text-warning">401 errors</h6><div class="mono small">' + d.recent401.map(e=>'['+_esc(e.ts)+'] '+_esc(e.model)+' / '+_esc(e.key)).join('<br>') + '</div>'
+    h += r401.length
+      ? '<h6 class="mt-3 text-warning">401 errors</h6><div class="mono small notranslate" translate="no">' + r401.map(e=>'['+_esc(e.ts)+'] '+_esc(e.model)+' / '+_esc(e.key)).join('<br>') + '</div>'
       : '<p class="text-secondary small mt-2"><i class="bi bi-check-circle text-success"></i> No 401 errors</p>';
+    h += '<h6 class="mt-3">Config keys <span class="text-secondary fw-normal small">(unsaved until Save)</span></h6><div id="detailKeys"></div>';
     $('detailBody').innerHTML = h;
-  } catch(e){ $('detailBody').innerHTML = '<p class="text-danger">Load failed: ' + _esc(e.message) + '</p>'; }
+    renderDetailKeys(p);
+    renderDetailMeta(p);
+  } catch(e){ if (!sessAlive(tag) || reqId !== _detailReq || e.message === 'unauthorized' || e.name === 'AbortError') return; $('detailBody').innerHTML = '<p class="text-danger">Load failed: ' + _esc(e.message) + '</p>'; }
+}
+// Upstream section inside the provider detail panel: where this provider
+// actually points, with edit/delete. Same in-memory _cfgObj as the Config page.
+function renderDetailMeta(p) {
+  const box = $('detailBody');
+  if (!box) return;
+  let sec = $('detailMeta');
+  if (sec && sec.dataset.prov && sec.dataset.prov !== p) return; // panel shows another provider
+  if (!sec) {
+    sec = document.createElement('div');
+    sec.id = 'detailMeta';
+    box.insertBefore(sec, box.firstChild);
+  }
+  sec.dataset.prov = p;
+  const m = _provMeta(p);
+  const rows = m
+    ? '<div class="small"><span class="text-secondary">Base URL:</span> <span class="mono notranslate">' + _esc(m.baseUrl || '(default)') + '</span></div>'
+      + '<div class="small"><span class="text-secondary">Path prefix:</span> <span class="mono notranslate">' + _esc(m.pathPrefix || '(default)') + '</span></div>'
+      + '<div class="small"><span class="text-secondary">RPM per key:</span> ' + (m.rpm != null ? _esc(m.rpm) : '(default)') + '</div>'
+    : '<div class="small text-secondary">Built-in default endpoint (OpenAI-compatible). Edit to set a custom upstream.</div>';
+  sec.innerHTML = '<h6 class="mt-3">Upstream</h6>' + rows
+    + '<div class="d-flex gap-2 mt-2">'
+    + '<button class="btn btn-outline-secondary btn-sm" id="detailEditProv"><i class="bi bi-pencil"></i> Edit upstream</button>'
+    + '<button class="btn btn-outline-danger btn-sm" id="detailDelProv"><i class="bi bi-trash"></i> Delete provider</button>'
+    + '</div>';
+  $('detailEditProv').addEventListener('click', () => openProvModal('edit', p));
+  $('detailDelProv').addEventListener('click', () => deleteProvider(p));
+}
+// Detail panel edits the same in-memory _cfgObj; Save persists (with restart).
+function renderDetailKeys(p) {
+  const box = $('detailKeys');
+  if (!box) return;
+  if ($('detailTitle').textContent !== p) return; // panel moved on to another provider
+  if (!_cfgObj || !_cfgObj.providers || !(_cfgObj.providers[p] !== undefined)) {
+    box.innerHTML = '<p class="text-secondary small mb-0">Not in local config (reload the Config page first).</p>';
+    return;
+  }
+  const ks = _provKeyList(p) || [];
+  box.innerHTML = '<div class="d-flex flex-wrap gap-1 mb-2 notranslate" translate="no">'
+    + (ks.length ? ks.map((k, i) =>
+      '<span class="badge border border-secondary text-secondary mono" style="cursor:pointer" title="Click to edit" data-dedit="' + i + '">' + _mask(k)
+      + ' <a href="#" class="text-danger text-decoration-none" data-ddel="' + i + '" title="Delete">×</a></span>').join('')
+      : '<span class="text-secondary small">No keys in config</span>')
+    + '</div>'
+    + '<div class="d-flex gap-1"><input class="form-control form-control-sm mono" id="detailAddInput" placeholder="Add key…" autocomplete="off">'
+    + '<button class="btn btn-outline-success btn-sm" id="detailAddBtn"><i class="bi bi-plus"></i></button></div>';
+  box.querySelectorAll('[data-dedit]').forEach(b => b.addEventListener('click', e => {
+    if (e.target.closest('[data-ddel]')) return;
+    const idx = Number(b.dataset.dedit);
+    $('keyModalSub').textContent = p + ' #' + (idx + 1);
+    $('keyModalInput').value = (_provKeyList(p) || [])[idx] || '';
+    $('keyModal').dataset.prov = p; $('keyModal').dataset.idx = String(idx);
+    if (!_keyModal) _keyModal = new bootstrap.Modal($('keyModal'));
+    _keyModal.show();
+    if (_keyFocusT) clearTimeout(_keyFocusT);
+    _keyFocusT = setTimeout(() => { _keyFocusT = null; if ($('keyModal').classList.contains('show')) $('keyModalInput').focus(); }, 300);
+  }));
+  box.querySelectorAll('[data-ddel]').forEach(a => a.addEventListener('click', e => {
+    e.preventDefault(); e.stopPropagation();
+    if (!confirm('Delete this key from ' + p + '? (Unsaved until Save.)')) return;
+    const list = _provKeyList(p);
+    if (!list) { toast('Provider no longer exists', 0); return; }
+    list.splice(Number(a.dataset.ddel), 1);
+    _syncCfgAfterKeyChange('Key deleted (unsaved)', p);
+  }));
+  $('detailAddBtn').addEventListener('click', () => {
+    const v = ($('detailAddInput').value || '').trim(); if (!v) return;
+    const list = _provKeyList(p, true);
+    if (!list) { toast('Provider no longer exists', 0); return; }
+    list.push(v);
+    _syncCfgAfterKeyChange('Key added (unsaved)', p);
+  });
+  $('detailAddInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('detailAddBtn').click(); });
 }
 $('btn401').addEventListener('click', async () => {
-  showLoading();
+  const tag = sessTag(), ld = showLoading();
   try {
-    const r = await fetch('/api/console/retry401', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body:'{}' });
-    hideLoading(); toast(r.ok ? 'All 401 records cleared' : 'Operation failed', r.ok);
-  } catch{ hideLoading(); toast('Operation failed', 0); }
+    const r = await apiFetch('/api/console/retry401', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body:'{}' }, tag);
+    if (!sessAlive(tag)) return;
+    hideLoading(ld); toast(r.ok ? 'All 401 records cleared' : 'Operation failed', r.ok);
+  } catch{ if (!sessAlive(tag)) return; hideLoading(ld); toast('Operation failed', 0); }
 });
 
 /* status + charts */
-function refreshStatus(){
-  fetch('/api/console/status', { headers:{ 'Authorization':'Bearer '+_token } })
+// HTTP snapshot must not overwrite newer SSE state; tag each source.
+let _sseStatusSeen = false;
+function refreshStatus(tag, force){
+// force=true: explicit refresh always applies, even after SSE frames arrived.
+  tag = (tag === undefined) ? sessTag() : tag;
+  apiFetch('/api/console/status', {}, tag)
     .then(r => { if (!r.ok) throw new Error('Status request failed ('+r.status+')'); return r.json(); })
-    .then(d => updateStatus(d))
-    .catch(e => { console.error('[console] status:', e); toast('Unable to load dashboard status: ' + _esc(e.message), 0); });
+    .then(d => { if (!sessAlive(tag)) return; if (!force && _sseStatusSeen) return; _sseStatusSeen = true; updateStatus(d); })
+    .catch(e => { if (!sessAlive(tag) || e.message === 'unauthorized' || e.name === 'AbortError') return; console.error('[console] status:', e); toast('Unable to load dashboard status: ' + e.message, 0); });
 }
+// fetch+ReadableStream instead of EventSource: real header auth (?token= leaked).
+let _sseAbort = null, _sseRetry = null, _sseAttempt = 0;
 function openSSE(){
   closeSSE();
-  _evt = new EventSource('/api/console/stream?token=' + encodeURIComponent(_token));
-  setConn(true);
-  _evt.addEventListener('status', e => { try { updateStatus(JSON.parse(e.data)); } catch{} });
-  _evt.onerror = () => setConn(false);
+  _sseStatusSeen = false;
+  const tag = sessTag();
+  const attempt = async () => {
+    if (!sessAlive(tag) || !_token) return;
+    const ctl = new AbortController();
+    _sseAbort = ctl;
+    try {
+      const r = await fetch('/api/console/stream', {
+        headers: { Authorization: 'Bearer ' + _token, Accept: 'text/event-stream' },
+        signal: ctl.signal, cache: 'no-store',
+      });
+      if (r.status === 401) { onUnauthorized(); return; }
+      if (!r.ok || !r.body) throw new Error('stream failed (' + r.status + ')');
+      _sseAttempt = 0;   // connected — reset backoff
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+          if (/^event:\s*status\s*$/m.test(frame)) {
+            const m = frame.match(/^data:\s*([\s\S]*)$/m);
+            if (!m) continue;
+            if (!sessAlive(tag)) return;
+            _sseStatusSeen = true;
+            try { updateStatus(JSON.parse(m[1])); }
+            catch (e) { console.error('[console] status render failed:', e); }
+          } else if (/^event:\s*health\s*$/m.test(frame)) {
+            const m = frame.match(/^data:\s*([\s\S]*)$/m);
+            if (!m) continue;
+            if (!sessAlive(tag)) return;
+            try { updateHealth(JSON.parse(m[1])); }
+            catch (e) { console.error('[console] health render failed:', e); }
+          }
+        }
+      }
+      throw new Error('stream closed');
+    } catch (e) {
+      if (sessAlive(tag) && e.name !== 'AbortError' && _token) console.warn('[console] status stream ended:', e && e.message);
+      if (!sessAlive(tag) || e.name === 'AbortError' || !_token) return;
+    }
+    // backoff reconnect: 2s, 4s, 8s … capped at 30s
+    _sseAttempt = Math.min(++_sseAttempt, 5);
+    if (!sessAlive(tag) || !_token) return;
+    _sseRetry = setTimeout(() => { _sseRetry = null; attempt(); }, Math.min(2000 * Math.pow(2, _sseAttempt - 1), 30000));
+  };
+  attempt();
 }
-function closeSSE(){ if (_evt){ _evt.close(); _evt = null; } setConn(false); }
-function setConn(on){ $('connDot').style.background = on ? '#198754' : '#6c757d'; const t = $('connTxt'); if (t) t.textContent = on ? 'Connected' : 'Disconnected'; }
+// Uncaught errors must surface: a silent catch once blanked the dashboard.
+window.addEventListener('error', (e) => {
+  console.error('[console] uncaught error:', e.error || e.message);
+  if (window.toast) window.toast('Console error: ' + String(e.message || 'see console'), 0);
+});
+window.addEventListener('unhandledrejection', (e) => {
+  console.error('[console] unhandled rejection:', e.reason);
+  if (window.toast) window.toast('Console error: ' + String((e.reason && e.reason.message) || e.reason), 0);
+});
+function closeSSE(){
+  if (_sseRetry) { clearTimeout(_sseRetry); _sseRetry = null; }
+  if (_sseAbort) { try { _sseAbort.abort(); } catch {} _sseAbort = null; }
+  _sseAttempt = 0;
+}
 function updateStatus(d){
-  _lastStatus = d; setConn(true);
+  _lastStatus = d;
   const total = (d.success_total||0) + (d.error_total||0);
   const rate = total ? (d.success_total/total*100) : 0;
   $('kpiRate').textContent = rate.toFixed(1) + '%';
@@ -908,12 +1679,20 @@ function updateStatus(d){
   $('kpiProvs').textContent = Object.keys(d.providers || {}).length;
   renderCharts(d); renderProvTable(d);
 }
+// Lightweight 10s tick: hardware numbers only. Everything else (KPIs, charts,
+// provider table) refreshes on the 60s full status.
+function updateHealth(d){
+  if (d.rss_mb != null) $('kpiMem').textContent = d.rss_mb;
+  if (d.active != null) $('kpiActive').textContent = d.active;
+  if (d.uptime) $('kpiUptime').textContent = d.uptime;
+}
 function chartColors(){
   const dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
   return { t: dark ? 'rgba(255,255,255,.7)' : 'rgba(0,0,0,.7)', g: dark ? 'rgba(255,255,255,.08)' : 'rgba(0,0,0,.06)' };
 }
 function upsertChart(key, ctx, cfg){
-  if (_charts[key]){ _charts[key].data = cfg.data; _charts[key].options = cfg.options; _charts[key].update(); }
+// update('none'): status pushes must not replay the entry animation.
+  if (_charts[key]){ _charts[key].data = cfg.data; _charts[key].options = cfg.options; _charts[key].update('none'); }
   else _charts[key] = new Chart(ctx, cfg);
 }
 function renderCharts(d){
@@ -961,7 +1740,14 @@ function syncHl(ta){
 }
 ['cfgRaw','lgRaw'].forEach(id => {
   const ta = $(id); if (!ta) return;
-  ta.addEventListener('input', () => syncHl(ta));
+  ta.addEventListener('input', () => {
+    syncHl(ta);
+    if (id === 'lgRaw') { _lgRawDirty = true; return; }
+    // textarea is the source of truth: keep _cfgObj fresh so a key/provider
+    // action cannot overwrite hand-made Raw edits with a stale snapshot
+    const p = tryParseCfg(ta.value);
+    if (p.ok) _cfgObj = p.obj;
+  });
   ta.addEventListener('scroll', () => { const pre = $(id + 'Hl'); if (pre){ pre.scrollTop = ta.scrollTop; pre.scrollLeft = ta.scrollLeft; } });
   syncHl(ta);
 });
@@ -992,11 +1778,29 @@ document.querySelectorAll('th[data-psort]').forEach(th => th.addEventListener('c
 const _mdTh = document.querySelector('th[data-msort]');
 if (_mdTh) _mdTh.addEventListener('click', () => { _mdDir *= -1; renderModels(); });
 
-/* boot */
-if (_token){ $('l_token').value = _token; doAuth(); }
-else (async () => {
-  try { const r = await fetch('/api/console/validate', { method:'POST' }); if (r.ok){ $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none'); await loadAll(); openSSE(); if (window.maybeStartTranslation) window.maybeStartTranslation(); } } catch{}
-})();
+/* boot — both paths run the same validate + session-tagged load, so a logout
+   (or a second attempt) during boot cannot be undone by a late response */
+async function bootAuth(token){
+  const tag = sessTag(), reqId = ++_authReq;
+  try {
+    const headers = token ? { 'Authorization':'Bearer ' + token } : {};
+    const r = await fetch('/api/console/validate', { method:'POST', headers });
+    if (!sessAlive(tag) || reqId !== _authReq) return;
+    if (!r.ok) { if (token) { _token=''; localStorage.removeItem('gw_token'); $('l_token').value=''; $('l_status').textContent='Auth failed: incorrect token'; } return; }
+    _token = token;
+    if (token) localStorage.setItem('gw_token', _token); else localStorage.removeItem('gw_token');
+    $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none');
+    await loadAll(tag); if (!sessAlive(tag)) return;
+    openSSE();
+    if (window.maybeStartTranslation) window.maybeStartTranslation();
+  } catch (e) {
+    // never let a boot failure look like "empty dashboard"
+    console.error('[console] boot failed:', e);
+    $('l_status').textContent = 'Boot failed: ' + String(e && e.message || e);
+  }
+}
+if (_token){ $('l_token').value = _token; bootAuth(_token); }
+else bootAuth('');
 </script>
 <!-- Translation overlay -->
 <div class="trans-overlay" id="transOverlay">
@@ -1005,98 +1809,6 @@ else (async () => {
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/i18n-jsautotranslate@4.0.0/index.js"></script>
-<script src="https://ss-vip.github.io/api-gateway/js/shared.js"></script>
-<script>
-  if (typeof toast === 'undefined') {
-    var _ovTimer = null;
-    window.toast = function(m, ok) {
-      var box = document.getElementById('toasts');
-      if (!box) { box = document.createElement('div'); box.id = 'toasts';
-        box.className = 'toast-container position-fixed bottom-0 end-0 p-3'; document.body.appendChild(box); }
-      var e = document.createElement('div');
-      e.className = 'toast align-items-center text-white border-0 show bg-' + (ok ? 'success' : 'danger');
-      e.innerHTML = '<div class="d-flex"><div class="toast-body">' + m + '</div></div>';
-      box.appendChild(e); setTimeout(function(){ e.classList.remove('show'); setTimeout(function(){ e.remove(); }, 300); }, 4000);
-    };
-    window.showLoading = function(msg, ms) {
-      msg = msg || 'Loading…'; ms = ms || 8000;
-      var ov = document.getElementById('overlay'); if (!ov) return;
-      var lbl = document.getElementById('overlayMsg'); if (lbl) lbl.textContent = msg;
-      ov.classList.remove('d-none'); ov.classList.add('d-flex');
-      if (_ovTimer) clearTimeout(_ovTimer);
-      _ovTimer = setTimeout(function(){ window.hideLoading(); window.toast('Connection timed out, try again later', 0); }, ms);
-    };
-    window.hideLoading = function(msg) {
-      msg = msg || 'Loading...';
-      if (_ovTimer) { clearTimeout(_ovTimer); _ovTimer = null; }
-      var ov = document.getElementById('overlay'); if (!ov) return;
-      ov.classList.add('d-none'); ov.classList.remove('d-flex');
-      var lbl = document.getElementById('overlayMsg'); if (lbl) lbl.textContent = msg;
-    };
-    window.initTranslation = function(itemsSelector, defaultLang, toastOk, toastErr, toastTimeout) {
-      defaultLang = defaultLang || 'english'; toastOk = toastOk || 'Translation done'; toastErr = toastErr || 'Translation failed'; toastTimeout = toastTimeout || 'Connection timed out, try again later';
-      var items = document.querySelectorAll(itemsSelector);
-      var savedLang = localStorage.getItem('gw_lang') || defaultLang;
-      var transOverlay = document.getElementById('transOverlay');
-      var transTimer = null, overlayHidden = false, transFailed = false, toastShown = false, finishHandled = false, hideDebounce = null, obs = null;
-      function markActive(lang) { items.forEach(function(i){ i.classList.toggle('active', i.getAttribute('data-lang') === lang); }); }
-      function showOverlay() { if (!overlayHidden) transOverlay.classList.add('show'); toastShown = false; finishHandled = false; transFailed = false; if (hideDebounce) { clearTimeout(hideDebounce); hideDebounce = null; } }
-      function hideOverlay() {
-        overlayHidden = true; transOverlay.classList.remove('show');
-        if (transTimer) { clearTimeout(transTimer); transTimer = null; }
-        if (!transFailed && !toastShown) { toastShown = true; window.toast(toastOk, 1); }
-        transFailed = false;
-      }
-      function failOverlay(isTimeout) { transFailed = true; toastShown = true; hideOverlay(); if (obs) { try { obs.disconnect(); } catch(e){} obs = null; } window.toast(isTimeout ? toastTimeout : toastErr, 0); }
-      var latestText = document.body.textContent || '';
-      var _ = (typeof translate !== 'undefined') ? translate : null;
-      if (!_) { markActive(savedLang); return; }
-      if (_ && _.listener && typeof _.listener.renderTaskFinish === 'function') {
-        var orig = _.listener.renderTaskFinish;
-        _.listener.renderTaskFinish = function() { if (finishHandled) return; finishHandled = true; if (typeof orig === 'function') orig(); };
-      }
-      var appVisible = function() { var v = document.getElementById('view-app'); return !!(v && !v.classList.contains('d-none')); };
-      var startTranslate = function() {
-        markActive(savedLang);
-        if (savedLang === defaultLang) return; // default: no translation action
-        if (!appVisible()) return; // login view stays untranslated; start only inside app
-        try {
-          _.language.setLocal(defaultLang); _.service.use('client.edge'); _.ignore.class.push('notranslate'); _.listener.start(); _.execute();
-          var appRoot = document.getElementById('view-app');
-          latestText = appRoot.textContent || '';
-          obs = new MutationObserver(function() {
-            var ct = appRoot.textContent || '';
-            if (ct !== latestText && ct.length > 100) {
-              latestText = ct;
-              if (hideDebounce) clearTimeout(hideDebounce);
-              hideDebounce = setTimeout(function() { hideOverlay(); hideDebounce = null; }, 600);
-            }
-          });
-          obs.observe(appRoot, { childList: true, subtree: true, characterData: true });
-          showOverlay(); transTimer = setTimeout(function(){ failOverlay(true); }, 5000);
-          setTimeout(function(){ try { _.changeLanguage(savedLang); } catch(e) { failOverlay(false); } }, 300);
-        }
-        catch(e) { failOverlay(false); }
-      };
-      // no auto-start on page load (login stays untouched); app calls this after login
-      window.maybeStartTranslation = startTranslate;
-      markActive(savedLang);
-      items.forEach(function(item) {
-        item.addEventListener('click', function(e) {
-          e.preventDefault(); var lang = this.getAttribute('data-lang');
-          localStorage.setItem('gw_lang', lang); markActive(lang);
-          if (lang === defaultLang) { location.reload(); return; } // back to source: reload for clean English
-          var app = document.getElementById('view-app');
-          if (!app || app.classList.contains('d-none')) return; // never translate login view
-          overlayHidden = false; transFailed = false; toastShown = false; finishHandled = false;
-          showOverlay(); transTimer = setTimeout(function(){ failOverlay(true); }, 5000);
-          try { _.changeLanguage(lang); } catch(e) { failOverlay(false); }
-        });
-      });
-    };
-  }
-
-</script>
 <script>
   initTranslation('#langMenu .lang-item', 'english', 'Translation done', 'Translation failed');
   /* dropdown toggle — console-specific (docs uses Bootstrap dropdown) */

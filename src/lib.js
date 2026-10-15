@@ -56,7 +56,7 @@ function _ndjsonValid(s) {
   let lineNo = 0;
   for (const rawLine of s.split('\n')) {
     const l = rawLine.trim();
-    if (!l) continue;
+    if (!l || l.startsWith('#')) continue;   // # lines are comments (save/load already treats them as such)
     lineNo++;
     try { JSON.parse(l); } catch (e) { return { ok: false, error: `line ${lineNo}: ${e.message}` }; }
   }
@@ -82,13 +82,38 @@ function _autoFixJson(s) {
   if (!stack.length) return null;
   let fixed = s;
   for (let i = stack.length - 1; i >= 0; i--) fixed += stack[i] === '{' ? '}' : ']';
-  return parseJsonc(fixed) !== null ? fixed : null;
+  // parseJsonc throws (never returns null): unguarded, a truncated config
+  // would crash boot via uncaughtException.
+  try {
+    parseJsonc(fixed);
+    return fixed;
+  } catch {
+    return null;
+  }
 }
 
 // --- Error message extraction ---
-function _errMsg(body, logBodyMax) {
+//
+// PRIVACY: upstream error bodies echo the request (prompts/PII). Default to a
+// redacted summary; full body goes only to the caller. Opt in with
+// log.capture_error_body for local debugging.
+function _errMsg(body, logBodyMax, capture) {
   if (!body) return '-';
   const raw = typeof body === 'string' ? body : body.toString();
+  if (!capture) {
+    // shape-only fingerprint: enough to triage, nothing to exfiltrate
+    let kind = 'text';
+    let code = '';
+    try {
+      const p = JSON.parse(raw);
+      const r = Array.isArray(p) ? p[0] : p;
+      kind = 'json';
+      // Upstream-controlled: restrict to identifier characters so a prompt echo
+      // smuggled into error.code cannot ride the fingerprint to disk/SSE.
+      code = String(r?.error?.code || r?.error?.type || r?.code || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 60);
+    } catch {}
+    return `[redacted] ${kind} ${Buffer.byteLength(raw)}B` + (code ? ` code=${code}` : '');
+  }
   const clean = raw.replace(/^\ufeff/, '').trim().replace(/\n/g, ' ');
   if (/^</i.test(clean)) return 'upstream returned HTML (' + Buffer.byteLength(raw) + ' bytes)';
   if (clean.length > logBodyMax) return clean.slice(0, logBodyMax) + '... (' + raw.length + ' chars)';
@@ -327,7 +352,7 @@ async function _fetchAndConvertImages(messages) {
             const originHost = o.slice('https://'.length);
             if (reqHost === originHost || reqHost.endsWith('.' + originHost)) {
               // note: origin is server-controlled, path from parsed URL
-              safeUrl = o + u.pathname;
+              safeUrl = o + u.pathname + u.search;
               break;
             }
           }
@@ -515,7 +540,11 @@ function chatToAnthropic(bodyObj) {
     const lastUser = [...msgs].reverse().find(m => m && m.role === 'user');
     messages.push({ role: 'user', content: _chatTextParts(lastUser && lastUser.content) || 'hi' });
   }
-  // note: Anthropic requires a non-empty user-first turn; merge leading non-user blocks
+  // Anthropic requires messages[0].role === 'user' — an assistant/tool-first
+  // history would 400. Mirror the empty-history fallback above.
+  if (messages.length && messages[0].role !== 'user') {
+    messages.unshift({ role: 'user', content: [{ type: 'text', text: 'hi' }] });
+  }
   const out = { model: bodyObj.model, max_tokens: Number(bodyObj.max_tokens) || 1024, messages };
   if (systemParts.length) out.system = systemParts.join('\n\n');
   if (bodyObj.temperature !== undefined) out.temperature = bodyObj.temperature;
@@ -613,6 +642,73 @@ function assembleResponsesSSE(sse) {
   return rj;
 }
 
+// --- health-state sequencing (pure) ---
+//
+// A success may only clear failure state that predates it; otherwise a slow
+// request wipes out a breaker that newer failures just opened.
+//
+//   successClearsFailure(lastFailAt, startedAt)
+//     lastFailAt  timestamp of the newest failure in the current state
+//     startedAt   timestamp of the request producing this success
+//                 (undefined = unknown, e.g. a path with no start time)
+function successClearsFailure(lastFailAt, startedAt) {
+  if (!lastFailAt) return true;              // nothing to clear
+  if (!startedAt) return true;               // unknown ordering: allow (pre-existing behaviour)
+  return lastFailAt <= startedAt;
+}
+
+// --- SSRF egress validation ---
+// Fold disguised IPv4 (decimal/hex/octal, inet_aton semantics) to a dotted
+// quad before checking; returns null for real DNS names.
+function normalizeIPv4(h) {
+  let s = String(h || '').toLowerCase();
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);  // IPv6 literal
+  if (s.includes(':')) {
+    // IPv6: fold loopback forms; link-local has no server meaning without a zone id.
+    if (s === '::1' || s === '::ffff:127.0.0.1' || /^::ffff:127\./.test(s)) return '127.0.0.1';
+    return null;
+  }
+  if (s.endsWith('.')) s = s.slice(0, -1);
+  const parts = s.split('.');
+  if (!parts.length || parts.length > 4) return null;
+  const nums = [];
+  for (const p of parts) {
+    if (!p.length) return null;
+    let n;
+    if (/^0x[0-9a-f]+$/i.test(p)) n = parseInt(p, 16);
+    else if (/^0\d+$/.test(p) && /^0[0-7]+$/.test(p)) n = parseInt(p, 8);
+    else if (/^\d+$/.test(p)) n = parseInt(p, 10);
+    else return null;
+    if (!Number.isSafeInteger(n) || n < 0 || n > 0xFFFFFFFF) return null;
+    nums.push(n);
+  }
+  // inet_aton: fewer than 4 parts pack into the low bytes
+  let v;
+  if (nums.length === 1) v = nums[0];
+  else if (nums.length === 2) { if (nums[0] > 255 || nums[1] > 0xFFFFFF) return null; v = nums[0] * 0x1000000 + nums[1]; }
+  else if (nums.length === 3) { if (nums[0] > 255 || nums[1] > 255 || nums[2] > 0xFFFF) return null; v = nums[0] * 0x1000000 + nums[1] * 0x10000 + nums[2]; }
+  else { if (nums.some((n) => n > 255)) return null; v = ((nums[0] * 256 + nums[1]) * 256 + nums[2]) * 256 + nums[3]; }
+  return [v >>> 24, (v >>> 16) & 255, (v >>> 8) & 255, v & 255].join('.');
+}
+// Null = may dial, else the reason. https-only except loopback; no creds in
+// URL; ports 443/80 off-loopback; no private/link-local/reserved names.
+function isBlockedEgressUrl(u) {
+  try {
+    const o = new URL(u);
+    if (o.username || o.password) return 'credentials in URL blocked';
+    let h = o.hostname.toLowerCase();
+    const norm = normalizeIPv4(h);
+    if (norm) h = norm;   // compare the address the OS will actually dial
+    const isLoopback = h === 'localhost' || h.endsWith('.localhost') || h === '127.0.0.1' || h === '[::1]' || h === '::1' || /^127\./.test(h);
+    if (o.protocol !== 'https:' && !(o.protocol === 'http:' && isLoopback)) return 'only https allowed';
+    if (!isLoopback) { const port = o.port ? parseInt(o.port, 10) : 443; if (![443, 80].includes(port) && o.port !== '') return 'port blocked'; }
+    if (h === 'localhost' || h.endsWith('.localhost') || h === '[::1]' || h === '::1') return 'loopback blocked';
+    if (isLoopback) return null;
+    if (/^10\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h) || /^169\.254\./.test(h) || /^0\./.test(h) || /\.(local|internal|lan|localhost)$/.test(h)) return 'private range blocked';
+    return null;
+  } catch { return 'invalid URL'; }
+}
+
 // --- smart routing helpers (pure) ---
 const CHAT_FAMILY_ENDPOINTS = ['/v1/chat/completions', '/v1/responses', '/v1/messages'];
 // note: legacy global overflow must not land on audio/image aliases — derive non-chat
@@ -635,10 +731,7 @@ function pickTier(tiers, totalEst) {
 }
 
 // --- bounded TTL memoizer (in-process; hard memory cap, PM2-safe by construction) ---
-// note: worst-case memory = min(maxEntries × avg entry, maxBytes) + map overhead.
-// defaults (2000 entries / 8MB) sit ~3% below a 256MB heap cap — it cannot move total RSS
-// meaningfully, and three outer guards still apply: V8 --max-old-space-size, in-app
-// MEM_LIMIT_MB (exit 1), PM2 --max-memory-restart. Expired entries are purged lazily.
+// note: worst-case memory ≈ min(maxEntries × avg entry, maxBytes); entries expire lazily.
 function createMemoCache({ maxEntries = 2000, maxBytes = 8 * 1024 * 1024, ttlMs = 3600000 } = {}) {
   const map = new Map(); // fp -> { value, exp, bytes } (insertion order = oldest first)
   let bytes = 0, hits = 0, misses = 0, sets = 0;
@@ -711,6 +804,109 @@ async function classifyTexts({ baseUrl, apiKey, tier = 'fast', timeoutMs = 15000
   return JSON.parse(body);
 }
 
+// Rejects "valid JSON but dead gateway" (empty providers, dangling aliases,
+// bad limits). Console mirrors this client-side; this copy is the enforcement.
+function validateConfigObject(c) {
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return 'config must be a JSON object';
+  const num = (v, name, min, max) => {
+    if (v === undefined || v === null || v === '') return '';
+    const n = Number(v);
+    if (!Number.isFinite(n)) return `${name} must be a number`;
+    if (min != null && n < min) return `${name} must be >= ${min}`;
+    if (max != null && n > max) return `${name} must be <= ${max}`;
+    return '';
+  };
+  for (const [k, min, max] of [
+    ['port', 1, 65535], ['timeout', 1, null], ['upstream_timeout', 1, null],
+    ['upstream_max_body', 1, null], ['key_cooldown', 0, null], ['max_key_backoff', 0, null],
+    ['max_body_size', 1, null], ['quota_backoff', 0, null],
+  ]) {
+    const e = num(c[k], k, min, max);
+    if (e) return e;
+  }
+  // Nested numeric maps: JSON-legal garbage ("cooldown_ms": "30s") otherwise
+  // reaches `now + value` and wedges the breaker/lockout/rate-limit state.
+  const numMap = (obj, label, min) => {
+    if (obj === undefined || obj === null) return '';
+    if (typeof obj !== 'object' || Array.isArray(obj)) return `${label} must be an object`;
+    for (const [k, v] of Object.entries(obj)) {
+      const e = num(v, `${label}.${k}`, min, null);
+      if (e) return e;
+    }
+    return '';
+  };
+  for (const label of ['rate_limit', 'tpm_limit']) {
+    const e = numMap(c[label], label, 0);
+    if (e) return e;
+  }
+  for (const label of ['model_lockout', 'circuit_breaker']) {
+    const e = numMap(c[label], label, 0);
+    if (e) return e;
+  }
+  const epc = numMap(c.provider_concurrency, 'provider_concurrency', 1);
+  if (epc) return epc;
+  // log.* garbage silently degrades cleanup: a NaN/negative retention cutoff
+  // makes `ts > cutoff` false for every line and wipes the whole file.
+  const lg = c.log;
+  if (lg !== undefined && lg !== null) {
+    if (typeof lg !== 'object' || Array.isArray(lg)) return 'log must be an object';
+    for (const k of ['retention_days', 'max_size_mb']) {
+      if (lg[k] === undefined || lg[k] === null || lg[k] === '') continue;
+      const n = Number(lg[k]);
+      if (!Number.isFinite(n)) return `log.${k} must be a number`;
+      if (n <= 0) return `log.${k} must be > 0`;
+    }
+    if (lg.path != null && lg.path !== '' && typeof lg.path !== 'string') return 'log.path must be a string';
+  }
+  const provs = c.providers;
+  if (!provs || typeof provs !== 'object' || Array.isArray(provs)) return 'providers must be an object';
+  const names = Object.keys(provs).filter((k) => !k.startsWith('_'));
+  if (!names.length) return 'at least one provider is required, otherwise nothing can route';
+  let totalKeys = 0;
+  for (const n of names) {
+    const v = provs[n];
+    const keys = Array.isArray(v) ? v : (v && Array.isArray(v.apiKeys) ? v.apiKeys : null);
+    if (keys === null) return `provider "${n}" must be a key array or {apiKeys:[...]}`;
+    totalKeys += keys.filter((k) => typeof k === 'string' && k.trim()).length;
+    if (!Array.isArray(v)) {
+      if (v.baseUrl !== undefined && !/^https?:\/\//i.test(String(v.baseUrl))) {
+        return `provider "${n}" baseUrl must start with http:// or https://`;
+      }
+      if (v.rpm !== undefined && !(Number(v.rpm) > 0)) return `provider "${n}" rpm must be a positive number`;
+    }
+  }
+  if (!totalKeys) return 'at least one non-empty API key is required, otherwise nothing can route';
+  const models = c.models;
+  if (!models || typeof models !== 'object' || Array.isArray(models)) return 'models must be an object';
+  const aliases = Object.keys(models).filter((k) => !k.startsWith('_'));
+  if (!aliases.length) return 'at least one model alias is required';
+  for (const a of aliases) {
+    const chain = models[a];
+    if (!Array.isArray(chain) || !chain.length) return `model alias "${a}" must be a non-empty array`;
+    for (const t of chain) {
+      if (!t || typeof t !== 'object') return `model alias "${a}" has a malformed target`;
+      if (!t.provider || typeof t.provider !== 'string') return `model alias "${a}" has a target without provider`;
+      if (!names.includes(t.provider)) return `model alias "${a}" points at unknown provider "${t.provider}"`;
+      const fb = t.fallback === undefined ? [] : (Array.isArray(t.fallback) ? t.fallback : [t.fallback]);
+      for (const f of fb) {
+        if (!aliases.includes(f)) return `model alias "${a}" falls back to unknown alias "${f}"`;
+      }
+    }
+  }
+  for (const [ep, alias] of Object.entries(c.endpoint_fallbacks || {})) {
+    if (!aliases.includes(alias)) return `endpoint_fallbacks["${ep}"] points at unknown alias "${alias}"`;
+  }
+  for (const [alias, tiers] of Object.entries(c.smart_route || {})) {
+    if (!aliases.includes(alias)) return `smart_route key "${alias}" is not a model alias`;
+    if (!Array.isArray(tiers)) return `smart_route["${alias}"] must be an array`;
+    for (const t of tiers) {
+      if (!t || !aliases.includes(t.alias)) return `smart_route["${alias}"] tier "${t && t.alias}" is not a model alias`;
+      if (!(Number(t.max_tokens) > 0)) return `smart_route["${alias}"] tier "${t.alias}" needs max_tokens > 0`;
+    }
+  }
+  return '';
+}
+
 module.exports = {
   parseJsonc,
   _jsonValid,
@@ -743,6 +939,10 @@ module.exports = {
   assembleResponsesSSE,
   CHAT_FAMILY_ENDPOINTS,
   buildNonChatAliases,
+  successClearsFailure,
+  normalizeIPv4,
+  isBlockedEgressUrl,
+  validateConfigObject,
   pickTier,
   createMemoCache,
   classifyTexts,

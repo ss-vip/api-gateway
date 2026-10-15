@@ -1,45 +1,64 @@
 {
-  "_note": "複製為 config.json。所有值可由同名環境變數覆寫",
+  // 複製為 config.json 或 config.jsonc 後填入 key 即可啟動。
+  // 支援 // 與 /* */ 註解。部分欄位可由環境變數覆寫（見 README）。
+
+  // ── 驗證 ──────────────────────────────────────────────
+  // 留空 = 所有端點不驗證，僅適合本機測試。
   "client_token": "sk-your-secret-token",
 
+  // ── 執行期 ────────────────────────────────────────────
   "timezone": "Asia/Taipei",
   "port": 3000,
   "timeout": 600000,
+  // 單次 upstream 無回應的容忍時間（非整體預算）。
+  "upstream_timeout": 120000,
+  // 超過視為截斷（回 502）。
+  "upstream_max_body": 20971520,
+  // 超過回 413。
+  "max_body_size": 10485760,
+
+  // ── 金鑰健康度 ────────────────────────────────────────
+  // 首次冷卻（毫秒），之後指數退避。
   "key_cooldown": 30000,
   "max_key_backoff": 300000,
-  "max_body_size": 10485760,
+  // quota / billing 耗盡時的長時間降級（毫秒）。
   "quota_backoff": 3600000,
 
+  // ── 熔斷與併發 ────────────────────────────────────────
+  "model_lockout": {
+    "threshold": 3,
+    "cooldown_ms": 60000
+  },
+  "circuit_breaker": {
+    "threshold": 5,
+    "cooldown_ms": 30000
+  },
+  "provider_concurrency": {
+    "max_concurrent": 4
+  },
+
+  // ── 日誌 ──────────────────────────────────────────────
+  "log": {
+    "enabled": true,
+    "retention_days": 7,
+    // 超過輪替為 <path>.1（只留前一代）。
+    "max_size_mb": 100,
+    // 相對路徑以設定檔所在目錄為基準。
+    "path": "./log.json",
+    // true 會把上游錯誤內文（含 prompt / PII）寫入日誌並推送到 /console。
+    "capture_error_body": false
+  },
+
+  // ── 圖片預處理 ────────────────────────────────────────
+  // 留空則由 providers 自動推導；只允許 https，單檔 8MB。
   "allowed_image_origins": [
     "https://openai.com",
     "https://cdn.openai.com"
   ],
 
-  "model_lockout": {
-    "_note": "(選用) 同一 provider/model 連續失敗達 threshold 次後暫時停用 (cooldown_ms 毫秒)",
-    "threshold": 3,
-    "cooldown_ms": 60000
-  },
-  "circuit_breaker": {
-    "_note": "(選用) circuit breaker: 失敗次數達 threshold 後暫時停用該 provider (cooldown 毫秒)",
-    "threshold": 5,
-    "cooldown_ms": 30000
-  },
-  "provider_concurrency": {
-    "_note": "(選用) 每個 provider 同時並發請求上限",
-    "max_concurrent": 4
-  },
-
-  "log": {
-    "_note": "(選用) 啟用回應日誌，自動刪除超過 retention_days 的舊資料",
-    "enabled": true,
-    "retention_days": 7,
-    "path": "./log.json"
-  },
-
+  // ── Provider ──────────────────────────────────────────
+  // 陣列 = OpenAI 相容端點。未使用的可刪除或留空。
   "providers": {
-    "_note": "只填入有 key 的 provider，未使用的可刪除或留空。支援清單與限制見 README",
-
     "openai": ["sk-..."],
     "orcarouter": ["sk-..."],
     "openrouter": ["sk-or-..."],
@@ -74,7 +93,7 @@
     "apinex": ["sk-apx-..."],
     "vyceai": ["sk-..."],
 
-    "_custom_provider_example": "下方為自定 provider 範例",
+    // 自訂上游。內網 / 私有 IP 會在啟動時被擋下（SSRF 防護）。
     "my-proxy": {
       "apiKeys": ["sk-..."],
       "baseUrl": "https://my-host.example.com",
@@ -83,8 +102,9 @@
     }
   },
 
+  // ── 限流 ──────────────────────────────────────────────
+  // 每把 key 的請求間隔（毫秒），不是 RPM。
   "rate_limit": {
-    "_note": "每個 key 請求間隔: 毫秒。不在此清單的 provider 會依 key 數量與 PROVIDER_RPM 自動計算",
     "cohere": 1000,
     "nvidia": 1000,
     "gpt4free": 1000,
@@ -92,15 +112,15 @@
     "sea-lion": 6000
   },
 
+  // 每把 key 每分鐘 token 上限。
   "tpm_limit": {
-    "_note": "每 key 每分鐘 token 限制",
     "groq": 8000,
     "cerebras": 30000,
     "mistral": 1000000
   },
 
+  // "provider/model" → 單次請求 context 上限（token）。
   "model_limits": {
-    "_note": "每次請求 token 上限: provider/model → max context",
     "groq/qwen/qwen3.6-27b": 8000,
     "cerebras/zai-glm-4.7": 8000,
     "cohere/command-a-plus-05-2026": 128000,
@@ -108,8 +128,9 @@
     "sea-lion/aisingapore/SEA-LION-ModernBERT-Embedding-600M": 8000
   },
 
+  // ── 端點自動派生 ──────────────────────────────────────
+  // model 不在 models 中時，依端點自動回退到對應別名。
   "endpoint_fallbacks": {
-    "_note": "client model 不在 models 中時，依端點路徑自動回退到對應的 model 別名",
     "/v1/chat/completions": "openai",
     "/v1/images/generations": "image",
     "/v1/audio/speech": "tts",
@@ -118,12 +139,14 @@
     "/v1/images/edits": "image",
     "/v1/images/variations": "image",
     "/v1/audio/translations": "stt",
-    "/v1/files": "nvidia",
+    "/v1/files": "file-store",
     "/v1/messages": "claude"
   },
 
+  // ── Model 別名 ────────────────────────────────────────
+  // key = client 送的名稱；value = 依序嘗試的鏈。
+  // 單一目標可加 "endpoint"（強制上游端點）或 "fallback"（整鏈失敗後展開的別名）。
   "models": {
-    "_note": "key = client 送的 model 名稱；value = provider/model 的 fallback 鏈，依序嘗試",
     "claude": [
       { "provider": "anthropic", "model": "claude-sonnet-4-20250514" }
     ],
@@ -151,6 +174,7 @@
       { "provider": "cohere", "model": "command-a-plus-05-2026" }
     ],
 
+    // 帶圖片時自動切到此鏈。
     "vision": [
       { "provider": "openrouter", "model": "google/gemma-4-31b-it:free" },
       { "provider": "mistral", "model": "mistral-small-latest" }
@@ -168,11 +192,16 @@
     ],
     "embedding": [
       { "provider": "sea-lion", "model": "aisingapore/SEA-LION-ModernBERT-Embedding-600M" }
+    ],
+    // 值必須是 models 別名，填 provider 名會靜默 fallback 到 openai。
+    "file-store": [
+      { "provider": "nvidia", "model": "" }
     ]
   },
 
+  // ── 智慧路由 ──────────────────────────────────────────
+  // 依估算 token 量 first-fit 由小到大挑 tier。
   "smart_route": {
-    "_note": "依照 token 量調用適合上游",
     "openai": [
       { "alias": "openai-lite", "max_tokens": 4000 },
       { "alias": "openai", "max_tokens": 32000 },
@@ -180,14 +209,14 @@
     ]
   },
 
+  // ── 分類模型 ──────────────────────────────────────────
+  // 僅分類不生成；api_key 可留空用免費層。
   "classifier": {
-    "_note": "classifier.dev 決策模型， api_key 可不填寫，預設使用免費層級調用",
     "base_url": "https://classifier.dev",
     "api_key": "",
     "timeout_ms": 15000,
     "max_chars": 32000,
     "cache": {
-      "_note": "內建快取機制",
       "enabled": true,
       "max_entries": 2000,
       "max_bytes": 8388608,
