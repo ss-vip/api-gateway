@@ -549,7 +549,7 @@ function _adjustReasoningFields(body, provider) {
   if (spec === 'effort') {
     if (typeof body.reasoning === 'object' && body.reasoning.enabled !== undefined) {
       const fromEffort = typeof body.reasoning.effort === 'number' ? body.reasoning.effort : (body.reasoning.enabled ? 3 : 1);
-      body.reasoning_effort = fromEffort;
+      body.reasoning_effort = fromEffort >= 3 ? 'high' : fromEffort >= 2 ? 'medium' : 'none';   // mistral enum is string-only (422 on numbers)
       delete body.reasoning;
       delete body.reasoning_content;
     } else if (body.reasoning?.effort !== undefined) {
@@ -557,6 +557,18 @@ function _adjustReasoningFields(body, provider) {
       delete body.reasoning;
     }
     return;
+  }
+}
+
+// Config-driven drop_params: strip provider-hostile params before forwarding.
+// Keys are "provider" (applies to all its models) or "provider/model" (that model only).
+function _applyConfigDropParams(body, provider, model, logId, tag) {
+  const dp = cfg && cfg.drop_params;
+  if (!dp) return;
+  for (const spec of [dp[provider], dp[`${provider}/${model}`]]) {
+    if (!Array.isArray(spec) || !spec.length) continue;
+    const dropped = lib.applyDropParams(body, spec);
+    if (dropped.length) log(`[${logId}] 🧹 ${tag} [${provider}/${model}] dropped unsupported params: ${dropped.join(', ')}`);
   }
 }
 
@@ -2025,6 +2037,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
                 const banned = PROVIDER_BANNED_FIELDS[provider];
                 if (banned) for (const f of banned) delete bodyObj[f];
                 _adjustReasoningFields(bodyObj, provider); // strip/rewrite unsupported reasoning params for this upstream
+                _applyConfigDropParams(bodyObj, provider, upstreamModel, logId, 'chat');
                 if (Array.isArray(bodyObj.tools)) bodyObj.tools = bodyObj.tools.map(t => { const c = { ...t }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
          if (Array.isArray(bodyObj.messages)) {
             if (!supportsReasoningContent(provider, upstreamModel)) {
@@ -2322,6 +2335,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
         const banned2 = PROVIDER_BANNED_FIELDS[tp];
         if (banned2) for (const f of banned2) delete bodyObj2[f];
         _adjustReasoningFields(bodyObj2, tp); // strip/rewrite unsupported reasoning params for this upstream
+        _applyConfigDropParams(bodyObj2, tp, tm, logId, 'sse-retry');
         if (Array.isArray(bodyObj2.tools)) bodyObj2.tools = bodyObj2.tools.map(tc => { const c = { ...tc }; delete c.strict; if (c.function) { c.function = { ...c.function }; delete c.function.strict; } return c; });
         const sseSanKey = `${tp}/${tm}`;
         if (!sseSanCache.has(sseSanKey)) {

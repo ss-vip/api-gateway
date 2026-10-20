@@ -261,11 +261,26 @@ test('validateConfigObject accepts a healthy config and rejects broken ones', ()
     ['dangling endpoint fallback', { ...good, endpoint_fallbacks: { '/v1/chat/completions': 'nope' } }, 'unknown alias "nope"'],
     ['dangling smart tier', { ...good, smart_route: { m1: [{ alias: 'nope', max_tokens: 1 }] } }, 'not a model alias'],
     ['tier without budget', { ...good, smart_route: { m1: [{ alias: 'm2', max_tokens: 0 }] } }, 'needs max_tokens > 0'],
+    ['drop_params not object', { ...good, drop_params: ['logprobs'] }, 'drop_params must map provider names to arrays'],
+    ['drop_params bad list', { ...good, drop_params: { a: 'logprobs' } }, 'must be an array of strings'],
   ];
   for (const [label, cfg, want] of cases) {
     const got = lib.validateConfigObject(cfg);
     assert.ok(got.includes(want), `${label}: expected "${want}" in "${got}"`);
   }
+});
+
+test('applyDropParams: bare key drops always, key=values drops by value', () => {
+  const b1 = { logprobs: true, reasoning_effort: 'low', temperature: 0.3 };
+  assert.deepEqual(lib.applyDropParams(b1, ['logprobs', 'reasoning_effort=low,medium']), ['logprobs', 'reasoning_effort']);
+  assert.deepEqual(b1, { temperature: 0.3 }, 'untouched keys survive');
+  const b2 = { reasoning_effort: 'high' };
+  assert.deepEqual(lib.applyDropParams(b2, ['logprobs', 'reasoning_effort=low,medium']), []);
+  assert.equal(b2.reasoning_effort, 'high', 'legit enum value passes through');
+  const b3 = { a: 1 };
+  assert.deepEqual(lib.applyDropParams(b3, 'nope'), [], 'non-array spec ignored');
+  assert.equal(b3.a, 1);
+  assert.deepEqual(lib.applyDropParams(null, ['a']), [], 'null body ignored');
 });
 
 test('config.example.jsonc passes validateConfigObject', () => {

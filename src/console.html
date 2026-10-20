@@ -190,6 +190,7 @@
         <div class="d-flex align-items-center gap-2">
           <button class="btn btn-outline-secondary btn-sm btn-sidebar-toggle" id="btnSidebar" title="Menu"><i class="bi bi-list"></i></button>
           <h1 class="fs-5 m-0" id="pageTitle">Dashboard</h1>
+          <button class="btn btn-primary btn-sm d-none" id="btnCfgSave" title="Persist the staged config and restart the gateway"><i class="bi bi-save"></i> Save &amp; activated</button>
         </div>
         <div class="d-flex gap-2 align-items-center nav-actions">
           <button class="btn btn-outline-secondary btn-sm" id="btnTheme" title="Toggle Theme"><i class="bi bi-moon-fill"></i></button>
@@ -315,7 +316,6 @@
                 <button class="btn btn-outline-secondary btn-sm" id="btnCfgValidate"><i class="bi bi-check2"></i> Validate</button>
                 <button class="btn btn-outline-secondary btn-sm" id="btnCfgFormat"><i class="bi bi-magic"></i> Format</button>
                 <button class="btn btn-outline-secondary btn-sm" id="btnCfgDl"><i class="bi bi-download"></i> Download</button>
-                <button class="btn btn-primary btn-sm ms-auto" id="btnCfgSave"><i class="bi bi-save"></i> Save &amp; activated</button>
               </div>
             </div>
           </div></div>
@@ -323,8 +323,8 @@
             <!-- Left: form + providers + models -->
             <div class="col-12 col-xl-5">
               <!-- Basic params -->
-              <div class="card mb-3"><div class="card-body">
-                <div class="small fw-bold mb-2"><i class="bi bi-sliders text-primary"></i> Basic Parameters <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Top-level config keys. client_token, port, timeouts, backoffs and PROVIDER keys can also be set via environment variables. Saving from this form reorders the JSON and drops comments — use the Raw editor to keep them."></i></div>
+              <div class="card mb-3" id="cardBasic"><div class="card-body">
+                <div class="small fw-bold mb-2"><i class="bi bi-sliders text-primary"></i> Basic Parameters <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Top-level config keys. client_token, port, timeouts, backoffs and PROVIDER keys can also be set via environment variables. Form edits stage into the Raw JSON automatically (reordered, comments dropped) — use the Raw editor to keep them; Save &amp; activated at the top persists and restarts."></i></div>
                 <div class="row g-2">
                   <div class="col-12"><label class="form-label small mb-1" title="Client 與 /console 共用的 Bearer token。留空 = 所有端點不驗證，僅適合本機測試。">client_token</label><input type="password" class="form-control form-control-sm mono" id="f_token" autocomplete="off"></div>
                   <div class="col-6"><label class="form-label small mb-1" title="監聽埠號 (1–65535)">port</label><input type="number" class="form-control form-control-sm" id="f_port"></div>
@@ -338,32 +338,76 @@
                   <div class="col-6"><label class="form-label small mb-1" title="相對路徑以設定檔所在目錄為基準">log.path</label><input type="text" class="form-control form-control-sm mono" id="f_logpath"></div>
                   <div class="col-3"><label class="form-label small mb-1" title="超過天數的舊紀錄會被清理">Retention (days)</label><input type="number" class="form-control form-control-sm" id="f_logdays"></div>
                   <div class="col-3 d-flex align-items-end"><div class="form-check mb-1"><input class="form-check-input" type="checkbox" id="f_logen"><label class="form-check-label small" for="f_logen" title="關閉後仍保留金鑰降級狀態（gw-state.json），不受影響">Enable logging</label></div></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="log 時間戳顯示時區（例 Asia/Taipei）">timezone</label><input type="text" class="form-control form-control-sm mono" id="f_tz" placeholder="Asia/Taipei"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="單一 provider 同時處理的請求上限（provider_concurrency.max_concurrent）">max_concurrent</label><input type="number" class="form-control form-control-sm" id="f_conc" min="1"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="同一 provider/model 連續失敗幾次後暫停（model_lockout.threshold）">lockout threshold</label><input type="number" class="form-control form-control-sm" id="f_lockTh" min="1"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="model_lockout 暫停冷卻（model_lockout.cooldown_ms）">lockout cooldown (ms)</label><input type="number" class="form-control form-control-sm" id="f_lockCd" min="0"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="連續 5xx 幾次後斷路整個 provider（circuit_breaker.threshold）">breaker threshold</label><input type="number" class="form-control form-control-sm" id="f_cbTh" min="1"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="斷路冷卻（circuit_breaker.cooldown_ms）">breaker cooldown (ms)</label><input type="number" class="form-control form-control-sm" id="f_cbCd" min="0"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="log 輪替上限，超過輪替為 .1（log.max_size_mb）">Log max (MB)</label><input type="number" class="form-control form-control-sm" id="f_logmax" min="1"></div>
+                  <div class="col-6 d-flex align-items-end"><div class="form-check mb-1"><input class="form-check-input" type="checkbox" id="f_logcap"><label class="form-check-label small" for="f_logcap" title="記錄上游錯誤內文到 log（含 prompt 風險，僅本機除錯；log.capture_error_body）">Capture error bodies</label></div></div>
                 </div>
-                <div class="d-flex gap-2 mt-3">
-                  <button class="btn btn-outline-primary btn-sm" id="btnApplyForm"><i class="bi bi-save"></i> Save &amp; activated</button>
-                </div>
-                <p class="small text-secondary mt-2 mb-0">Apply will reorder JSON (comments lost). To preserve comments, edit Raw directly.</p>
+                <p class="small text-secondary mt-3 mb-0">Edits stage into the Raw buffer automatically (JSON reordered, comments dropped) — persist with Save &amp; activated in the top bar.</p>
               </div></div>
               <!-- Providers -->
               <div class="card mb-3"><div class="card-body">
                 <div class="small fw-bold mb-2"><i class="bi bi-key text-warning"></i> Providers <span class="text-secondary fw-normal notranslate">(keys masked, last 4 only)</span> <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Quick-add creates the plain key-array form; Custom… sets baseUrl, pathPrefix and rpm. Health comes from live traffic — only 401/403/429/5xx mark a key bad, client errors (400/404) never do."></i></div>
-                <div id="provEdit" class="d-flex flex-column gap-2"></div>
-                <div class="d-flex gap-2 mt-2">
+                <div class="d-flex gap-2 mb-2">
                   <input class="form-control form-control-sm" id="newProvName" placeholder="Add provider name" style="max-width:180px">
                   <input class="form-control form-control-sm mono" id="newProvKey" placeholder="API key" autocomplete="off">
                   <button class="btn btn-outline-success btn-sm" id="btnAddProv" title="Add provider"><i class="bi bi-plus"></i></button>
                   <button class="btn btn-outline-secondary btn-sm" id="btnAddProvCustom" title="Add custom upstream (base URL, path, RPM)"><i class="bi bi-gear"></i> Custom…</button>
                 </div>
+                <div id="provEdit" class="d-flex flex-column gap-2"></div>
+              </div></div>
+              <!-- Advanced: image origins + classifier -->
+              <div class="card mb-3" id="cardAdv"><div class="card-body">
+                <div class="small fw-bold mb-2"><i class="bi bi-tools text-secondary"></i> Advanced <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Image whitelist for fetched remote pictures, plus the /v1/classifier upstream. classifier.cache is edited via Raw."></i></div>
+                <label class="form-label small mb-1" title="遠端圖片白名單，每行一個 HTTPS 網址；留空＝用 provider 根域名（allowed_image_origins）">allowed_image_origins</label>
+                <textarea class="form-control form-control-sm mono" id="f_originsAdv" rows="2" placeholder="https://cdn.example.com（每行一個）" spellcheck="false"></textarea>
+                <div class="small fw-bold mt-3 mb-2"><i class="bi bi-ui-checks-grid text-success"></i> classifier</div>
+                <div class="row g-2">
+                  <div class="col-12"><label class="form-label small mb-1" title="分類上游網址，留空用預設 classifier.dev（classifier.base_url）">base_url</label><input type="text" class="form-control form-control-sm mono" id="f_clbase" placeholder="https://classifier.dev" spellcheck="false"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="分類上游金鑰，預設可留空（classifier.api_key）">api_key</label><input type="password" class="form-control form-control-sm mono" id="f_clkey" autocomplete="off"></div>
+                  <div class="col-6"><label class="form-label small mb-1" title="分類請求逾時（classifier.timeout_ms）">timeout (ms)</label><input type="number" class="form-control form-control-sm" id="f_cltimeout" min="1"></div>
+                  <div class="col-12"><label class="form-label small mb-1" title="單次分類輸入字元上限（classifier.max_chars）">max_chars</label><input type="number" class="form-control form-control-sm" id="f_clchars" min="1"></div>
+                </div>
               </div></div>
             </div>
             <!-- Right: models -->
             <div class="col-12 col-xl-7">
-              <div class="card"><div class="card-body">
-                <div class="small fw-bold mb-2"><i class="bi bi-diagram-3 text-info"></i> Models alias <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Key = the model name clients send; value = ordered target chain — a target whose keys are all exhausted moves to the next."></i></div>
+              <div class="card mb-3"><div class="card-body">
+                <div class="d-flex small fw-bold mb-2 justify-content-between align-items-center">
+                  <span><i class="bi bi-diagram-3 text-info"></i> Models alias <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="Key = the model name clients send; value = ordered target chain — a target whose keys are all exhausted moves to the next."></i></span>
+                  <button class="btn btn-outline-primary btn-sm" id="btnAddModel"><i class="bi bi-plus"></i> Add alias</button>
+                </div>
                 <div class="table-responsive"><table class="table table-sm mb-0">
-                  <thead><tr><th data-msort>Alias<span class="sort-ind" id="sortAlias"></span></th><th>Target URL</th></tr></thead>
-                  <tbody id="modelsTable" class="notranslate" translate="no"><tr><td colspan="2" class="text-secondary small text-center notranslate">No data</td></tr></tbody>
+                  <thead><tr><th data-msort>Alias<span class="sort-ind" id="sortAlias"></span></th><th>Targets</th><th class="text-end">Actions</th></tr></thead>
+                  <tbody id="modelsTable" class="notranslate" translate="no"><tr><td colspan="3" class="text-secondary small text-center notranslate">No data</td></tr></tbody>
                 </table></div>
+              </div></div>
+              <!-- Routing: endpoint_fallbacks + smart_route -->
+              <div class="card mb-3"><div class="card-body">
+                <div class="small fw-bold mb-2"><i class="bi bi-signpost-2 text-warning"></i> Routing <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="endpoint_fallbacks: an unknown model name maps to an alias by request path. smart_route: the requested max_tokens picks a tier alias (lite → heavy)."></i></div>
+                <div class="small fw-bold mb-1">endpoint_fallbacks <span class="text-secondary fw-normal fw-normal">(unknown model → alias per path)</span></div>
+                <div id="epRows" class="d-flex flex-column gap-1"></div>
+                <button class="btn btn-outline-secondary btn-sm mt-2" id="btnAddEp"><i class="bi bi-plus"></i> Add endpoint</button>
+                <div class="small fw-bold mt-3 mb-1">smart_route <span class="text-secondary fw-normal">(tier picked by max_tokens)</span></div>
+                <div id="srRows" class="d-flex flex-column gap-1"></div>
+                <button class="btn btn-outline-secondary btn-sm mt-2" id="btnAddSr"><i class="bi bi-plus"></i> Add tier row</button>
+              </div></div>
+              <!-- Limits: rate / tpm / model context -->
+              <div class="card"><div class="card-body">
+                <div class="small fw-bold mb-2"><i class="bi bi-speedometer2 text-danger"></i> Limits <i class="bi bi-question-circle text-secondary ms-1" role="button" tabindex="0" data-bs-toggle="popover" data-bs-trigger="hover focus" data-bs-content="rate_limit = ms between requests per key · tpm_limit = tokens/min per key · model_limits = context cap per provider/model."></i></div>
+                <div class="small fw-bold mb-1">rate_limit <span class="text-secondary fw-normal">(ms / key)</span></div>
+                <div id="rlRows" class="d-flex flex-column gap-1"></div>
+                <button class="btn btn-outline-secondary btn-sm mt-2" id="btnAddRl"><i class="bi bi-plus"></i> Add rate rule</button>
+                <div class="small fw-bold mt-3 mb-1">tpm_limit <span class="text-secondary fw-normal">(tokens / min / key)</span></div>
+                <div id="tlRows" class="d-flex flex-column gap-1"></div>
+                <button class="btn btn-outline-secondary btn-sm mt-2" id="btnAddTl"><i class="bi bi-plus"></i> Add TPM rule</button>
+                <div class="small fw-bold mt-3 mb-1">model_limits <span class="text-secondary fw-normal">(context cap, provider/model)</span></div>
+                <div id="mlRows" class="d-flex flex-column gap-1"></div>
+                <button class="btn btn-outline-secondary btn-sm mt-2" id="btnAddMl"><i class="bi bi-plus"></i> Add model cap</button>
               </div></div>
             </div>
           </div>
@@ -521,6 +565,34 @@
   </div>
 </div></div>
 
+<!-- Model alias modal: alias name + ordered target chain (provider/model/endpoint/fallback) -->
+<div class="modal fade" id="modelModal" tabindex="-1"><div class="modal-dialog modal-lg">
+  <div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title fs-6"><span id="modelModalTitle">Add model alias</span></h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body">
+      <label class="form-label small mb-1" title="Client 請求時送的 model 名稱">Alias (model name clients send)</label>
+      <input type="text" class="form-control form-control-sm mono notranslate" id="mmAlias" translate="no" autocomplete="off" spellcheck="false" placeholder="auto-openai">
+      <div class="small fw-bold mt-3 mb-1">Targets <span class="text-secondary fw-normal fw-normal">(ordered — first target's keys exhausted → next)</span></div>
+      <div id="mmTargets" class="d-flex flex-column gap-1"></div>
+      <button class="btn btn-outline-secondary btn-sm mt-2" id="mmAddTarget"><i class="bi bi-plus"></i> Add target</button>
+      <div class="form-text">endpoint = force another upstream path (e.g. /v1/responses) · fallback = comma-separated aliases to continue on after this target fails</div>
+    </div>
+    <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="mmSave" title="Write into Raw JSON (unsaved until Save)">OK</button></div>
+  </div>
+</div></div>
+
+<!-- In-page confirm: native confirm() is silently swallowed in iframes/webviews -->
+<div class="modal fade" id="confirmModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered">
+  <div class="modal-content">
+    <div class="modal-header"><h5 class="modal-title fs-6">Confirm</h5><button class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body small" id="confirmModalMsg"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary btn-sm" id="confirmModalCancel" data-bs-dismiss="modal">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="confirmModalOk">OK</button>
+    </div>
+  </div>
+</div></div>
+
 <script>
 // Own login-safe initTranslation; shared.js would auto-translate the login view.
   if (typeof toast === 'undefined') {
@@ -562,7 +634,7 @@
       defaultLang = defaultLang || 'english'; toastOk = toastOk || 'Translation done'; toastErr = toastErr || 'Translation failed'; toastTimeout = toastTimeout || 'Connection timed out, try again later';
       var TRANS_TIMEOUT_MS = 20000, TRANS_SETTLE_MS = 800, TRANS_QUIET_MS = 600;
       var items = document.querySelectorAll(itemsSelector);
-      var savedLang = localStorage.getItem('gw_lang') || defaultLang;
+      var savedLang = (() => { try { return localStorage.getItem('gw_lang') || defaultLang; } catch { return defaultLang; } })();
       var transOverlay = document.getElementById('transOverlay');
       var transTimer = null, overlayHidden = false, transFailed = false, toastShown = false, finishHandled = false, succeeded = false, hideDebounce = null, settleTimer = null, langTimer = null, obs = null, cycleId = 0;
       function markActive(lang) { items.forEach(function(i){ i.classList.toggle('active', i.getAttribute('data-lang') === lang); }); }
@@ -660,7 +732,7 @@
       }
       var startTranslate = function() {
         // Refresh the saved preference: the user may have changed it in another tab.
-        savedLang = localStorage.getItem('gw_lang') || defaultLang;
+        savedLang = (() => { try { return localStorage.getItem('gw_lang') || defaultLang; } catch { return defaultLang; } })();
         markActive(savedLang);
         if (savedLang === defaultLang) return; // default: no translation action
         if (!appVisible()) return; // login view stays untranslated; start only inside app
@@ -682,16 +754,19 @@
       items.forEach(function(item) {
         item.addEventListener('click', function(e) {
           e.preventDefault(); var lang = this.getAttribute('data-lang');
-          var prevLang = localStorage.getItem('gw_lang') || defaultLang;   // before this click overwrites it
-          localStorage.setItem('gw_lang', lang); markActive(lang);
+          var prevLang = (() => { try { return localStorage.getItem('gw_lang'); } catch { return null; } })() || defaultLang;   // before this click overwrites it
+          try { localStorage.setItem('gw_lang', lang); } catch {} markActive(lang);
           if (lang === defaultLang) {
 // Reload wipes unsaved edits: ask first; cancel restores THIS click's pre-state
 // (savedLang is boot-time and goes stale after any earlier language switch).
             try {
               const dirty = typeof unsavedEdits === 'function' && unsavedEdits();
-              if (dirty && !confirm('Switching language reloads the page and discards UNSAVED changes. Continue?')) {
-                try { localStorage.setItem('gw_lang', prevLang); } catch {}
-                markActive(prevLang); return;
+              if (dirty && typeof askConfirm === 'function') {
+                askConfirm('Switching language reloads the page and discards UNSAVED changes. Continue?').then(ok => {
+                  if (!ok) { try { localStorage.setItem('gw_lang', prevLang); } catch {} markActive(prevLang); return; }
+                  location.reload();
+                });
+                return;
               }
             } catch {}
             location.reload(); return;
@@ -708,6 +783,21 @@
     };
   }
 
+  // Surfacing layer: a parse-time crash in any block would otherwise show up as
+  // "button with no reaction" — toast the real error and flag a dead main block.
+  window.addEventListener('error', function (ev) {
+    if (!ev || !ev.error) return;   // resource errors (img/font) are noise
+    try { window.toast('Script error: ' + (ev.error.message || ev.message), 0); }
+    catch (e) { console.error('[console] script error:', ev.error || ev.message); }
+  });
+  window.addEventListener('load', function () {
+    setTimeout(function () {
+      if (!window.__gwMainAlive) {
+        try { window.toast('Console script failed to initialise — hard-reload this page', 0); } catch (e) {}
+      }
+    }, 800);
+  });
+
 </script>
 
 <!-- SCRIPT -->
@@ -715,7 +805,7 @@
 'use strict';
 
 /* globals */
-let _token = localStorage.getItem('gw_token') || '';
+let _token = (() => { try { return localStorage.getItem('gw_token') || ''; } catch { return ''; } })();   // sandboxed iframe = SecurityError; never kill the block
 let _rawLog = '', _cfgText = '', _cfgObj = null, _lastStatus = null, _logTruncated = false;
 let _charts = {};
 let _logRows = [], _logFiltered = [], _logPage = 0;
@@ -756,6 +846,7 @@ function bindNavBtns(){
     b.classList.add('active');
     document.querySelectorAll('[data-sec]').forEach(s => s.classList.toggle('d-none', s.dataset.sec !== b.dataset.v));
     $('pageTitle').textContent = TITLES[b.dataset.v];
+    $('btnCfgSave').classList.toggle('d-none', b.dataset.v !== 'config');   // save lives beside the Config title
   }));
 }
 bindNavBtns();
@@ -770,11 +861,11 @@ $('btnSidebar').addEventListener('click', () => {
   oc.show();
 });
 
-(function(){ const t = localStorage.getItem('bsTheme'); if(t){ document.documentElement.setAttribute('data-bs-theme', t); syncThemeIcon(); } })();
+(function(){ try { const t = localStorage.getItem('bsTheme'); if(t){ document.documentElement.setAttribute('data-bs-theme', t); syncThemeIcon(); } } catch {} })();
 function syncThemeIcon(){ $('btnTheme').innerHTML = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? '<i class="bi bi-moon-fill"></i>' : '<i class="bi bi-sun-fill"></i>'; }
 $('btnTheme').addEventListener('click', () => {
   const h = document.documentElement, t = h.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark';
-  h.setAttribute('data-bs-theme', t); localStorage.setItem('bsTheme', t); syncThemeIcon();
+  h.setAttribute('data-bs-theme', t); try { localStorage.setItem('bsTheme', t); } catch {} syncThemeIcon();
   if (_lastStatus) renderCharts(_lastStatus);
 });
 $('gotop').addEventListener('click', () => window.scrollTo({ top:0, behavior:'smooth' }));
@@ -796,7 +887,7 @@ function resetSession(msg) {
   if (_loadCtl) { _loadCtl.abort(); _loadCtl = null; }
   if (_detailCtl) { _detailCtl.abort(); _detailCtl = null; }
   _authReq++;
-  _token=''; localStorage.removeItem('gw_token'); closeSSE();
+  _token=''; try { localStorage.removeItem('gw_token'); } catch {} closeSSE();
   _rawLog=''; _cfgText=''; _cfgObj=null; _lastStatus=null; _logTruncated=false;
   _logRows=[]; _logFiltered=[]; _logPage=0; _lgRawDirty=false;
   // drop raw editors too — a later login must never see the previous session's keys
@@ -850,7 +941,7 @@ function unsavedEdits(){
 }
 async function loadAll(tag){
   tag = (tag === undefined) ? sessTag() : tag;
-  if (unsavedEdits() && !confirm('Reload discards UNSAVED changes (config / raw log edits). Continue?')) return;
+  if (unsavedEdits() && !(await askConfirm('Reload discards UNSAVED changes (config / raw log edits). Continue?'))) return;
   if (_loadCtl) { try { _loadCtl.abort(); } catch{} }
   const ctl = new AbortController(); _loadCtl = ctl;
   const ld = showLoading();
@@ -882,13 +973,28 @@ async function loadAll(tag){
   } catch(e){ if (!sessAlive(tag) || _loadCtl !== ctl) return; hideLoading(ld); if (e.name !== 'AbortError') toast('Load error: ' + e.message, 0); }
 }
 
+/* in-page confirm — native confirm() returns false silently in iframes/webviews */
+let _confirmResolve = null, _confirmBox = null;
+function askConfirm(msg){
+  if (!window.bootstrap || !$('confirmModal')) return Promise.resolve(window.confirm(msg));
+  $('confirmModalMsg').textContent = String(msg);
+  if (!_confirmBox) _confirmBox = new bootstrap.Modal($('confirmModal'));
+  _confirmBox.show();
+  return new Promise(res => { _confirmResolve = res; });
+}
+function _confirmDone(ok){ const r = _confirmResolve; _confirmResolve = null; if (r) r(ok); }
+$('confirmModalOk').addEventListener('click', () => { _confirmDone(true); if (_confirmBox) _confirmBox.hide(); });
+$('confirmModalCancel').addEventListener('click', () => _confirmDone(false));
+$('confirmModal').addEventListener('hidden.bs.modal', () => _confirmDone(false));   // ESC / backdrop = cancel
+
 /* config form */
 // Snapshot of the form as last filled/applied — btnCfgSave refuses to save a
 // config that would silently discard unapplied form edits.
 let _formSnap = null;
 function _readForm(){
   const one = (id) => { const el = $(id); return el ? (el.type === 'checkbox' ? String(el.checked) : el.value) : ''; };
-  return ['f_token','f_port','f_timeout','f_uptimeout','f_upmaxbody','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays','f_logen'].map(one).join('\u0001');
+  return ['f_token','f_port','f_timeout','f_uptimeout','f_upmaxbody','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays','f_logen',
+    'f_tz','f_conc','f_lockTh','f_lockCd','f_cbTh','f_cbCd','f_logmax','f_logcap','f_originsAdv','f_clbase','f_clkey','f_cltimeout','f_clchars'].map(one).join('\u0001');
 }
 function fillConfigForm(){
   // textarea first: _cfgText is the last-loaded snapshot, so reading it here
@@ -897,11 +1003,13 @@ function fillConfigForm(){
   _cfgObj = p.ok ? p.obj : null;
   if (!p.ok){
     setCfgStatus('Raw parse failed: ' + p.err, 0);
-    ['f_token','f_port','f_timeout','f_uptimeout','f_upmaxbody','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays'].forEach(id => { $(id).value = ''; });
+    ['f_token','f_port','f_timeout','f_uptimeout','f_upmaxbody','f_cooldown','f_backoff','f_maxbody','f_quota','f_logpath','f_logdays','f_tz','f_conc','f_lockTh','f_lockCd','f_cbTh','f_cbCd','f_logmax','f_originsAdv','f_clbase','f_clkey','f_cltimeout','f_clchars'].forEach(id => { $(id).value = ''; });
     $('f_logen').checked = true;
+    $('f_logcap').checked = false;
     _formSnap = _readForm();   // cleared fields ARE the current form state
     $('provEdit').innerHTML = '<p class="text-secondary small mb-0">Invalid config. Fix Raw and reload.</p>';
-    $('modelsTable').innerHTML = '<tr><td colspan="2" class="text-secondary small text-center">Invalid config</td></tr>';
+    $('modelsTable').innerHTML = '<tr><td colspan="3" class="text-secondary small text-center">Invalid config</td></tr>';
+    renderRouting(); renderLimits();
     return;
   }
   setCfgStatus('Valid JSON', 1);
@@ -913,7 +1021,14 @@ function fillConfigForm(){
   $('f_quota').value = c.quota_backoff ?? '';
   $('f_logpath').value = c.log?.path || ''; $('f_logdays').value = c.log?.retention_days ?? '';
   $('f_logen').checked = c.log?.enabled !== false;
-  renderProvEdit();
+  $('f_tz').value = c.timezone || ''; $('f_conc').value = c.provider_concurrency?.max_concurrent ?? '';
+  $('f_lockTh').value = c.model_lockout?.threshold ?? ''; $('f_lockCd').value = c.model_lockout?.cooldown_ms ?? c.model_lockout?.cooldown ?? '';
+  $('f_cbTh').value = c.circuit_breaker?.threshold ?? ''; $('f_cbCd').value = c.circuit_breaker?.cooldown_ms ?? c.circuit_breaker?.cooldown ?? '';
+  $('f_logmax').value = c.log?.max_size_mb ?? ''; $('f_logcap').checked = c.log?.capture_error_body === true;
+  $('f_originsAdv').value = Array.isArray(c.allowed_image_origins) ? c.allowed_image_origins.join('\n') : '';
+  $('f_clbase').value = c.classifier?.base_url ?? ''; $('f_clkey').value = c.classifier?.api_key ?? '';
+  $('f_cltimeout').value = c.classifier?.timeout_ms ?? ''; $('f_clchars').value = c.classifier?.max_chars ?? '';
+  renderProvEdit(); renderRouting(); renderLimits();
   _formSnap = _readForm();
 }
 function setCfgStatus(m, ok){ $('cfgStatus').innerHTML = m ? '<span class="'+(ok?'text-success':'text-danger')+'">'+_esc(m)+'</span>' : ''; }
@@ -928,10 +1043,11 @@ $('btnCfgRawToggle').addEventListener('click', () => setRawCollapsed(!$('cfgRawW
 // Default collapsed: the form + provider cards cover daily edits, Raw is for
 // advanced use. Only an explicit prior "open" persists across sessions.
 try { setRawCollapsed(localStorage.getItem('gw_raw_open') !== '1'); } catch { setRawCollapsed(true); }
-$('btnApplyForm').addEventListener('click', () => {
-  if (!confirm('Write the form values into the Raw JSON editor?')) return;
+// Form → staging: every keystroke (debounced) rewrites the Raw buffer; the only
+// write to disk stays Save & activated (persist + restart).
+function _applyFormToStaging(){
   const p = tryParseCfg($('cfgRaw').value);
-  if (!p.ok){ setCfgStatus('Raw parse failed, fix JSON first: ' + p.err, 0); return; }
+  if (!p.ok){ setCfgStatus('Raw parse failed, fix JSON first: ' + p.err, 0); return false; }
   const c = p.obj, num = id => { const v = $(id).value; return v === '' ? undefined : Number(v); };
   const put = (k, v) => { if (v === undefined || (typeof v === 'number' && isNaN(v))) delete c[k]; else c[k] = v; };
   c.client_token = $('f_token').value; put('port', num('f_port')); put('timeout', num('f_timeout'));
@@ -941,9 +1057,36 @@ $('btnApplyForm').addEventListener('click', () => {
   c.log = c.log || {}; c.log.path = $('f_logpath').value || './log.json';
   const d = num('f_logdays'); if (d !== undefined) c.log.retention_days = d;
   c.log.enabled = $('f_logen').checked;
+  const tz = $('f_tz').value.trim(); if (tz) c.timezone = tz; else delete c.timezone;
+  const mk = (k, obj) => { if (Object.values(obj).some(v => v !== undefined)) c[k] = obj; else delete c[k]; };
+  mk('provider_concurrency', { max_concurrent: num('f_conc') });
+  mk('model_lockout', { threshold: num('f_lockTh'), cooldown_ms: num('f_lockCd') });
+  mk('circuit_breaker', { threshold: num('f_cbTh'), cooldown_ms: num('f_cbCd') });
+  const lgm = num('f_logmax'); if (lgm !== undefined) c.log.max_size_mb = lgm; else delete c.log.max_size_mb;
+  if ($('f_logcap').checked) c.log.capture_error_body = true; else delete c.log.capture_error_body;
+  const orig = $('f_originsAdv').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (orig.length) c.allowed_image_origins = orig; else delete c.allowed_image_origins;
+  const cl = (c.classifier && typeof c.classifier === 'object' && !Array.isArray(c.classifier)) ? c.classifier : {};
+  const cb2 = $('f_clbase').value.trim(); if (cb2) cl.base_url = cb2; else delete cl.base_url;
+  const ck2 = $('f_clkey').value; if (ck2) cl.api_key = ck2; else delete cl.api_key;
+  const ct2 = num('f_cltimeout'); if (ct2 !== undefined) cl.timeout_ms = ct2; else delete cl.timeout_ms;
+  const cc2 = num('f_clchars'); if (cc2 !== undefined) cl.max_chars = cc2; else delete cl.max_chars;
+  if (Object.keys(cl).length) c.classifier = cl; else delete c.classifier;
+  // rebuild provider/model lists only when Raw hand-edits actually changed them
+  const listsChanged = JSON.stringify([c.providers, c.models]) !== JSON.stringify([(_cfgObj || {}).providers, (_cfgObj || {}).models]);
   $('cfgRaw').value = JSON.stringify(c, null, 2);
-  _cfgObj = c; renderProvEdit(); renderModels(); setCfgStatus('Applied to JSON (unsaved)', 1); syncHl($('cfgRaw'));
+  _cfgObj = c; syncHl($('cfgRaw'));
+  if (listsChanged){ renderProvEdit(); renderModels(); }
+  setCfgStatus('Applied to JSON (unsaved)', 1);
   _formSnap = _readForm();
+  return true;
+}
+let _formSyncT = null;
+function _scheduleFormSync(){ clearTimeout(_formSyncT); _formSyncT = setTimeout(() => { _formSyncT = null; _applyFormToStaging(); }, 300); }
+['cardBasic', 'cardAdv'].forEach(id => {
+  const card = $(id); if (!card) return;
+  card.addEventListener('input', _scheduleFormSync);
+  card.addEventListener('change', _scheduleFormSync);
 });
 // Handles both provider shapes (array vs {apiKeys,...}); array-only code dropped meta.
 function _provKeyList(name, create) {
@@ -960,7 +1103,7 @@ function _provKeyList(name, create) {
 // status flag. Nothing touches the server — Save (with restart) stays explicit.
 function _syncCfgAfterKeyChange(msg, detailProv) {
   $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2); syncHl($('cfgRaw'));
-  renderProvEdit(); renderModels();
+  renderProvEdit(); renderModels(); renderRouting(); renderLimits();
   setCfgStatus(msg || 'Keys updated (unsaved)', 1);
   if (detailProv) { renderDetailKeys(detailProv); renderDetailMeta(detailProv); }
 }
@@ -983,10 +1126,10 @@ function _provReferencedBy(name) {
   }
   return out;
 }
-function deleteProvider(name) {
+async function deleteProvider(name) {
   const refs = _provReferencedBy(name);
   const msg = 'Delete provider "' + name + '"' + (refs.length ? ', used by model alias(es): ' + refs.join(', ') : '') + '? (Unsaved until Save.)';
-  if (!confirm(msg)) return;
+  if (!(await askConfirm(msg))) return;
   delete _cfgObj.providers[name];
   if (_detailOc && $('detailTitle').textContent === name) { try { _detailOc.hide(); } catch {} }
   _syncCfgAfterKeyChange('Provider deleted (unsaved)');
@@ -1121,15 +1264,255 @@ $('btnAddProv').addEventListener('click', () => {  const n = ($('newProvName').v
   $('newProvName').value=''; $('newProvKey').value='';
   renderProvEdit(); renderModels(); setCfgStatus('Provider added (unsaved)', 1); syncHl($('cfgRaw'));
 });
+$('newProvName').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnAddProv').click(); });
+$('newProvKey').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnAddProv').click(); });
 function renderModels(){
   const tb = $('modelsTable'); const models = (_cfgObj && _cfgObj.models) || {};
   const names = Object.keys(models).filter(k => !k.startsWith('_')).sort((a, b) => _mdDir * a.localeCompare(b));
-  if (!names.length){ tb.innerHTML = '<tr><td colspan="2" class="text-secondary small text-center notranslate">No data</td></tr>'; return; }
+  if (!names.length){ tb.innerHTML = '<tr><td colspan="3" class="text-secondary small text-center notranslate">No data</td></tr>'; return; }
   tb.innerHTML = names.slice(0, 60).map(a => {
     const t = models[a];
-    const chips = Array.isArray(t) ? t.map(x=>'<span class="badge border border-info text-info me-1 mb-1">'+_esc(x.provider||'?')+' / '+_esc(x.model||'')+(x.endpoint?' @'+_esc(x.endpoint):'')+'</span>').join('') : '<span class="text-secondary small">'+_esc(String(t))+'</span>';
-    return '<tr class="notranslate" translate="no"><td class="mono small">'+_esc(a)+'</td><td>'+chips+'</td></tr>';
-  }).join('') + (names.length > 60 ? '<tr><td colspan="2" class="text-secondary small">… '+names.length+' total, see Raw for full list</td></tr>' : '');
+    const chips = Array.isArray(t) ? t.map(x=>{
+      const fb = x && x.fallback ? (Array.isArray(x.fallback) ? x.fallback.join(',') : x.fallback) : '';
+      return '<span class="badge border border-info text-info me-1 mb-1" title="'+_esc(JSON.stringify(x))+'">'+_esc((x&&x.provider)||'?')+' / '+_esc((x&&x.model)||'')+((x&&x.endpoint)?' @'+_esc(x.endpoint):'')+(fb?' → '+_esc(fb):'')+'</span>';
+    }).join('') : '<span class="text-secondary small">'+_esc(String(t))+'</span>';
+    return '<tr class="notranslate" translate="no"><td class="mono small">'+_esc(a)+'</td><td>'+chips+'</td>'
+      + '<td class="text-end text-nowrap"><button class="btn btn-outline-secondary btn-sm py-0 px-1" data-medit="'+_esc(a)+'" title="Edit alias"><i class="bi bi-pencil"></i></button> '
+      + '<button class="btn btn-outline-danger btn-sm py-0 px-1" data-mdel="'+_esc(a)+'" title="Delete alias"><i class="bi bi-trash"></i></button></td></tr>';
+  }).join('') + (names.length > 60 ? '<tr><td colspan="3" class="text-secondary small">… '+names.length+' total, see Raw for full list</td></tr>' : '');
+  tb.querySelectorAll('[data-medit]').forEach(b => b.addEventListener('click', () => openModelModal('edit', b.getAttribute('data-medit'))));
+  tb.querySelectorAll('[data-mdel]').forEach(b => b.addEventListener('click', () => deleteModelAlias(b.getAttribute('data-mdel'))));
+}
+/* --- structured editors: routing/limit rows + model alias modal --- */
+// Row boxes edit DOM rows directly; collect fns write complete rows back to
+// _cfgObj. Fully-empty rows are pruned so an abandoned Add disappears.
+function _aliasNames(){ return Object.keys((_cfgObj && _cfgObj.models) || {}).filter(k => !k.startsWith('_')); }
+function _provNames(){ return Object.keys((_cfgObj && _cfgObj.providers) || {}); }
+function _selOpts(names, sel){
+  const all = names.slice();
+  if (sel && !all.includes(sel)) all.unshift(sel);   // keep deleted provider/alias selectable instead of silently dropping the row
+  return '<option value=""></option>' + all.map(n => '<option value="' + _esc(n) + '"' + (n === sel ? ' selected' : '') + '>' + _esc(n) + '</option>').join('');
+}
+function _rowDel(){ return '<button class="btn btn-outline-danger btn-sm py-0 px-1" data-rdel title="Remove"><i class="bi bi-x"></i></button>'; }
+function _epRow(ep, a){ return '<div class="d-flex gap-1 align-items-center flex-wrap" data-eprow>'
+  + '<input class="form-control form-control-sm mono" data-k style="min-width:200px" placeholder="/v1/…" value="' + _esc(ep) + '" spellcheck="false">'
+  + '<select class="form-select form-select-sm" data-v style="max-width:180px">' + _selOpts(_aliasNames(), a) + '</select>' + _rowDel() + '</div>'; }
+function _srRow(k, a, n){ return '<div class="d-flex gap-1 align-items-center flex-wrap" data-srrow>'
+  + '<select class="form-select form-select-sm" data-k style="max-width:170px">' + _selOpts(_aliasNames(), k) + '</select>'
+  + '<select class="form-select form-select-sm" data-v style="max-width:170px">' + _selOpts(_aliasNames(), a) + '</select>'
+  + '<input type="number" class="form-control form-control-sm" data-n placeholder="max_tokens" min="1" style="max-width:130px" value="' + _esc(n == null ? '' : String(n)) + '">' + _rowDel() + '</div>'; }
+function _numSelRow(attr, k, v){ return '<div class="d-flex gap-1 align-items-center flex-wrap" data-' + attr + 'row>'
+  + '<select class="form-select form-select-sm" data-k style="max-width:200px">' + _selOpts(_provNames(), k) + '</select>'
+  + '<input type="number" class="form-control form-control-sm" data-v min="0" style="max-width:150px" value="' + _esc(v == null ? '' : String(v)) + '">' + _rowDel() + '</div>'; }
+function _numTxtRow(k, v){ return '<div class="d-flex gap-1 align-items-center flex-wrap" data-mlrow>'
+  + '<input class="form-control form-control-sm mono" data-k placeholder="provider/model" style="min-width:220px" value="' + _esc(k) + '" spellcheck="false">'
+  + '<input type="number" class="form-control form-control-sm" data-v min="1" style="max-width:150px" value="' + _esc(v == null ? '' : String(v)) + '">' + _rowDel() + '</div>'; }
+function _epInvalid(){ $('epRows').innerHTML = '<p class="text-secondary small mb-0">Invalid config. Fix Raw and reload.</p>'; }
+function _srInvalid(){ $('srRows').innerHTML = '<p class="text-secondary small mb-0">Invalid config. Fix Raw and reload.</p>'; }
+function _renderEpRows(){
+  const c = _cfgObj;
+  if (!c){ _epInvalid(); return; }
+  const eps = Object.entries(c.endpoint_fallbacks || {});
+  $('epRows').innerHTML = eps.length ? eps.map(([ep, a]) => _epRow(ep, a)).join('')
+    : '<p class="text-secondary small mb-0">No entries — unknown model names then return 404.</p>';
+}
+function _renderSrRows(){
+  const c = _cfgObj;
+  if (!c){ _srInvalid(); return; }
+  const rows = [];
+  for (const [k, tiers] of Object.entries(c.smart_route || {})) if (Array.isArray(tiers)) for (const t of tiers) rows.push([k, t]);
+  $('srRows').innerHTML = rows.length ? rows.map(([k, t]) => _srRow(k, t && t.alias, t && t.max_tokens)).join('')
+    : '<p class="text-secondary small mb-0">No tiers — the plain model chain is used for every request.</p>';
+}
+function renderRouting(){ _renderEpRows(); _renderSrRows(); }
+const _emptyMsg = '<p class="text-secondary small mb-0">Invalid config. Fix Raw and reload.</p>';
+function _renderRlRows(){
+  const c = _cfgObj;
+  if (!c){ $('rlRows').innerHTML = _emptyMsg; return; }
+  const rl = Object.entries(c.rate_limit || {});
+  $('rlRows').innerHTML = rl.length ? rl.map(([k, v]) => _numSelRow('rl', k, v)).join('')
+    : '<p class="text-secondary small mb-0">No per-key interval — auto interval by key count.</p>';
+}
+function _renderTlRows(){
+  const c = _cfgObj;
+  if (!c){ $('tlRows').innerHTML = _emptyMsg; return; }
+  const tl = Object.entries(c.tpm_limit || {});
+  $('tlRows').innerHTML = tl.length ? tl.map(([k, v]) => _numSelRow('tl', k, v)).join('')
+    : '<p class="text-secondary small mb-0">No TPM cap.</p>';
+}
+function _renderMlRows(){
+  const c = _cfgObj;
+  if (!c){ $('mlRows').innerHTML = _emptyMsg; return; }
+  const ml = Object.entries(c.model_limits || {});
+  $('mlRows').innerHTML = ml.length ? ml.map(([k, v]) => _numTxtRow(k, v)).join('')
+    : '<p class="text-secondary small mb-0">No per-model context caps.</p>';
+}
+function renderLimits(){ _renderRlRows(); _renderTlRows(); _renderMlRows(); }
+function _flushRaw(msg){ $('cfgRaw').value = JSON.stringify(_cfgObj, null, 2); syncHl($('cfgRaw')); setCfgStatus(msg || 'Updated (unsaved)', 1); }
+const _boxRender = { epRows: _renderEpRows, srRows: _renderSrRows, rlRows: _renderRlRows, tlRows: _renderTlRows, mlRows: _renderMlRows };
+function _collectRows(boxId, rowSel, entry){
+  const out = []; const box = $(boxId);
+  box.querySelectorAll(rowSel).forEach(r => { const e = entry(r); if (e === '__dead') r.remove(); else if (e) out.push(e); });
+  if (!box.querySelector('[data-rdel]')) _boxRender[boxId]();   // emptied box → restore its empty-state note only
+  return out;
+}
+function _numVal(r){ return (r.querySelector('[data-v]').value || '').trim(); }
+function _collectEp(){
+  if (!_cfgObj) return;
+  const out = {};
+  _collectRows('epRows', '[data-eprow]', r => {
+    const k = (r.querySelector('[data-k]').value || '').trim(), v = r.querySelector('[data-v]').value;
+    if (!k && !v) return '__dead';
+    if (!k || !v) return 0;   // mid-edit partial: keep in DOM, don't write yet
+    out[k] = v; return [k];
+  });
+  if (Object.keys(out).length) _cfgObj.endpoint_fallbacks = out; else delete _cfgObj.endpoint_fallbacks;
+  _flushRaw('endpoint_fallbacks updated (unsaved)');
+}
+function _collectSr(){
+  if (!_cfgObj) return;
+  const groups = {};
+  _collectRows('srRows', '[data-srrow]', r => {
+    const k = r.querySelector('[data-k]').value, v = r.querySelector('[data-v]').value, n = r.querySelector('[data-n]').value;
+    if (!k && !v && !n) return '__dead';
+    if (!k || !v || !(Number(n) > 0)) return 0;
+    (groups[k] = groups[k] || []).push({ alias: v, max_tokens: Number(n) });
+    return [k];
+  });
+  if (Object.keys(groups).length) _cfgObj.smart_route = groups; else delete _cfgObj.smart_route;
+  _flushRaw('smart_route updated (unsaved)');
+}
+function _collectNumMap(boxId, rowSel, key){
+  if (!_cfgObj) return;
+  const out = {};
+  _collectRows(boxId, rowSel, r => {
+    const k = r.querySelector('[data-k]').value, v = _numVal(r);
+    if (!k && !v) return '__dead';
+    if (!k || v === '' || isNaN(Number(v))) return 0;
+    out[k] = Number(v); return [k];
+  });
+  if (Object.keys(out).length) _cfgObj[key] = out; else delete _cfgObj[key];
+  _flushRaw(key + ' updated (unsaved)');
+}
+function _bindRowBox(boxId, rowSel, collectFn){
+  const box = $(boxId);
+  // stage while typing (debounced); change stays for select/checkbox immediacy
+  let t; box.addEventListener('input', () => { clearTimeout(t); t = setTimeout(collectFn, 300); });
+  box.addEventListener('change', () => { clearTimeout(t); collectFn(); });
+  box.addEventListener('click', e => {
+    const b = e.target.closest('[data-rdel]'); if (!b) return;
+    const row = e.target.closest(rowSel); if (row) row.remove();
+    collectFn();
+  });
+}
+_bindRowBox('epRows', '[data-eprow]', _collectEp);
+_bindRowBox('srRows', '[data-srrow]', _collectSr);
+_bindRowBox('rlRows', '[data-rlrow]', () => _collectNumMap('rlRows', '[data-rlrow]', 'rate_limit'));
+_bindRowBox('tlRows', '[data-tlrow]', () => _collectNumMap('tlRows', '[data-tlrow]', 'tpm_limit'));
+_bindRowBox('mlRows', '[data-mlrow]', () => _collectNumMap('mlRows', '[data-mlrow]', 'model_limits'));
+function _addRow(boxId, html){ const b = $(boxId); const p = b.querySelector('p'); if (p) p.remove(); b.insertAdjacentHTML('beforeend', html); const inp = b.lastElementChild && b.lastElementChild.querySelector('input,select'); if (inp) inp.focus(); }
+$('btnAddEp').addEventListener('click', () => _addRow('epRows', _epRow('', '')));
+$('btnAddSr').addEventListener('click', () => _addRow('srRows', _srRow('', '', '')));
+$('btnAddRl').addEventListener('click', () => _addRow('rlRows', _numSelRow('rl', '', '')));
+$('btnAddTl').addEventListener('click', () => _addRow('tlRows', _numSelRow('tl', '', '')));
+$('btnAddMl').addEventListener('click', () => _addRow('mlRows', _numTxtRow('', '')));
+// Incomplete (half-filled) rows would be dropped by the collect pass on save — block the save instead.
+function _findPartialRow(){
+  const numPartial = r => { const k = r.querySelector('[data-k]').value, v = _numVal(r); return !!(k || v) && !(k && v !== '' && !isNaN(Number(v))); };
+  const checks = [
+    ['endpoint_fallbacks', 'epRows', '[data-eprow]', r => { const k = (r.querySelector('[data-k]').value || '').trim(), v = r.querySelector('[data-v]').value; return !!(k || v) && !(k && v); }],
+    ['smart_route', 'srRows', '[data-srrow]', r => { const k = r.querySelector('[data-k]').value, v = r.querySelector('[data-v]').value, n = r.querySelector('[data-n]').value; return !!(k || v || n) && !(k && v && Number(n) > 0); }],
+    ['rate_limit', 'rlRows', '[data-rlrow]', numPartial],
+    ['tpm_limit', 'tlRows', '[data-tlrow]', numPartial],
+    ['model_limits', 'mlRows', '[data-mlrow]', numPartial],
+  ];
+  for (const [name, id, sel, fn] of checks) {
+    let bad = false;
+    $(id).querySelectorAll(sel).forEach(r => { if (!bad && fn(r)) bad = true; });
+    if (bad) return 'Incomplete row in ' + name + ' — finish or remove it before saving';
+  }
+  return '';
+}
+function _collectAllRows(){
+  _collectEp(); _collectSr();
+  _collectNumMap('rlRows', '[data-rlrow]', 'rate_limit');
+  _collectNumMap('tlRows', '[data-tlrow]', 'tpm_limit');
+  _collectNumMap('mlRows', '[data-mlrow]', 'model_limits');
+}
+/* model alias modal */
+let _modelModal = null, _mmMode = 'add';
+function _mmRow(t){
+  t = t || {};
+  const fb = t.fallback != null ? (Array.isArray(t.fallback) ? t.fallback.join(',') : String(t.fallback)) : '';
+  return '<div class="d-flex gap-1 align-items-center flex-wrap border rounded p-1" data-mmrow>'
+    + '<select class="form-select form-select-sm" data-f="provider" style="max-width:170px">' + _selOpts(_provNames(), t.provider) + '</select>'
+    + '<input class="form-control form-control-sm mono" data-f="model" style="min-width:160px" placeholder="upstream model" value="' + _esc(t.model || '') + '" spellcheck="false">'
+    + '<input class="form-control form-control-sm mono" data-f="endpoint" style="max-width:150px" placeholder="endpoint (opt)" value="' + _esc(t.endpoint || '') + '" spellcheck="false">'
+    + '<input class="form-control form-control-sm mono" data-f="fallback" style="max-width:180px" placeholder="fallback alias (opt)" value="' + _esc(fb) + '" spellcheck="false">'
+    + '<button class="btn btn-outline-danger btn-sm py-0 px-1" data-mmdel title="Remove target"><i class="bi bi-x"></i></button></div>';
+}
+function openModelModal(mode, alias){
+  _mmMode = mode;
+  $('modelModalTitle').textContent = mode === 'edit' ? 'Edit alias: ' + alias : 'Add model alias';
+  $('mmAlias').value = alias || '';
+  $('mmAlias').disabled = mode === 'edit';   // rename = delete + add, keeps references intact
+  const chain = mode === 'edit' && _cfgObj && Array.isArray((_cfgObj.models || {})[alias]) ? _cfgObj.models[alias] : [];
+  $('mmTargets').innerHTML = chain.length ? chain.map(t => _mmRow(t)).join('') : _mmRow({});
+  if (!_modelModal) _modelModal = new bootstrap.Modal($('modelModal'));
+  _modelModal.show();
+}
+$('mmAddTarget').addEventListener('click', () => _addRow('mmTargets', _mmRow({})));
+$('mmTargets').addEventListener('click', e => { const b = e.target.closest('[data-mmdel]'); if (b && b.closest('[data-mmrow]')) b.closest('[data-mmrow]').remove(); });
+$('modelModal').addEventListener('hidden.bs.modal', () => { $('mmAlias').value = ''; $('mmAlias').disabled = false; $('mmTargets').innerHTML = ''; });
+$('btnAddModel').addEventListener('click', () => openModelModal('add'));
+$('mmAlias').addEventListener('keydown', e => { if (e.key === 'Enter') $('mmSave').click(); });
+$('mmSave').addEventListener('click', () => {
+  if (!_cfgObj) { toast('Config is not loaded yet', 0); return; }
+  const alias = ($('mmAlias').value || '').trim();
+  if (!alias) { toast('Alias name cannot be empty', 0); return; }
+  if (_mmMode === 'add' && (_cfgObj.models || {})[alias] !== undefined) { toast('Alias already exists — use Edit instead', 0); return; }
+  const rows = Array.prototype.slice.call($('mmTargets').querySelectorAll('[data-mmrow]'));
+  if (!rows.length) { toast('Add at least one target', 0); return; }
+  const known = _aliasNames(), chain = [];
+  for (const r of rows) {
+    const g = f => (r.querySelector('[data-f="' + f + '"]').value || '').trim();
+    const provider = g('provider');
+    if (!provider) { toast('Every target needs a provider — pick one or remove the row', 0); return; }
+    const t = { provider: provider, model: g('model') };
+    if (g('endpoint')) t.endpoint = g('endpoint');
+    if (g('fallback')) {
+      const fbs = g('fallback').split(',').map(s => s.trim()).filter(Boolean);
+      const bad = fbs.filter(f => f !== alias && !known.includes(f));
+      if (bad.length) { toast('Unknown fallback alias: ' + bad.join(', '), 0); return; }
+      t.fallback = fbs;
+    }
+    chain.push(t);
+  }
+  _cfgObj.models = _cfgObj.models || {};
+  _cfgObj.models[alias] = chain;
+  if (_modelModal) _modelModal.hide();
+  _syncCfgAfterKeyChange('Model alias saved (unsaved)');
+});
+function _aliasRefs(name){
+  const out = [];
+  for (const [ep, a] of Object.entries(_cfgObj.endpoint_fallbacks || {})) if (a === name) out.push('endpoint_fallbacks["' + ep + '"]');
+  for (const [k, tiers] of Object.entries(_cfgObj.smart_route || {})) {
+    if (k === name) out.push('smart_route["' + k + '"]');
+    if (Array.isArray(tiers) && tiers.some(t => t && t.alias === name)) out.push('smart_route["' + k + '"] tier');
+  }
+  for (const [a, chain] of Object.entries(_cfgObj.models || {})) {
+    if (!Array.isArray(chain)) continue;
+    if (chain.some(t => { const fb = t && t.fallback; return Array.isArray(fb) ? fb.includes(name) : fb === name; })) out.push('models["' + a + '"].fallback');
+  }
+  return out;
+}
+async function deleteModelAlias(alias){
+  if (!_cfgObj) return;
+  const refs = _aliasRefs(alias);
+  const msg = 'Delete model alias "' + alias + '"' + (refs.length ? ', referenced by: ' + refs.join(', ') : '') + '? (Unsaved until Save.)';
+  if (!(await askConfirm(msg))) return;
+  delete _cfgObj.models[alias];
+  _syncCfgAfterKeyChange('Model alias deleted (unsaved)');
 }
 $('btnCfgValidate').addEventListener('click', () => {
   const p = tryParseCfg($('cfgRaw').value);
@@ -1243,18 +1626,29 @@ function validateConfigForSave(c) {
       if (!(Number(t.max_tokens) > 0)) return `smart_route["${alias}"] tier "${t.alias}" needs max_tokens > 0`;
     }
   }
+  if (c.drop_params !== undefined) {
+    if (!c.drop_params || typeof c.drop_params !== 'object' || Array.isArray(c.drop_params)) return 'drop_params must map provider names to arrays';
+    for (const [pv, list] of Object.entries(c.drop_params)) {
+      if (!Array.isArray(list) || list.some((s) => typeof s !== 'string' || !s.trim())) return `drop_params["${pv}"] must be an array of strings (bare key, or key=value1,value2)`;
+    }
+  }
   return '';
 }
-$('btnCfgSave').addEventListener('click', () => {
+$('btnCfgSave').addEventListener('click', async () => {
+  // stage pending form keystrokes now — Save is the only step that persists
+  clearTimeout(_formSyncT); _formSyncT = null; _applyFormToStaging();
+  const partial = _findPartialRow();
+  if (partial){ toast(partial, 0); return; }
+  _collectAllRows();   // flush completed row edits into Raw before validating what gets saved
   const p = tryParseCfg($('cfgRaw').value);
   if (!p.ok) { setCfgStatus('Raw parse failed: ' + p.err, 0); toast('Fix JSON errors before saving', 0); return; }
-  // Form edits never reached the Raw textarea — saving would silently discard them.
-  if (_formSnap !== null && _readForm() !== _formSnap) { toast('Form has unapplied edits — press "Apply to JSON" first', 0); return; }
+  // belt: sync failed above (Raw broken) while the form held edits — refuse to drop them
+  if (_formSnap !== null && _readForm() !== _formSnap) { toast('Form edits are not staged — fix the Raw JSON first', 0); return; }
   const err = validateConfigForSave(p.obj);
   if (err) { setCfgStatus('Invalid config: ' + err, 0); toast('Invalid config: ' + err, 0); return; }
-  if (!String(p.obj.client_token || '').trim()
-    && !confirm('client_token is empty — all endpoints will be unprotected. Save anyway?')) return;
-  if (!confirm('Save the config to the server? The gateway will restart and the new config takes effect.')) return;
+  const warnToken = String(p.obj.client_token || '').trim() ? ''
+    : ' WARNING: client_token is empty — all endpoints will be unprotected.';
+  if (!(await askConfirm('Save the config to the server? The gateway will restart and the new config takes effect.' + warnToken))) return;
   saveFile('config', $('cfgRaw').value);
 });
 async function saveFile(file, content){
@@ -1392,10 +1786,10 @@ $('btnLgAll').addEventListener('click', () => { $('lgFrom').value=''; $('lgTo').
 $('btnLgPrev').addEventListener('click', () => { _logPage--; renderLogPage(); });
 $('btnLgNext').addEventListener('click', () => { _logPage++; renderLogPage(); });
 $('btnLgRaw').addEventListener('click', () => $('lgRawWrap').classList.toggle('d-none'));
-$('btnLgSave').addEventListener('click', () => {
+$('btnLgSave').addEventListener('click', async () => {
   const c = mergeLogContent();
   if (!c.trim()) { toast('Log view is empty — refusing to overwrite the log file', 0); return; }
-  if (_logTruncated && !confirm('The loaded view holds only the newest log lines; saving overwrites the file and drops earlier entries. Continue?')) return;
+  if (_logTruncated && !(await askConfirm('The loaded view holds only the newest log lines; saving overwrites the file and drops earlier entries. Continue?'))) return;
   saveFile('log', c);
 });
 $('btnLgClear').addEventListener('click', () => {
@@ -1554,9 +1948,9 @@ function renderDetailKeys(p) {
     if (_keyFocusT) clearTimeout(_keyFocusT);
     _keyFocusT = setTimeout(() => { _keyFocusT = null; if ($('keyModal').classList.contains('show')) $('keyModalInput').focus(); }, 300);
   }));
-  box.querySelectorAll('[data-ddel]').forEach(a => a.addEventListener('click', e => {
+  box.querySelectorAll('[data-ddel]').forEach(a => a.addEventListener('click', async e => {
     e.preventDefault(); e.stopPropagation();
-    if (!confirm('Delete this key from ' + p + '? (Unsaved until Save.)')) return;
+    if (!(await askConfirm('Delete this key from ' + p + '? (Unsaved until Save.)'))) return;
     const list = _provKeyList(p);
     if (!list) { toast('Provider no longer exists', 0); return; }
     list.splice(Number(a.dataset.ddel), 1);
@@ -1786,9 +2180,10 @@ async function bootAuth(token){
     const headers = token ? { 'Authorization':'Bearer ' + token } : {};
     const r = await fetch('/api/console/validate', { method:'POST', headers });
     if (!sessAlive(tag) || reqId !== _authReq) return;
-    if (!r.ok) { if (token) { _token=''; localStorage.removeItem('gw_token'); $('l_token').value=''; $('l_status').textContent='Auth failed: incorrect token'; } return; }
+    if (!r.ok) { if (token) { _token=''; try { localStorage.removeItem('gw_token'); } catch {} $('l_token').value=''; $('l_status').textContent='Auth failed: incorrect token'; } return; }
     _token = token;
-    if (token) localStorage.setItem('gw_token', _token); else localStorage.removeItem('gw_token');
+    // storage-blocked env: skip persistence, session survives in-memory for this page
+    try { if (token) localStorage.setItem('gw_token', _token); else localStorage.removeItem('gw_token'); } catch {}
     $('view-login').classList.add('d-none'); $('view-app').classList.remove('d-none');
     await loadAll(tag); if (!sessAlive(tag)) return;
     openSSE();
@@ -1801,6 +2196,7 @@ async function bootAuth(token){
 }
 if (_token){ $('l_token').value = _token; bootAuth(_token); }
 else bootAuth('');
+window.__gwMainAlive = 1;   // set only if block1 evaluated end-to-end (block0 load check reads this)
 </script>
 <!-- Translation overlay -->
 <div class="trans-overlay" id="transOverlay">

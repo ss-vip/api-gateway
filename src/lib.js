@@ -904,11 +904,37 @@ function validateConfigObject(c) {
       if (!(Number(t.max_tokens) > 0)) return `smart_route["${alias}"] tier "${t.alias}" needs max_tokens > 0`;
     }
   }
+  if (c.drop_params !== undefined) {
+    if (!c.drop_params || typeof c.drop_params !== 'object' || Array.isArray(c.drop_params)) return 'drop_params must map provider names to arrays';
+    for (const [pv, list] of Object.entries(c.drop_params)) {
+      if (!Array.isArray(list) || list.some((s) => typeof s !== 'string' || !s.trim())) return `drop_params["${pv}"] must be an array of strings (bare key, or key=value1,value2)`;
+    }
+  }
   return '';
+}
+
+// Config-driven param filter (drop_params): an entry is a bare key (always
+// dropped) or key=v1,v2 (dropped only for those values). Returns dropped keys.
+function applyDropParams(body, spec) {
+  if (!body || typeof body !== 'object' || !Array.isArray(spec)) return [];
+  const dropped = [];
+  for (const entry of spec) {
+    if (typeof entry !== 'string' || !entry) continue;
+    const eq = entry.indexOf('=');
+    if (eq < 0) {
+      if (body[entry] !== undefined) { delete body[entry]; dropped.push(entry); }
+    } else {
+      const key = entry.slice(0, eq).trim();
+      const vals = entry.slice(eq + 1).split(',').map((s) => s.trim()).filter(Boolean);
+      if (key && body[key] !== undefined && vals.includes(String(body[key]))) { delete body[key]; dropped.push(key); }
+    }
+  }
+  return dropped;
 }
 
 module.exports = {
   parseJsonc,
+  applyDropParams,
   _jsonValid,
   _ndjsonValid,
   _autoFixJson,
