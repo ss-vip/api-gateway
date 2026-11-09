@@ -46,14 +46,20 @@ function _captureErrorBody() {
   return _logCaptureBody;
 }
 function _errMsg(body) { return lib._errMsg(body, LOG_BODY_MAX, _captureErrorBody()); }
-function _atomicWrite(p, data) {
+function _atomicWrite(p, data, beforeRename) {
   const tmp = p + '.tmp';
   // Preserve the target's mode: a fresh 0666&umask tmp resets a 0600
   // key-bearing config back to 0644 on every console save.
   let mode;
   try { mode = fs.statSync(p).mode & 0o777; } catch {}
-  fs.writeFileSync(tmp, data, mode !== undefined ? { encoding: 'utf-8', mode } : 'utf-8');
-  fs.renameSync(tmp, p);
+  try {
+    fs.writeFileSync(tmp, data, mode !== undefined ? { encoding: 'utf-8', mode } : 'utf-8');
+    if (beforeRename) beforeRename(tmp);
+    fs.renameSync(tmp, p);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    throw e;
+  }
 }
 // absolute → as-is; relative → config file's directory; traversal → rejected.
 let _cfgDirCache = null;
@@ -76,18 +82,29 @@ function getLogPath() {
   }
   return path.join(dir, 'log.json');
 }
-let _logBuf = [], _logFlushTimer = null, _logFlushFast = false;
+let _logBuf = [], _logFlushTimer = null, _logFlushFast = false, _logGeneration = 0;
+const _pendingLogBatches = new Set();
 const LOG_FLUSH_INTERVAL_MS = 5000, LOG_FLUSH_BATCH = 50;
 // Serialize appends vs cleanup renames, or in-flight lines get silently dropped.
 let _logIoChain = Promise.resolve();
-function _logIo(fn) { _logIoChain = _logIoChain.then(fn).catch(() => {}); return _logIoChain; }
+function _logIo(fn) {
+  const op = _logIoChain.then(fn);
+  _logIoChain = op.catch(() => {});
+  return op;
+}
 function _flushLog() {
   if (_logBuf.length === 0) return;
-  const p = getLogPath(), data = _logBuf.join('\n') + '\n'; _logBuf = [];
+  const p = getLogPath(), batch = _logBuf; _logBuf = [];
+  const generation = _logGeneration;
+  _pendingLogBatches.add(batch);
   if (_logFlushTimer) { clearTimeout(_logFlushTimer); _logFlushTimer = null; _logFlushFast = false; }
-  _logIo(() => new Promise((done) => {
-    fs.appendFile(p, data, (err) => { if (err) { elog('─'); elog(`[log] flush ${p}: ${err.message}`); } done(); });
-  }));
+  _logIo(async () => {
+    try {
+      // A Clear queued ahead of this batch supersedes it.
+      if (generation === _logGeneration) await fs.promises.appendFile(p, batch.join('\n') + '\n');
+    } catch (e) { elog('─'); elog(`[log] flush ${p}: ${e.message}`); }
+    finally { _pendingLogBatches.delete(batch); }
+  });
 }
 function _flushLogSync() {
   if (_logBuf.length === 0) return;
@@ -261,7 +278,7 @@ function _buildStatusJSON() {
     active: _activeRequests, rss_mb: Math.round(mem.rss / 1024 / 1024), totalmem_mb: Math.round(os.totalmem() / 1024 / 1024), heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
     uptime: formatUptime(process.uptime()), keys: totalKeys, providers,
     success_total: stats.success, error_total: stats.error,
-    avg_latency_ms: stats.latN ? Math.round((stats.latSum / stats.latN) * 1000) : 0,
+    avg_latency_ms: stats.latN ? Math.round(stats.latSum / stats.latN) : 0,
     error_rate: totalReq ? (stats.error / totalReq * 100).toFixed(1) + '%' : '0%',
     http_codes: { ...stats.httpCodes },
     cls_memo: CLS_MEMO_ON ? _clsMemo.stats() : { disabled: true },
@@ -302,6 +319,7 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
     entry.type = 'error';
   } else {
     entry.latency = Math.round(latency || 0);
+    entry.latency_ms = Number.isFinite(latency) && latency >= 0 ? Math.round(latency * 1000) : null;
     entry.tokens = tokens || 0;
     entry.type = 'success';
   }
@@ -309,16 +327,14 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
   // The flush timer is shared. A success entry arms it at 5s; without this
   // fast-path an error arriving behind that timer would wait 5s on disk too,
   // defeating the 500ms error-flush intent (E2E-verified race).
+  _countLogEntry(entry);
   if (entry.type === 'error') {
-    stats.error++;
     if (!_logFlushTimer || !_logFlushFast) {
       if (_logFlushTimer) clearTimeout(_logFlushTimer);
       _logFlushTimer = setTimeout(_flushLog, 500);
       _logFlushFast = true;
     }
-    if (status) stats.httpCodes[status] = (stats.httpCodes[status] || 0) + 1;
   }
-  else { stats.success++; stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1; if (latency) { stats.latSum += latency; stats.latN++; } }
   _pushSSE('log', entry);
   _logWriteCount = (_logWriteCount + 1) % 1000000007;
   if (_logBuf.length >= LOG_FLUSH_BATCH) _flushLog();
@@ -326,39 +342,49 @@ function logEvent({ logId, provider, model, key, status, latency, tokens, body }
   if (_logWriteCount % LOG_CLEANUP_EVERY === 1 && Date.now() - _lastCleanup > LOG_CLEANUP_COOLDOWN_MS) _triggerCleanup();
 }
 
+function _countLogEntry(entry) {
+  if (entry?.type === 'success') {
+    stats.success++;
+    stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1;
+    const ms = entry.latency_ms === undefined && Number.isFinite(entry.latency) ? entry.latency * 1000 : entry.latency_ms;
+    if (Number.isFinite(ms) && ms >= 0) { stats.latSum += ms; stats.latN++; }
+  } else if (entry?.type === 'error') {
+    stats.error++;
+    if (entry.status) stats.httpCodes[entry.status] = (stats.httpCodes[entry.status] || 0) + 1;
+  }
+}
+
+function _readLogTail(file, size, cap) {
+  if (!size) return '';
+  const max = Math.min(size, cap), fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(max);
+    const n = fs.readSync(fd, buf, 0, max, size - max);
+    if (n !== max) throw new Error('Log changed while reading');
+    const text = buf.toString('utf8', 0, n);
+    const firstBreak = text.indexOf('\n');
+    return max === size ? text : firstBreak < 0 ? '' : text.slice(firstBreak + 1);
+  } finally { fs.closeSync(fd); }
+}
+
 function _reseedStats() {
   try {
-    const p = getLogPath(); let lines = [];
+    const p = getLogPath();
     // Read only the TAIL of both generations. readFileSync of a 100MB log
     // blocked the event loop for seconds on every restart and doubled RSS.
-    const tailOf = (f) => {
-      try {
-        const st = fs.statSync(f);
-        if (!st.size) return '';
-        const max = Math.min(st.size, 4 * 1024 * 1024);
-        const fd = fs.openSync(f, 'r');
-        try {
-          const buf = Buffer.alloc(max);
-          const n = fs.readSync(fd, buf, 0, max, st.size - max);
-          let text = buf.toString('utf8', 0, n);
-          if (max < st.size) text = text.slice(text.indexOf('\n') + 1);
-          return text;
-        } finally { fs.closeSync(fd); }
-      } catch { return ''; }
+    const tailOf = f => { try { return _readLogTail(f, fs.statSync(f).size, 4 * 1024 * 1024); } catch { return ''; } };
+    const text = [tailOf(p + '.1'), tailOf(p)].filter(Boolean).join('\n');
+    const countLine = line => {
+      if (!line.trim() || line.trimStart().startsWith('#')) return;
+      let entry;
+      try { entry = JSON.parse(line); } catch { return; }
+      _countLogEntry(entry);
     };
-    try {
-      const text = [tailOf(p + '.1'), tailOf(p)].filter(Boolean).join('\n');
-      lines = text.split('\n').slice(-RESEED_MAX_LINES);
-    } catch {}
-    const all = lines.filter(l => l.trim() && !l.trim().startsWith('#'))
-      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    stats.httpCodes = {};
-    for (const e of all) {
-      if (e.type === 'success') stats.httpCodes[200] = (stats.httpCodes[200] || 0) + 1;
-      else if (e.status) stats.httpCodes[e.status] = (stats.httpCodes[e.status] || 0) + 1;
-    }
-    stats.success = all.filter(e => e.type === 'success').length;
-    stats.error = all.filter(e => e.type === 'error').length;
+    Object.assign(stats, { success: 0, error: 0, latSum: 0, latN: 0, httpCodes: {} });
+    for (const line of text.split('\n').slice(-RESEED_MAX_LINES)) countLine(line);
+    // Batches behind this save and the current buffer are not on disk yet.
+    for (const batch of _pendingLogBatches) for (const line of batch) countLine(line);
+    for (const line of _logBuf) countLine(line);
     if (stats.success || stats.error) { log('─'); log(`✅ [stats] reseeded: success=${stats.success} error=${stats.error}`); }
   } catch (e) { elog('─'); elog(`[stats] reseed error: ${e.message}`); }
 }
@@ -2875,41 +2901,67 @@ function handleConsoleValidate(req, res, logId) {
   res.end(JSON.stringify({ ok: true }));
 }
 
-function handleConsoleLoad(req, res, logId) {
+function _logFileVersion(file) {
+  try {
+    const st = fs.statSync(file, { bigint: true });
+    return { id: `${st.dev}:${st.ino}:${st.birthtimeNs}`, size: Number(st.size), mtime: String(st.mtimeNs) };
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    return { id: null, size: 0, mtime: null };
+  }
+}
+
+function _readLogView(file) {
+  const log_revision = { active: _logFileVersion(file), rotated: _logFileVersion(file + '.1') };
+  const { active, rotated } = log_revision;
+  const cap = 8 * 1024 * 1024;
+  const text = [_readLogTail(file + '.1', rotated.size, cap), _readLogTail(file, active.size, cap)].filter(Boolean).join('\n');
+  const lines = text.split('\n');
+  return {
+    log: lines.slice(-MAX_LOG_LINES).join('\n'),
+    log_truncated: active.size > cap || rotated.size > cap || lines.length > MAX_LOG_LINES,
+    log_revision,
+  };
+}
+
+function _logAppendOffset(snapshot, active, rotated) {
+  const old = snapshot?.active, oldRotated = snapshot?.rotated;
+  if (!old || !oldRotated || oldRotated.id !== rotated.id || oldRotated.size !== rotated.size || oldRotated.mtime !== rotated.mtime) return null;
+  if (old.id === null && old.size === 0) return 0;
+  if (old.id !== active.id || !Number.isSafeInteger(old.size) || old.size < 0 || old.size > active.size) return null;
+  if (old.size === active.size && old.mtime !== active.mtime) return null;
+  return old.size;
+}
+
+function _copyLogAppend(file, tmp, start, end) {
+  const input = fs.openSync(file, 'r');
+  try {
+    const output = fs.openSync(tmp, 'a');
+    try {
+      const buf = Buffer.alloc(64 * 1024);
+      for (let offset = start; offset < end;) {
+        const n = fs.readSync(input, buf, 0, Math.min(buf.length, end - offset), offset);
+        if (!n) throw new Error('Log changed while saving');
+        fs.writeFileSync(output, buf.subarray(0, n));
+        offset += n;
+      }
+    } finally { fs.closeSync(output); }
+  } finally { fs.closeSync(input); }
+}
+
+async function handleConsoleLoad(req, res, logId) {
   log('─'); log(`[${logId}] /api/console/load`);
   if (!checkConsoleAuth(req, res)) return;
   const readAll = (p) => { try { return fs.readFileSync(p, 'utf-8'); } catch { return ''; } };
-  // Tail-read instead of readFileSync+split. A capped 100MB log would otherwise
-  // be loaded into memory and shipped to the browser on every dashboard open.
-  // Save ships this view back verbatim — logCut makes truncation visible to the UI.
-  let logCut = false;
-  const tailOf = (p) => {
-    try {
-      const st = fs.statSync(p);
-      if (!st.size) return '';
-      const max = Math.min(st.size, 8 * 1024 * 1024);
-      if (max < st.size) logCut = true;
-      const fd = fs.openSync(p, 'r');
-      try {
-        const buf = Buffer.alloc(max);
-        const n = fs.readSync(fd, buf, 0, max, st.size - max);
-        let text = buf.toString('utf8', 0, n);
-        if (max < st.size) text = text.slice(text.indexOf('\n') + 1);
-        return text;
-      } finally { fs.closeSync(fd); }
-    } catch { return ''; }
-  };
-  // After a size rotation the newest entries live in the `.1` generation, so a
-  // console that only read the live file would show an empty log. Merge
-  // oldest-generation-first and cap the combined line count.
-  const readTail = (p) => {
-    const text = [tailOf(p + '.1'), tailOf(p)].filter(Boolean).join('\n');
-    if (!text) return '';
-    const lines = text.split('\n');
-    if (lines.length > MAX_LOG_LINES) logCut = true;
-    return lines.slice(-MAX_LOG_LINES).join('\n');
-  };
-  const cfgContent = readAll(CONFIG_PATH), logContent = readTail(getLogPath());
+  let view;
+  try { view = await _logIo(() => _readLogView(getLogPath())); }
+  catch (e) {
+    elog(`[${logId}] read log: ${e.message}`);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unable to read log' }));
+    return;
+  }
+  const cfgContent = readAll(CONFIG_PATH), logContent = view.log;
   const cfgVal = _jsonValid(cfgContent), logVal = _ndjsonValid(logContent);
   let cfgOut = cfgContent, cfgFixed = false;
   if (!cfgVal.ok) {
@@ -2934,8 +2986,7 @@ function handleConsoleLoad(req, res, logId) {
     config_file: path.basename(CONFIG_PATH || 'config.json'),
     log_file: path.basename(getLogPath()),
     config: cfgOut, config_valid: cfgVal.ok || cfgFixed, config_error: cfgVal.error || null, config_fixed: cfgFixed,
-    log: logOut, log_valid: logVal.ok || logFixed, log_error: logVal.error || null, log_fixed: logFixed,
-    log_truncated: logCut,
+    ...view, log: logOut, log_valid: logVal.ok || logFixed, log_error: logVal.error || null, log_fixed: logFixed,
   }));
 }
 
@@ -2962,18 +3013,8 @@ async function handleConsoleSave(req, res, body, logId) {
   const target = body.file === 'config' ? (CONFIG_PATH || path.join(__dirname, 'config.json')) : getLogPath();
   log(`[${logId}] save ${body.file} → ${target}  contentLen=${(body.content||'').length}`);
   try {
-    if (body.file === 'log' && !body.content.trim()) {
-      // Empty view + Save would wipe the file (the .1 generation dies too) —
-      // count .1 as well: right after a rotation the live file is empty but .1 isn't.
-      let sz = 0;
-      for (const f of [target, target + '.1']) { try { sz += fs.statSync(f).size; } catch {} }
-      if (sz > 0) {
-        log(`[${logId}] ❌ save rejected: refusing to overwrite a non-empty log with empty content`);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'log content is empty — refusing to overwrite a non-empty log file' }));
-        return;
-      }
-    }
+    const emptyLog = body.file === 'log' && !body.content.trim();
+    const clearLog = emptyLog && body.clear === true;
     if (body.file === 'config') {
       const isJsonc = CONFIG_PATH ? CONFIG_PATH.endsWith('.jsonc') : false;
       if (isJsonc) {
@@ -3020,29 +3061,46 @@ async function handleConsoleSave(req, res, body, logId) {
         return;
       }
     }
+    let savedLog;
     if (body.file === 'log') {
-      // Join the log IO chain: an in-flight fs.appendFile holds the old inode,
-      // and renaming over it mid-write silently drops that batch.
-      let writeErr = null;
-      await _logIo(() => {
-        try {
-          _atomicWrite(target, body.content);
-// Saved file supersedes the rotated .1 generation: delete it or deleted rows resurrect.
-          const prev = target + '.1';
-          if (fs.existsSync(prev)) {
-            fs.unlinkSync(prev);
-            log(`[${logId}] removed stale rotated generation ${path.basename(prev)} (log was saved as a single file)`);
-          }
-          stats.latSum = 0; stats.latN = 0; _reseedStats();
-        } catch (e) { writeErr = e; }
+      savedLog = await _logIo(() => {
+        const prev = target + '.1';
+        const active = _logFileVersion(target), rotated = _logFileVersion(prev);
+        if (emptyLog && !clearLog && (active.size || rotated.size || _logBuf.length || _pendingLogBatches.size)) {
+          return { status: 400, error: 'log content is empty — refusing to overwrite a non-empty log file' };
+        }
+        const offset = clearLog ? active.size : _logAppendOffset(body.log_revision, active, rotated);
+        if (offset === null) return { status: 409, error: 'Log changed or rotated. Reload Logs before saving.' };
+        const content = emptyLog || body.content.endsWith('\n') ? body.content : body.content + '\n';
+        // Copy entries appended since the editor loaded, before replacing the live file.
+        _atomicWrite(target, content, offset < active.size ? tmp => _copyLogAppend(target, tmp, offset, active.size) : undefined);
+        // Saved file supersedes the rotated generation.
+        if (rotated.id !== null) {
+          fs.unlinkSync(prev);
+          log(`[${logId}] removed stale rotated generation ${path.basename(prev)} (log was saved as a single file)`);
+        }
+        if (clearLog) {
+          _logGeneration++;
+          _logBuf = [];
+          _pendingLogBatches.clear();
+          clearTimeout(_logFlushTimer);
+          _logFlushTimer = null;
+          _logFlushFast = false;
+        }
+        _reseedStats();
+        return _readLogView(target);
       });
-      if (writeErr) throw writeErr;
+      if (savedLog.error) {
+        res.writeHead(savedLog.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: savedLog.error }));
+        return;
+      }
     } else {
       _atomicWrite(target, body.content);
     }
     log(`[${logId}] saved ${body.file}`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    res.end(JSON.stringify({ ok: true, ...savedLog }));
     if (body.file === 'config' && !CONFIG_PATH) {
       setTimeout(() => {
         log('─'); log(`🔄 [config] first config file created — restarting...`);

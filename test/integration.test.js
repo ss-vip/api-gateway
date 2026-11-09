@@ -305,6 +305,9 @@ function startGateway() {
         },
       };
       fs.writeFileSync(cfgPath, JSON.stringify(cfg));
+      // Seed both generations before startup: older logs store rounded seconds.
+      fs.writeFileSync(path.join(dir, 'log.json.1'), '{"type":"success","id":"legacy","latency":2}\n');
+      fs.writeFileSync(path.join(dir, 'log.json'), '{"type":"success","id":"precise","latency":0,"latency_ms":300}\n');
 
 // NOTE: stdio ignored — piping it would fill the 64KB buffer and block the gateway.
       gw = spawn(process.execPath, ['src/index.js'], {
@@ -882,4 +885,56 @@ test('console save rejects structurally invalid config without touching the file
     assert.ok(want.test(r.body), `${label}: expected ${want}, got ${r.body.slice(0, 160)}`);
   }
   assert.equal(fs.readFileSync(cfgPath, 'utf8'), before, 'rejected saves must not modify the config file');
+});
+
+test('console log save preserves newer entries and restores historical latency', async () => {
+  const logPath = path.join(path.dirname(cfgPath), 'log.json');
+  const get = async (endpoint) => {
+    const r = await req({ method: 'GET', path: '/api/console/' + endpoint, headers: authH() });
+    assert.equal(r.status, 200, r.body);
+    return JSON.parse(r.body);
+  };
+  const save = (content, fields) => req(
+    { path: '/api/console/save', headers: authH() },
+    { file: 'log', content, ...fields },
+  );
+  const ids = log => log.split('\n').filter(line => line.trim()).map(line => JSON.parse(line).id);
+
+  const seeded = await get('status');
+  assert.equal(seeded.success_total, 2);
+  assert.equal(seeded.avg_latency_ms, 1150);
+  const loaded = await get('load');
+  assert.deepEqual(ids(loaded.log), ['legacy', 'precise']);
+  // Identical lines are separate events and must survive by byte offset.
+  const newer = '{"type":"success","id":"newer","latency_ms":450}\n';
+  fs.appendFileSync(logPath, newer.repeat(2));
+  const edited = '{"type":"success","id":"edited","latency_ms":900}';
+  const first = await save(edited, { log_revision: loaded.log_revision });
+  assert.equal(first.status, 200, first.body);
+  const saved = JSON.parse(first.body);
+  assert.deepEqual(ids(saved.log), ['edited', 'newer', 'newer']);
+  assert.equal((await get('status')).avg_latency_ms, 600);
+  assert.equal(fs.existsSync(logPath + '.1'), false);
+
+  fs.appendFileSync(logPath, '{"type":"error","id":"latest","status":502,"latency_ms":9999}\n');
+  const stale = await save(edited, { log_revision: loaded.log_revision });
+  assert.equal(stale.status, 409, stale.body);
+  assert.deepEqual(ids(fs.readFileSync(logPath, 'utf8')), ['edited', 'newer', 'newer', 'latest']);
+  const second = await save(saved.log, { log_revision: saved.log_revision });
+  assert.equal(second.status, 200, second.body);
+  const updated = JSON.parse(second.body);
+  assert.deepEqual(ids(updated.log), ['edited', 'newer', 'newer', 'latest']);
+  assert.equal((await get('status')).avg_latency_ms, 600);
+
+  fs.renameSync(logPath, logPath + '.1');
+  fs.writeFileSync(logPath, newer);
+  const rotated = await save(edited, { log_revision: updated.log_revision });
+  assert.equal(rotated.status, 409, rotated.body);
+  assert.equal(fs.readFileSync(logPath, 'utf8'), newer);
+  assert.deepEqual(ids(fs.readFileSync(logPath + '.1', 'utf8')), ['edited', 'newer', 'newer', 'latest']);
+
+  const cleared = await save('', { clear: true });
+  assert.equal(cleared.status, 200, cleared.body);
+  assert.equal(JSON.parse(cleared.body).log, '');
+  assert.equal((await get('status')).avg_latency_ms, 0);
 });

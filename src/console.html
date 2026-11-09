@@ -806,10 +806,11 @@
 
 /* globals */
 let _token = (() => { try { return localStorage.getItem('gw_token') || ''; } catch { return ''; } })();   // sandboxed iframe = SecurityError; never kill the block
-let _rawLog = '', _cfgText = '', _cfgObj = null, _lastStatus = null, _logTruncated = false;
+let _rawLog = '', _cfgText = '', _cfgObj = null, _lastStatus = null, _logTruncated = false, _logRevision = null;
 let _charts = {};
 let _logRows = [], _logFiltered = [], _logPage = 0;
 let _lgRawDirty = false;   // user hand-edited the raw log textarea
+let _lgClearPending = false;
 const LG_PER = 50;
 let _lgType = 'all', _rowModal = null, _detailOc = null;
 let _keyModal = null, _keyFocusT = null;
@@ -888,8 +889,9 @@ function resetSession(msg) {
   if (_detailCtl) { _detailCtl.abort(); _detailCtl = null; }
   _authReq++;
   _token=''; try { localStorage.removeItem('gw_token'); } catch {} closeSSE();
-  _rawLog=''; _cfgText=''; _cfgObj=null; _lastStatus=null; _logTruncated=false;
+  _rawLog=''; _cfgText=''; _cfgObj=null; _lastStatus=null; _logTruncated=false; _logRevision=null;
   _logRows=[]; _logFiltered=[]; _logPage=0; _lgRawDirty=false;
+  _lgClearPending = false;
   // drop raw editors too — a later login must never see the previous session's keys
   try { $('cfgRaw').value=''; $('lgRaw').value=''; syncHl($('cfgRaw')); syncHl($('lgRaw')); } catch {}
   if ($('f_token')) $('f_token').value='';
@@ -937,7 +939,7 @@ $('btnLgReload').addEventListener('click', () => loadAll());
 function unsavedEdits(){
   return /unsaved/i.test((($('cfgStatus') || {}).textContent) || '')
     || (($('cfgRaw') || {}).value || '') !== (_cfgText || '')
-    || !!_lgRawDirty;
+    || _lgRawDirty || _lgClearPending;
 }
 async function loadAll(tag){
   tag = (tag === undefined) ? sessTag() : tag;
@@ -952,7 +954,9 @@ async function loadAll(tag){
     const d = await r.json();
     if (!sessAlive(tag) || _loadCtl !== ctl) return;
     _cfgText = d.config || DEFAULT_CONFIG; _rawLog = d.log || ''; _lgRawDirty = false;
+    _lgClearPending = false;
     _logTruncated = !!d.log_truncated;
+    _logRevision = d.log_revision ?? null;
     // label the editors with the files that are actually read/written
     const cfgName = d.config_file || 'config.json', logName = d.log_file || 'log.json';
     $('cfgFileName').textContent = cfgName;
@@ -1651,19 +1655,30 @@ $('btnCfgSave').addEventListener('click', async () => {
   if (!(await askConfirm('Save the config to the server? The gateway will restart and the new config takes effect.' + warnToken))) return;
   saveFile('config', $('cfgRaw').value);
 });
-async function saveFile(file, content){
+async function saveFile(file, content, clear = false){
   const tag = sessTag();
   const parsed = file === 'config' ? tryParseCfg(content) : null;
   const newClientToken = parsed?.ok ? String(parsed.obj?.client_token || '') : '';
   const requiresRelogin = file === 'config' && newClientToken !== '' && newClientToken !== _token;
   const ld = showLoading();
   try {
-    const r = await apiFetch('/api/console/save', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify({ file, content }) }, tag);
+    const payload = { file, content };
+    if (file === 'log') {
+      if (clear) payload.clear = true;
+      else payload.log_revision = _logRevision;
+    }
+    const r = await apiFetch('/api/console/save', { method:'POST', headers:{ 'Authorization':'Bearer '+_token, 'Content-Type':'application/json' }, body: JSON.stringify(payload) }, tag);
     if (!sessAlive(tag)) return;
     if (!r.ok){ const d = await r.json().catch(()=>({})); hideLoading(ld); toast('Save failed: ' + (d?.error || r.status), 0); return; }
-    toast('Saved', 1);
-    if (file === 'config') { _cfgText = content; setCfgStatus('Saved', 1); await waitForServer(requiresRelogin, tag, ld); }
-    else { _rawLog = content; parseLogRows(); applyLogFilter(); _lgRawDirty = false; hideLoading(ld); refreshStatus(tag, true); }   // _rawLog follows the save, else a 2nd save writes the pre-save view back
+    if (file === 'config') { toast('Saved', 1); _cfgText = content; setCfgStatus('Saved', 1); await waitForServer(requiresRelogin, tag, ld); }
+    else {
+      const d = await r.json();
+      if (!sessAlive(tag)) return;
+      _rawLog = d.log; _lgRawDirty = false; _lgClearPending = false;
+      _logTruncated = !!d.log_truncated; _logRevision = d.log_revision;
+      toast('Saved', 1);
+      parseLogRows(); hideLoading(ld); refreshStatus(tag, true);
+    }
   } catch(e){ if (!sessAlive(tag)) return; hideLoading(ld); if (e.message !== 'unauthorized') toast('Save error: ' + e.message, 0); }
 }
 async function waitForServer(requiresRelogin = false, tag, ld){
@@ -1787,6 +1802,7 @@ $('btnLgPrev').addEventListener('click', () => { _logPage--; renderLogPage(); })
 $('btnLgNext').addEventListener('click', () => { _logPage++; renderLogPage(); });
 $('btnLgRaw').addEventListener('click', () => $('lgRawWrap').classList.toggle('d-none'));
 $('btnLgSave').addEventListener('click', async () => {
+  if (_lgClearPending) { await saveFile('log', '', true); return; }
   const c = mergeLogContent();
   if (!c.trim()) { toast('Log view is empty — refusing to overwrite the log file', 0); return; }
   if (_logTruncated && !(await askConfirm('The loaded view holds only the newest log lines; saving overwrites the file and drops earlier entries. Continue?'))) return;
@@ -1797,7 +1813,8 @@ $('btnLgClear').addEventListener('click', () => {
   // from the stale filtered set and undoes the clear
   _rawLog=''; _logRows=[]; _logFiltered=[]; _logPage=0;
   $('lgRaw').value=''; _lgRawDirty=false; syncHl($('lgRaw')); renderLogPage();
-  toast('Cleared (display only — reload restores rows; an empty Save is refused)', 1);
+  _lgClearPending = true;
+  toast('Log cleared in the editor. Press Save to clear stored logs.', 1);
 });
 function mergeLogContent(){
   const f = $('lgFrom').value, t = $('lgTo').value, q = ($('lgSearch').value||'').toLowerCase(), pv = $('lgProv').value;
@@ -2059,7 +2076,9 @@ function updateStatus(d){
   _lastStatus = d;
   const total = (d.success_total||0) + (d.error_total||0);
   const rate = total ? (d.success_total/total*100) : 0;
-  $('kpiRate').textContent = rate.toFixed(1) + '%';
+  const roundedRate = rate.toFixed(1);
+  const rateLabel = rate > 0 && roundedRate === '0.0' ? '<0.1%' : roundedRate + '%';
+  $('kpiRate').textContent = total ? rateLabel : '—';
   $('kpiRateBar').style.width = rate + '%';
   $('kpiOk').textContent = (d.success_total||0) + ' Successful';
   $('kpiErr').textContent = (d.error_total||0) + ' Errors';
@@ -2136,7 +2155,7 @@ function syncHl(ta){
   const ta = $(id); if (!ta) return;
   ta.addEventListener('input', () => {
     syncHl(ta);
-    if (id === 'lgRaw') { _lgRawDirty = true; return; }
+    if (id === 'lgRaw') { _lgRawDirty = true; _lgClearPending = false; return; }
     // textarea is the source of truth: keep _cfgObj fresh so a key/provider
     // action cannot overwrite hand-made Raw edits with a stale snapshot
     const p = tryParseCfg(ta.value);
