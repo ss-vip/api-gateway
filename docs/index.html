@@ -171,7 +171,7 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
         </div>
         <h3>Multi-Provider Routing</h3>
-        <p>Route to OpenAI, DeepSeek, Mistral, Groq, Anthropic, VyceAI, AMD Radeon, BazaarLink, FlatKey, TokenRouter, or any OpenAI-compatible provider from a single endpoint.</p>
+        <p>Route to Mistral, Groq, VyceAI, AMD Radeon, BazaarLink, FlatKey, TokenRouter, or any OpenAI-compatible provider from a single endpoint.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">
@@ -243,13 +243,13 @@
 {
   <span class="keyword">"port"</span>: 3000,
   <span class="keyword">"providers"</span>: {
-    <span class="keyword">"openai"</span>: {
-      <span class="keyword">"apiKeys"</span>: [<span class="string">"sk-...KeyA", "sk-...KeyB"</span>],
-      <span class="keyword">"baseUrl"</span>: <span class="string">"https://api.openai.com"</span>
+    <span class="keyword">"openrouter"</span>: {
+      <span class="keyword">"apiKeys"</span>: [<span class="string">"sk-or-...KeyA", "sk-or-...KeyB"</span>],
+      <span class="keyword">"baseUrl"</span>: <span class="string">"https://openrouter.ai/api/v1"</span>
     }
   },
   <span class="keyword">"models"</span>: {
-    <span class="string">"gpt-5.6"</span>: <span class="string">"openai"</span>
+    <span class="string">"gpt-5.6"</span>: <span class="string">"openrouter"</span>
   }
 }</pre>
         </div>
@@ -267,7 +267,7 @@
       </details>
       <details class="faq-item">
         <summary class="faq-question">What providers are supported? <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></summary>
-        <div class="faq-answer">OpenAI, DeepSeek, Mistral, Groq, Anthropic, VyceAI, Navy, Ollama, AMD Radeon, BazaarLink, FlatKey, TokenRouter, Cloudflare Workers AI, and any OpenAI-compatible endpoint. Add custom providers via the config file — no code changes needed.</div>
+        <div class="faq-answer">Mistral, Cerebras, Groq, OpenRouter, Cohere, Pollinations, NVIDIA, Sea-Lion, Kilo, VyceAI, Ollama, AMD Radeon, AI Horde, LLM7, Morph, Parallel, Cartesia, ElevenLabs, BazaarLink, FlatKey, TokenRouter, Cloudflare Workers AI, and any OpenAI-compatible endpoint. Add custom providers via the config file — no code changes needed. See the README for the full list.</div>
       </details>
       <details class="faq-item">
         <summary class="faq-question">Do I need a database? <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></summary>

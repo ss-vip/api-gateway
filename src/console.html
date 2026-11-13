@@ -56,6 +56,14 @@
     .kpi-ic{font-size:1.1rem;opacity:.7}
     .detail-offcanvas{--bs-offcanvas-width:480px}
 
+    /* unsaved-changes indicators: yellow dot on the Save button + Config nav */
+    .dirty-dot{width:8px;height:8px;border-radius:50%;background:var(--bs-warning);display:inline-block;
+      margin-left:6px;vertical-align:middle;box-shadow:0 0 0 2px rgba(0,0,0,.25);flex:none}
+    .snav .dirty-dot{margin-left:auto}
+    #cfgDiffBody{font-family:Consolas,'Courier New',monospace;font-size:12.5px;line-height:1.6;
+      background:var(--bs-body-bg);border:1px solid var(--bs-border-color);border-radius:var(--bs-border-radius);
+      padding:.5rem .75rem;white-space:pre;overflow:auto;max-height:240px}
+
     /* translate dropdown */
     #langDropdown{color:var(--bs-secondary-color);padding:.25rem .5rem;border-radius:.375rem}
     #langDropdown:hover{color:var(--bs-body-color)}
@@ -157,7 +165,7 @@
         <span class="fw-bold">API Gateway</span>
       </div>
       <button class="snav active" data-v="overview"><i class="bi bi-speedometer2"></i><span>Dashboard</span></button>
-      <button class="snav" data-v="config"><i class="bi bi-gear"></i><span>Config</span></button>
+      <button class="snav" data-v="config"><i class="bi bi-gear"></i><span>Config</span><span class="dirty-dot d-none" data-cfgdirty title="Unsaved changes"></span></button>
       <button class="snav" data-v="logs"><i class="bi bi-journal-text"></i><span>Logs</span></button>
       <button class="snav" data-v="providers"><i class="bi bi-hdd-stack"></i><span>Providers</span></button>
       <div class="mt-auto pt-3 border-top">
@@ -173,7 +181,7 @@
       </div>
       <div class="offcanvas-body d-flex flex-column gap-1">
         <button class="snav active" data-v="overview" data-bs-dismiss="offcanvas"><i class="bi bi-speedometer2"></i><span>Dashboard</span></button>
-        <button class="snav" data-v="config" data-bs-dismiss="offcanvas"><i class="bi bi-gear"></i><span>Config</span></button>
+        <button class="snav" data-v="config" data-bs-dismiss="offcanvas"><i class="bi bi-gear"></i><span>Config</span><span class="dirty-dot d-none" data-cfgdirty title="Unsaved changes"></span></button>
         <button class="snav" data-v="logs" data-bs-dismiss="offcanvas"><i class="bi bi-journal-text"></i><span>Logs</span></button>
         <button class="snav" data-v="providers" data-bs-dismiss="offcanvas"><i class="bi bi-hdd-stack"></i><span>Providers</span></button>
         <div class="mt-auto pt-3 border-top">
@@ -190,7 +198,7 @@
         <div class="d-flex align-items-center gap-2">
           <button class="btn btn-outline-secondary btn-sm btn-sidebar-toggle" id="btnSidebar" title="Menu"><i class="bi bi-list"></i></button>
           <h1 class="fs-5 m-0" id="pageTitle">Dashboard</h1>
-          <button class="btn btn-primary btn-sm d-none" id="btnCfgSave" title="Persist the staged config and restart the gateway"><i class="bi bi-save"></i> Save &amp; activated</button>
+          <button class="btn btn-primary btn-sm d-none" id="btnCfgSave" title="Persist the staged config and restart the gateway"><i class="bi bi-save"></i> Save &amp; activate<span class="dirty-dot d-none" id="cfgDirtyDot" title="Unsaved changes"></span></button>
         </div>
         <div class="d-flex gap-2 align-items-center nav-actions">
           <button class="btn btn-outline-secondary btn-sm" id="btnTheme" title="Toggle Theme"><i class="bi bi-moon-fill"></i></button>
@@ -541,6 +549,27 @@
     <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button><button class="btn btn-primary btn-sm" id="keyModalSave" title="Save and it will take effect">OK</button></div>
   </div>
 </div></div>
+
+<!-- Config save diff modal: shows what will change before restart -->
+<div class="modal fade" id="cfgDiffModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h5 class="modal-title fs-6"><i class="bi bi-save text-primary"></i> Save &amp; activate</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body py-2">
+        <div class="small text-secondary mb-2">Gateway will restart and apply the new config (about 2-4s; requests queue briefly). Changes to be saved:</div>
+        <pre id="cfgDiffBody" class="mb-2 notranslate" translate="no"></pre>
+        <div class="alert alert-warning py-2 small mb-0 d-none" id="cfgDiffTokenWarn"><i class="bi bi-exclamation-triangle"></i> client_token is empty — all endpoints will be unauthenticated. Only suitable for local testing.</div>
+      </div>
+      <div class="modal-footer py-2">
+        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary btn-sm" id="cfgDiffSave"><i class="bi bi-check-lg"></i> Save &amp; activate</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- Provider modal: add a custom upstream, or edit baseUrl/pathPrefix/rpm.
   Array-form providers (built-in endpoint) convert to object form on save, but
@@ -1035,7 +1064,7 @@ function fillConfigForm(){
   renderProvEdit(); renderRouting(); renderLimits();
   _formSnap = _readForm();
 }
-function setCfgStatus(m, ok){ $('cfgStatus').innerHTML = m ? '<span class="'+(ok?'text-success':'text-danger')+'">'+_esc(m)+'</span>' : ''; }
+function setCfgStatus(m, ok){ $('cfgStatus').innerHTML = m ? '<span class="'+(ok?'text-success':'text-danger')+'">'+_esc(m)+'</span>' : ''; _updateUnsavedUI(); }
 // Raw editor collapse, persisted across sessions. The header (title + status +
 // toggle) always stays visible so "Valid JSON" remains readable while collapsed.
 function setRawCollapsed(collapsed) {
@@ -1276,9 +1305,12 @@ function renderModels(){
   if (!names.length){ tb.innerHTML = '<tr><td colspan="3" class="text-secondary small text-center notranslate">No data</td></tr>'; return; }
   tb.innerHTML = names.slice(0, 60).map(a => {
     const t = models[a];
-    const chips = Array.isArray(t) ? t.map(x=>{
+    // chain visualization: provider/model ➜ provider/model (dashed badge = fallback alias)
+    const chips = Array.isArray(t) ? t.map((x,i)=>{
       const fb = x && x.fallback ? (Array.isArray(x.fallback) ? x.fallback.join(',') : x.fallback) : '';
-      return '<span class="badge border border-info text-info me-1 mb-1" title="'+_esc(JSON.stringify(x))+'">'+_esc((x&&x.provider)||'?')+' / '+_esc((x&&x.model)||'')+((x&&x.endpoint)?' @'+_esc(x.endpoint):'')+(fb?' → '+_esc(fb):'')+'</span>';
+      const badge = '<span class="badge border border-info text-info me-0 mb-1" title="'+_esc(JSON.stringify(x))+'">'+_esc((x&&x.provider)||'?')+' / '+_esc((x&&x.model)||'')+((x&&x.endpoint)?' @'+_esc(x.endpoint):'')+'</span>';
+      const fbBadge = fb ? '<span class="badge border border-info text-info opacity-75 mb-1" title="After the whole chain fails, expand this alias: '+_esc(fb)+'">➜ '+_esc(fb)+'</span>' : '';
+      return (i ? '<span class="text-secondary mx-1 mb-1" title="Try next target on failure">➜</span>' : '') + badge + fbBadge;
     }).join('') : '<span class="text-secondary small">'+_esc(String(t))+'</span>';
     return '<tr class="notranslate" translate="no"><td class="mono small">'+_esc(a)+'</td><td>'+chips+'</td>'
       + '<td class="text-end text-nowrap"><button class="btn btn-outline-secondary btn-sm py-0 px-1" data-medit="'+_esc(a)+'" title="Edit alias"><i class="bi bi-pencil"></i></button> '
@@ -1638,6 +1670,87 @@ function validateConfigForSave(c) {
   }
   return '';
 }
+// --- Unsaved-changes indicator + diff summary ------------------------------
+// Config dirty = status text says unsaved, or the Raw buffer differs from the
+// last saved snapshot. Drives the yellow dot on the Save button + Config nav.
+function cfgIsDirty(){
+  if (cfgStatusHasUnsaved()) return true;
+  const raw = ($('cfgRaw') || {}).value;
+  return raw !== _cfgText;
+}
+function cfgStatusHasUnsaved(){
+  const el = $('cfgStatus');
+  return !!(el && /unsaved/i.test(el.textContent));
+}
+// Snapshot of the last saved config (parsed object) for the diff summary.
+function _cfgSnapshotObj(){ const p = tryParseCfg(_cfgText || ''); return p.ok ? p.obj : null; }
+function _cfgDiffLines(oldObj, newObj){
+  const lines = [];
+  const brief = (v) => {
+    if (Array.isArray(v)) return '[' + v.length + ' entries]';
+    if (v && typeof v === 'object') return '{' + Object.keys(v).length + ' keys}';
+    if (v === undefined) return '(removed)';
+    return JSON.stringify(v);
+  };
+  const keys = [...new Set([...Object.keys(oldObj || {}), ...Object.keys(newObj || {})])];
+  for (const k of keys){
+    if (k.startsWith('_')) continue;
+    const a = oldObj ? oldObj[k] : undefined, b = newObj ? newObj[k] : undefined;
+    if (JSON.stringify(a) === JSON.stringify(b)) continue;
+    if (a && b && !Array.isArray(a) && !Array.isArray(b) && typeof a === 'object' && typeof b === 'object'){
+      for (const sk of [...new Set([...Object.keys(a), ...Object.keys(b)])]){
+        if (sk.startsWith('_')) continue;
+        const sa = JSON.stringify(a[sk]), sb = JSON.stringify(b[sk]);
+        if (sa === sb) continue;
+        if (k === 'providers'){
+          const cnt = (x) => {
+            if (Array.isArray(x)) return x.filter(Boolean).length + ' keys';
+            if (x && typeof x === 'object'){
+              const kn = (x.apiKeys || []).filter(Boolean).length + ' keys';
+              return kn + (x.baseUrl ? ', baseUrl=' + x.baseUrl : '') + (x.rpm ? ', rpm=' + x.rpm : '');
+            }
+            return brief(x);
+          };
+          if (sa === undefined) lines.push('+ providers.' + sk + ' added (' + cnt(b[sk]) + ')');
+          else if (sb === undefined) lines.push('- providers.' + sk + ' removed');
+          else lines.push('~ providers.' + sk + ': ' + cnt(a[sk]) + ' → ' + cnt(b[sk]));
+        } else if (k === 'models'){
+          const chain = (x) => Array.isArray(x) ? x.map(t => (t && t.provider) || '?').join(' → ') : brief(x);
+          if (sa === undefined) lines.push('+ models.' + sk + ' added (' + chain(b[sk]) + ')');
+          else if (sb === undefined) lines.push('- models.' + sk + ' removed');
+          else lines.push('~ models.' + sk + ': ' + chain(a[sk]) + ' → ' + chain(b[sk]));
+        } else {
+          lines.push('~ ' + k + '.' + sk + ': ' + brief(sa) + ' → ' + brief(sb));
+        }
+      }
+    } else {
+      lines.push('~ ' + k + ': ' + brief(a) + ' → ' + brief(b));
+    }
+  }
+  return lines;
+}
+function _cfgDiffClass(line){
+  return line.startsWith('+') ? 'diff-add' : (line.startsWith('-') ? 'diff-del' : 'diff-chg');
+}
+function _updateUnsavedUI(){
+  const dirty = cfgIsDirty();
+  $('cfgDirtyDot').classList.toggle('d-none', !dirty);
+  $('btnCfgSave').title = dirty ? 'Persist the staged config and restart the gateway (unsaved changes)' : 'Persist the staged config and restart the gateway';
+  document.querySelectorAll('[data-cfgdirty]').forEach(el => el.classList.toggle('d-none', !dirty));
+}
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')){
+    if ($('btnCfgSave').classList.contains('d-none')) return;
+    if ($('cfgDiffModal').classList.contains('show')) return;
+    e.preventDefault();
+    $('btnCfgSave').click();
+  }
+});
+window.addEventListener('beforeunload', (e) => {
+  if (!cfgIsDirty()) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
 $('btnCfgSave').addEventListener('click', async () => {
   // stage pending form keystrokes now — Save is the only step that persists
   clearTimeout(_formSyncT); _formSyncT = null; _applyFormToStaging();
@@ -1650,9 +1763,16 @@ $('btnCfgSave').addEventListener('click', async () => {
   if (_formSnap !== null && _readForm() !== _formSnap) { toast('Form edits are not staged — fix the Raw JSON first', 0); return; }
   const err = validateConfigForSave(p.obj);
   if (err) { setCfgStatus('Invalid config: ' + err, 0); toast('Invalid config: ' + err, 0); return; }
-  const warnToken = String(p.obj.client_token || '').trim() ? ''
-    : ' WARNING: client_token is empty — all endpoints will be unprotected.';
-  if (!(await askConfirm('Save the config to the server? The gateway will restart and the new config takes effect.' + warnToken))) return;
+  const lines = _cfgDiffLines(_cfgSnapshotObj(), p.obj);
+  if (!lines.length){ toast('No changes to save', 0); return; }
+  const shown = lines.slice(0, 40);
+  if (lines.length > 40) shown.push('… ' + (lines.length - 40) + ' more');
+  $('cfgDiffBody').innerHTML = shown.map(l => '<span class="' + _cfgDiffClass(l) + '">' + _esc(l) + '</span>').join('\n');
+  $('cfgDiffTokenWarn').classList.toggle('d-none', !!String(p.obj.client_token || '').trim());
+  bootstrap.Modal.getOrCreateInstance($('cfgDiffModal')).show();
+});
+$('cfgDiffSave').addEventListener('click', () => {
+  bootstrap.Modal.getOrCreateInstance($('cfgDiffModal')).hide();
   saveFile('config', $('cfgRaw').value);
 });
 async function saveFile(file, content, clear = false){
@@ -1660,6 +1780,7 @@ async function saveFile(file, content, clear = false){
   const parsed = file === 'config' ? tryParseCfg(content) : null;
   const newClientToken = parsed?.ok ? String(parsed.obj?.client_token || '') : '';
   const requiresRelogin = file === 'config' && newClientToken !== '' && newClientToken !== _token;
+  if (file === 'log' && !clear && _logRevision == null) { toast('Log revision unknown — reload Logs before saving', 0); return; }
   const ld = showLoading();
   try {
     const payload = { file, content };
@@ -1802,7 +1923,10 @@ $('btnLgPrev').addEventListener('click', () => { _logPage--; renderLogPage(); })
 $('btnLgNext').addEventListener('click', () => { _logPage++; renderLogPage(); });
 $('btnLgRaw').addEventListener('click', () => $('lgRawWrap').classList.toggle('d-none'));
 $('btnLgSave').addEventListener('click', async () => {
-  if (_lgClearPending) { await saveFile('log', '', true); return; }
+  if (_lgClearPending) {
+    if (!(await askConfirm('Clear ALL stored logs on the server? Entries logged since this view loaded will also be deleted.'))) return;
+    await saveFile('log', '', true); return;
+  }
   const c = mergeLogContent();
   if (!c.trim()) { toast('Log view is empty — refusing to overwrite the log file', 0); return; }
   if (_logTruncated && !(await askConfirm('The loaded view holds only the newest log lines; saving overwrites the file and drops earlier entries. Continue?'))) return;
@@ -1814,7 +1938,7 @@ $('btnLgClear').addEventListener('click', () => {
   _rawLog=''; _logRows=[]; _logFiltered=[]; _logPage=0;
   $('lgRaw').value=''; _lgRawDirty=false; syncHl($('lgRaw')); renderLogPage();
   _lgClearPending = true;
-  toast('Log cleared in the editor. Press Save to clear stored logs.', 1);
+  toast('Log cleared in the editor. Press Save to delete stored logs — including entries logged after this view loaded.', 1);
 });
 function mergeLogContent(){
   const f = $('lgFrom').value, t = $('lgTo').value, q = ($('lgSearch').value||'').toLowerCase(), pv = $('lgProv').value;
@@ -2079,7 +2203,7 @@ function updateStatus(d){
   const roundedRate = rate.toFixed(1);
   const rateLabel = rate > 0 && roundedRate === '0.0' ? '<0.1%' : roundedRate + '%';
   $('kpiRate').textContent = total ? rateLabel : '—';
-  $('kpiRateBar').style.width = rate + '%';
+  $('kpiRateBar').style.width = (rate > 0 && rate < 0.1 ? 0.5 : rate) + '%';
   $('kpiOk').textContent = (d.success_total||0) + ' Successful';
   $('kpiErr').textContent = (d.error_total||0) + ' Errors';
   $('kpiTotal').textContent = total;

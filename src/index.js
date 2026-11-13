@@ -479,9 +479,8 @@ for (const [p, ks] of Object.entries(_norm)) PROVIDER_KEYS[p] = ks;
 
 const ENV_MAP = {
   MISTRAL_KEYS:'mistral', CEREBRAS_KEYS:'cerebras',
-  OPENAI_KEYS:'openai', DEEPSEEK_KEYS:'deepseek',
-  XAI_KEYS:'xai', GROQ_KEYS:'groq', TOGETHER_KEYS:'together', OPENROUTER_KEYS:'openrouter',
-  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', OPENCODE_KEYS:'opencode', ANTHROPIC_API_KEY:'anthropic', ANTHROPIC_KEYS:'anthropic', AIHORDE_KEYS:'aihorde', NAVY_KEYS:'navy', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink', FLATKEY_KEYS:'flatkey', TOKENROUTER_KEYS:'tokenrouter', APINEX_KEYS:'apinex',
+  XAI_KEYS:'', GROQ_KEYS:'groq', OPENROUTER_KEYS:'openrouter',
+  POLLINATIONS_KEYS:'pollinations', LITEROUTER_KEYS:'literouter', LLM7_KEYS:'llm7', NVIDIA_KEYS:'nvidia', G4F_KEYS:'gpt4free', AGNES_AI_KEYS:'agnes-ai', SEA_LION_KEYS:'sea-lion', KILO_KEYS:'kilo', AIHORDE_KEYS:'aihorde', OLLAMA_KEYS:'ollama', AMD_KEYS:'amd', BAZAARLINK_KEYS:'bazaarlink', FLATKEY_KEYS:'flatkey', TOKENROUTER_KEYS:'tokenrouter', APINEX_KEYS:'apinex',
 };
 
 // Direct upstream connection (no CF AI Gateway). All providers are OpenAI-compatible.
@@ -491,17 +490,11 @@ const   DIRECT_PROVIDERS = {
   nvidia: 'https://integrate.api.nvidia.com',
   gpt4free: 'https://g4f.space', 'agnes-ai': 'https://apihub.agnes-ai.com',
   'sea-lion': 'https://api.sea-lion.ai', kilo: 'https://api.kilo.ai',
-  openai: 'https://api.openai.com', cerebras: 'https://api.cerebras.ai',
-  deepseek: 'https://api.deepseek.com', xai: 'https://api.x.ai',
-  groq: 'https://api.groq.com', together: 'https://api.together.xyz',
+  cerebras: 'https://api.cerebras.ai',
+  groq: 'https://api.groq.com',
   openrouter: 'https://openrouter.ai', cohere: 'https://api.cohere.ai',
-  perplexity: 'https://api.perplexity.ai', huggingface: 'https://router.huggingface.co',
-  // --- Bearer-compatible additions ---
-  replicate: 'https://api.replicate.com', baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
-  opencode: 'https://opencode.ai/zen',
-  anthropic: 'https://api.anthropic.com',
+  baseten: 'https://inference.baseten.co', parallel: 'https://api.parallel.ai',
   aihorde: 'https://oai.aihorde.net',
-  navy: 'https://api.navy',
   vyceai: 'https://vyceai.com',
   ollama: 'https://ollama.com',
   orcarouter: 'https://api.orcarouter.ai',
@@ -526,7 +519,6 @@ for (const [p, m] of Object.entries(provMeta)) {
 const DIRECT_PATH_PREFIX = {
   kilo: '/api/gateway',
   groq: '/openai/v1', openrouter: '/api/v1', cohere: '/compatibility/v1',
-  perplexity: '/v1/sonar',
 };
 // Overlay config-defined path prefixes (manual providers)
 for (const [p, m] of Object.entries(provMeta)) {
@@ -540,7 +532,6 @@ const ADAPTERS = {
   nvidia:     { banned: new Set(['parallel_tool_calls']) },
   cohere:     { banned: new Set(['n','logit_bias','top_logprobs','parallel_tool_calls']) },
   mistral:    { banned: new Set(['user','n','logit_bias','top_logprobs','store']) },
-  huggingface:{ banned: new Set(['user']) },
   gpt4free:   { banned: new Set(['top_p']) },
   ollama:     { banned: new Set(['tool_choice','logit_bias','user','n']) },
   llm7:       { banned: new Set(['response_format','quality','style','output_format']) },
@@ -553,8 +544,6 @@ const PROVIDER_BANNED_FIELDS = {};
 for (const [k,v] of Object.entries(ADAPTERS)) { if (v.banned) PROVIDER_BANNED_FIELDS[k] = v.banned; }
 
 const PROVIDER_REASONING_SPEC = {
-  deepseek:   'keep',
-  opencode:   'keep',
   nvidia:     'keep',
   amd:        'strip',
   kilo:       'strip',
@@ -763,9 +752,6 @@ function markKeyError(p, key) {
 
 const QUOTA_RE = lib.QUOTA_RE;
 function _isQuotaError(status, body) { return lib._isQuotaError(status, body); }
-// note: opencode free-tier models only work inside OpenCode — case-insensitive, no circuit penalty (model-level only)
-const FREE_TIER_RE = /free\s*tier\s*can\s*only\s*be\s*used\s*in\s*opencode/i;
-function _isFreeTierError(body) { return typeof body === 'string' && FREE_TIER_RE.test(body); }
 function _parseRetryAfter(res) {
   const h = res?.headers?.['retry-after'] || res?.headers?.['Retry-After'];
   if (!h) return 0;
@@ -982,19 +968,11 @@ const PROVIDER_RPM = {
   openrouter: 10,
   groq: 12,
   cerebras: 5,
-  deepseek: 12,
   'agnes-ai': 10,
-  navy: 10,
   ollama: 10,
   'sea-lion': 5,
   kilo: 1,
-  openai: 10,
-  xai: 10,
-  together: 10,
   cohere: 10,
-  perplexity: 10,
-  huggingface: 10,
-  replicate: 10,
   baseten: 10,
   parallel: 10,
   orcarouter: 10,
@@ -1280,7 +1258,7 @@ function estimateTokens(messages) { return lib.estimateTokens(messages); }
 
 
 // --- context sanitization ---
-const REASONING_PROVIDERS = new Set(['deepseek', 'opencode', 'nvidia']);
+const REASONING_PROVIDERS = new Set(['nvidia']);
 const STRICT_ORDER_PROVIDERS = new Set(['nvidia']);
 // non-text (vision) content unsupported — log-verified 400s ("does not support vision input")
 const NO_NON_TEXT_TARGETS = new Set(['llm7/codestral-latest', 'llm7/gpt-oss:20b'].map(s => s.toLowerCase()));
@@ -1638,29 +1616,6 @@ const _NVIDIA_ASSISTANT_CONTENT = '.\n';
 const _isCFBase = (base) => /api\.cloudflare\.com/i.test(base);
 const _cfRunPath = (model) => 'run/' + String(model).replace(/[^a-zA-Z0-9@._\-/]/g, (c) => encodeURIComponent(c));
 
-function _opencodeExtraHeaders(req, provider) {
-  const isOpencode = provider === 'opencode' || provider === 'opencode-go';
-  if (!isOpencode) return undefined;
-  const h = {};
-  for (const [k, v] of Object.entries(req.headers || {})) {
-    if (k.toLowerCase().startsWith('x-opencode-')) h[k] = v;
-  }
-  // note: Zen free tier enforces the full request contract (versioned UA + ses_shape session + stream + accepted tools) — imitate the official CLI; client-sent values always win
-  if (!h['x-opencode-client'] && !h['X-Opencode-Client']) h['x-opencode-client'] = 'tui';
-  const s0 = h['x-opencode-session'] || h['X-Opencode-Session'];
-  if (!s0 || !lib.isCanonOpencodeSession(s0)) {
-    // note: hash only auth tail + UA to avoid holding full token in a temp string; foreign sessions are translated deterministically
-    const auth = req.headers['authorization'] || '';
-    const ua = req.headers['user-agent'] || '';
-    delete h['x-opencode-session']; delete h['X-Opencode-Session'];
-    h['x-opencode-session'] = lib.canonOpencodeSession(s0 || `${auth.slice(-12)}|${ua}|${provider}`);
-  }
-  if (!h['x-opencode-request'] && !h['X-Opencode-Request']) h['x-opencode-request'] = `req-${rid()}`;
-  h['User-Agent'] = OPENCODE_UA;
-  return h;
-}
-// note: free-tier floor moves fast (1.17 → 1.18 in a day) — override via OPENCODE_UA env on 426 UpgradeRequired
-const OPENCODE_UA = process.env.OPENCODE_UA || 'opencode/latest/1.18.31';
 function _chatToResponses(bodyObj) { return lib.chatToResponses(bodyObj); }
 
 function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, contentType, extraHeaders, signal, method) {
@@ -1669,7 +1624,6 @@ function forwardToDirect(apiKey, bodyStr, baseUrl, endpointPath, accept, content
     const joined = baseUrl.replace(/\/+$/, '') + '/' + endpointPath.replace(/^\/+/, '');
     const url = new URL(joined);
     const isHttps = url.protocol === 'https:';
-    const isOpencode = baseUrl.includes('opencode.ai');
     let isAnthropic = false;
 try { isAnthropic = new URL(baseUrl).hostname === 'api.anthropic.com'; } catch {}
     const headers = {
@@ -1683,7 +1637,6 @@ try { isAnthropic = new URL(baseUrl).hostname === 'api.anthropic.com'; } catch {
       headers['anthropic-version'] = '2023-06-01';
       delete headers['Authorization'];
     }
-    if (isOpencode && !headers['User-Agent'] && !headers['user-agent']) headers['User-Agent'] = 'api-gateway';
     const opts = {
       hostname: url.hostname,
       port: url.port || (isHttps ? 443 : 80),
@@ -2102,17 +2055,12 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
             addActive(provider); slotHeld = true;
             let targetPath = target.endpoint || (DIRECT_PATH_PREFIX[provider] || '/v1') + '/chat/completions';
             let targetBodyStr = bodyStr;
-            // note: /v1/responses is always streamed upstream (free-tier contract) then converted back to chat JSON / replayed SSE
+            // note: /v1/responses is always streamed upstream then converted back to chat JSON / replayed SSE
             let acceptHdr = isStream ? 'text/event-stream' : 'application/json';
             if (target.endpoint === '/v1/responses') {
               const rBody = _chatToResponses(bodyObj);
               rBody.model = upstreamModel;
               rBody.stream = true;
-              if ((provider === 'opencode' || provider === 'opencode-go') && /free/i.test(upstreamModel) && !rBody.tools) {
-                rBody.tools = lib.PLACEHOLDER_TOOLS;
-                rBody.tool_choice = 'auto';
-                log(`[${logId}] ➡️ [${provider}/${upstreamModel}] free-tier gate: injected ${lib.PLACEHOLDER_TOOLS.length} placeholder tools`);
-              }
               if (responsesMaxOverride > 0 && responsesMaxTarget === `${provider}/${upstreamModel}`) rBody.max_output_tokens = responsesMaxOverride;
               targetBodyStr = JSON.stringify(rBody);
               acceptHdr = 'text/event-stream';
@@ -2120,7 +2068,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               const mBody = lib.chatToAnthropic({ ...bodyObj, model: upstreamModel });
               targetBodyStr = JSON.stringify(mBody);
             }
-            upstreamRes = await forwardToDirect(usedKey, targetBodyStr, DIRECT_PROVIDERS[provider], targetPath, acceptHdr, 'application/json', _opencodeExtraHeaders(req, provider), sig);
+            upstreamRes = await forwardToDirect(usedKey, targetBodyStr, DIRECT_PROVIDERS[provider], targetPath, acceptHdr, 'application/json', undefined, sig);
             usedProvider = provider;
             usedModel = upstreamModel;
             curProvider = provider; curUpstream = upstreamRes; curKey = usedKey;
@@ -2228,15 +2176,6 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
               if (credProblem || sc === 429 || sc >= 500) _markKeyFailed(provider, usedKey, sc, body);
               log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(usedKey)} ${_errMsg(body)}`);   // stdout honours the disk redaction policy
               logEvent({ logId, provider, model: upstreamModel, key: usedKey, status: sc, body });
-              if (typeof body === 'string' && /or newer is required/.test(body)) log(`[${logId}] ⚠️ Zen demands a newer client — bump OPENCODE_UA (${_safeSlice(body, 120)})`);
-              if (_isFreeTierError(body)) {
-                // note: model-level only — skip channel for fallback, lock model, no provider circuit
-                _recordModelFailure(provider, upstreamModel);
-                skippedProviders.add(provider);
-                lastErr = { status: sc, body };
-                upstreamRes = null;
-                break;
-              }
               if (sc >= 500) _recordProviderFailure(provider);
               // lock the MODEL for a permanently unavailable model, but only
               // penalise the channel for failures that indicate channel health
@@ -2381,7 +2320,7 @@ async function handleChatCompletion(req, res, bodyJson, logId) {
           addActive(tp);
           const base = DIRECT_PROVIDERS[tp];
           const ep = (DIRECT_PATH_PREFIX[tp] || '/v1') + '/chat/completions';
-          const up = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, _opencodeExtraHeaders(req, tp), sig);
+          const up = await forwardToDirect(nk, b2, base, ep, 'text/event-stream', undefined, undefined, sig);
           if (up.statusCode >= 200 && up.statusCode < 300) {
             sseUpstream = up; sseProvider = tp; sseModel = tm;
             curProvider = tp; curUpstream = up; curKey = nk;
@@ -2661,19 +2600,13 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
     releaseKey(provider, key);
     if (_isHealthFailure(sc)) _markKeyFailed(provider, key, sc, body);
     if (sc === 429) await _handleUpstream429(provider, key, upstreamRes, body, logId, res);
-    const isFreeTier = _isFreeTierError(body);
-    log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_errMsg(body)}${isFreeTier ? ' free-tier' : ''}`);   // stdout honours the disk redaction policy
+    log(`[${logId}] ${_statusIcon(sc)} ${sc} [${provider}/${upstreamModel}] key=${logKey(key)} ${_errMsg(body)}`);   // stdout honours the disk redaction policy
     logEvent({ logId, provider, model: upstreamModel, key, status: sc, body });
     lastErr = { status: sc, body };
-    if (isFreeTier) {
-      _recordModelFailure(provider, upstreamModel, t0);
-      skippedProviders.add(provider);
-    } else {
-      if (sc >= 500) _recordProviderFailure(provider);
-      // same policy as chat: only credential/429/5xx failures lock the model
-      if (sc === 401 || sc === 403 || sc === 429 || sc >= 500) _recordModelFailure(provider, upstreamModel, t0);
-      if (sc !== 429) skippedProviders.add(provider);
-    }
+    if (sc >= 500) _recordProviderFailure(provider);
+    // same policy as chat: only credential/429/5xx failures lock the model
+    if (sc === 401 || sc === 403 || sc === 429 || sc >= 500) _recordModelFailure(provider, upstreamModel, t0);
+    if (sc !== 429) skippedProviders.add(provider);
     if (sc === 401) markKey401(provider, key, upstreamModel);
     return 'retry';
   };
@@ -2718,7 +2651,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
           const cfEp = _cfRunPath(upstreamModel);
           try {
             addActive(provider);
-            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', _opencodeExtraHeaders(req, provider), sig);
+            const upstreamRes = await forwardToDirect(key, JSON.stringify(cfBody), directBase, cfEp, 'application/json', 'application/json', undefined, sig);
             const sc = upstreamRes.statusCode;
             if (sc >= 200 && sc < 300 && !clientGone) {
               const raw = (await collectBody(upstreamRes)) ?? '';
@@ -2774,7 +2707,7 @@ async function handleProxy(req, res, bodyJson, logId, endpointPath, jsonBody, co
         upstreamContentType = jsonBody !== false ? 'application/json' : (contentType || 'application/octet-stream');
         try {
           addActive(provider);
-          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, _opencodeExtraHeaders(req, provider), sig);
+          const upstreamRes = await forwardToDirect(key, bodyStr, directBase, (DIRECT_PATH_PREFIX[provider] || '/v1') + endpointPath, 'application/json', upstreamContentType, undefined, sig);
           if (await processResponse(upstreamRes, provider, upstreamModel, key) === 'done') return;
           continue;
         } catch (e) {

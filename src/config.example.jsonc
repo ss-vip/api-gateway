@@ -59,24 +59,17 @@
   // ── Provider ──────────────────────────────────────────
   // 陣列 = OpenAI 相容端點。未使用的可刪除或留空。
   "providers": {
-    "openai": ["sk-..."],
     "orcarouter": ["sk-..."],
     "openrouter": ["sk-or-..."],
-    "together": ["..."],
     "mistral": ["..."],
     "cerebras": ["csk-..."],
-    "deepseek": ["sk-..."],
-    "xai": ["xai-..."],
     "groq": ["gsk_..."],
     "cohere": ["..."],
     "nvidia": ["nvapi-..."],
-    "huggingface": ["hf_..."],
     "pollinations": ["sk_..."],
     "literouter": ["..."],
     "llm7": ["..."],
     "gpt4free": ["g4f_..."],
-    "opencode": ["sk-..."],
-    "anthropic": ["sk-ant-..."],
     "kilo": ["eyJ..."],
     "sea-lion": ["sk-...", "sk-..."],
     "cartesia": ["sk_car_..."],
@@ -84,7 +77,6 @@
     "morph": ["sk-..."],
     "aihorde": ["..."],
     "aihubmix": ["..."],
-    "navy": ["..."],
     "ollama": ["sk-..."],
     "amd": ["rc-..."],
     "bazaarlink": ["bz-..."],
@@ -108,7 +100,6 @@
     "cohere": 1000,
     "nvidia": 1000,
     "gpt4free": 1000,
-    "opencode": 1000,
     "sea-lion": 6000
   },
 
@@ -139,20 +130,13 @@
     "/v1/images/edits": "image",
     "/v1/images/variations": "image",
     "/v1/audio/translations": "stt",
-    "/v1/files": "file-store",
-    "/v1/messages": "claude"
+    "/v1/files": "file-store"
   },
 
   // ── Model 別名 ────────────────────────────────────────
   // key = client 送的名稱；value = 依序嘗試的鏈。
   // 單一目標可加 "endpoint"（強制上游端點）或 "fallback"（整鏈失敗後展開的別名）。
   "models": {
-    "claude": [
-      { "provider": "anthropic", "model": "claude-sonnet-4-20250514" }
-    ],
-    "opencode-free": [
-      { "provider": "opencode", "model": "muse-spark-1.2-contributor-free", "endpoint": "/v1/responses", "fallback": "claude" }
-    ],
     "vyceai-auto": [
       { "provider": "vyceai", "model": "auto", "fallback": "openai" }
     ],
@@ -162,7 +146,6 @@
     "openai": [
       { "provider": "mistral", "model": "mistral-small-latest" },
       { "provider": "cerebras", "model": "zai-glm-4.7" },
-      { "provider": "opencode", "model": "deepseek-v4-flash-free" },
       { "provider": "groq", "model": "qwen/qwen3.6-27b" },
       { "provider": "kilo", "model": "kilo-auto/free" },
       { "provider": "cohere", "model": "command-a-plus-05-2026" }
@@ -180,7 +163,7 @@
       { "provider": "mistral", "model": "mistral-small-latest" }
     ],
     "image": [
-      { "provider": "together", "model": "black-forest-labs/FLUX.1-schnell-free" }
+      { "provider": "pollinations", "model": "flux" }
     ],
     "tts": [
       { "provider": "cartesia", "model": "sonic-3.5" },

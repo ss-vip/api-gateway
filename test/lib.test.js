@@ -69,11 +69,11 @@ test('createModelResolver matches exact and prefixed client models', () => {
 
 test('createModelResolver propagates endpoint and fallback', () => {
   const entries = new Map([
-    ['a', [{ provider: 'opencode', model: 'm', endpoint: '/v1/responses', fallback: 'b' }]],
+    ['a', [{ provider: 'upx', model: 'm', endpoint: '/v1/responses', fallback: 'b' }]],
     ['c', [{ provider: 'x', model: 'y', fallback: ['b', 'a'] }]],
   ]);
   const resolve = lib.createModelResolver(entries);
-  assert.deepEqual(resolve('a'), [{ provider: 'opencode', upstreamModel: 'm', endpoint: '/v1/responses', fallback: 'b' }]);
+  assert.deepEqual(resolve('a'), [{ provider: 'upx', upstreamModel: 'm', endpoint: '/v1/responses', fallback: 'b' }]);
   assert.deepEqual(resolve('c'), [{ provider: 'x', upstreamModel: 'y', fallback: ['b', 'a'] }]);
 });
 
@@ -445,26 +445,6 @@ test('chatToResponses maps named tool_choice and parallel tool_calls', () => {
     { type: 'function_call_output', call_id: 'c1', output: 'r1' },
     { type: 'function_call_output', call_id: 'c2', output: '{"nested":true}' },
   ]);
-});
-
-test('canonOpencodeSession renders stable ses_shape sessions', () => {
-  const a = lib.canonOpencodeSession('seed-1');
-  const b = lib.canonOpencodeSession('seed-1');
-  const c = lib.canonOpencodeSession('seed-2');
-  assert.equal(a, b);
-  assert.notEqual(a, c);
-  assert.ok(lib.isCanonOpencodeSession(a));
-  assert.ok(lib.isCanonOpencodeSession('ses_abcdef123456AbCdEfGhIjKlMn'));
-  assert.equal(lib.isCanonOpencodeSession('gw-abc'), false);
-  assert.equal(lib.isCanonOpencodeSession('ses_short'), false);
-});
-
-test('PLACEHOLDER_TOOLS declares callable-shaped function tools', () => {
-  assert.ok(Array.isArray(lib.PLACEHOLDER_TOOLS) && lib.PLACEHOLDER_TOOLS.length >= 6);
-  for (const t of lib.PLACEHOLDER_TOOLS) {
-    assert.equal(t.type, 'function');
-    assert.ok(typeof t.name === 'string' && t.name);
-  }
 });
 
 test('assembleResponsesSSE prefers the completed snapshot', () => {

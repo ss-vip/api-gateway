@@ -19,7 +19,6 @@ const TOKEN = 'test-client-token';
 const KEY_JSON = 'key-json';
 const KEY_SSE = 'key-sse';
 const KEY_ERR = 'key-err';
-const KEY_OC = 'key-oc';
 const KEY_RSP = 'key-rsp';
 const KEY_RSPEMPTY = 'key-rspempty';
 // stream that closes WITHOUT a terminal marker ([DONE] / stop / message_stop) →
@@ -82,9 +81,7 @@ function startMock() {
         const raw = Buffer.concat(chunks).toString('utf8');
         try { body = JSON.parse(raw || '{}'); } catch {}
         const auth = req.headers['authorization'] || '';
-        mock.requests.push({ method: req.method, url: req.url, auth, body, raw,
-          fp: { ua: req.headers['user-agent'] || '', client: req.headers['x-opencode-client'] || '',
-            session: req.headers['x-opencode-session'] || '', request: req.headers['x-opencode-request'] || '' } });
+        mock.requests.push({ method: req.method, url: req.url, auth, body, raw });
 
         // classifier.dev shape (free-mode: no auth) — label by marker, else by labels
         if (body && Array.isArray(body.inputs) && Array.isArray(body.labels)) {
@@ -232,7 +229,6 @@ function startGateway() {
           mocksse: { apiKeys: [KEY_SSE], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockerr: { apiKeys: [KEY_ERR], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           orcarouter: { apiKeys: ['key-orca'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
-          opencode: { apiKeys: [KEY_OC], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockrsp: { apiKeys: [KEY_RSP], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           mockrspempty: { apiKeys: [KEY_RSPEMPTY], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
           tierlite: { apiKeys: ['key-lite'], baseUrl: `http://127.0.0.1:${mockPort}`, pathPrefix: '/v1' },
@@ -273,7 +269,6 @@ function startGateway() {
         classifier: { base_url: `http://127.0.0.1:${mockPort}`, timeout_ms: 3000 },
         models: {
           [MODEL_JSON]: [{ provider: 'mockjson', model: 'mock-model' }],
-          ocmock: [{ provider: 'opencode', model: 'mock-model' }],
           rsp: [{ provider: 'mockrsp', model: 'mock-model', endpoint: '/v1/responses' }],
           rspempty: [{ provider: 'mockrspempty', model: 'mock-model', endpoint: '/v1/responses' }],
           [MODEL_SSE]: [{ provider: 'mocksse', model: 'mock-model' }],
@@ -426,23 +421,6 @@ test('chat: orcarouter provider routes to upstream with its key', async () => {
   assert.equal(r.status, 200);
   const seen = mock.requests.some((x) => x.auth.includes('key-orca') && x.body && x.body.model === 'orca-model');
   assert.ok(seen, 'orcarouter provider should forward with its own key and upstream model');
-});
-
-test('chat: opencode provider sends CLI-imitating fingerprint headers', async () => {
-  mock.requests.length = 0;
-  const r1 = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('ocmock'));
-  assert.equal(r1.status, 200);
-  const r2 = await req({ method: 'POST', path: '/v1/chat/completions', headers: authH() }, chatBody('ocmock'));
-  assert.equal(r2.status, 200);
-  const seen = mock.requests.filter(x => x.auth.includes(KEY_OC));
-  assert.ok(seen.length >= 2, 'upstream should receive both requests');
-  for (const s of seen) {
-    assert.match(s.fp.ua, /^opencode\/latest\/\d+\.\d+/, 'UA must carry versioned opencode identity');
-    assert.equal(s.fp.client, 'tui');
-    assert.ok(/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(s.fp.session), 'session must be canonical ses_shape');
-    assert.ok(s.fp.request.startsWith('req-'), 'request id should be unique per call');
-  }
-  assert.notEqual(seen[0].fp.request, seen[1].fp.request, 'request ids must differ per call');
 });
 
 test('chat: responses-override streams upstream and assembles chat completion', async () => {

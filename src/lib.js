@@ -583,23 +583,6 @@ function responsesOutputToChat(rj, clientModel) {
   return { text, toolCalls, finish, usage };
 }
 
-// --- opencode free-tier contract ---
-// note: upstream checks the session SHAPE (ses_ + 12 hex + 14 base62), not the value — render deterministically so cache affinity survives
-function canonOpencodeSession(seed) {
-  const hex = crypto.createHash('sha256').update(String(seed ?? '')).digest('hex');
-  const B62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-  const raw = Buffer.from(hex.slice(12, 40), 'hex');
-  let tail = '';
-  for (let i = 0; i < 14; i++) tail += B62[raw[i] % 62];
-  return `ses_${hex.slice(0, 12)}${tail}`;
-}
-function isCanonOpencodeSession(s) {
-  return typeof s === 'string' && /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(s);
-}
-// note: free tier refuses tool-less requests (names allowlisted upstream, shifts over time) — declare plausible placeholders so plain-chat callers pass the gate
-const PLACEHOLDER_TOOLS = ['read', 'write', 'edit', 'bash', 'glob', 'grep', 'list', 'task'].map(name => ({
-  type: 'function', name, description: 'Do not call this tool.', parameters: { type: 'object', properties: {} },
-}));
 // note: assemble a responses-SSE stream into an rj-like object for responsesOutputToChat; prefers the completed snapshot, falls back to deltas
 function assembleResponsesSSE(sse) {
   const rj = { id: null, status: 'incomplete', output: [], usage: {} };
@@ -959,9 +942,6 @@ module.exports = {
   chatToResponses,
   chatToAnthropic,
   responsesOutputToChat,
-  canonOpencodeSession,
-  isCanonOpencodeSession,
-  PLACEHOLDER_TOOLS,
   assembleResponsesSSE,
   CHAT_FAMILY_ENDPOINTS,
   buildNonChatAliases,
